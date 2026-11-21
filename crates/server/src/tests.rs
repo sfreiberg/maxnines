@@ -11,6 +11,7 @@ mod events;
 mod proxies;
 mod roles;
 mod sign_ins;
+mod templates;
 mod two_factor;
 mod users;
 
@@ -258,6 +259,7 @@ async fn start_with_heartbeat(
         require_two_factor: Arc::default(),
         pending_sign_ins: Arc::default(),
         health_limit,
+        template_upgrades: Arc::default(),
     };
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

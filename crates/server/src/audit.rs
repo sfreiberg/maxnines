@@ -256,10 +256,11 @@ pub enum Kind {
     Setting,
     /// An address or range decided to be a proxy in front of the server, or not one.
     Proxy,
+    Template,
 }
 
 impl Kind {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::User,
         Self::ApiKey,
         Self::AppSignIn,
@@ -277,6 +278,7 @@ impl Kind {
         Self::Annotation,
         Self::Setting,
         Self::Proxy,
+        Self::Template,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -298,6 +300,7 @@ impl Kind {
             Self::Annotation => "annotation",
             Self::Setting => "setting",
             Self::Proxy => "proxy",
+            Self::Template => "template",
         }
     }
 
@@ -320,6 +323,7 @@ impl Kind {
             Self::Annotation => "Annotation",
             Self::Setting => "Setting",
             Self::Proxy => "Proxy",
+            Self::Template => "Template",
         }
     }
 

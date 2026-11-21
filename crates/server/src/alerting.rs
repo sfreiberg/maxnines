@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionRun, RuleAction, check_rule_actions};
-use crate::alert_conditions::{Conditions, MetricUse, Scope};
+use crate::alert_conditions::{Conditions, LocalMetrics, MetricUse, Scope};
 use crate::calculations::{Calculation, Question};
 use crate::channels;
 use crate::metric_charts::format_value;
@@ -71,10 +71,27 @@ pub struct AlertRule {
     pub id: i64,
     #[serde(flatten)]
     pub rule: AlertRuleInput,
+    /// The template whose alert it is, for one that's a template's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateLink>,
     /// Its conditions, read once as it's loaded. None for ones that can't be read,
     /// which saving a rule doesn't allow.
     #[serde(skip)]
     pub conditions: Option<Arc<Conditions>>,
+}
+
+/// How a rule is one of a template's alerts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemplateLink {
+    /// The template's ID.
+    pub id: i64,
+    /// The alert's key in the template.
+    pub alert: String,
+    /// The fields people changed from the template's values, which upgrades leave.
+    pub overridden: Vec<String>,
+    /// Whether it needs what only agents running the template would send, its own
+    /// metrics or what its discovery finds, so it isn't checked yet.
+    pub waits_for_agents: bool,
 }
 
 impl AlertRule {
@@ -83,8 +100,17 @@ impl AlertRule {
         Self {
             id,
             rule,
+            template: None,
             conditions,
         }
+    }
+
+    /// Whether it's left alone for now, as only agents running its template could
+    /// give it what it needs.
+    pub fn waits_for_agents(&self) -> bool {
+        self.template
+            .as_ref()
+            .is_some_and(|template| template.waits_for_agents)
     }
 
     /// See [`AlertRuleInput::watched`].
@@ -181,13 +207,18 @@ const MIN_REMINDER: TimeDelta = TimeDelta::minutes(5);
 /// Checks a rule before it's saved, with no host's facts to try its conditions on.
 #[cfg(test)]
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
-    check_rule_with(rule, &Value::Null).map(|_| ())
+    check_rule_in(rule, &Value::Null, None).map(|_| ())
 }
 
 /// Checks a rule before it's saved, trying its conditions on `facts`, a real host's
-/// if there is one, and gives its conditions, read. Whether its channels exist is up
-/// to the caller, which can see them.
-pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<Conditions> {
+/// if there is one, and gives its conditions, read. A template's alert's conditions
+/// and summaries can use the template's own metrics, `local`, too. Whether its
+/// channels exist is up to the caller, which can see them.
+pub fn check_rule_in(
+    rule: &AlertRuleInput,
+    facts: &Value,
+    local: Option<&LocalMetrics>,
+) -> Result<Conditions> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
     ensure!(
@@ -204,12 +235,12 @@ pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<Condition
         "choose every channel or some of them, not both"
     );
 
-    let conditions = rule.conditions()?;
+    let conditions = rule.conditions_in(local)?;
     // A calculation's value is in the unit it's worked out in.
     let value_unit = rule
         .question()
         .map_or(Unit::Number, |question| question.unit());
-    conditions.dry_run(facts, value_unit)?;
+    conditions.dry_run_in(facts, value_unit, local)?;
     if let Some(applies_to) = &rule.applies_to {
         ensure!(
             !rule.is_calculation(),
@@ -229,7 +260,9 @@ pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<Condition
             rule.metric.is_none() && rule.group_by.is_none() && rule.filter.is_none(),
             "only a rule with a calculation takes a metric, grouping or filter"
         );
-        if conditions.forecast_metrics().is_empty() {
+        let forecasts = !conditions.forecast_metrics().is_empty()
+            || conditions.local_uses().any(|used| used.forecast);
+        if !forecasts {
             ensure!(
                 rule.window.is_none(),
                 "only a calculation or forecast() looks back over a window"
@@ -246,7 +279,7 @@ pub fn check_rule_with(rule: &AlertRuleInput, facts: &Value) -> Result<Condition
         (&rule.resolved_summary, "resolved summary"),
     ] {
         if let Some(template) = template {
-            rule.check_summary(template, &conditions)
+            rule.check_summary(template, &conditions, local)
                 .map_err(|error| anyhow!("the {which}: {error:#}"))?;
         }
     }
@@ -261,6 +294,20 @@ pub struct SummaryValues {
     /// The first metric's reading, or the calculated value.
     pub value: Option<String>,
     pub metrics: Vec<(&'static str, Value)>,
+    /// What a template's alert can show besides.
+    pub template: Option<TemplateValues>,
+}
+
+/// What a template's alert can show besides what any rule can.
+pub struct TemplateValues {
+    /// The template's key, which starts its metrics' full names.
+    pub prefix: String,
+    /// Its metrics' readings by their short names.
+    pub metrics: Map<String, Value>,
+    /// What it's running for, such as a database's name.
+    pub instance: String,
+    /// The series' labels, such as `slot`.
+    pub labels: Map<String, Value>,
 }
 
 impl SummaryValues {
@@ -268,6 +315,18 @@ impl SummaryValues {
         let mut fields = Map::new();
         for (name, value) in &self.metrics {
             insert_at(&mut fields, name, value.clone());
+        }
+        if let Some(template) = &self.template {
+            for (short, value) in &template.metrics {
+                fields.entry(short.clone()).or_insert_with(|| value.clone());
+                insert_at(
+                    &mut fields,
+                    &format!("{}.{short}", template.prefix),
+                    value.clone(),
+                );
+            }
+            fields.insert("instance".to_string(), json!(template.instance));
+            fields.insert("labels".to_string(), Value::Object(template.labels.clone()));
         }
         fields.insert("hostname".to_string(), json!(self.hostname));
         fields.insert("series".to_string(), json!(self.series));
@@ -309,11 +368,21 @@ impl AlertRuleInput {
 
     /// The rule's conditions, read. Saving a rule checks they can be.
     pub fn conditions(&self) -> Result<Conditions> {
+        self.conditions_in(None)
+    }
+
+    /// The rule's conditions, read with a template's own metrics known as well.
+    pub fn conditions_in(&self, local: Option<&LocalMetrics>) -> Result<Conditions> {
         let scope = match self.is_calculation() {
             true => Scope::Calculation,
             false => Scope::Hosts,
         };
-        Conditions::compile(self.warning.as_deref(), self.critical.as_deref(), scope)
+        Conditions::compile_in(
+            self.warning.as_deref(),
+            self.critical.as_deref(),
+            scope,
+            local,
+        )
     }
 
     /// What a calculation rule asks. The error says what's wrong, to show whoever chose it.
@@ -401,7 +470,12 @@ impl AlertRuleInput {
 
     /// Fills in a summary template with example values, to find mistakes when a
     /// rule is saved: a metric the conditions don't use can't be shown.
-    fn check_summary(&self, template: &str, conditions: &Conditions) -> Result<()> {
+    fn check_summary(
+        &self,
+        template: &str,
+        conditions: &Conditions,
+        local: Option<&LocalMetrics>,
+    ) -> Result<()> {
         ensure!(
             template.len() <= MAX_SUMMARY_LEN,
             "it can be up to {MAX_SUMMARY_LEN} characters"
@@ -426,12 +500,31 @@ impl AlertRuleInput {
             };
             metrics.push((used.metric.name, value));
         }
-        let example = SummaryValues {
+        let mut example = SummaryValues {
             hostname: "web-1".to_string(),
             series: "/".to_string(),
             value: Some("50%".to_string()),
             metrics,
+            template: None,
         };
+        // A template's alert can show any of its metrics, by either name, what it's
+        // running for and its series' labels.
+        if let Some(local) = local {
+            let mut labels = Map::new();
+            let mut metrics = Map::new();
+            for (short, metric) in &local.metrics {
+                metrics.insert(short.clone(), json!("50"));
+                for label in &metric.labels {
+                    labels.insert(label.clone(), json!("main"));
+                }
+            }
+            example.template = Some(TemplateValues {
+                prefix: local.prefix.clone(),
+                metrics,
+                instance: "main".to_string(),
+                labels,
+            });
+        }
         fill_summary(template, &example)?;
         Ok(())
     }
@@ -913,6 +1006,8 @@ pub enum NameTaken {
     Channel(String),
     ConfigRule(String),
     RemoteCheck(String),
+    Template(String),
+    TemplateKey(String),
 }
 
 impl std::fmt::Display for NameTaken {
@@ -923,6 +1018,10 @@ impl std::fmt::Display for NameTaken {
             Self::ConfigRule(name) => write!(f, "a rule named {name:?} already exists"),
             Self::RemoteCheck(name) => {
                 write!(f, "a check named {name:?} already exists for this host")
+            }
+            Self::Template(name) => write!(f, "a template named {name:?} already exists"),
+            Self::TemplateKey(key) => {
+                write!(f, "a template with the key {key:?} already exists")
             }
         }
     }
@@ -1153,6 +1252,7 @@ mod tests {
                 ("disk.usage", json!("92%")),
                 ("cpu.load", json!({ "5 minutes": "4.2" })),
             ],
+            template: None,
         }
     }
 

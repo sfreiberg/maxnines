@@ -23,6 +23,15 @@ pub struct Model {
     pub window_secs: Option<i64>,
     pub remind_every_secs: Option<i64>,
     pub all_channels: bool,
+    /// The template whose alert it is, if it's one.
+    pub template_id: Option<i64>,
+    /// Which of the template's alerts.
+    pub template_alert: Option<String>,
+    /// What people changed of the template's values, by field, as the API names
+    /// them. The rest of the row is what's in effect.
+    pub overrides: Option<Json>,
+    /// Whether it needs what only agents running its template would send.
+    pub waits_for_agents: bool,
     /// When it was deleted. Its alerts keep pointing at it.
     pub deleted_at: Option<DateTimeUtc>,
 }

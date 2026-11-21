@@ -95,6 +95,10 @@ pub struct AppState {
     pub pending_sign_ins: Arc<crate::app_sign_ins::PendingSignIns>,
     /// How long the health check waits on each database before calling it failing.
     pub health_limit: std::time::Duration,
+    /// The built-in templates an upgrade changed, which admins are told of on every
+    /// page until one of them dismisses it. Kept here so each page doesn't ask the
+    /// database.
+    pub template_upgrades: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl FromRef<AppState> for CsrfConfig {
@@ -224,13 +228,37 @@ impl AppState {
     /// Everything that has to be true for an alert rule to be saved, giving its
     /// conditions, read.
     pub async fn check_alert_rule(&self, input: &AlertRuleInput) -> Result<Conditions> {
-        // Conditions are tried on a real host's facts, so a fact used the wrong way
-        // shows, when there's a host with an agent to take them from.
+        self.check_alert_rule_in(input, None).await
+    }
+
+    /// The same, for a rule that's already saved: one of a template's alerts is
+    /// checked with the template's own metrics known, and can't be a calculation.
+    pub async fn check_saved_alert_rule(
+        &self,
+        id: i64,
+        input: &AlertRuleInput,
+    ) -> Result<Conditions> {
+        match self.database.template_rule(id).await? {
+            Some((stored, ..)) => {
+                ensure!(
+                    !input.is_calculation(),
+                    "a template's alert is about each host, so it can't have a calculation"
+                );
+                let local = crate::templates::local_metrics(&stored.template);
+                self.check_alert_rule_in(input, Some(&local)).await
+            }
+            None => self.check_alert_rule(input).await,
+        }
+    }
+
+    /// A real host's facts, for trying conditions on, so a fact used the wrong way
+    /// shows, when there's a host with an agent to take them from.
+    pub async fn example_facts(&self) -> Result<serde_json::Value> {
         let hosts = self.registry.list().await;
         let example = hosts.iter().find(|host| {
             host.state == HostState::Approved && !host.is_agentless() && !host.is_local()
         });
-        let facts = match example {
+        Ok(match example {
             Some(host) => {
                 let mut facts = self.database.facts_of(&[host.id.as_str()]).await?;
                 unflatten(&facts.remove(&host.id).unwrap_or_default())
@@ -238,8 +266,16 @@ impl AppState {
             // With no host yet, conditions are tried on a host with no facts, so any
             // fact they use is missing, as a host's are until its agent says.
             None => serde_json::Value::Object(serde_json::Map::new()),
-        };
-        let conditions = alerting::check_rule_with(input, &facts)?;
+        })
+    }
+
+    async fn check_alert_rule_in(
+        &self,
+        input: &AlertRuleInput,
+        local: Option<&crate::alert_conditions::LocalMetrics>,
+    ) -> Result<Conditions> {
+        let facts = self.example_facts().await?;
+        let conditions = alerting::check_rule_in(input, &facts, local)?;
         if !input.actions.is_empty() {
             let known = self.database.known_actions().await?;
             crate::actions::check_against_hosts(input, &conditions, &known)?;

@@ -1190,9 +1190,14 @@ async fn an_agent_going_offline_alerts_after_the_wait() {
     }
 }
 
-/// The rules every server starts with, as the migrations add them.
+/// The rules every server starts with, from the built-in host template.
 async fn built_in_rules() -> Vec<AlertRuleInput> {
     let fresh = Database::for_test().await;
+    let shipped = crate::templates::built_in::all().unwrap();
+    fresh
+        .sync_templates(&shipped, crate::times::now())
+        .await
+        .unwrap();
     let rules = fresh.list_alert_rules().await.unwrap();
     rules.into_iter().map(|rule| rule.rule).collect()
 }

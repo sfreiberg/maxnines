@@ -61,6 +61,8 @@ wildmatch = "2.7.0"
 cel = "0.15"
 # Suggests the metric someone meant when a condition names one that doesn't exist.
 strsim = "0.11"
+# Reads the columns a template's SQL gives, which become its metrics.
+sqlparser = { version = "0.64", default-features = false, features = ["std"] }
 tera = "2.4"
 axum_csrf = "0.12"
 rust-embed = { version = "8.13", features = ["include-exclude", "mime-guess"] }

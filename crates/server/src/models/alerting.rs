@@ -24,7 +24,7 @@ use crate::actions::{ActionRun, RuleAction, RunOn};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Delivery,
     DeliveryProblem, Event, Mail, MailSecurity, MailServer, NameTaken, NewAlert, RULE_GONE_REASON,
-    Severity, SeverityChange, WebhookMethod, WebhookRequest,
+    Severity, SeverityChange, TemplateLink, WebhookMethod, WebhookRequest,
 };
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
@@ -42,7 +42,19 @@ fn to_alert_rule(
     channels: Vec<i64>,
     actions: Vec<RuleAction>,
 ) -> Result<AlertRule> {
-    Ok(AlertRule::new(
+    let template = match (row.template_id, &row.template_alert) {
+        (Some(id), Some(alert)) => Some(TemplateLink {
+            id,
+            alert: alert.clone(),
+            overridden: match &row.overrides {
+                Some(serde_json::Value::Object(fields)) => fields.keys().cloned().collect(),
+                _ => Vec::new(),
+            },
+            waits_for_agents: row.waits_for_agents,
+        }),
+        _ => None,
+    };
+    let mut rule = AlertRule::new(
         row.id,
         AlertRuleInput {
             name: row.name,
@@ -71,7 +83,9 @@ fn to_alert_rule(
                 .context("invalid reminder")?,
             actions,
         },
-    ))
+    );
+    rule.template = template;
+    Ok(rule)
 }
 
 /// A length the database keeps in whole seconds, as rules are written. One that's
@@ -83,7 +97,7 @@ fn whole_seconds(seconds: i64) -> Result<TimeDelta> {
         .context("not a length of time")
 }
 
-fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
+pub(super) fn alert_rule_row(input: &AlertRuleInput) -> Result<alert_rule::ActiveModel> {
     Ok(alert_rule::ActiveModel {
         name: Set(input.name.clone()),
         name_key: Set(name_key(&input.name)),
@@ -310,7 +324,7 @@ fn to_rule_action(row: alert_rule_action::Model) -> Result<RuleAction> {
 }
 
 /// Replaces a rule's actions with these.
-async fn save_actions<C: ConnectionTrait>(
+pub(super) async fn save_actions<C: ConnectionTrait>(
     connection: &C,
     rule_id: i64,
     actions: &[RuleAction],
@@ -333,7 +347,7 @@ async fn save_actions<C: ConnectionTrait>(
 /// Links a rule to each of `channels` that hasn't been deleted. They're locked as
 /// [`live_channels`] locks them, so one being deleted meanwhile is waited for and
 /// left out, and one deleted after can't miss the link to drop it.
-async fn save_links<C: ConnectionTrait>(
+pub(super) async fn save_links<C: ConnectionTrait>(
     connection: &C,
     rule_id: i64,
     channels: &[i64],
@@ -603,7 +617,14 @@ impl Database {
     }
 
     /// Returns false if there's no such rule.
+    /// One of a template's alerts keeps what's different from the template's values,
+    /// as [`Database::override_template_rule`] does.
     pub async fn update_alert_rule(&self, id: i64, input: &AlertRuleInput) -> Result<bool> {
+        if self.template_rule(id).await?.is_some() {
+            return self
+                .override_template_rule(id, input, crate::times::now())
+                .await;
+        }
         let transaction = self.connection.begin().await.context("saving alert rule")?;
         let Some(before) = load_alert_rule(&transaction, id).await? else {
             return Ok(false);
@@ -667,73 +688,99 @@ impl Database {
             .begin()
             .await
             .context("deleting alert rule")?;
-        // Locked first, so an alert can't start for it meanwhile: firing one waits
-        // for this, and then finds the rule deleted.
-        let live = alert_rule::Entity::find_by_id(id)
+        let template = alert_rule::Entity::find_by_id(id)
             .select_only()
-            .column(alert_rule::Column::Id)
+            .column(alert_rule::Column::TemplateId)
             .filter(alert_rule::Column::DeletedAt.is_null())
-            .lock_exclusive()
-            .into_tuple::<i64>()
+            .into_tuple::<Option<i64>>()
             .one(&transaction)
             .await
-            .context("loading alert rule")?;
-        if live.is_none() {
-            return Ok(false);
+            .context("loading alert rule")?
+            .flatten();
+        if template.is_some() {
+            bail!(crate::templates::Refused(
+                "this rule is one of a template's alerts, so it can be disabled but not deleted"
+                    .to_string()
+            ));
         }
-        let Some(rule) = load_alert_rule(&transaction, id).await? else {
-            return Ok(false);
-        };
-        let before = alert_rule_snapshot(&transaction, &rule).await?;
-        alert_rule::Entity::update_many()
-            .col_expr(alert_rule::Column::DeletedAt, Expr::value(now))
-            .filter(alert_rule::Column::Id.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting alert rule")?;
-        // Its open alerts, locked, so one ending some other way meanwhile is either
-        // waited for and left out, or waits and then finds it ended.
-        let open: Vec<i64> = alert::Entity::find()
-            .select_only()
-            .column(alert::Column::Id)
-            .filter(alert::Column::RuleId.eq(id))
-            .filter(alert::Column::ResolvedAt.is_null())
-            .lock_exclusive()
-            .into_tuple()
-            .all(&transaction)
-            .await
-            .context("loading the rule's alerts")?;
-        if !open.is_empty() {
-            alert::Entity::update_many()
-                .col_expr(alert::Column::ResolvedAt, Expr::value(now))
-                .col_expr(alert::Column::ResolveReason, Expr::value(RULE_GONE_REASON))
-                .col_expr(alert::Column::ResolvedSummary, Expr::value(None::<String>))
-                .filter(alert::Column::Id.is_in(open.iter().copied()))
-                .exec(&transaction)
-                .await
-                .context("resolving the rule's alerts")?;
-            let ended = Query::select()
-                .column(alert::Column::Id)
-                .from(alert::Entity)
-                .and_where(alert::Column::Id.is_in(open))
-                .to_owned();
-            tell_of_ending(&transaction, ended, now).await?;
-        }
-        silence::Entity::delete_many()
-            .filter(silence::Column::RuleId.eq(id))
-            .filter(silence::Column::EndsAt.gt(now))
-            .exec(&transaction)
-            .await
-            .context("deleting the rule's silences")?;
-        maintenance_window::Entity::delete_many()
-            .filter(maintenance_window::Column::RuleId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("deleting the rule's maintenance windows")?;
-        record_change(&transaction, Kind::AlertRule, id, Some(&before), None, None).await?;
+        let deleted = delete_rule_in(&transaction, id, now).await?;
         transaction.commit().await.context("deleting alert rule")?;
-        Ok(true)
+        Ok(deleted)
     }
+}
+
+/// Deletes a rule as [`Database::delete_alert_rule`] does, inside a transaction of
+/// the caller's, whoever's rule it is. Returns false if there's no such rule.
+pub(super) async fn delete_rule_in<C: ConnectionTrait>(
+    transaction: &C,
+    id: i64,
+    now: Timestamp,
+) -> Result<bool> {
+    // Locked first, so an alert can't start for it meanwhile: firing one waits
+    // for this, and then finds the rule deleted.
+    let live = alert_rule::Entity::find_by_id(id)
+        .select_only()
+        .column(alert_rule::Column::Id)
+        .filter(alert_rule::Column::DeletedAt.is_null())
+        .lock_exclusive()
+        .into_tuple::<i64>()
+        .one(transaction)
+        .await
+        .context("loading alert rule")?;
+    if live.is_none() {
+        return Ok(false);
+    }
+    let Some(rule) = load_alert_rule(transaction, id).await? else {
+        return Ok(false);
+    };
+    let before = alert_rule_snapshot(transaction, &rule).await?;
+    alert_rule::Entity::update_many()
+        .col_expr(alert_rule::Column::DeletedAt, Expr::value(now))
+        .filter(alert_rule::Column::Id.eq(id))
+        .exec(transaction)
+        .await
+        .context("deleting alert rule")?;
+    // Its open alerts, locked, so one ending some other way meanwhile is either
+    // waited for and left out, or waits and then finds it ended.
+    let open: Vec<i64> = alert::Entity::find()
+        .select_only()
+        .column(alert::Column::Id)
+        .filter(alert::Column::RuleId.eq(id))
+        .filter(alert::Column::ResolvedAt.is_null())
+        .lock_exclusive()
+        .into_tuple()
+        .all(transaction)
+        .await
+        .context("loading the rule's alerts")?;
+    if !open.is_empty() {
+        alert::Entity::update_many()
+            .col_expr(alert::Column::ResolvedAt, Expr::value(now))
+            .col_expr(alert::Column::ResolveReason, Expr::value(RULE_GONE_REASON))
+            .col_expr(alert::Column::ResolvedSummary, Expr::value(None::<String>))
+            .filter(alert::Column::Id.is_in(open.iter().copied()))
+            .exec(transaction)
+            .await
+            .context("resolving the rule's alerts")?;
+        let ended = Query::select()
+            .column(alert::Column::Id)
+            .from(alert::Entity)
+            .and_where(alert::Column::Id.is_in(open))
+            .to_owned();
+        tell_of_ending(transaction, ended, now).await?;
+    }
+    silence::Entity::delete_many()
+        .filter(silence::Column::RuleId.eq(id))
+        .filter(silence::Column::EndsAt.gt(now))
+        .exec(transaction)
+        .await
+        .context("deleting the rule's silences")?;
+    maintenance_window::Entity::delete_many()
+        .filter(maintenance_window::Column::RuleId.eq(id))
+        .exec(transaction)
+        .await
+        .context("deleting the rule's maintenance windows")?;
+    record_change(transaction, Kind::AlertRule, id, Some(&before), None, None).await?;
+    Ok(true)
 }
 
 impl Database {
@@ -828,7 +875,10 @@ impl Database {
 }
 
 /// A rule that hasn't been deleted.
-async fn load_alert_rule<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<AlertRule>> {
+pub(super) async fn load_alert_rule<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+) -> Result<Option<AlertRule>> {
     let Some(row) = alert_rule::Entity::find_by_id(id)
         .filter(alert_rule::Column::DeletedAt.is_null())
         .one(connection)
@@ -856,7 +906,7 @@ async fn load_alert_rule<C: ConnectionTrait>(connection: &C, id: i64) -> Result<
 }
 
 /// A rule as the audit log compares them, with its channels by name.
-async fn alert_rule_snapshot<C: ConnectionTrait>(
+pub(super) async fn alert_rule_snapshot<C: ConnectionTrait>(
     connection: &C,
     rule: &AlertRule,
 ) -> Result<Snapshot> {
@@ -881,7 +931,7 @@ async fn alert_rule_snapshot<C: ConnectionTrait>(
 }
 
 /// Records how an alert rule changed from `before`, reading it as it is now.
-async fn record_alert_rule<C: ConnectionTrait>(
+pub(super) async fn record_alert_rule<C: ConnectionTrait>(
     connection: &C,
     id: i64,
     before: Option<&Snapshot>,

@@ -499,10 +499,18 @@ async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
     }
 }
 
-/// Turns the form into a valid rule, or explains what's wrong with it.
-async fn validate(state: &AppState, form: &AlertRuleForm) -> Result<AlertRuleInput> {
+/// Turns the form into a valid rule, or explains what's wrong with it. A rule that's
+/// saved already may be one of a template's alerts, which can use its metrics.
+async fn validate(
+    state: &AppState,
+    id: Option<i64>,
+    form: &AlertRuleForm,
+) -> Result<AlertRuleInput> {
     let input = form.to_rule(&known_facts(state).await)?;
-    state.check_alert_rule(&input).await?;
+    match id {
+        Some(id) => state.check_saved_alert_rule(id, &input).await?,
+        None => state.check_alert_rule(&input).await?,
+    };
     Ok(input)
 }
 
@@ -519,7 +527,14 @@ async fn without_saving(
         // Tried as it would be saved, so a mistake says what it would on saving.
         let replayed = async {
             let input = fields.to_rule(&known_facts(state).await)?;
-            let conditions = state.check_alert_rule(&input).await?;
+            let conditions = match id {
+                Some(id) => state.check_saved_alert_rule(id, &input).await?,
+                None => state.check_alert_rule(&input).await?,
+            };
+            anyhow::ensure!(
+                !conditions.uses_local(),
+                "nothing stored covers the template's own metrics, so this can't be tried on the last day"
+            );
             replay(&state.sources(), &input, conditions, crate::times::now()).await
         };
         let replayed = replayed.await;
@@ -546,7 +561,7 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         return response;
     }
 
-    let input = match validate(&state, &fields).await {
+    let input = match validate(&state, None, &fields).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -570,7 +585,7 @@ async fn update(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         return response;
     }
 
-    let input = match validate(&state, &fields).await {
+    let input = match validate(&state, Some(id), &fields).await {
         Ok(input) => input,
         Err(error) => {
             let message = format!("{error:#}");
@@ -597,6 +612,17 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
     {
         Ok(true) => (form.token, Redirect::to("/alerts/rules")).into_response(),
         Ok(false) => not_found(&state, &form.token),
+        Err(error) if error.is::<crate::templates::Refused>() => {
+            let message = format!("{error:#}");
+            match state.database.get_alert_rule(id).await {
+                Ok(Some(rule)) => {
+                    let fields = AlertRuleForm::from_rule(&rule.rule);
+                    form_page(&state, &form.token, Some(id), &fields, Some(&message)).await
+                }
+                Ok(None) => not_found(&state, &form.token),
+                Err(error) => server_error(&error),
+            }
+        }
         Err(error) => server_error(&error),
     }
 }

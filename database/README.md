@@ -7,7 +7,8 @@ MaxNines keeps its data in two places:
   or PostgreSQL, MySQL or MariaDB, through sea-orm. One migration,
   `m20261119_000001_create_tables` in
   [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs), makes its
-  tables and adds the built-in hosts and alert rules.
+  tables and adds the built-in hosts. The built-in config rules and templates, and the
+  alert rules templates have, are written each time the server starts.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has one
   migration, `0001_create_tables`, which makes its tables: in
@@ -44,9 +45,9 @@ What a row goes with is the database's to say. Deleting a host deletes its facts
 config status, boot time, metrics pages, checks, alerts and action runs; deleting a
 user deletes their sessions, keys, app sign-ins, recovery codes and sign-in
 challenges; deleting an alert deletes its notifications and action runs, and deleting
-an action run the notifications of what it printed. Alert rules and channels are only
-ever marked deleted, so what they raised and sent still names them: the database
-refuses to delete one an alert or notification points at. A link between a rule and a
+an action run the notifications of what it printed. Alert rules, channels and templates
+are only ever marked deleted, so what they raised and sent still names them: the
+database refuses to delete one an alert, notification or rule points at. A link between a rule and a
 channel, a rule's actions, silences and maintenance windows, a config rule's settings
 and a dashboard's widgets and variables go with what they belong to.
 
@@ -58,6 +59,7 @@ erDiagram
     hosts ||--o{ metrics_pages : "is read from"
     hosts ||--o{ remote_checks : "is checked by"
     hosts ||--o{ alerts : "has"
+    templates |o--o{ alert_rules : "alerts as"
     alert_rules ||--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
     notification_channels ||--o{ alert_rule_channels : "told by"
@@ -142,7 +144,27 @@ erDiagram
         string filter
         int window_secs
         int remind_every_secs
+        int template_id FK "the template whose alert it is, or NULL"
+        string template_alert "which of its alerts, by key"
+        json overrides "what people changed of the template's values, by field"
+        boolean waits_for_agents "needs what only agents running the template send"
         timestamp deleted_at "kept so alerts can name it"
+    }
+    templates {
+        int id PK
+        string key "starts its metrics' names, unique among those not deleted"
+        string name
+        string name_key "unique among those not deleted"
+        text description
+        boolean built_in
+        text source "the template in HCL"
+        string fingerprint "a hash of what a built-in one says, or NULL"
+        boolean enabled
+        timestamp created_at
+        timestamp updated_at
+        timestamp upgraded_at "when an upgrade last changed a built-in one"
+        boolean upgrade_seen "whether admins dismissed the notice of it"
+        timestamp deleted_at "kept so its rules can name it"
     }
     alerts {
         int id PK
@@ -460,7 +482,8 @@ erDiagram
 | `host_config_status` | The config each host's agent last applied, why if it refused one, and the collectors in it the agent doesn't know |
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
-| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it |
+| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A rule that's a template's alert holds what's in effect, the template's values with what people changed, which `overrides` keeps on its own, so a new version of the template never touches it |
+| `templates` | What MaxNines watches for in something it monitors, in HCL: the built-in ones, which the server writes each time it starts, marked by `built_in`, and people's own. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
 | `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |
 | `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |
@@ -485,7 +508,8 @@ the server's queries and foreign keys use. Those kept unique only among some row
 such as rules that aren't deleted, index those rows alone on PostgreSQL and SQLite.
 MySQL and MariaDB can't, so those tables also have a column the database works out,
 holding what's kept unique for those rows and NULL for the rest, with a unique index
-that lets NULL repeat: `live_name` on `alert_rules` and `notification_channels`,
+that lets NULL repeat: `live_name` on `alert_rules`, `notification_channels` and
+`templates`, `live_key` on `templates`, `live_template_alert` on `alert_rules`,
 `current_name` on `host_facts` and `open_series` on `alerts`. Each compares exactly,
 by the `utf8mb4_bin` collation, as the other databases do, rather than as the table's
 collation would. MySQL and MariaDB also make an index for each foreign key that no
@@ -511,6 +535,9 @@ index here starts with.
 | `idx_sign_in_challenges_expires` | `sign_in_challenges (expires_at)` | Clearing challenges that ran out, on every sign in |
 | `idx_alert_rules_live_name` | `alert_rules (name_key)` where `deleted_at` is NULL, unique | One rule to a name |
 | `idx_notification_channels_live_name` | `notification_channels (name_key)` where `deleted_at` is NULL, unique | One channel to a name |
+| `idx_templates_live_name` | `templates (name_key)` where `deleted_at` is NULL, unique | One template to a name |
+| `idx_templates_live_key` | `templates (key)` where `deleted_at` is NULL, unique | One template to a key |
+| `idx_alert_rules_template_alert` | `alert_rules (template_id, template_alert)` where `deleted_at` is NULL and `template_id` isn't, unique | One rule to each of a template's alerts |
 | `idx_alert_rule_channels_channel` | `alert_rule_channels (channel_id)` | The rules telling a channel |
 | `idx_alert_rule_actions_rule` | `alert_rule_actions (rule_id)` | A rule's actions |
 | `idx_alerts_resolved` | `alerts (resolved_at, id)` | Open alerts, and those that ended most recently |

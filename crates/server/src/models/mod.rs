@@ -48,6 +48,8 @@ mod sign_in_challenge;
 mod silence;
 mod silences;
 mod stats;
+mod template;
+mod templates;
 mod two_factor;
 mod user;
 mod user_session;

@@ -577,7 +577,10 @@ impl Evaluator {
         // Saving a rule checks its conditions can be read, so one that can't was
         // saved some other way, and is left alone rather than stopping every rule.
         let mut conditions: HashMap<i64, Arc<Conditions>> = HashMap::new();
-        for rule in rules.values().filter(|rule| rule.rule.enabled) {
+        for rule in rules
+            .values()
+            .filter(|rule| rule.rule.enabled && !rule.waits_for_agents())
+        {
             match &rule.conditions {
                 Some(read) => {
                     conditions.insert(rule.id, read.clone());
@@ -1072,6 +1075,7 @@ impl Evaluator {
                     .zip(gathered.value)
                     .map(|(primary, value)| format_value(primary.metric.unit, value)),
                 metrics: gathered.shown.clone(),
+                template: None,
             };
             // Said in the collector's own words where it has them, such as a
             // service that's failed, as the alert starts, while it lasts, and as
@@ -1357,6 +1361,7 @@ impl Evaluator {
                 series: line.clone(),
                 value: Some(format_value(unit, *value)),
                 metrics: Vec::new(),
+                template: None,
             };
             let summary = match change {
                 Some(Change::Resolve) => rule

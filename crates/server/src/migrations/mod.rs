@@ -149,8 +149,9 @@ impl MigrationName for CreateTables {
 }
 
 /// Every table, in the order their foreign keys need, and what a new server starts
-/// with: the server itself and the fleet as hosts, and the built-in alert rules. The
-/// built-in config rules are written each time the server starts instead. A column that can be empty is NULL when it is, never an empty
+/// with: the server itself and the fleet as hosts. The built-in config rules and
+/// templates, and the alert rules templates have, are written each time the server
+/// starts instead. A column that can be empty is NULL when it is, never an empty
 /// string, so it says plainly when there's nothing in it.
 #[async_trait::async_trait]
 impl MigrationTrait for CreateTables {
@@ -762,8 +763,65 @@ impl MigrationTrait for CreateTables {
             .col(moment(backend, NotificationChannels::DeletedAt))
             .to_owned();
         live_names(manager, channels, "notification_channels").await?;
+        // A template is only ever marked deleted, as its alert rules point at it. Its
+        // key and its name are each used once among those that aren't.
+        let templates = Table::create()
+            .table(Templates::Table)
+            .col(id(Templates::Id))
+            .col(exact_text(backend, Templates::Key, 64).not_null())
+            .col(ColumnDef::new(Templates::Name).string_len(255).not_null())
+            .col(name_key(backend))
+            .col(ColumnDef::new(Templates::Description).text())
+            .col(ColumnDef::new(Templates::BuiltIn).boolean().not_null())
+            // The HCL, as the built-in file or whoever saved it wrote it.
+            .col(ColumnDef::new(Templates::Source).text().not_null())
+            // What a built-in one says, hashed, so an upgrade can tell it changed.
+            .col(ColumnDef::new(Templates::Fingerprint).string_len(64))
+            .col(ColumnDef::new(Templates::Enabled).boolean().not_null())
+            .col(moment(backend, Templates::CreatedAt).not_null())
+            .col(moment(backend, Templates::UpdatedAt).not_null())
+            // When an upgrade last changed a built-in one, and whether admins have
+            // dismissed the notice saying so.
+            .col(moment(backend, Templates::UpgradedAt))
+            .col(
+                ColumnDef::new(Templates::UpgradeSeen)
+                    .boolean()
+                    .not_null()
+                    .default(true),
+            )
+            .col(moment(backend, Templates::DeletedAt))
+            .to_owned();
+        let live = "deleted_at IS NULL";
+        let mut templates = templates;
+        if mysql {
+            templates.col(only_while("live_key", 64, live, "`key`"));
+        }
+        live_names(manager, templates, "templates").await?;
+        if mysql {
+            index_of(
+                manager,
+                Unique,
+                "idx_templates_live_key",
+                "templates",
+                "live_key",
+                None,
+            )
+            .await?;
+        } else {
+            index_of(
+                manager,
+                Unique,
+                "idx_templates_live_key",
+                "templates",
+                "\"key\"",
+                Some(live),
+            )
+            .await?;
+        }
         // A rule is only ever marked deleted, as its alerts keep it, and its name is
-        // used once among those that aren't.
+        // used once among those that aren't. One a template's alert became holds
+        // what's in effect, the template's values with what people changed in
+        // `overrides`, which is all that's kept of their changes.
         let rules = Table::create()
             .table(AlertRules::Table)
             .col(id(AlertRules::Id))
@@ -788,9 +846,57 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(AlertRules::Filter).string_len(500))
             .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
             .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
+            .col(ColumnDef::new(AlertRules::TemplateId).big_integer())
+            .col(exact_text(backend, AlertRules::TemplateAlert, 64))
+            .col(json(backend, AlertRules::Overrides))
+            // Until agents run templates, one whose alert needs what only they'd send,
+            // the template's own metrics or what its discovery finds, isn't checked.
+            .col(
+                ColumnDef::new(AlertRules::WaitsForAgents)
+                    .boolean()
+                    .not_null()
+                    .default(false),
+            )
             .col(moment(backend, AlertRules::DeletedAt))
+            .foreign_key(
+                ForeignKey::create()
+                    .name("fk_alert_rules_template_id")
+                    .from(AlertRules::Table, AlertRules::TemplateId)
+                    .to(Templates::Table, Templates::Id),
+            )
             .to_owned();
+        let mut rules = rules;
+        if mysql {
+            rules.col(only_while(
+                "live_template_alert",
+                64,
+                live,
+                "template_alert",
+            ));
+        }
         live_names(manager, rules, "alert_rules").await?;
+        // Each of a template's alerts is one rule, among those that aren't deleted.
+        if mysql {
+            index_of(
+                manager,
+                Unique,
+                "idx_alert_rules_template_alert",
+                "alert_rules",
+                "template_id, live_template_alert",
+                None,
+            )
+            .await?;
+        } else {
+            index_of(
+                manager,
+                Unique,
+                "idx_alert_rules_template_alert",
+                "alert_rules",
+                "template_id, template_alert",
+                Some("deleted_at IS NULL AND template_id IS NOT NULL"),
+            )
+            .await?;
+        }
         manager
             .create_table(
                 Table::create()
@@ -1534,79 +1640,6 @@ impl MigrationTrait for CreateTables {
 /// numbers under one, and alerts about many hosts at once under the other.
 const BUILT_IN_HOSTS: [(&str, &str); 2] = [("server", "MaxNines server"), ("fleet", "Fleet")];
 
-/// One built-in alert rule. Each tells every channel.
-struct BuiltInRule {
-    name: &'static str,
-    warning: Option<&'static str>,
-    critical: Option<&'static str>,
-    summary: Option<&'static str>,
-    resolved_summary: Option<&'static str>,
-    for_secs: i64,
-    window_secs: Option<i64>,
-}
-
-const fn built_in(
-    name: &'static str,
-    warning: Option<&'static str>,
-    critical: Option<&'static str>,
-    for_secs: i64,
-) -> BuiltInRule {
-    BuiltInRule {
-        name,
-        warning,
-        critical,
-        summary: None,
-        resolved_summary: None,
-        for_secs,
-        window_secs: None,
-    }
-}
-
-const BUILT_IN_RULES: [BuiltInRule; 8] = [
-    BuiltInRule {
-        summary: Some("{{ hostname }} is offline"),
-        resolved_summary: Some("{{ hostname }} is back online"),
-        ..built_in("Host offline", None, Some("!online"), 60)
-    },
-    built_in(
-        "Disk filling up",
-        Some("disk.usage > 80"),
-        Some("disk.usage > 90"),
-        300,
-    ),
-    built_in("Container down", None, Some("container.up < 1"), 60),
-    BuiltInRule {
-        window_secs: Some(21_600),
-        ..built_in(
-            "Disk will be full soon",
-            Some("forecast(disk.usage, duration('24h')) >= 100"),
-            Some("forecast(disk.usage, duration('4h')) >= 100"),
-            1800,
-        )
-    },
-    built_in(
-        "Disk running out of inodes",
-        Some("disk.inodes > 80"),
-        Some("disk.inodes > 90"),
-        300,
-    ),
-    built_in(
-        "Clock is wrong",
-        Some("clock.difference > duration('5s')"),
-        Some("clock.difference > duration('30s')"),
-        60,
-    ),
-    // Long enough for a restart, and no longer: a service that's down is down.
-    built_in("Service stopped", None, Some("service.running < 1"), 60),
-    // A connected agent whose samples all stop being stored, such as after a change to
-    // what agents send, never goes offline, so nothing else notices.
-    BuiltInRule {
-        summary: Some("{{ hostname }} is connected but sending no metrics"),
-        resolved_summary: Some("{{ hostname }} is sending metrics again"),
-        ..built_in("Host sending no metrics", None, Some("!reporting"), 300)
-    },
-];
-
 async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let mut hosts = Query::insert()
         .into_table(Hosts::Table)
@@ -1630,43 +1663,7 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
             chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.into(),
         ]);
     }
-    manager.exec_stmt(hosts).await?;
-
-    for rule in &BUILT_IN_RULES {
-        add_built_in_rule(manager, rule).await?;
-    }
-    Ok(())
-}
-
-async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> Result<(), DbErr> {
-    let insert = Query::insert()
-        .into_table(AlertRules::Table)
-        .columns([
-            AlertRules::Name,
-            AlertRules::NameKey,
-            AlertRules::Warning,
-            AlertRules::Critical,
-            AlertRules::Summary,
-            AlertRules::ResolvedSummary,
-            AlertRules::ForSecs,
-            AlertRules::Enabled,
-            AlertRules::AllChannels,
-            AlertRules::WindowSecs,
-        ])
-        .values_panic([
-            rule.name.into(),
-            crate::models::name_key(rule.name).into(),
-            rule.warning.into(),
-            rule.critical.into(),
-            rule.summary.into(),
-            rule.resolved_summary.into(),
-            rule.for_secs.into(),
-            true.into(),
-            true.into(),
-            rule.window_secs.into(),
-        ])
-        .to_owned();
-    manager.exec_stmt(insert).await
+    manager.exec_stmt(hosts).await
 }
 
 #[derive(Iden)]
@@ -1833,7 +1830,6 @@ enum AlertRules {
     Table,
     Id,
     Name,
-    NameKey,
     Warning,
     Critical,
     Summary,
@@ -1848,6 +1844,28 @@ enum AlertRules {
     Filter,
     WindowSecs,
     RemindEverySecs,
+    TemplateId,
+    TemplateAlert,
+    Overrides,
+    WaitsForAgents,
+    DeletedAt,
+}
+
+#[derive(Iden)]
+enum Templates {
+    Table,
+    Id,
+    Key,
+    Name,
+    Description,
+    BuiltIn,
+    Source,
+    Fingerprint,
+    Enabled,
+    CreatedAt,
+    UpdatedAt,
+    UpgradedAt,
+    UpgradeSeen,
     DeletedAt,
 }
 
@@ -2190,27 +2208,13 @@ mod tests {
         assert_eq!(hosts, ["Fleet", "MaxNines server"]);
         let keyless = "SELECT id FROM hosts WHERE public_key IS NULL ORDER BY id";
         assert_eq!(texts(&connection, keyless).await, ["fleet", "server"]);
-        let rules = texts(&connection, "SELECT name FROM alert_rules ORDER BY id").await;
-        assert_eq!(
-            rules,
-            [
-                "Host offline",
-                "Disk filling up",
-                "Container down",
-                "Disk will be full soon",
-                "Disk running out of inodes",
-                "Clock is wrong",
-                "Service stopped",
-                "Host sending no metrics",
-            ]
-        );
-        let keys = texts(&connection, "SELECT name_key FROM alert_rules ORDER BY id").await;
-        assert_eq!(keys[0], "host offline");
-        assert_eq!(
-            count(&connection, "config_rules").await,
-            0,
-            "the server writes the built-in config rules as it starts"
-        );
+        for table in ["config_rules", "templates", "alert_rules"] {
+            assert_eq!(
+                count(&connection, table).await,
+                0,
+                "the server writes the built-in {table} as it starts"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2314,6 +2318,9 @@ mod tests {
                 .to_string(),
             "INSERT INTO notification_channels (name, name_key, kind, target)
              VALUES ('Ops', 'ops', 'webhook', 'http://ops')"
+                .to_string(),
+            "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled)
+             VALUES ('Offline', 'offline', '!online', 60, TRUE)"
                 .to_string(),
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
@@ -2420,10 +2427,10 @@ mod tests {
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, series, summary, started_at,
                      breached_at, resolved_at)
-                 VALUES (9, 'critical', 'h1', NULL, 'over', {AT}, {AT}, {later}),
-                        (9, 'critical', 'h1', NULL, 'first', {later}, {later}, NULL),
-                        (9, 'critical', 'h1', '/data', 'a disk', {AT}, {AT}, NULL),
-                        (9, 'critical', 'h1', '/Data', 'another', {AT}, {AT}, NULL)"
+                 VALUES (1, 'critical', 'h1', NULL, 'over', {AT}, {AT}, {later}),
+                        (1, 'critical', 'h1', NULL, 'first', {later}, {later}, NULL),
+                        (1, 'critical', 'h1', '/data', 'a disk', {AT}, {AT}, NULL),
+                        (1, 'critical', 'h1', '/Data', 'another', {AT}, {AT}, NULL)"
             ),
         ] {
             run(&connection, &sql).await;
@@ -2449,12 +2456,12 @@ mod tests {
             ),
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
-                 VALUES (9, 'critical', 'h1', 'second', {AT}, {AT})"
+                 VALUES (1, 'critical', 'h1', 'second', {AT}, {AT})"
             ),
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, series, summary, started_at,
                      breached_at)
-                 VALUES (9, 'critical', 'h1', '/data', 'again', {AT}, {AT})"
+                 VALUES (1, 'critical', 'h1', '/data', 'again', {AT}, {AT})"
             ),
         ] {
             refused(&connection, &sql).await;
@@ -2478,29 +2485,10 @@ mod tests {
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at,
                      resolved_at)
-                 VALUES (9, 'critical', 'h1', 'over', {AT}, {AT}, {AT})"
+                 VALUES (1, 'critical', 'h1', 'over', {AT}, {AT}, {AT})"
             ),
         ] {
             run(&connection, &sql).await;
-        }
-    }
-
-    #[test]
-    fn every_built_in_alert_rule_is_one_this_server_takes() {
-        for rule in &BUILT_IN_RULES {
-            let input = crate::alerting::AlertRuleInput {
-                summary: rule.summary.map(str::to_string),
-                resolved_summary: rule.resolved_summary.map(str::to_string),
-                window: rule.window_secs.map(chrono::TimeDelta::seconds),
-                hold: chrono::TimeDelta::seconds(rule.for_secs),
-                ..crate::alerting::AlertRuleInput::with_conditions(
-                    rule.name,
-                    rule.warning,
-                    rule.critical,
-                )
-            };
-            crate::alerting::check_rule(&input)
-                .unwrap_or_else(|error| panic!("{}: {error:#}", rule.name));
         }
     }
 }

@@ -1984,7 +1984,7 @@ async fn update_alert_rule(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<AlertRuleInput>,
 ) -> Response {
-    if let Err(error) = state.check_alert_rule(&input).await {
+    if let Err(error) = state.check_saved_alert_rule(id, &input).await {
         return refused(&error);
     }
     match state.database.update_alert_rule(id, &input).await {
@@ -1999,6 +1999,7 @@ async fn delete_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i
     match state.database.delete_alert_rule(id, times::now()).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) if error.is::<crate::templates::Refused>() => refused(&error),
         Err(error) => server_error(&error),
     }
 }

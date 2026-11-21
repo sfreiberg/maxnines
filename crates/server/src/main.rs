@@ -49,6 +49,7 @@ mod server_stats;
 mod silences;
 mod slack_actions;
 mod store;
+mod templates;
 mod text;
 mod times;
 mod tls;
@@ -391,6 +392,15 @@ async fn serve(path: &Path) -> Result<()> {
     if !changed.is_empty() {
         info!(rules = changed.join(", "), "built-in config rules updated");
     }
+    // The templates that come with this version, and the alert rules they have.
+    let changed = database
+        .sync_templates(&templates::built_in::all()?, crate::times::now())
+        .await
+        .context("updating the built-in templates")?;
+    if !changed.is_empty() {
+        info!(templates = changed.join(", "), "built-in templates updated");
+    }
+    let template_upgrades = database.template_upgrades().await?;
     let secure_site = config.audience().starts_with("wss://");
     let csrf = csrf::config(&database, secure_site).await?;
     database
@@ -438,6 +448,7 @@ async fn serve(path: &Path) -> Result<()> {
         require_two_factor: Arc::new(require_two_factor.into()),
         pending_sign_ins: Arc::default(),
         health_limit: controllers::health::CHECK_LIMIT,
+        template_upgrades: Arc::new(std::sync::Mutex::new(template_upgrades)),
     };
 
     let listener = TcpListener::bind(config.listen)

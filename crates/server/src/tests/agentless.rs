@@ -435,7 +435,13 @@ async fn a_host_that_stops_answering_is_offline_and_one_with_nothing_to_read_is_
     let mut scheduler = scheduler(&server);
     let state = &server.state;
     // The rule every server starts with.
-    let built_in = Database::for_test().await.list_alert_rules().await.unwrap();
+    let built_in = Database::for_test().await;
+    let shipped = crate::templates::built_in::all().unwrap();
+    built_in
+        .sync_templates(&shipped, crate::times::now())
+        .await
+        .unwrap();
+    let built_in = built_in.list_alert_rules().await.unwrap();
     let offline = built_in
         .into_iter()
         .find(|rule| rule.rule.critical.as_deref() == Some("!online"))

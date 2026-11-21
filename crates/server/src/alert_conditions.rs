@@ -61,7 +61,7 @@ pub enum Variable {
 }
 
 impl Variable {
-    const ALL: [Self; 6] = [
+    pub const ALL: [Self; 6] = [
         Self::Facts,
         Self::Online,
         Self::Reporting,
@@ -69,6 +69,18 @@ impl Variable {
         Self::Series,
         Self::Value,
     ];
+
+    /// What it is, in a few words.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::Facts => "what the host's agent reports about it",
+            Self::Online => "whether the host is connected",
+            Self::Reporting => "whether a connected host's samples are arriving",
+            Self::Hostname => "the hostname",
+            Self::Series => "the series being looked at",
+            Self::Value => "a calculation's value",
+        }
+    }
 
     pub fn name(self) -> &'static str {
         match self {
@@ -104,6 +116,69 @@ pub struct MetricUse {
     pub forecast: bool,
 }
 
+/// What kind of value a template's own metric is, as far as can be told before an
+/// agent sends one: a query's column could be a number, a length of time or a yes or
+/// no until the database says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalKind {
+    Number,
+    Seconds,
+    Flag,
+    Unknown,
+}
+
+impl LocalKind {
+    fn sample(self) -> CelValue {
+        match self {
+            Self::Number | Self::Unknown => CelValue::Float(50.0),
+            Self::Seconds => duration(50.0),
+            Self::Flag => CelValue::Bool(true),
+        }
+    }
+}
+
+/// One of a template's own metrics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalMetric {
+    pub kind: LocalKind,
+    /// What tells its series apart, such as `slot`. Metrics pair up when these match.
+    pub labels: Vec<String>,
+}
+
+/// A template's own metrics, which its conditions use by their short names, `lag`,
+/// or by their full ones, `postgres.lag`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LocalMetrics {
+    /// The template's key, which starts their full names.
+    pub prefix: String,
+    pub metrics: BTreeMap<String, LocalMetric>,
+}
+
+impl LocalMetrics {
+    /// The short name of the metric a dotted name means, if it's one of these.
+    fn find(&self, name: &[String]) -> Option<String> {
+        let short = match name {
+            [short] => short,
+            [prefix, short] if *prefix == self.prefix => short,
+            _ => return None,
+        };
+        self.metrics.contains_key(short).then(|| short.clone())
+    }
+
+    fn full_name(&self, short: &str) -> String {
+        format!("{}.{short}", self.prefix)
+    }
+}
+
+/// One of a template's own metrics as a condition uses it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalUse {
+    pub short: String,
+    pub bracketed: bool,
+    pub picked: Option<String>,
+    pub forecast: bool,
+}
+
 /// A condition, read and ready to work out.
 #[derive(Debug, Clone)]
 pub struct Condition {
@@ -111,6 +186,8 @@ pub struct Condition {
     /// The condition with every metric named as it's bound.
     expr: IdedExpr,
     uses: Vec<MetricUse>,
+    /// A template's own metrics it uses, which only a template's checks bind.
+    local: Vec<LocalUse>,
     variables: BTreeSet<Variable>,
 }
 
@@ -167,16 +244,18 @@ fn string_literal(expr: &Expr) -> Option<String> {
 }
 
 /// Reads a condition's names, binding each metric under its own name.
-struct Reader {
+struct Reader<'a> {
     scope: Scope,
+    local_metrics: Option<&'a LocalMetrics>,
     uses: Vec<MetricUse>,
+    local: Vec<LocalUse>,
     variables: BTreeSet<Variable>,
     functions: BTreeSet<String>,
     /// Names a macro such as `exists` brings in.
     locals: Vec<String>,
 }
 
-impl Reader {
+impl Reader<'_> {
     fn use_metric(&mut self, used: MetricUse) -> Result<()> {
         ensure!(
             self.scope == Scope::Hosts,
@@ -185,6 +264,49 @@ impl Reader {
         );
         self.uses.push(used);
         Ok(())
+    }
+
+    /// The template's own metric most like a name that isn't one, if any is close.
+    fn closest_local(&self, name: &str) -> Option<String> {
+        let local = self.local_metrics?;
+        local
+            .metrics
+            .keys()
+            .map(|short| (strsim::levenshtein(name, short), short))
+            .filter(|(distance, _)| *distance <= 3)
+            .min()
+            .map(|(_, short)| short.clone())
+    }
+
+    /// Notes a template's own metric being used, giving the name it's bound as.
+    fn use_local(&mut self, used: LocalUse) -> Result<String> {
+        let local = self.local_metrics.expect("only found with local metrics");
+        let full = local.full_name(&used.short);
+        ensure!(
+            self.scope == Scope::Hosts,
+            "a rule with a calculation watches the calculated value, like value > 80, not {full}"
+        );
+        let bound = match used.forecast {
+            true => format!("forecast:{full}"),
+            false => full,
+        };
+        self.local.push(used);
+        Ok(bound)
+    }
+
+    /// The template's own metric an expression names, by itself or picked out with
+    /// brackets, and whether it's bracketed.
+    fn local_named(&self, expr: &Expr) -> Option<(String, bool)> {
+        let local = self.local_metrics?;
+        let (target, bracketed) = match expr {
+            Expr::Call(call) if is_index(call) => (&call.args[0].expr, true),
+            other => (other, false),
+        };
+        let name = name_of(target)?;
+        if self.locals.contains(&name[0]) {
+            return None;
+        }
+        Some((local.find(&name)?, bracketed))
     }
 
     fn read(&mut self, expr: &mut IdedExpr) -> Result<()> {
@@ -243,6 +365,16 @@ impl Reader {
             return Ok(());
         }
         let whole = name.join(".");
+        if let Some(short) = self.local_metrics.and_then(|local| local.find(name)) {
+            let full = self.use_local(LocalUse {
+                short,
+                bracketed: false,
+                picked: None,
+                forecast: false,
+            })?;
+            expr.expr = Expr::Ident(full);
+            return Ok(());
+        }
         if let Some((metric, parts)) = metric_in(name) {
             ensure!(
                 parts == name.len(),
@@ -274,7 +406,10 @@ impl Reader {
             (Some(_), Scope::Calculation) => bail!(
                 "a rule with a calculation watches the calculated value, like value > 80, not {whole}"
             ),
-            (None, _) => match closest_metric(&whole) {
+            (None, _) => match self
+                .closest_local(&whole)
+                .or_else(|| closest_metric(&whole).map(str::to_string))
+            {
                 Some(closest) => bail!("there's no metric called {whole}: did you mean {closest}?"),
                 None => bail!(
                     "{whole} isn't a metric or anything else a condition knows: it can use metrics by their names, facts, online, reporting, hostname and series"
@@ -300,6 +435,26 @@ impl Reader {
     /// Binds a metric written by itself or picked out with brackets, as a forecast's
     /// starting point if it's in `forecast()`. False if it isn't a metric.
     fn metric_argument(&mut self, expr: &mut IdedExpr, forecast: bool) -> Result<bool> {
+        if let Some((short, bracketed)) = self.local_named(&expr.expr) {
+            let picked = match &expr.expr {
+                Expr::Call(call) if bracketed => string_literal(&call.args[1].expr),
+                _ => None,
+            };
+            let bound = Expr::Ident(self.use_local(LocalUse {
+                short,
+                bracketed,
+                picked,
+                forecast,
+            })?);
+            match &mut expr.expr {
+                Expr::Call(call) if bracketed => {
+                    call.args[0].expr = bound;
+                    self.read(&mut call.args[1])?;
+                }
+                _ => expr.expr = bound,
+            }
+            return Ok(true);
+        }
         let Some((metric, bracketed)) = self.metric_named(&expr.expr) else {
             return Ok(false);
         };
@@ -554,6 +709,11 @@ impl Condition {
     /// Reads a condition, refusing one that isn't CEL, uses a name nothing has, or
     /// uses a metric in a way that can't work.
     pub fn compile(text: &str, scope: Scope) -> Result<Self> {
+        Self::compile_in(text, scope, None)
+    }
+
+    /// Reads a condition that can use a template's own metrics as well.
+    pub fn compile_in(text: &str, scope: Scope, local: Option<&LocalMetrics>) -> Result<Self> {
         ensure!(!text.trim().is_empty(), "a condition can't be empty");
         ensure!(
             text.len() <= MAX_CONDITION_LEN,
@@ -563,7 +723,9 @@ impl Condition {
         let mut expr = program.expression().clone();
         let mut reader = Reader {
             scope,
+            local_metrics: local,
             uses: Vec::new(),
+            local: Vec::new(),
             variables: BTreeSet::new(),
             functions: BTreeSet::new(),
             locals: Vec::new(),
@@ -576,6 +738,7 @@ impl Condition {
             text: text.to_string(),
             expr,
             uses: reader.uses,
+            local: reader.local,
             variables: reader.variables,
         })
     }
@@ -751,13 +914,23 @@ impl Conditions {
     /// series for each of something are worked out for each, so the ones used by
     /// themselves have to be about the same things to pair up.
     pub fn compile(warning: Option<&str>, critical: Option<&str>, scope: Scope) -> Result<Self> {
+        Self::compile_in(warning, critical, scope, None)
+    }
+
+    /// Reads conditions that can use a template's own metrics as well.
+    pub fn compile_in(
+        warning: Option<&str>,
+        critical: Option<&str>,
+        scope: Scope,
+        local: Option<&LocalMetrics>,
+    ) -> Result<Self> {
         ensure!(
             warning.is_some() || critical.is_some(),
             "a rule needs a warning or critical condition, or both"
         );
         let read = |text: Option<&str>, which: &str| {
             text.map(|text| {
-                Condition::compile(text, scope)
+                Condition::compile_in(text, scope, local)
                     .map_err(|error| anyhow!("the {which} condition: {error:#}"))
             })
             .transpose()
@@ -767,7 +940,70 @@ impl Conditions {
             critical: read(critical, "critical")?,
         };
         conditions.check_series()?;
+        if let Some(local) = local {
+            conditions.check_local_series(local)?;
+        }
         Ok(conditions)
+    }
+
+    /// The template's own metrics they use, each time they use one.
+    pub fn local_uses(&self) -> impl Iterator<Item = &LocalUse> {
+        let warning = self.warning.iter().flat_map(|condition| &condition.local);
+        let critical = self.critical.iter().flat_map(|condition| &condition.local);
+        warning.chain(critical)
+    }
+
+    /// Whether they use any of a template's own metrics, which only an agent running
+    /// the template sends.
+    pub fn uses_local(&self) -> bool {
+        self.local_uses().next().is_some()
+    }
+
+    /// A template's own metrics used by themselves are worked out for each series, so
+    /// those with labels have to have the same ones to pair up, and can't pair with a
+    /// metric that has a series for each disk or such.
+    fn check_local_series(&self, local: &LocalMetrics) -> Result<()> {
+        let uses: Vec<&LocalUse> = self.local_uses().collect();
+        for used in &uses {
+            let both = uses.iter().any(|other| {
+                other.short == used.short
+                    && other.bracketed != used.bracketed
+                    && other.forecast == used.forecast
+            });
+            ensure!(
+                !both,
+                "{} is used both with and without brackets, which can't be worked out together: pick a series with brackets each time, or none",
+                used.short
+            );
+        }
+        let labelled: Vec<(&str, &Vec<String>)> = uses
+            .iter()
+            .filter(|used| !used.bracketed)
+            .map(|used| (used.short.as_str(), &local.metrics[&used.short].labels))
+            .filter(|(_, labels)| !labels.is_empty())
+            .collect();
+        fn sorted(labels: &[String]) -> BTreeSet<&String> {
+            labels.iter().collect()
+        }
+        if let Some((first, labels)) = labelled.first()
+            && let Some((other, theirs)) = labelled
+                .iter()
+                .find(|(_, theirs)| sorted(theirs) != sorted(labels))
+        {
+            bail!(
+                "{first} and {other} have series labelled differently ({} and {}), so they can't be paired up: pick a series of one of them with brackets, like {other}['name']",
+                labels.join(", "),
+                theirs.join(", ")
+            );
+        }
+        if let (Some((first, _)), Some(fanned)) = (labelled.first(), self.fanned_out().first()) {
+            bail!(
+                "{first} and {} have series of different things, so they can't be paired up: pick a series of one of them with brackets, like {}['name']",
+                fanned.metric.name,
+                fanned.metric.name
+            );
+        }
+        Ok(())
     }
 
     /// Each condition with the severity it's for, mildest first.
@@ -872,14 +1108,136 @@ impl Conditions {
     /// from a real host if there is one, and says what's wrong in plain words. A fact
     /// that isn't there is fine, as hosts differ.
     pub fn dry_run(&self, facts: &serde_json::Value, value_unit: Unit) -> Result<()> {
+        self.dry_run_in(facts, value_unit, None)
+    }
+
+    /// The same, with a template's own metrics bound as well. One whose kind can't be
+    /// told yet, a query's column, is tried as each kind it could be, and the
+    /// conditions only have to work for one way of choosing them.
+    pub fn dry_run_in(
+        &self,
+        facts: &serde_json::Value,
+        value_unit: Unit,
+        local: Option<&LocalMetrics>,
+    ) -> Result<()> {
         let inputs = self.sample_inputs(facts, value_unit);
-        let bindings = inputs.bind();
-        for (severity, condition) in self.levels() {
-            condition
-                .dry_run(&bindings)
-                .map_err(|error| anyhow!("the {} condition: {error:#}", severity.as_str()))?;
+        let mut unknown: Vec<&str> = Vec::new();
+        if let Some(local) = local {
+            for used in self.local_uses() {
+                if local.metrics[&used.short].kind == LocalKind::Unknown
+                    && !unknown.contains(&used.short.as_str())
+                {
+                    unknown.push(&used.short);
+                }
+            }
         }
-        Ok(())
+        const CHOICES: [LocalKind; 3] = [LocalKind::Number, LocalKind::Seconds, LocalKind::Flag];
+        // Every way of choosing, while there are few enough; otherwise the same kind
+        // for all of them.
+        let ways: Vec<Vec<LocalKind>> = match u32::try_from(unknown.len()) {
+            Ok(count) if count <= 5 => (0..3usize.pow(count))
+                .map(|mut way| {
+                    (0..unknown.len())
+                        .map(|_| {
+                            let kind = CHOICES[way % 3];
+                            way /= 3;
+                            kind
+                        })
+                        .collect()
+                })
+                .collect(),
+            _ => CHOICES
+                .iter()
+                .map(|kind| vec![*kind; unknown.len()])
+                .collect(),
+        };
+        let mut first_error = None;
+        for way in ways {
+            let mut bindings = inputs.bind();
+            if let Some(local) = local {
+                let kind_of = |short: &str| match unknown.iter().position(|name| *name == short) {
+                    Some(at) => way[at],
+                    None => local.metrics[short].kind,
+                };
+                self.bind_local(&mut bindings, local, &kind_of);
+            }
+            let tried = self
+                .levels()
+                .into_iter()
+                .try_for_each(|(severity, condition)| {
+                    condition
+                        .dry_run(&bindings)
+                        .map_err(|error| anyhow!("the {} condition: {error:#}", severity.as_str()))
+                });
+            match tried {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        Err(first_error.expect("there's always a way to try"))
+    }
+
+    /// Binds a sample of each of a template's own metrics that's used, as `kind_of` says.
+    fn bind_local(
+        &self,
+        bindings: &mut Bindings,
+        local: &LocalMetrics,
+        kind_of: &dyn Fn(&str) -> LocalKind,
+    ) {
+        let mut picked: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+        for used in self.local_uses() {
+            picked
+                .entry(&used.short)
+                .or_default()
+                .extend(used.picked.clone());
+        }
+        for used in self.local_uses() {
+            let sample = kind_of(&used.short).sample();
+            let full = local.full_name(&used.short);
+            let value = match used.bracketed {
+                true => picked[used.short.as_str()]
+                    .iter()
+                    .map(|series| (series.clone(), sample.clone()))
+                    .collect::<HashMap<String, CelValue>>()
+                    .into(),
+                false => sample,
+            };
+            let name = match used.forecast {
+                true => format!("forecast:{full}"),
+                false => full,
+            };
+            let value = match used.forecast {
+                // A forecast's starting point, as a catalog metric's is bound.
+                true => {
+                    let heading = |value: &CelValue| {
+                        let unit = match value {
+                            CelValue::Duration(_) => Unit::Seconds,
+                            _ => Unit::Number,
+                        };
+                        heading_value(
+                            unit,
+                            Heading {
+                                value: 50.0,
+                                slope_per_sec: 0.0,
+                            },
+                        )
+                    };
+                    match &value {
+                        CelValue::Map(map) => map
+                            .map
+                            .iter()
+                            .map(|(key, value)| (key.clone(), heading(value)))
+                            .collect::<HashMap<cel::objects::Key, CelValue>>()
+                            .into(),
+                        other => heading(other),
+                    }
+                }
+                false => value,
+            };
+            bindings.0.add_variable_from_value(name, value);
+        }
     }
 
     fn sample_inputs(&self, facts: &serde_json::Value, value_unit: Unit) -> Inputs<'static> {
