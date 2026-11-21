@@ -108,6 +108,38 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 { "id": 1 }
 ```
 
+## Try an alert rule on the last day
+
+`POST /api/v1/alert-rules/replay`
+
+Works a rule out on the last 24 hours of what's stored, without saving it, as **Try it
+on the last day** on its form does. The body is a rule, as for adding one, and one that
+couldn't be saved gives `422` with why. `alerted` has only the hosts, or a
+calculation's lines, it would have alerted on, the most first, with how many times it
+would have started as a warning and how many it would have started critical or become
+it. `tried` is how many had anything stored to try it on. It's worked out on each
+`step_minutes` of what's stored, so something shorter may not show, `forecast()` is
+drawn through those steps, and hosts are taken to have been `online` and `reporting`,
+which `notes` say when they apply. It tries at most 100 hosts.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "name": "Disk", "warning": "disk.usage > 80", "critical": "disk.usage > 90", "for_secs": 300 }' \
+  "$MAXNINES_URL/api/v1/alert-rules/replay"
+```
+
+```json
+{
+  "alerted": [{ "name": "web-1", "warned": 2, "critical": 1 }],
+  "warned": 2,
+  "critical": 1,
+  "tried": 12,
+  "step_minutes": 10,
+  "notes": []
+}
+```
+
 ## Get an alert rule
 
 `GET /api/v1/alert-rules/{id}`

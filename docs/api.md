@@ -101,7 +101,7 @@ Each part has a page of its own:
 | [Silences](api-silences.md) | Keeping notifications back for a while |
 | [Annotations](api-annotations.md) | Deploys and notes marked on charts, and a host's events |
 | [Maintenance windows](api-maintenance-windows.md) | Silences that come round on a schedule |
-| [Alert rules](api-alert-rules.md) | What to alert on, and who to tell |
+| [Alert rules](api-alert-rules.md) | What to alert on, who to tell, and trying a rule on the last day |
 | [Notification channels](api-notification-channels.md) | Where notifications go, and testing them |
 | [Remote checks](api-remote-checks.md) | Checks the server runs against other sites |
 | [Map](api-map.md) | Where hosts are, and the rules that place them |

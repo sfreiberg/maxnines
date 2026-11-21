@@ -159,6 +159,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/alert-rules",
             get(list_alert_rules).post(create_alert_rule),
         )
+        .route("/alert-rules/replay", post(replay_alert_rule))
         .route(
             "/alert-rules/{id}",
             get(show_alert_rule)
@@ -1944,6 +1945,22 @@ async fn show_alert_rule(State(state): State<AppState>, UrlPath(id): UrlPath<i64
     match state.database.get_alert_rule(id).await {
         Ok(Some(rule)) => Json(rule).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How often a rule would have alerted over the last day, without saving it.
+async fn replay_alert_rule(
+    State(state): State<AppState>,
+    Json(input): Json<AlertRuleInput>,
+) -> Response {
+    let conditions = match state.check_alert_rule(&input).await {
+        Ok(conditions) => conditions,
+        Err(error) => return refused(&error),
+    };
+    let now = crate::times::now();
+    match crate::alert_replay::replay(&state.sources(), &input, conditions, now).await {
+        Ok(replay) => Json(replay).into_response(),
         Err(error) => server_error(&error),
     }
 }

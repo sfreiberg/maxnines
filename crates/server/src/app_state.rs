@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::actions::Actions;
 use crate::agent_configs::AgentConfigs;
+use crate::alert_conditions::Conditions;
 use crate::alerting::{self, AlertRuleInput};
 use crate::calculations::Sources;
 use crate::events::{EventInput, TimelineEvent};
@@ -211,8 +212,9 @@ impl AppState {
             .context("working out the preview")
     }
 
-    /// Everything that has to be true for an alert rule to be saved.
-    pub async fn check_alert_rule(&self, input: &AlertRuleInput) -> Result<()> {
+    /// Everything that has to be true for an alert rule to be saved, giving its
+    /// conditions, read.
+    pub async fn check_alert_rule(&self, input: &AlertRuleInput) -> Result<Conditions> {
         // Conditions are tried on a real host's facts, so a fact used the wrong way
         // shows, when there's a host with an agent to take them from.
         let hosts = self.registry.list().await;
@@ -240,7 +242,7 @@ impl AppState {
         if let Some(wanted) = input.channels.iter().find(|id| !live.contains(id)) {
             bail!("there's no notification channel {wanted}");
         }
-        Ok(())
+        Ok(conditions)
     }
 
     /// Everything that has to be true for a maintenance window to be saved.

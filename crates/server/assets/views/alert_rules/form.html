@@ -146,7 +146,7 @@
 <section id="replay" class="preview">
   <h2>The last day</h2>
   <p>Nothing has been saved.
-  {% if replay.warned == 0 and replay.critical == 0 %}Over the last 24 hours, this wouldn't have alerted on any of the {{ replay.tried }} {% if rule.calculation %}lines{% else %}hosts{% endif %} it covers.{% else %}Over the last 24 hours, this would have warned {{ replay.warned }} {% if replay.warned == 1 %}time{% else %}times{% endif %} and gone critical {{ replay.critical }} {% if replay.critical == 1 %}time{% else %}times{% endif %}.{% endif %}</p>
+  {% if replay.tried == 0 %}Nothing stored in the last 24 hours covers this rule, so it couldn't be tried.{% elif replay.warned == 0 and replay.critical == 0 %}Over the last 24 hours, this wouldn't have alerted on any of the {{ replay.tried }} {% if rule.calculation %}lines{% else %}hosts{% endif %} it was tried on.{% else %}Over the last 24 hours, this would have warned {{ replay.warned }} {% if replay.warned == 1 %}time{% else %}times{% endif %} and gone critical {{ replay.critical }} {% if replay.critical == 1 %}time{% else %}times{% endif %}.{% endif %}</p>
   {% if replay.alerted %}
   <div class="tablebox"><table>
     <thead><tr><th>{% if rule.calculation %}Line{% else %}Host{% endif %}</th><th>Warned</th><th>Critical</th></tr></thead>

@@ -517,10 +517,12 @@ async fn without_saving(
     let action = form.fields.get("form_action").cloned().unwrap_or_default();
     if action == "replay" {
         // Tried as it would be saved, so a mistake says what it would on saving.
-        let replayed = match validate(state, fields).await {
-            Ok(input) => replay(&state.sources(), &input, crate::times::now()).await,
-            Err(error) => Err(error),
+        let replayed = async {
+            let input = fields.to_rule(&known_facts(state).await)?;
+            let conditions = state.check_alert_rule(&input).await?;
+            replay(&state.sources(), &input, conditions, crate::times::now()).await
         };
+        let replayed = replayed.await;
         return Some(match replayed {
             Ok(replayed) => {
                 form_page_with(state, &form.token, id, fields, None, Some(&replayed)).await

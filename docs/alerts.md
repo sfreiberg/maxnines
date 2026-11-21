@@ -80,8 +80,9 @@ conditions about the calculated `value` instead, like `value > 80`.
 of what's stored, without saving it, and says how many times it would have warned and
 gone critical, and on which hosts, waiting its **For at least** time as it would. It's
 tried on each stored step's average, 10 minutes for a day, so something shorter may not
-show. `forecast()` can't be tried on the past, and hosts are taken to have been
-`online` and `reporting`, as that isn't kept.
+show, and `forecast()` is drawn through those steps. Hosts are taken to have been
+`online` and `reporting`, as that isn't kept. The API does the same, as
+[trying a rule](api-alert-rules.md#try-an-alert-rule-on-the-last-day) describes.
 
 ### What alerts say
 

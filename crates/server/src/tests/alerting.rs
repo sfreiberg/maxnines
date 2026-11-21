@@ -31,6 +31,8 @@ const MINUTE: TimeDelta = TimeDelta::minutes(1);
 #[derive(Clone, Default)]
 struct Script {
     readings: Arc<Mutex<Vec<NewestReading>>>,
+    /// What calculations answer, if they're answered at all.
+    calculated: Arc<Mutex<Option<Vec<crate::metrics::Series>>>>,
     /// What's stored over time, by metric, for charts and trying rules on the past.
     stored: Arc<Mutex<BTreeMap<String, Vec<crate::metrics::Series>>>>,
     /// Readings for one metric in particular, where every other has `readings`.
@@ -145,7 +147,10 @@ impl MetricsReader for Script {
         &self,
         _query: &crate::calculations::CalculationQuery,
     ) -> anyhow::Result<crate::metrics::SeriesResult> {
-        anyhow::bail!("deliberate test failure");
+        match self.calculated.lock().unwrap().clone() {
+            Some(series) => Ok(crate::metrics::SeriesResult { series, hidden: 0 }),
+            None => anyhow::bail!("deliberate test failure"),
+        }
     }
 }
 
@@ -617,6 +622,100 @@ async fn a_rule_can_be_tried_on_the_last_day_before_it_is_saved() {
         "{}",
         page.body
     );
+}
+
+/// Points every ten minutes through the last hour.
+fn last_hour(test: &Harness, values: &[f64]) -> Vec<crate::metrics::Point> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(step, avg)| crate::metrics::Point {
+            time: test.now - MINUTE * 60 + MINUTE * 10 * step as i32,
+            avg: *avg,
+            min: *avg,
+            max: *avg,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_rule_can_be_tried_on_the_last_day_through_the_api() {
+    let test = Harness::start().await;
+    let disks = vec![crate::metrics::Series {
+        name: "/".to_string(),
+        points: last_hour(&test, &[50.0, 85.0, 95.0, 95.0, 50.0, 85.0]),
+    }];
+    test.script
+        .stored
+        .lock()
+        .unwrap()
+        .insert("disk.usage".to_string(), disks);
+    let path = "/api/v1/alert-rules/replay";
+    let rule = json!({
+        "name": "Disk", "warning": "disk.usage > 80", "critical": "disk.usage > 90",
+        "for_secs": 0,
+    });
+    let (status, body) = api(&test.server, "POST", path, &rule).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["warned"], 2, "{body}");
+    assert_eq!(body["critical"], 1, "{body}");
+    assert_eq!(body["alerted"][0]["name"], "web-1", "{body}");
+    assert!(test.database().list_alert_rules().await.unwrap().is_empty());
+
+    // A forecast is tried on the line through the steps before each.
+    let rising = vec![crate::metrics::Series {
+        name: "/".to_string(),
+        points: last_hour(&test, &[70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0]),
+    }];
+    test.script
+        .stored
+        .lock()
+        .unwrap()
+        .insert("disk.usage".to_string(), rising);
+    let rule = json!({
+        "name": "Filling", "critical": "forecast(disk.usage, duration('4h')) >= 100",
+        "window_secs": 3600, "for_secs": 0,
+    });
+    let (status, body) = api(&test.server, "POST", path, &rule).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["critical"], 1, "{body}");
+
+    // A rule that couldn't be tried on anything says so.
+    let rule = json!({ "name": "Nothing", "critical": "cpu.usage > 90", "for_secs": 0 });
+    let (_, body) = api(&test.server, "POST", path, &rule).await;
+    assert_eq!(body["tried"], 0, "{body}");
+
+    let wrong = json!({ "name": "Bad", "critical": "disk.usag > 1", "for_secs": 0 });
+    let (status, body) = api(&test.server, "POST", path, &wrong).await;
+    assert_eq!(status, 422, "{body}");
+}
+
+#[tokio::test]
+async fn a_calculation_is_tried_over_its_window_and_counts_nothing_as_none() {
+    let test = Harness::start().await;
+    let path = "/api/v1/alert-rules/replay";
+    // Nothing reporting is a count of 0, as it is live.
+    *test.script.calculated.lock().unwrap() = Some(Vec::new());
+    let counting = json!({
+        "name": "Nobody", "calculation": "count", "metric": "cpu.usage",
+        "critical": "value < 1", "for_secs": 0,
+    });
+    let (status, body) = api(&test.server, "POST", path, &counting).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["critical"], 1, "{body}");
+    assert_eq!(body["alerted"][0]["name"], "Fleet", "{body}");
+
+    let line = crate::metrics::Series {
+        name: String::new(),
+        points: last_hour(&test, &[50.0, 85.0, 85.0, 50.0]),
+    };
+    *test.script.calculated.lock().unwrap() = Some(vec![line]);
+    let busy = json!({
+        "name": "Busy", "calculation": "avg", "metric": "cpu.usage",
+        "warning": "value > 80", "for_secs": 0,
+    });
+    let (_, body) = api(&test.server, "POST", path, &busy).await;
+    assert_eq!(body["warned"], 1, "{body}");
 }
 
 #[tokio::test]
