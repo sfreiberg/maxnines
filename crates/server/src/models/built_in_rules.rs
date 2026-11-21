@@ -49,9 +49,8 @@ impl Database {
     /// Writes `shipped` over the built-in rules, adding any that are new and
     /// removing any no longer shipped. Whether each is turned on stays as it was. A
     /// rule of someone's own that has a built-in rule's name, as names are compared,
-    /// becomes theirs under another name, unless it's already just the same and the
-    /// built-in one is new, when it becomes the built-in one. Gives the names of the
-    /// rules this changed.
+    /// keeps everything it had under a name of its own. Gives the names of the rules
+    /// this changed.
     pub async fn sync_built_in_rules(
         &self,
         shipped: &[BuiltInRule],
@@ -76,8 +75,7 @@ impl Database {
                 .iter()
                 .find(|row| row.built_in.as_deref() == Some(built_in.key));
 
-            // Someone's own rule with this name, as names are compared: the same rule
-            // is adopted when there's no built-in one yet, and a different one keeps
+            // Someone's own rule with this name, as names are compared, keeps
             // everything it had under a name of its own.
             let named = rows
                 .iter()
@@ -87,14 +85,6 @@ impl Database {
                     .await?
                     .context("a rule went missing")?;
                 let mut active: config_rule::ActiveModel = row.clone().into();
-                if existing.is_none() && same_rule(&before.rule, &built_in.rule) {
-                    active.built_in = Set(Some(built_in.key.to_string()));
-                    active
-                        .update(&transaction)
-                        .await
-                        .context("marking a built-in rule")?;
-                    continue;
-                }
                 let mut name = format!("{} (yours)", built_in.rule.name);
                 let mut number = 2;
                 while taken.contains(&name_key(&name)) {

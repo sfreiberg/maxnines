@@ -4,28 +4,10 @@ MaxNines keeps its data in two places:
 
 - **The main database** holds everything people set up and everything the server
   decides: hosts, facts, rules, alerts, users and the rest. It's SQLite by default,
-  or PostgreSQL, MySQL or MariaDB, through sea-orm. Its migrations are in
-  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs):
-  - `m20261119_000001_create_tables` makes its tables.
-  - `m20261119_000002_add_no_metrics_rule` adds the built-in Host sending no metrics
-    rule, which the first doesn't have.
-  - `m20261119_000003_keys_and_indexes` makes deleting a host or user delete what's
-    theirs, adds the notifications' key to their action runs, keeps names unique
-    among rules and channels that aren't deleted, and adds indexes the first didn't
-    have.
-  - `m20261119_000004_names_and_uniqueness` compares names ignoring case, the same
-    way on every database, keeps one current value of each fact and one open alert
-    for each problem, and adds the rest of the indexes below.
-  - `m20261119_000005_exact_facts_and_ended_alerts` has MySQL and MariaDB compare
-    facts' names and values exactly, as the others do, and indexes alerts by when
-    they ended and their IDs, the order ended ones are listed in.
-  - `m20261119_000006_durations_in_seconds` keeps how long an action ran as
-    `duration_secs`, with a fraction, in place of `duration_ms`.
-  - `m20261120_000001_refused_agents` keeps why the server refuses a host's agent,
-    while it does, for the protocol it speaks: since when, what the agent was told,
-    and that protocol.
-  - `m20261120_000002_skipped_collectors` keeps which collectors in its config a
-    host's agent doesn't know, as it's older than the server.
+  or PostgreSQL, MySQL or MariaDB, through sea-orm. One migration,
+  `m20261119_000001_create_tables` in
+  [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs), makes its
+  tables and adds the built-in hosts and alert rules.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in
@@ -48,8 +30,8 @@ The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.
 
 These diagrams have to change with every change to a table. Until the first
-release, later migrations are squashed back into these, and a database made before
-then has its migrations table changed to name only them.
+release there are no upgrade steps: a change to a table is made to the migration
+that makes it, and a database made before the change is deleted and made again.
 
 ## Main database
 

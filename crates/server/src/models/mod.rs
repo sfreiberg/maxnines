@@ -2152,12 +2152,8 @@ mod tests {
     }
 
     async fn exercise_rules(database: &Database) {
-        // A new install has a default rule, from the migration.
-        let rules = database.list_rules().await.unwrap();
-        assert_eq!(rules[0].rule.name, "Default");
-        assert_eq!(rules[0].rule.applies_to, None);
-        assert_eq!(rules[0].rule.settings["interval_secs"], 15);
-        assert_eq!(rules[0].rule.settings["collectors"]["cpu"]["enabled"], true);
+        // A new database has no rules: the server writes the built-in ones as it starts.
+        assert!(database.list_rules().await.unwrap().is_empty());
 
         // Settings come back with their types and shape.
         let later = database
@@ -2179,7 +2175,7 @@ mod tests {
             .into_iter()
             .map(|rule| rule.rule.name)
             .collect();
-        assert_eq!(names, ["Default", "earlier", "later"]);
+        assert_eq!(names, ["earlier", "later"]);
 
         // Updating replaces the settings instead of adding to them.
         let mut changed = rule_input("renamed", 300);
@@ -2207,7 +2203,7 @@ mod tests {
 
         assert!(database.delete_rule(later).await.unwrap());
         assert!(database.delete_rule(earlier).await.unwrap());
-        assert_eq!(database.list_rules().await.unwrap().len(), 1);
+        assert!(database.list_rules().await.unwrap().is_empty());
     }
 
     async fn exercise_config_status(database: &Database, host: &str) {
@@ -2705,29 +2701,6 @@ mod tests {
             .unwrap();
 
         assert!(database.load_hosts().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn every_migration_can_be_undone_and_applied_again() {
-        let database = Database::for_test().await;
-        let connection = &database.connection;
-        let count = u32::try_from(Migrator::migrations().len()).unwrap();
-
-        for _ in 0..count {
-            Migrator::down(connection, Some(1)).await.unwrap();
-            Migrator::up(connection, Some(1)).await.unwrap();
-        }
-        Migrator::down(connection, None).await.unwrap();
-        assert!(
-            Migrator::get_applied_migrations(connection)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-
-        Migrator::up(connection, None).await.unwrap();
-        let hosts = database.load_hosts().await.unwrap();
-        assert_eq!(hosts.len(), 2, "both built-in hosts are back: {hosts:?}");
     }
 
     #[tokio::test]

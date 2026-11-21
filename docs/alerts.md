@@ -22,8 +22,7 @@ agent reconnecting, even just after the server restarts. They tell every notific
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
 
 They're ordinary rules from then on: change them, turn them off or delete them under
-**Settings > Alert rules**, and upgrades leave them alone. A server that already had a
-rule called Host sending no metrics when it upgraded keeps that one instead.
+**Settings > Alert rules**, and upgrades leave them alone.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.

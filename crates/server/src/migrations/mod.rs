@@ -1,26 +1,16 @@
 //! The main database's tables, made by one migration: what `database/README.md`
-//! draws. A change to a table is a new migration after this one, with the README
-//! changed to match. Until the first release, those are squashed back into this one
-//! now and then, as if the design had been right from the start, and a database made
-//! before then has its `seaql_migrations` rows changed to name this one alone.
+//! draws. Until the first release there are no upgrade steps: a change to a table is
+//! made to this migration, with the README changed to match, and a database made
+//! before the change is deleted and made again.
 
-use sea_orm::{DatabaseBackend, Statement};
+use sea_orm::DatabaseBackend;
 use sea_orm_migration::prelude::*;
 
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![
-            Box::new(CreateTables),
-            Box::new(AddNoMetricsRule),
-            Box::new(KeysAndIndexes),
-            Box::new(NamesAndUniqueness),
-            Box::new(ExactFactsAndEndedAlerts),
-            Box::new(DurationsInSeconds),
-            Box::new(RefusedAgents),
-            Box::new(SkippedCollectors),
-        ]
+        vec![Box::new(CreateTables)]
     }
 }
 
@@ -60,6 +50,96 @@ fn json(backend: DatabaseBackend, column: impl IntoIden) -> ColumnDef {
     json
 }
 
+/// Text compared exactly, as it's written. MySQL and MariaDB would otherwise compare
+/// it by the table's collation, usually ignoring case and accents, as the other
+/// databases never do.
+fn exact_text(backend: DatabaseBackend, column: impl IntoIden, length: u32) -> ColumnDef {
+    let mut text = ColumnDef::new(column);
+    match backend {
+        DatabaseBackend::MySql => text.custom(Alias::new(format!(
+            "varchar({length}) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"
+        ))),
+        _ => text.string_len(length),
+    };
+    text
+}
+
+/// How long a name can be as it's compared: lowercased, which can make it longer, from
+/// a name of up to 255 characters.
+const NAME_KEY_LEN: u32 = 512;
+
+/// A name as it's compared, ignoring case and the spaces around it, which is what's
+/// kept unique. The server fills it in, as [`crate::models::name_key`] works it out,
+/// so every database compares names the same way.
+fn name_key(backend: DatabaseBackend) -> ColumnDef {
+    exact_text(backend, Alias::new("name_key"), NAME_KEY_LEN)
+        .not_null()
+        .to_owned()
+}
+
+/// For MySQL, which can't index only some rows: a column it works out itself, holding
+/// `value` while `only` holds and NULL otherwise, which a unique index lets repeat.
+fn only_while(column: &str, length: u32, only: &str, value: &str) -> ColumnDef {
+    exact_text(DatabaseBackend::MySql, Alias::new(column), length)
+        .generated(
+            Expr::cust(format!("CASE WHEN {only} THEN {value} END")),
+            true,
+        )
+        .to_owned()
+}
+
+#[derive(Clone, Copy)]
+enum IndexKind {
+    Unique,
+    Plain,
+}
+
+use IndexKind::{Plain, Unique};
+
+/// Makes an index of `columns`, as SQL writes them, of only the rows `only` picks when
+/// it's given, which MySQL can't do.
+async fn index_of(
+    manager: &SchemaManager<'_>,
+    kind: IndexKind,
+    name: &str,
+    table: &str,
+    columns: &str,
+    only: Option<&str>,
+) -> Result<(), DbErr> {
+    let unique = match kind {
+        Unique => "UNIQUE ",
+        Plain => "",
+    };
+    let only = only
+        .map(|only| format!(" WHERE {only}"))
+        .unwrap_or_default();
+    manager
+        .get_connection()
+        .execute_unprepared(&format!(
+            "CREATE {unique}INDEX {name} ON {table} ({columns}){only}"
+        ))
+        .await?;
+    Ok(())
+}
+
+/// Makes `table`, whose names are each used once among the rows that aren't deleted.
+async fn live_names(
+    manager: &SchemaManager<'_>,
+    mut table: TableCreateStatement,
+    name: &str,
+) -> Result<(), DbErr> {
+    let index = format!("idx_{name}_live_name");
+    let live = "deleted_at IS NULL";
+    if manager.get_database_backend() == DatabaseBackend::MySql {
+        table.col(only_while("live_name", NAME_KEY_LEN, live, "name_key"));
+        manager.create_table(table).await?;
+        index_of(manager, Unique, &index, name, "live_name", None).await
+    } else {
+        manager.create_table(table).await?;
+        index_of(manager, Unique, &index, name, "name_key", Some(live)).await
+    }
+}
+
 struct CreateTables;
 
 impl MigrationName for CreateTables {
@@ -69,8 +149,8 @@ impl MigrationName for CreateTables {
 }
 
 /// Every table, in the order their foreign keys need, and what a new server starts
-/// with: the server itself and the fleet as hosts, a default config rule, and the
-/// built-in alert rules. A column that can be empty is NULL when it is, never an empty
+/// with: the server itself and the fleet as hosts, and the built-in alert rules. The
+/// built-in config rules are written each time the server starts instead. A column that can be empty is NULL when it is, never an empty
 /// string, so it says plainly when there's nothing in it.
 #[async_trait::async_trait]
 impl MigrationTrait for CreateTables {
@@ -80,6 +160,7 @@ impl MigrationTrait for CreateTables {
 
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let backend = manager.get_database_backend();
+        let mysql = backend == DatabaseBackend::MySql;
         manager
             .create_table(
                 Table::create()
@@ -102,33 +183,41 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(Hosts::DecidedBy).text())
                     .col(moment(backend, Hosts::FirstSeenAt).not_null())
                     .col(moment(backend, Hosts::DecidedAt))
+                    // Why the server refuses the host's agent, while it does, for the
+                    // protocol it speaks.
+                    .col(moment(backend, Hosts::RefusedAt))
+                    .col(ColumnDef::new(Hosts::RefusedReason).text())
+                    .col(ColumnDef::new(Hosts::RefusedProtocol).big_integer())
                     .to_owned(),
             )
             .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(HostFacts::Table)
-                    .col(id(HostFacts::Id))
-                    .col(ColumnDef::new(HostFacts::HostId).string_len(32).not_null())
-                    .col(ColumnDef::new(HostFacts::Name).string_len(255).not_null())
-                    .col(ColumnDef::new(HostFacts::Value).string_len(255).not_null())
-                    .col(
-                        ColumnDef::new(HostFacts::ValueType)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(moment(backend, HostFacts::ValidFrom).not_null())
-                    .col(moment(backend, HostFacts::ValidTo))
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_host_facts_host_id")
-                            .from(HostFacts::Table, HostFacts::HostId)
-                            .to(Hosts::Table, Hosts::Id),
-                    )
-                    .to_owned(),
+        // Facts are what agents report, so `os.Family` isn't `os.family`: names and
+        // values are compared exactly. A host has one current value of each fact.
+        let mut host_facts = Table::create()
+            .table(HostFacts::Table)
+            .col(id(HostFacts::Id))
+            .col(ColumnDef::new(HostFacts::HostId).string_len(32).not_null())
+            .col(exact_text(backend, HostFacts::Name, 255).not_null())
+            .col(exact_text(backend, HostFacts::Value, 255).not_null())
+            .col(
+                ColumnDef::new(HostFacts::ValueType)
+                    .string_len(16)
+                    .not_null(),
             )
-            .await?;
+            .col(moment(backend, HostFacts::ValidFrom).not_null())
+            .col(moment(backend, HostFacts::ValidTo))
+            .foreign_key(
+                ForeignKey::create()
+                    .name("fk_host_facts_host_id")
+                    .from(HostFacts::Table, HostFacts::HostId)
+                    .to(Hosts::Table, Hosts::Id)
+                    .on_delete(ForeignKeyAction::Cascade),
+            )
+            .to_owned();
+        if mysql {
+            host_facts.col(only_while("current_name", 255, "valid_to IS NULL", "name"));
+        }
+        manager.create_table(host_facts).await?;
         manager
             .create_index(
                 Index::create()
@@ -139,16 +228,49 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_host_facts_name_value")
-                    .table(HostFacts::Table)
-                    .col(HostFacts::Name)
-                    .col(HostFacts::Value)
-                    .to_owned(),
+        // One current value of each fact, and the facts hosts have now by name.
+        let current = "valid_to IS NULL";
+        if mysql {
+            let (table, unique) = ("host_facts", "idx_host_facts_current");
+            index_of(
+                manager,
+                Unique,
+                unique,
+                table,
+                "host_id, current_name",
+                None,
             )
             .await?;
+            index_of(
+                manager,
+                Plain,
+                "idx_host_facts_current_name",
+                table,
+                "valid_to, name",
+                None,
+            )
+            .await?;
+        } else {
+            let (table, unique) = ("host_facts", "idx_host_facts_current");
+            index_of(
+                manager,
+                Unique,
+                unique,
+                table,
+                "host_id, name",
+                Some(current),
+            )
+            .await?;
+            index_of(
+                manager,
+                Plain,
+                "idx_host_facts_current_name",
+                table,
+                "name",
+                Some(current),
+            )
+            .await?;
+        }
         manager
             .create_table(
                 Table::create()
@@ -166,11 +288,15 @@ impl MigrationTrait for CreateTables {
                     )
                     .col(ColumnDef::new(HostConfigStatus::Error).text())
                     .col(moment(backend, HostConfigStatus::ReportedAt).not_null())
+                    // The collectors in the config that the agent doesn't know, as it's
+                    // older than the server, one to a line.
+                    .col(ColumnDef::new(HostConfigStatus::SkippedCollectors).text())
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_host_config_status_host_id")
                             .from(HostConfigStatus::Table, HostConfigStatus::HostId)
-                            .to(Hosts::Table, Hosts::Id),
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
@@ -190,7 +316,8 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_host_boots_host_id")
                             .from(HostBoots::Table, HostBoots::HostId)
-                            .to(Hosts::Table, Hosts::Id),
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
@@ -222,7 +349,8 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_metrics_pages_host_id")
                             .from(MetricsPages::Table, MetricsPages::HostId)
-                            .to(Hosts::Table, Hosts::Id),
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
@@ -241,12 +369,8 @@ impl MigrationTrait for CreateTables {
                 Table::create()
                     .table(ConfigRules::Table)
                     .col(id(ConfigRules::Id))
-                    .col(
-                        ColumnDef::new(ConfigRules::Name)
-                            .string_len(255)
-                            .not_null()
-                            .unique_key(),
-                    )
+                    .col(ColumnDef::new(ConfigRules::Name).string_len(255).not_null())
+                    .col(name_key(backend))
                     .col(ColumnDef::new(ConfigRules::Priority).integer().not_null())
                     .col(ColumnDef::new(ConfigRules::AppliesTo).text())
                     .col(ColumnDef::new(ConfigRules::Enabled).boolean().not_null())
@@ -256,6 +380,15 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        index_of(
+            manager,
+            Unique,
+            "idx_config_rules_name",
+            "config_rules",
+            "name_key",
+            None,
+        )
+        .await?;
         manager
             .create_table(
                 Table::create()
@@ -394,6 +527,16 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        // Sessions that have run out, which every sign in clears.
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_user_sessions_expires")
+                    .table(UserSessions::Table)
+                    .col(UserSessions::ExpiresAt)
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -424,8 +567,18 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_api_keys_user_id")
                             .from(ApiKeys::Table, ApiKeys::UserId)
-                            .to(Users::Table, Users::Id),
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_api_keys_user_id")
+                    .table(ApiKeys::Table)
+                    .col(ApiKeys::UserId)
                     .to_owned(),
             )
             .await?;
@@ -456,7 +609,8 @@ impl MigrationTrait for CreateTables {
                             ForeignKey::create()
                                 .name("fk_app_sign_ins_user_id")
                                 .from(T::Table, T::UserId)
-                                .to(Users::Table, Users::Id),
+                                .to(Users::Table, Users::Id)
+                                .on_delete(ForeignKeyAction::Cascade),
                         )
                         .to_owned(),
                 )
@@ -467,6 +621,9 @@ impl MigrationTrait for CreateTables {
                     "idx_app_sign_ins_previous_refresh_hash",
                     T::PreviousRefreshHash,
                 ),
+                // What's cleared on every sign in.
+                ("idx_app_sign_ins_revoked", T::RevokedAt),
+                ("idx_app_sign_ins_refresh_expires", T::RefreshExpiresAt),
             ] {
                 manager
                     .create_index(
@@ -499,8 +656,18 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_recovery_codes_user_id")
                             .from(RecoveryCodes::Table, RecoveryCodes::UserId)
-                            .to(Users::Table, Users::Id),
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_recovery_codes_user_id")
+                    .table(RecoveryCodes::Table)
+                    .col(RecoveryCodes::UserId)
                     .to_owned(),
             )
             .await?;
@@ -525,86 +692,105 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_sign_in_challenges_user_id")
                             .from(SignInChallenges::Table, SignInChallenges::UserId)
-                            .to(Users::Table, Users::Id),
+                            .to(Users::Table, Users::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
             .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(NotificationChannels::Table)
-                    .col(id(NotificationChannels::Id))
-                    .col(
-                        ColumnDef::new(NotificationChannels::Name)
-                            .string_len(255)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(NotificationChannels::Kind)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(NotificationChannels::Target)
-                            .text()
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(NotificationChannels::Credential).text())
-                    .col(ColumnDef::new(NotificationChannels::AppToken).text())
-                    .col(
-                        ColumnDef::new(NotificationChannels::SendsWarnings)
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(
-                        ColumnDef::new(NotificationChannels::SendsCritical)
-                            .boolean()
-                            .not_null()
-                            .default(true),
-                    )
-                    .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
-                    .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
-                    .col(ColumnDef::new(NotificationChannels::MailPort).integer())
-                    .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
-                    .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
-                    .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
-                    .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
-                    .col(ColumnDef::new(NotificationChannels::RequestBody).text())
-                    .col(moment(backend, NotificationChannels::DeletedAt))
-                    .to_owned(),
+        for (name, column) in [
+            ("idx_sign_in_challenges_user_id", SignInChallenges::UserId),
+            // What's cleared on every sign in.
+            (
+                "idx_sign_in_challenges_expires",
+                SignInChallenges::ExpiresAt,
+            ),
+        ] {
+            manager
+                .create_index(
+                    Index::create()
+                        .name(name)
+                        .table(SignInChallenges::Table)
+                        .col(column)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        // A channel is only ever marked deleted, so what was sent through it still
+        // names it, and its name is used once among those that aren't.
+        let channels = Table::create()
+            .table(NotificationChannels::Table)
+            .col(id(NotificationChannels::Id))
+            .col(
+                ColumnDef::new(NotificationChannels::Name)
+                    .string_len(255)
+                    .not_null(),
             )
-            .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(AlertRules::Table)
-                    .col(id(AlertRules::Id))
-                    .col(ColumnDef::new(AlertRules::Name).string_len(255).not_null())
-                    .col(ColumnDef::new(AlertRules::Warning).text())
-                    .col(ColumnDef::new(AlertRules::Critical).text())
-                    .col(ColumnDef::new(AlertRules::Summary).text())
-                    .col(ColumnDef::new(AlertRules::ResolvedSummary).text())
-                    .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
-                    .col(ColumnDef::new(AlertRules::AppliesTo).text())
-                    .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
-                    .col(
-                        ColumnDef::new(AlertRules::AllChannels)
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    )
-                    .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
-                    .col(ColumnDef::new(AlertRules::Metric).string_len(64))
-                    .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
-                    .col(ColumnDef::new(AlertRules::Filter).string_len(500))
-                    .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
-                    .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
-                    .col(moment(backend, AlertRules::DeletedAt))
-                    .to_owned(),
+            .col(name_key(backend))
+            .col(
+                ColumnDef::new(NotificationChannels::Kind)
+                    .string_len(16)
+                    .not_null(),
             )
-            .await?;
+            .col(
+                ColumnDef::new(NotificationChannels::Target)
+                    .text()
+                    .not_null(),
+            )
+            .col(ColumnDef::new(NotificationChannels::Credential).text())
+            .col(ColumnDef::new(NotificationChannels::AppToken).text())
+            .col(
+                ColumnDef::new(NotificationChannels::SendsWarnings)
+                    .boolean()
+                    .not_null()
+                    .default(true),
+            )
+            .col(
+                ColumnDef::new(NotificationChannels::SendsCritical)
+                    .boolean()
+                    .not_null()
+                    .default(true),
+            )
+            .col(ColumnDef::new(NotificationChannels::MailFrom).string_len(320))
+            .col(ColumnDef::new(NotificationChannels::MailHostname).string_len(255))
+            .col(ColumnDef::new(NotificationChannels::MailPort).integer())
+            .col(ColumnDef::new(NotificationChannels::MailSecurity).string_len(16))
+            .col(ColumnDef::new(NotificationChannels::MailUsername).string_len(255))
+            .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
+            .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
+            .col(ColumnDef::new(NotificationChannels::RequestBody).text())
+            .col(moment(backend, NotificationChannels::DeletedAt))
+            .to_owned();
+        live_names(manager, channels, "notification_channels").await?;
+        // A rule is only ever marked deleted, as its alerts keep it, and its name is
+        // used once among those that aren't.
+        let rules = Table::create()
+            .table(AlertRules::Table)
+            .col(id(AlertRules::Id))
+            .col(ColumnDef::new(AlertRules::Name).string_len(255).not_null())
+            .col(name_key(backend))
+            .col(ColumnDef::new(AlertRules::Warning).text())
+            .col(ColumnDef::new(AlertRules::Critical).text())
+            .col(ColumnDef::new(AlertRules::Summary).text())
+            .col(ColumnDef::new(AlertRules::ResolvedSummary).text())
+            .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
+            .col(ColumnDef::new(AlertRules::AppliesTo).text())
+            .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
+            .col(
+                ColumnDef::new(AlertRules::AllChannels)
+                    .boolean()
+                    .not_null()
+                    .default(false),
+            )
+            .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
+            .col(ColumnDef::new(AlertRules::Metric).string_len(64))
+            .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
+            .col(ColumnDef::new(AlertRules::Filter).string_len(500))
+            .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
+            .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
+            .col(moment(backend, AlertRules::DeletedAt))
+            .to_owned();
+        live_names(manager, rules, "alert_rules").await?;
         manager
             .create_table(
                 Table::create()
@@ -641,128 +827,92 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_alert_rule_channels_channel")
+                    .table(AlertRuleChannels::Table)
+                    .col(AlertRuleChannels::ChannelId)
+                    .to_owned(),
+            )
+            .await?;
         // An alert keeps no copy of its rule's name or its host's, which would only go
         // stale when either was renamed. Rules are only ever marked deleted, and a
         // host's alerts go with it, so both are always there to be read.
-        manager
-            .create_table(
-                Table::create()
-                    .table(Alerts::Table)
-                    .col(id(Alerts::Id))
-                    .col(ColumnDef::new(Alerts::RuleId).big_integer().not_null())
-                    .col(ColumnDef::new(Alerts::Severity).string_len(16).not_null())
-                    .col(ColumnDef::new(Alerts::HostId).string_len(32).not_null())
-                    .col(ColumnDef::new(Alerts::Series).string_len(255))
-                    .col(ColumnDef::new(Alerts::Value).double())
-                    .col(ColumnDef::new(Alerts::Summary).text().not_null())
-                    .col(moment(backend, Alerts::StartedAt).not_null())
-                    .col(moment(backend, Alerts::BreachedAt).not_null())
-                    .col(moment(backend, Alerts::ResolvedAt))
-                    .col(ColumnDef::new(Alerts::ResolveReason).text())
-                    .col(ColumnDef::new(Alerts::ResolvedSummary).text())
-                    .col(ColumnDef::new(Alerts::AcknowledgedBy).string_len(255))
-                    .col(moment(backend, Alerts::AcknowledgedAt))
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_alerts_host_id")
-                            .from(Alerts::Table, Alerts::HostId)
-                            .to(Hosts::Table, Hosts::Id),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_alerts_rule_id")
-                            .from(Alerts::Table, Alerts::RuleId)
-                            .to(AlertRules::Table, AlertRules::Id),
-                    )
-                    .to_owned(),
+        let mut alerts = Table::create()
+            .table(Alerts::Table)
+            .col(id(Alerts::Id))
+            .col(ColumnDef::new(Alerts::RuleId).big_integer().not_null())
+            .col(ColumnDef::new(Alerts::Severity).string_len(16).not_null())
+            .col(ColumnDef::new(Alerts::HostId).string_len(32).not_null())
+            .col(ColumnDef::new(Alerts::Series).string_len(255))
+            .col(ColumnDef::new(Alerts::Value).double())
+            .col(ColumnDef::new(Alerts::Summary).text().not_null())
+            .col(moment(backend, Alerts::StartedAt).not_null())
+            .col(moment(backend, Alerts::BreachedAt).not_null())
+            .col(moment(backend, Alerts::ResolvedAt))
+            .col(ColumnDef::new(Alerts::ResolveReason).text())
+            .col(ColumnDef::new(Alerts::ResolvedSummary).text())
+            .col(ColumnDef::new(Alerts::AcknowledgedBy).string_len(255))
+            .col(moment(backend, Alerts::AcknowledgedAt))
+            .foreign_key(
+                ForeignKey::create()
+                    .name("fk_alerts_host_id")
+                    .from(Alerts::Table, Alerts::HostId)
+                    .to(Hosts::Table, Hosts::Id)
+                    .on_delete(ForeignKeyAction::Cascade),
+            )
+            .foreign_key(
+                ForeignKey::create()
+                    .name("fk_alerts_rule_id")
+                    .from(Alerts::Table, Alerts::RuleId)
+                    .to(AlertRules::Table, AlertRules::Id),
+            )
+            .to_owned();
+        let open = "resolved_at IS NULL";
+        if mysql {
+            alerts.col(only_while("open_series", 255, open, "COALESCE(series, '')"));
+        }
+        manager.create_table(alerts).await?;
+        // One open alert from each rule about each host and series. A host as a whole
+        // has no series, which counts as one of its own.
+        if mysql {
+            let columns = "rule_id, host_id, open_series";
+            index_of(manager, Unique, "idx_alerts_open", "alerts", columns, None).await?;
+        } else {
+            let columns = "rule_id, host_id, COALESCE(series, '')";
+            index_of(
+                manager,
+                Unique,
+                "idx_alerts_open",
+                "alerts",
+                columns,
+                Some(open),
             )
             .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_alerts_resolved")
-                    .table(Alerts::Table)
-                    .col(Alerts::ResolvedAt)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_alerts_started")
-                    .table(Alerts::Table)
-                    .col(Alerts::StartedAt)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_table(
-                Table::create()
-                    .table(Notifications::Table)
-                    .col(id(Notifications::Id))
-                    .col(
-                        ColumnDef::new(Notifications::AlertId)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Notifications::ChannelId)
-                            .big_integer()
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Notifications::Event)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(
-                        ColumnDef::new(Notifications::State)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(Notifications::Attempts).integer().not_null())
-                    .col(moment(backend, Notifications::NextAttemptAt).not_null())
-                    .col(ColumnDef::new(Notifications::LastError).text())
-                    .col(moment(backend, Notifications::CreatedAt).not_null())
-                    .col(moment(backend, Notifications::SentAt))
-                    .col(ColumnDef::new(Notifications::ExternalId).string_len(128))
-                    .col(ColumnDef::new(Notifications::ActionRunId).big_integer())
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_notifications_alert_id")
-                            .from(Notifications::Table, Notifications::AlertId)
-                            .to(Alerts::Table, Alerts::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .foreign_key(
-                        ForeignKey::create()
-                            .name("fk_notifications_channel_id")
-                            .from(Notifications::Table, Notifications::ChannelId)
-                            .to(NotificationChannels::Table, NotificationChannels::Id)
-                            .on_delete(ForeignKeyAction::Cascade),
-                    )
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_notifications_alert")
-                    .table(Notifications::Table)
-                    .col(Notifications::AlertId)
-                    .to_owned(),
-            )
-            .await?;
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_notifications_due")
-                    .table(Notifications::Table)
-                    .col(Notifications::State)
-                    .col(Notifications::NextAttemptAt)
-                    .to_owned(),
-            )
-            .await?;
+        }
+        for (name, columns) in [
+            // Ended alerts, newest first, in the order they ended.
+            ("idx_alerts_resolved", vec![Alerts::ResolvedAt, Alerts::Id]),
+            ("idx_alerts_started", vec![Alerts::StartedAt]),
+            // A host's timeline, newest first.
+            (
+                "idx_alerts_host_started",
+                vec![Alerts::HostId, Alerts::StartedAt],
+            ),
+            // A rule's open alerts, to end them when it's deleted or remind people.
+            (
+                "idx_alerts_rule_resolved",
+                vec![Alerts::RuleId, Alerts::ResolvedAt],
+            ),
+        ] {
+            let mut index = Index::create();
+            index.name(name).table(Alerts::Table);
+            for column in columns {
+                index.col(column);
+            }
+            manager.create_index(index).await?;
+        }
         manager
             .create_table(
                 Table::create()
@@ -919,7 +1069,8 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(ActionRuns::Error).text())
                     .col(output)
                     .col(ColumnDef::new(ActionRuns::Truncated).boolean().not_null())
-                    .col(ColumnDef::new(ActionRuns::DurationMs).big_integer())
+                    // In seconds, with a fraction, as many take less than one.
+                    .col(ColumnDef::new(ActionRuns::DurationSecs).double())
                     .col(moment(backend, ActionRuns::FinishedAt))
                     .foreign_key(
                         ForeignKey::create()
@@ -970,9 +1121,116 @@ impl MigrationTrait for CreateTables {
         manager
             .create_table(
                 Table::create()
+                    .table(Notifications::Table)
+                    .col(id(Notifications::Id))
+                    .col(
+                        ColumnDef::new(Notifications::AlertId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::ChannelId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::Event)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(Notifications::State)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(Notifications::Attempts).integer().not_null())
+                    .col(moment(backend, Notifications::NextAttemptAt).not_null())
+                    .col(ColumnDef::new(Notifications::LastError).text())
+                    .col(moment(backend, Notifications::CreatedAt).not_null())
+                    .col(moment(backend, Notifications::SentAt))
+                    .col(ColumnDef::new(Notifications::ExternalId).string_len(128))
+                    .col(ColumnDef::new(Notifications::ActionRunId).big_integer())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_notifications_alert_id")
+                            .from(Notifications::Table, Notifications::AlertId)
+                            .to(Alerts::Table, Alerts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_notifications_channel_id")
+                            .from(Notifications::Table, Notifications::ChannelId)
+                            .to(NotificationChannels::Table, NotificationChannels::Id),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_notifications_action_run_id")
+                            .from(Notifications::Table, Notifications::ActionRunId)
+                            .to(ActionRuns::Table, ActionRuns::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_notifications_alert")
+                    .table(Notifications::Table)
+                    .col(Notifications::AlertId)
+                    .to_owned(),
+            )
+            .await?;
+        manager
+            .create_index(
+                Index::create()
+                    .name("idx_notifications_due")
+                    .table(Notifications::Table)
+                    .col(Notifications::State)
+                    .col(Notifications::NextAttemptAt)
+                    .to_owned(),
+            )
+            .await?;
+        for (name, columns) in [
+            // What's waiting for a channel.
+            (
+                "idx_notifications_channel",
+                vec![Notifications::ChannelId, Notifications::State],
+            ),
+            (
+                "idx_notifications_action_run",
+                vec![Notifications::ActionRunId],
+            ),
+        ] {
+            let mut index = Index::create();
+            index.name(name).table(Notifications::Table);
+            for column in columns {
+                index.col(column);
+            }
+            manager.create_index(index).await?;
+        }
+        // Notifications that failed, newest first, for the alerts page. MySQL can't
+        // index only some rows, and it's only worth having as one.
+        if !mysql {
+            let failed = Some("last_error IS NOT NULL");
+            index_of(
+                manager,
+                Plain,
+                "idx_notifications_problems",
+                "notifications",
+                "id",
+                failed,
+            )
+            .await?;
+        }
+        manager
+            .create_table(
+                Table::create()
                     .table(RemoteChecks::Table)
                     .col(id(RemoteChecks::Id))
                     .col(ColumnDef::new(RemoteChecks::Name).string_len(64).not_null())
+                    .col(name_key(backend))
                     .col(ColumnDef::new(RemoteChecks::Kind).string_len(16).not_null())
                     .col(
                         ColumnDef::new(RemoteChecks::Target)
@@ -1019,23 +1277,15 @@ impl MigrationTrait for CreateTables {
                         ForeignKey::create()
                             .name("fk_remote_checks_host_id")
                             .from(RemoteChecks::Table, RemoteChecks::HostId)
-                            .to(Hosts::Table, Hosts::Id),
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
                     )
                     .to_owned(),
             )
             .await?;
         // A check's name only has to differ from the others about the same host.
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_remote_checks_host_name")
-                    .table(RemoteChecks::Table)
-                    .col(RemoteChecks::HostId)
-                    .col(RemoteChecks::Name)
-                    .unique()
-                    .to_owned(),
-            )
-            .await?;
+        let (name, columns) = ("idx_remote_checks_host_name", "host_id, name_key");
+        index_of(manager, Unique, name, "remote_checks", columns, None).await?;
         manager
             .create_table(
                 Table::create()
@@ -1279,65 +1529,11 @@ impl MigrationTrait for CreateTables {
 
         add_built_ins(manager).await
     }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        for table in [
-            "proxies",
-            "server_secrets",
-            "server_settings",
-            "audit_log",
-            "events",
-            "location_rules",
-            "dashboard_variables",
-            "dashboard_widgets",
-            "dashboards",
-            "remote_checks",
-            "action_runs",
-            "alert_rule_actions",
-            "maintenance_windows",
-            "silences",
-            "notifications",
-            "alerts",
-            "alert_rule_channels",
-            "alert_rules",
-            "notification_channels",
-            "sign_in_challenges",
-            "recovery_codes",
-            "app_sign_ins",
-            "api_keys",
-            "user_sessions",
-            "users",
-            "config_rule_settings",
-            "config_rules",
-            "metrics_pages",
-            "host_boots",
-            "host_config_status",
-            "host_facts",
-            "hosts",
-        ] {
-            manager
-                .drop_table(Table::drop().table(Alias::new(table)).to_owned())
-                .await?;
-        }
-        Ok(())
-    }
 }
 
 /// The two hosts that aren't machines: the server records its own checks and
 /// numbers under one, and alerts about many hosts at once under the other.
 const BUILT_IN_HOSTS: [(&str, &str); 2] = [("server", "MaxNines server"), ("fleet", "Fleet")];
-
-/// What every agent collects unless a config rule says otherwise.
-const DEFAULT_SETTINGS: [(&str, &str, &str); 8] = [
-    ("interval_secs", "15", "number"),
-    ("facts_interval_secs", "3600", "number"),
-    ("collectors.host.enabled", "true", "boolean"),
-    ("collectors.cpu.enabled", "true", "boolean"),
-    ("collectors.memory.enabled", "true", "boolean"),
-    ("collectors.disk.enabled", "true", "boolean"),
-    ("collectors.network.enabled", "true", "boolean"),
-    ("collectors.system.enabled", "true", "boolean"),
-];
 
 /// One built-in alert rule. Each tells every channel.
 struct BuiltInRule {
@@ -1367,7 +1563,7 @@ const fn built_in(
     }
 }
 
-const BUILT_IN_RULES: [BuiltInRule; 7] = [
+const BUILT_IN_RULES: [BuiltInRule; 8] = [
     BuiltInRule {
         summary: Some("{{ hostname }} is offline"),
         resolved_summary: Some("{{ hostname }} is back online"),
@@ -1403,6 +1599,13 @@ const BUILT_IN_RULES: [BuiltInRule; 7] = [
     ),
     // Long enough for a restart, and no longer: a service that's down is down.
     built_in("Service stopped", None, Some("service.running < 1"), 60),
+    // A connected agent whose samples all stop being stored, such as after a change to
+    // what agents send, never goes offline, so nothing else notices.
+    BuiltInRule {
+        summary: Some("{{ hostname }} is connected but sending no metrics"),
+        resolved_summary: Some("{{ hostname }} is sending metrics again"),
+        ..built_in("Host sending no metrics", None, Some("!reporting"), 300)
+    },
 ];
 
 async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
@@ -1430,40 +1633,6 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     }
     manager.exec_stmt(hosts).await?;
 
-    let rule = Query::insert()
-        .into_table(ConfigRules::Table)
-        .columns([
-            ConfigRules::Name,
-            ConfigRules::Priority,
-            ConfigRules::Enabled,
-        ])
-        .values_panic(["Default".into(), 0.into(), true.into()])
-        .to_owned();
-    manager.exec_stmt(rule).await?;
-    for (name, value, value_type) in DEFAULT_SETTINGS {
-        let setting = Query::insert()
-            .into_table(ConfigRuleSettings::Table)
-            .columns([
-                ConfigRuleSettings::RuleId,
-                ConfigRuleSettings::Name,
-                ConfigRuleSettings::Value,
-                ConfigRuleSettings::ValueType,
-            ])
-            .select_from(
-                Query::select()
-                    .column(ConfigRules::Id)
-                    .expr(Expr::val(name))
-                    .expr(Expr::val(value))
-                    .expr(Expr::val(value_type))
-                    .from(ConfigRules::Table)
-                    .and_where(Expr::col(ConfigRules::Name).eq("Default"))
-                    .to_owned(),
-            )
-            .map_err(|error| DbErr::Migration(error.to_string()))?
-            .to_owned();
-        manager.exec_stmt(setting).await?;
-    }
-
     for rule in &BUILT_IN_RULES {
         add_built_in_rule(manager, rule).await?;
     }
@@ -1475,6 +1644,7 @@ async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> R
         .into_table(AlertRules::Table)
         .columns([
             AlertRules::Name,
+            AlertRules::NameKey,
             AlertRules::Warning,
             AlertRules::Critical,
             AlertRules::Summary,
@@ -1486,6 +1656,7 @@ async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> R
         ])
         .values_panic([
             rule.name.into(),
+            crate::models::name_key(rule.name).into(),
             rule.warning.into(),
             rule.critical.into(),
             rule.summary.into(),
@@ -1497,1666 +1668,6 @@ async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> R
         ])
         .to_owned();
     manager.exec_stmt(insert).await
-}
-
-struct AddNoMetricsRule;
-
-impl MigrationName for AddNoMetricsRule {
-    fn name(&self) -> &str {
-        "m20261119_000002_add_no_metrics_rule"
-    }
-}
-
-/// A connected agent whose samples all stop being stored, such as after a change to
-/// what agents send, never goes offline, so nothing else notices.
-const NO_METRICS_RULE: BuiltInRule = BuiltInRule {
-    summary: Some("{{ hostname }} is connected but sending no metrics"),
-    resolved_summary: Some("{{ hostname }} is sending metrics again"),
-    ..built_in("Host sending no metrics", None, Some("!reporting"), 300)
-};
-
-/// Adds the built-in rule for an agent that's connected but sending no metrics, to
-/// new servers and ones made before it, as upgrades leave the rules a server has
-/// alone. One that already has a rule of that name keeps it rather than getting a
-/// second, as names are each used once.
-#[async_trait::async_trait]
-impl MigrationTrait for AddNoMetricsRule {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let same = Query::select()
-            .column(AlertRules::Id)
-            .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::DeletedAt).is_null())
-            .and_where(
-                Expr::col(AlertRules::Name)
-                    .eq(NO_METRICS_RULE.name)
-                    .or(Expr::col(AlertRules::Critical).eq(NO_METRICS_RULE.critical)),
-            )
-            .limit(1)
-            .to_owned();
-        if manager.get_connection().query_one(&same).await?.is_some() {
-            return Ok(());
-        }
-        add_built_in_rule(manager, &NO_METRICS_RULE).await
-    }
-
-    /// The server before this can't read a rule of this kind, so every one goes, with
-    /// its alerts, whose notifications and action runs go with them.
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let rules = Query::select()
-            .column(AlertRules::Id)
-            .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Critical).eq(NO_METRICS_RULE.critical))
-            .to_owned();
-        let alerts = Query::delete()
-            .from_table(Alerts::Table)
-            .and_where(Expr::col(Alerts::RuleId).in_subquery(rules))
-            .to_owned();
-        manager.exec_stmt(alerts).await?;
-        let rules = Query::delete()
-            .from_table(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Critical).eq(NO_METRICS_RULE.critical))
-            .to_owned();
-        manager.exec_stmt(rules).await
-    }
-}
-
-struct KeysAndIndexes;
-
-impl MigrationName for KeysAndIndexes {
-    fn name(&self) -> &str {
-        "m20261119_000003_keys_and_indexes"
-    }
-}
-
-/// What happens to a row when the row its foreign key points at is deleted.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OnDelete {
-    /// The delete is refused while the row is there, which is the default.
-    Refuse,
-    /// The row goes too.
-    Cascade,
-}
-
-impl OnDelete {
-    /// How SQLite's definition of a table writes it after the key.
-    fn sqlite(self) -> &'static str {
-        match self {
-            Self::Refuse => "",
-            Self::Cascade => " ON DELETE CASCADE",
-        }
-    }
-}
-
-/// A foreign key on `table.column` to `parent.id`, named as the first migration
-/// names them, and what deleting the parent did before this migration and does after.
-struct KeyChange {
-    table: &'static str,
-    column: &'static str,
-    parent: &'static str,
-    was: OnDelete,
-    now: OnDelete,
-}
-
-impl KeyChange {
-    fn name(&self) -> String {
-        format!("fk_{}_{}", self.table, self.column)
-    }
-}
-
-const fn key(
-    table: &'static str,
-    column: &'static str,
-    parent: &'static str,
-    was: OnDelete,
-    now: OnDelete,
-) -> KeyChange {
-    KeyChange {
-        table,
-        column,
-        parent,
-        was,
-        now,
-    }
-}
-
-/// What the database does when a host or user is deleted is what the server means:
-/// everything kept about a host or by a user goes with it, as each was already deleted
-/// by hand. A notification keeps its channel, which is only ever marked deleted so
-/// what was sent through it still names it, as an alert keeps its rule.
-const CHANGED_KEYS: [KeyChange; 11] = {
-    use OnDelete::{Cascade, Refuse};
-    [
-        key("host_facts", "host_id", "hosts", Refuse, Cascade),
-        key("host_config_status", "host_id", "hosts", Refuse, Cascade),
-        key("host_boots", "host_id", "hosts", Refuse, Cascade),
-        key("metrics_pages", "host_id", "hosts", Refuse, Cascade),
-        key("remote_checks", "host_id", "hosts", Refuse, Cascade),
-        key("alerts", "host_id", "hosts", Refuse, Cascade),
-        key("api_keys", "user_id", "users", Refuse, Cascade),
-        key("app_sign_ins", "user_id", "users", Refuse, Cascade),
-        key("recovery_codes", "user_id", "users", Refuse, Cascade),
-        key("sign_in_challenges", "user_id", "users", Refuse, Cascade),
-        key(
-            "notifications",
-            "channel_id",
-            "notification_channels",
-            Cascade,
-            Refuse,
-        ),
-    ]
-};
-
-/// The foreign key this adds: what an action printed goes with the action run.
-const ADDED_KEY: KeyChange = key(
-    "notifications",
-    "action_run_id",
-    "action_runs",
-    OnDelete::Refuse,
-    OnDelete::Cascade,
-);
-
-/// An index this adds: its name, table and columns, and whether its first column is
-/// a foreign key the first migration made, for which MySQL made an index of its own
-/// that this one replaces.
-struct NewIndex {
-    name: &'static str,
-    table: &'static str,
-    columns: &'static [&'static str],
-    replaces_mysql_key_index: bool,
-}
-
-const NEW_INDEXES: [NewIndex; 9] = [
-    // A host's timeline, newest first, and finding its alerts to delete with it.
-    NewIndex {
-        name: "idx_alerts_host_started",
-        table: "alerts",
-        columns: &["host_id", "started_at"],
-        replaces_mysql_key_index: true,
-    },
-    // A rule's open alerts, to end them when it's deleted or remind people of them.
-    NewIndex {
-        name: "idx_alerts_rule_resolved",
-        table: "alerts",
-        columns: &["rule_id", "resolved_at"],
-        replaces_mysql_key_index: true,
-    },
-    // What's waiting for a channel, dropped when it's deleted.
-    NewIndex {
-        name: "idx_notifications_channel",
-        table: "notifications",
-        columns: &["channel_id", "state"],
-        replaces_mysql_key_index: true,
-    },
-    NewIndex {
-        name: "idx_notifications_action_run",
-        table: "notifications",
-        columns: &["action_run_id"],
-        replaces_mysql_key_index: false,
-    },
-    NewIndex {
-        name: "idx_alert_rule_channels_channel",
-        table: "alert_rule_channels",
-        columns: &["channel_id"],
-        replaces_mysql_key_index: true,
-    },
-    NewIndex {
-        name: "idx_api_keys_user_id",
-        table: "api_keys",
-        columns: &["user_id"],
-        replaces_mysql_key_index: true,
-    },
-    NewIndex {
-        name: "idx_recovery_codes_user_id",
-        table: "recovery_codes",
-        columns: &["user_id"],
-        replaces_mysql_key_index: true,
-    },
-    NewIndex {
-        name: "idx_sign_in_challenges_user_id",
-        table: "sign_in_challenges",
-        columns: &["user_id"],
-        replaces_mysql_key_index: true,
-    },
-    // Sessions that have run out, which every sign in clears.
-    NewIndex {
-        name: "idx_user_sessions_expires",
-        table: "user_sessions",
-        columns: &["expires_at"],
-        replaces_mysql_key_index: false,
-    },
-];
-
-/// Tables whose names are each used once among the rows that aren't deleted.
-const LIVE_NAMES: [&str; 2] = ["alert_rules", "notification_channels"];
-
-/// Foreign keys say what the server means, and the indexes its queries and foreign
-/// keys need are there:
-///
-/// - Deleting a host or a user deletes what's kept about them, and a notification
-///   keeps its channel, as [`CHANGED_KEYS`] says.
-/// - A notification of what an action printed points at its run, and goes with it.
-///   Ones whose run has already gone are deleted first.
-/// - The indexes in [`NEW_INDEXES`], and on PostgreSQL and SQLite one of
-///   notifications that failed, newest first, for the alerts page. MySQL has no
-///   index of only some rows, and it's only worth having as one.
-/// - A name is used once among the alert rules that aren't deleted, and among the
-///   channels, which the database now makes sure of. PostgreSQL and SQLite index the
-///   name of those rows alone. MySQL can't, so it indexes a column it works out
-///   itself, holding the name while the row isn't deleted and NULL once it is, which
-///   a unique index lets repeat. It compares names as the table's collation does, as
-///   it does every other unique name. A later rule or channel sharing a name with an
-///   earlier one, which only two saved at once could do, has its ID added to its name.
-#[async_trait::async_trait]
-impl MigrationTrait for KeysAndIndexes {
-    /// SQLite can only change a foreign key by making the table again, with foreign
-    /// keys off, which can't be done inside a transaction, so this starts its own.
-    fn use_transaction(&self) -> Option<bool> {
-        Some(false)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        without_foreign_keys(manager, |manager| Box::pin(keys_and_indexes_up(manager))).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        without_foreign_keys(manager, |manager| Box::pin(keys_and_indexes_down(manager))).await
-    }
-}
-
-async fn keys_and_indexes_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = manager.get_database_backend();
-
-    db.execute_unprepared(
-        "DELETE FROM notifications WHERE action_run_id IS NOT NULL \
-         AND action_run_id NOT IN (SELECT id FROM action_runs)",
-    )
-    .await?;
-    match backend {
-        DatabaseBackend::Sqlite => {
-            for table in tables_with_changed_keys() {
-                remake_sqlite_table(db, table, |definition| {
-                    let mut definition = definition.to_string();
-                    for change in CHANGED_KEYS.iter().filter(|change| change.table == table) {
-                        definition = with_on_delete(&definition, change, change.was, change.now)?;
-                    }
-                    if table == ADDED_KEY.table {
-                        definition = with_key_added(&definition, &ADDED_KEY)?;
-                    }
-                    Ok(definition)
-                })
-                .await?;
-            }
-        }
-        // MySQL commits each change to a table as it's made, so one stopped partway
-        // carries on from where it got to when it's run again.
-        _ => {
-            for change in CHANGED_KEYS.iter().chain([&ADDED_KEY]) {
-                match key_on_delete(db, change).await? {
-                    Some(now) if now == change.now => {}
-                    Some(_) => {
-                        drop_key(manager, change).await?;
-                        add_key(manager, change, change.now).await?;
-                    }
-                    None => add_key(manager, change, change.now).await?,
-                }
-            }
-        }
-    }
-
-    for index in &NEW_INDEXES {
-        if backend == DatabaseBackend::MySql && mysql_has_index(db, index.table, index.name).await?
-        {
-            continue;
-        }
-        let mut create = Index::create();
-        create.name(index.name).table(Alias::new(index.table));
-        for column in index.columns {
-            create.col(Alias::new(*column));
-        }
-        manager.create_index(create).await?;
-        // MySQL drops the index it made for a foreign key once another can do its job,
-        // but not one made again by going down, so that one goes here.
-        let key_index = format!("fk_{}_{}", index.table, index.columns[0]);
-        if backend == DatabaseBackend::MySql
-            && index.replaces_mysql_key_index
-            && mysql_has_index(db, index.table, &key_index).await?
-        {
-            drop_index(manager, &key_index, index.table).await?;
-        }
-    }
-    if backend != DatabaseBackend::MySql {
-        manager
-            .create_index(
-                Index::create()
-                    .name("idx_notifications_problems")
-                    .table(Notifications::Table)
-                    .col(Notifications::Id)
-                    .and_where(Expr::col(Notifications::LastError).is_not_null())
-                    .to_owned(),
-            )
-            .await?;
-    }
-
-    for table in LIVE_NAMES {
-        rename_repeated_live_names(manager, table).await?;
-        let index = format!("idx_{table}_live_name");
-        if backend == DatabaseBackend::MySql {
-            if mysql_has_column(db, table, "live_name").await? {
-                continue;
-            }
-            db.execute_unprepared(&format!(
-                "ALTER TABLE `{table}` \
-                 ADD COLUMN `live_name` varchar(255) \
-                 AS (CASE WHEN `deleted_at` IS NULL THEN `name` END) STORED, \
-                 ADD UNIQUE INDEX `{index}` (`live_name`)"
-            ))
-            .await?;
-        } else {
-            manager
-                .create_index(
-                    Index::create()
-                        .name(&index)
-                        .table(Alias::new(table))
-                        .col(Alias::new("name"))
-                        .unique()
-                        .and_where(Expr::col(Alias::new("deleted_at")).is_null())
-                        .to_owned(),
-                )
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-async fn keys_and_indexes_down(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = manager.get_database_backend();
-
-    for table in LIVE_NAMES {
-        let index = format!("idx_{table}_live_name");
-        if backend == DatabaseBackend::MySql {
-            db.execute_unprepared(&format!(
-                "ALTER TABLE `{table}` DROP INDEX `{index}`, DROP COLUMN `live_name`"
-            ))
-            .await?;
-        } else {
-            drop_index(manager, &index, table).await?;
-        }
-    }
-    if backend != DatabaseBackend::MySql {
-        drop_index(manager, "idx_notifications_problems", "notifications").await?;
-    }
-
-    // MySQL won't drop an index a foreign key needs, so the keys go first, and the
-    // index MySQL had made for each, named after the key, is made again before the
-    // index that replaced it goes.
-    if backend == DatabaseBackend::MySql {
-        for change in CHANGED_KEYS.iter().chain([&ADDED_KEY]) {
-            drop_key(manager, change).await?;
-        }
-    }
-    for index in &NEW_INDEXES {
-        if backend == DatabaseBackend::MySql && index.replaces_mysql_key_index {
-            let column = index.columns[0];
-            manager
-                .create_index(
-                    Index::create()
-                        .name(format!("fk_{}_{column}", index.table))
-                        .table(Alias::new(index.table))
-                        .col(Alias::new(column))
-                        .to_owned(),
-                )
-                .await?;
-        }
-        drop_index(manager, index.name, index.table).await?;
-    }
-
-    match backend {
-        DatabaseBackend::Sqlite => {
-            for table in tables_with_changed_keys() {
-                remake_sqlite_table(db, table, |definition| {
-                    let mut definition = definition.to_string();
-                    if table == ADDED_KEY.table {
-                        definition = without_key_added(&definition, &ADDED_KEY)?;
-                    }
-                    for change in CHANGED_KEYS.iter().filter(|change| change.table == table) {
-                        definition = with_on_delete(&definition, change, change.now, change.was)?;
-                    }
-                    Ok(definition)
-                })
-                .await?;
-            }
-        }
-        DatabaseBackend::MySql => {
-            for change in &CHANGED_KEYS {
-                add_key(manager, change, change.was).await?;
-            }
-        }
-        _ => {
-            for change in &CHANGED_KEYS {
-                drop_key(manager, change).await?;
-                add_key(manager, change, change.was).await?;
-            }
-            drop_key(manager, &ADDED_KEY).await?;
-        }
-    }
-    Ok(())
-}
-
-/// Whether a MySQL table has an index of this name.
-async fn mysql_has_index(
-    db: &impl ConnectionTrait,
-    table: &str,
-    name: &str,
-) -> Result<bool, DbErr> {
-    let count: i64 = one_value(
-        db,
-        &format!(
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() AND table_name = '{table}' AND index_name = '{name}'"
-        ),
-    )
-    .await?;
-    Ok(count > 0)
-}
-
-/// Whether a MySQL table has a column of this name.
-async fn mysql_has_column(
-    db: &impl ConnectionTrait,
-    table: &str,
-    name: &str,
-) -> Result<bool, DbErr> {
-    let count: i64 = one_value(
-        db,
-        &format!(
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = '{table}' AND column_name = '{name}'"
-        ),
-    )
-    .await?;
-    Ok(count > 0)
-}
-
-/// What a foreign key on PostgreSQL or MySQL does on delete, or `None` if there's
-/// no such key.
-async fn key_on_delete(
-    db: &impl ConnectionTrait,
-    key: &KeyChange,
-) -> Result<Option<OnDelete>, DbErr> {
-    let schema = match db.get_database_backend() {
-        DatabaseBackend::MySql => "DATABASE()",
-        _ => "current_schema()",
-    };
-    let rules: Vec<String> = all_values(
-        db,
-        &format!(
-            "SELECT CAST(delete_rule AS CHAR(16)) FROM information_schema.referential_constraints \
-             WHERE constraint_schema = {schema} AND constraint_name = '{}'",
-            key.name()
-        ),
-    )
-    .await?;
-    Ok(rules.first().map(|rule| match rule.trim() {
-        "CASCADE" => OnDelete::Cascade,
-        _ => OnDelete::Refuse,
-    }))
-}
-
-/// Each table with a foreign key that changes, once, in the order they're first
-/// named.
-fn tables_with_changed_keys() -> Vec<&'static str> {
-    let mut tables: Vec<&str> = Vec::new();
-    for table in CHANGED_KEYS
-        .iter()
-        .chain([&ADDED_KEY])
-        .map(|change| change.table)
-    {
-        if !tables.contains(&table) {
-            tables.push(table);
-        }
-    }
-    tables
-}
-
-async fn drop_index(manager: &SchemaManager<'_>, name: &str, table: &str) -> Result<(), DbErr> {
-    manager
-        .drop_index(Index::drop().name(name).table(Alias::new(table)).to_owned())
-        .await
-}
-
-async fn drop_key(manager: &SchemaManager<'_>, key: &KeyChange) -> Result<(), DbErr> {
-    manager
-        .drop_foreign_key(
-            ForeignKey::drop()
-                .name(key.name())
-                .table(Alias::new(key.table))
-                .to_owned(),
-        )
-        .await
-}
-
-/// Adds a foreign key on PostgreSQL or MySQL. One that refuses is written without
-/// saying so, as the first migration wrote them.
-async fn add_key(
-    manager: &SchemaManager<'_>,
-    key: &KeyChange,
-    on_delete: OnDelete,
-) -> Result<(), DbErr> {
-    let mut create = ForeignKey::create();
-    create
-        .name(key.name())
-        .from(Alias::new(key.table), Alias::new(key.column))
-        .to(Alias::new(key.parent), Alias::new("id"));
-    if on_delete == OnDelete::Cascade {
-        create.on_delete(ForeignKeyAction::Cascade);
-    }
-    manager.create_foreign_key(create).await
-}
-
-/// Adds a later rule's or channel's ID to its name where one before it that isn't
-/// deleted has the same name, so a unique index can be made. Names are compared as
-/// that index will compare them. A name made that way that's already taken, as
-/// another rule could have been named like that, gets a number after the ID too.
-async fn rename_repeated_live_names(manager: &SchemaManager<'_>, table: &str) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let (quote, backend) = match db.get_database_backend() {
-        DatabaseBackend::MySql => ('`', DatabaseBackend::MySql),
-        backend => ('"', backend),
-    };
-    let table_name = format!("{quote}{table}{quote}");
-    let repeated = db
-        .query_all_raw(Statement::from_string(
-            backend,
-            format!(
-                "SELECT later.id, later.name FROM {table_name} later \
-                 WHERE later.deleted_at IS NULL AND EXISTS (SELECT 1 FROM {table_name} earlier \
-                 WHERE earlier.name = later.name AND earlier.id < later.id \
-                 AND earlier.deleted_at IS NULL) ORDER BY later.id"
-            ),
-        ))
-        .await?;
-    for row in repeated {
-        let id: i64 = column(&row, 0)?;
-        let name: String = column(&row, 1)?;
-        let base: String = name.chars().take(230).collect();
-        let mut number = 1;
-        let renamed = loop {
-            let candidate = match number {
-                1 => format!("{base} ({id})"),
-                _ => format!("{base} ({id}, {number})"),
-            };
-            let taken = Query::select()
-                .expr(Expr::col(Alias::new("id")).count())
-                .from(Alias::new(table))
-                .and_where(Expr::col(Alias::new("deleted_at")).is_null())
-                .and_where(Expr::col(Alias::new("name")).eq(candidate.as_str()))
-                .to_owned();
-            let row = db
-                .query_one(&taken)
-                .await?
-                .ok_or_else(|| DbErr::Migration(format!("counting names in {table}")))?;
-            let count: i64 = column(&row, 0)?;
-            if count == 0 {
-                break candidate;
-            }
-            number += 1;
-        };
-        let rename = Query::update()
-            .table(Alias::new(table))
-            .value(Alias::new("name"), renamed)
-            .and_where(Expr::col(Alias::new("id")).eq(id))
-            .to_owned();
-        db.execute(&rename).await?;
-    }
-    Ok(())
-}
-
-struct NamesAndUniqueness;
-
-impl MigrationName for NamesAndUniqueness {
-    fn name(&self) -> &str {
-        "m20261119_000004_names_and_uniqueness"
-    }
-}
-
-/// How long a name can be as it's compared: lowercased, which can make it longer, from
-/// a name of up to 255 characters.
-const NAME_KEY_LEN: usize = 512;
-
-/// How the column holding a name as it's compared is added, with a default only so
-/// rows already there can have one until they're filled in.
-const NAME_KEY_ADDED: &str = "\"name_key\" varchar(512) NOT NULL DEFAULT ''";
-
-/// A table whose names are each used once, compared as [`crate::models::name_key`]
-/// compares them.
-struct NamedTable {
-    table: &'static str,
-    /// How many characters its names can have.
-    longest: usize,
-    /// Each host's names are its own.
-    per_host: bool,
-    /// Only rows that aren't deleted count.
-    live_only: bool,
-    /// The unique index of its names.
-    index: &'static str,
-}
-
-const NAMED_TABLES: [NamedTable; 4] = [
-    NamedTable {
-        table: "alert_rules",
-        longest: 255,
-        per_host: false,
-        live_only: true,
-        index: "idx_alert_rules_live_name",
-    },
-    NamedTable {
-        table: "notification_channels",
-        longest: 255,
-        per_host: false,
-        live_only: true,
-        index: "idx_notification_channels_live_name",
-    },
-    NamedTable {
-        table: "config_rules",
-        longest: 255,
-        per_host: false,
-        live_only: false,
-        index: "idx_config_rules_name",
-    },
-    NamedTable {
-        table: "remote_checks",
-        longest: 64,
-        per_host: true,
-        live_only: false,
-        index: "idx_remote_checks_host_name",
-    },
-];
-
-/// How SQLite's definition of `config_rules` writes its name, which was unique as
-/// written until this migration.
-const CONFIG_RULE_NAME: &str = "\"name\" varchar(255) NOT NULL";
-
-/// Indexes this adds for clearing what's run out, as each sign in does.
-const CLEARING_INDEXES: [(&str, &str, &str); 3] = [
-    (
-        "idx_sign_in_challenges_expires",
-        "sign_in_challenges",
-        "expires_at",
-    ),
-    ("idx_app_sign_ins_revoked", "app_sign_ins", "revoked_at"),
-    (
-        "idx_app_sign_ins_refresh_expires",
-        "app_sign_ins",
-        "refresh_expires_at",
-    ),
-];
-
-/// What the database keeps unique, it compares the same way on every database:
-///
-/// - Names of alert rules, channels, config rules and checks are compared ignoring
-///   case and the spaces around them, as people read them, by a column holding each
-///   name as it's compared, `name_key`, which the server fills in. MySQL compares it
-///   exactly, as the other databases do, rather than by its collation. A name that's
-///   now the same as an earlier one's gets its ID added, and more if that's taken.
-/// - A host has one current value of each fact, and a rule one open alert about each
-///   host and series. Any repeats a server before this made are closed: the earlier
-///   fact, as the later one is what the host said last, and the later alert.
-///   PostgreSQL and SQLite index those rows alone, and MySQL a column it works out,
-///   as it does for names.
-/// - The facts every host has now are indexed by name, rather than every value any
-///   host has had by name and value, which nothing looked up.
-/// - What's cleared on every sign in is indexed.
-///
-/// MySQL commits each change to a table as it's made, so this checks what's there
-/// before each change, and one stopped partway carries on when it's run again.
-#[async_trait::async_trait]
-impl MigrationTrait for NamesAndUniqueness {
-    /// SQLite can only drop a column's default by making the table again, which needs
-    /// its own transaction: see [`without_foreign_keys`].
-    fn use_transaction(&self) -> Option<bool> {
-        Some(false)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        without_foreign_keys(manager, |manager| {
-            Box::pin(names_and_uniqueness_up(manager))
-        })
-        .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        without_foreign_keys(manager, |manager| {
-            Box::pin(names_and_uniqueness_down(manager))
-        })
-        .await
-    }
-}
-
-async fn names_and_uniqueness_up(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = manager.get_database_backend();
-    let mysql = backend == DatabaseBackend::MySql;
-
-    for named in &NAMED_TABLES {
-        let table = named.table;
-        if !mysql || !mysql_has_column(db, table, "name_key").await? {
-            let added = match backend {
-                DatabaseBackend::MySql => NAME_KEY_ADDED.replace('"', "`").replace(
-                    "NOT NULL",
-                    "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL",
-                ),
-                _ => NAME_KEY_ADDED.to_string(),
-            };
-            db.execute_unprepared(&format!("ALTER TABLE {table} ADD COLUMN {added}"))
-                .await?;
-        }
-        fill_name_keys(db, named).await?;
-    }
-
-    // The default was only for the rows already there.
-    for named in &NAMED_TABLES {
-        let table = named.table;
-        if backend == DatabaseBackend::Sqlite {
-            remake_sqlite_table(db, table, |definition| {
-                let without = NAME_KEY_ADDED.replace(" DEFAULT ''", "");
-                let definition = replace_once(definition, NAME_KEY_ADDED, &without)?;
-                if table == "config_rules" {
-                    let unique = format!("{CONFIG_RULE_NAME} UNIQUE");
-                    return replace_once(&definition, &unique, CONFIG_RULE_NAME);
-                }
-                Ok(definition)
-            })
-            .await?;
-        } else {
-            db.execute_unprepared(&format!(
-                "ALTER TABLE {table} ALTER COLUMN name_key DROP DEFAULT"
-            ))
-            .await?;
-        }
-    }
-
-    for named in &NAMED_TABLES {
-        index_name_keys(db, named).await?;
-    }
-    one_current_fact(db).await?;
-    one_open_alert(db).await?;
-    for (index, table, column) in CLEARING_INDEXES {
-        if !mysql || !mysql_has_index(db, table, index).await? {
-            db.execute_unprepared(&format!("CREATE INDEX {index} ON {table} ({column})"))
-                .await?;
-        }
-    }
-    Ok(())
-}
-
-/// `definition` with `old` in it, just once, changed to `new`, or an error if it isn't
-/// there just once, when the table isn't the one this was written for.
-fn replace_once(definition: &str, old: &str, new: &str) -> Result<String, DbErr> {
-    if definition.matches(old).count() != 1 {
-        return Err(DbErr::Migration(format!(
-            "a table isn't made the way it's expected to be: no {old}"
-        )));
-    }
-    Ok(definition.replacen(old, new, 1))
-}
-
-/// Fills in each row's name as it's compared. Where one that counts has the same name
-/// as an earlier one, its ID is added to its name, and a number too if that's taken.
-async fn fill_name_keys(db: &impl ConnectionTrait, named: &NamedTable) -> Result<(), DbErr> {
-    let table = named.table;
-    let backend = db.get_database_backend();
-    let save = |id: i64, name: Option<&str>, key: &str| {
-        let mut update = Query::update();
-        update
-            .table(Alias::new(table))
-            .value(Alias::new("name_key"), key)
-            .and_where(Expr::col(Alias::new("id")).eq(id));
-        if let Some(name) = name {
-            update.value(Alias::new("name"), name);
-        }
-        update.to_owned()
-    };
-
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            backend,
-            format!("SELECT id, name, name_key FROM {table}"),
-        ))
-        .await?;
-    for row in rows {
-        let (id, name, saved): (i64, String, String) =
-            (column(&row, 0)?, column(&row, 1)?, column(&row, 2)?);
-        let key = crate::models::name_key(&name);
-        if key != saved {
-            db.execute(&save(id, None, &key)).await?;
-        }
-    }
-
-    let scope = if named.per_host { "host_id" } else { "id" };
-    let live = if named.live_only {
-        " WHERE deleted_at IS NULL"
-    } else {
-        ""
-    };
-    let rows = db
-        .query_all_raw(Statement::from_string(
-            backend,
-            format!("SELECT id, name, name_key, {scope} FROM {table}{live} ORDER BY id"),
-        ))
-        .await?;
-    let mut counted = Vec::with_capacity(rows.len());
-    for row in rows {
-        let id: i64 = column(&row, 0)?;
-        let scope = if named.per_host {
-            column::<String>(&row, 3)?
-        } else {
-            String::new()
-        };
-        counted.push((
-            id,
-            column::<String>(&row, 1)?,
-            scope,
-            column::<String>(&row, 2)?,
-        ));
-    }
-    let mut taken: std::collections::HashSet<(String, String)> = counted
-        .iter()
-        .map(|(_, _, scope, key)| (scope.clone(), key.clone()))
-        .collect();
-    let mut kept: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-    for (id, name, scope, key) in counted {
-        if kept.insert((scope.clone(), key)) {
-            continue;
-        }
-        let mut number = 1;
-        let (renamed, key) = loop {
-            let suffix = match number {
-                1 => format!(" ({id})"),
-                _ => format!(" ({id}, {number})"),
-            };
-            let room = named.longest.saturating_sub(suffix.chars().count());
-            let candidate: String = name.chars().take(room).collect::<String>() + &suffix;
-            let key = crate::models::name_key(&candidate);
-            if !taken.contains(&(scope.clone(), key.clone())) {
-                break (candidate, key);
-            }
-            number += 1;
-        };
-        taken.insert((scope.clone(), key.clone()));
-        kept.insert((scope, key.clone()));
-        db.execute(&save(id, Some(&renamed), &key)).await?;
-    }
-    Ok(())
-}
-
-/// Makes the index that keeps each table's names unique use their `name_key`.
-async fn index_name_keys(db: &impl ConnectionTrait, named: &NamedTable) -> Result<(), DbErr> {
-    let (table, index) = (named.table, named.index);
-    let backend = db.get_database_backend();
-    match (backend, table) {
-        (DatabaseBackend::MySql, "config_rules") => {
-            if mysql_has_index(db, table, "name").await? {
-                db.execute_unprepared("ALTER TABLE config_rules DROP INDEX `name`")
-                    .await?;
-            }
-            if !mysql_has_index(db, table, index).await? {
-                db.execute_unprepared(&format!(
-                    "CREATE UNIQUE INDEX {index} ON {table} (name_key)"
-                ))
-                .await?;
-            }
-        }
-        (DatabaseBackend::MySql, "remote_checks") => {
-            if !mysql_index_has_column(db, table, index, "name_key").await? {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE {table} DROP INDEX {index}, \
-                     ADD UNIQUE INDEX {index} (host_id, name_key)"
-                ))
-                .await?;
-            }
-        }
-        (DatabaseBackend::MySql, _) => {
-            if !mysql_generates_from(db, table, "live_name", "name_key").await? {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE {table} DROP INDEX {index}, DROP COLUMN live_name, \
-                     ADD COLUMN live_name varchar({NAME_KEY_LEN}) \
-                     CHARACTER SET utf8mb4 COLLATE utf8mb4_bin \
-                     AS (CASE WHEN deleted_at IS NULL THEN name_key END) STORED, \
-                     ADD UNIQUE INDEX {index} (live_name)"
-                ))
-                .await?;
-            }
-        }
-        (_, "config_rules") => {
-            if backend == DatabaseBackend::Postgres {
-                // The constraint the first migration made, named by PostgreSQL.
-                let unique: Vec<String> = all_values(
-                    db,
-                    "SELECT conname::text FROM pg_constraint \
-                     WHERE conrelid = 'config_rules'::regclass AND contype = 'u'",
-                )
-                .await?;
-                for constraint in unique {
-                    db.execute_unprepared(&format!(
-                        "ALTER TABLE config_rules DROP CONSTRAINT \"{constraint}\""
-                    ))
-                    .await?;
-                }
-            }
-            db.execute_unprepared(&format!(
-                "CREATE UNIQUE INDEX {index} ON {table} (name_key)"
-            ))
-            .await?;
-        }
-        (_, "remote_checks") => {
-            db.execute_unprepared(&format!("DROP INDEX {index}"))
-                .await?;
-            db.execute_unprepared(&format!(
-                "CREATE UNIQUE INDEX {index} ON {table} (host_id, name_key)"
-            ))
-            .await?;
-        }
-        _ => {
-            db.execute_unprepared(&format!("DROP INDEX {index}"))
-                .await?;
-            db.execute_unprepared(&format!(
-                "CREATE UNIQUE INDEX {index} ON {table} (name_key) WHERE deleted_at IS NULL"
-            ))
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-/// One current value of each fact for each host, and the facts hosts have now
-/// indexed by name.
-async fn one_current_fact(db: &impl ConnectionTrait) -> Result<(), DbErr> {
-    let mysql = db.get_database_backend() == DatabaseBackend::MySql;
-    if mysql {
-        db.execute_unprepared(
-            "UPDATE host_facts earlier JOIN host_facts later \
-             ON later.host_id = earlier.host_id AND BINARY later.name = BINARY earlier.name \
-             AND later.valid_to IS NULL AND later.id > earlier.id \
-             SET earlier.valid_to = earlier.valid_from WHERE earlier.valid_to IS NULL",
-        )
-        .await?;
-        if !mysql_has_column(db, "host_facts", "current_name").await? {
-            db.execute_unprepared(
-                "ALTER TABLE host_facts ADD COLUMN current_name varchar(255) \
-                 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin \
-                 AS (CASE WHEN valid_to IS NULL THEN name END) STORED, \
-                 ADD UNIQUE INDEX idx_host_facts_current (host_id, current_name)",
-            )
-            .await?;
-        }
-        if !mysql_has_index(db, "host_facts", "idx_host_facts_current_name").await? {
-            db.execute_unprepared(
-                "CREATE INDEX idx_host_facts_current_name ON host_facts (valid_to, name)",
-            )
-            .await?;
-        }
-        if mysql_has_index(db, "host_facts", "idx_host_facts_name_value").await? {
-            db.execute_unprepared("DROP INDEX idx_host_facts_name_value ON host_facts")
-                .await?;
-        }
-        return Ok(());
-    }
-    db.execute_unprepared(
-        "UPDATE host_facts SET valid_to = valid_from WHERE valid_to IS NULL \
-         AND EXISTS (SELECT 1 FROM host_facts later WHERE later.host_id = host_facts.host_id \
-         AND later.name = host_facts.name AND later.valid_to IS NULL \
-         AND later.id > host_facts.id)",
-    )
-    .await?;
-    for sql in [
-        "CREATE UNIQUE INDEX idx_host_facts_current ON host_facts (host_id, name) \
-         WHERE valid_to IS NULL",
-        "CREATE INDEX idx_host_facts_current_name ON host_facts (name) WHERE valid_to IS NULL",
-        "DROP INDEX idx_host_facts_name_value",
-    ] {
-        db.execute_unprepared(sql).await?;
-    }
-    Ok(())
-}
-
-/// Why an alert a server before this opened a second time was closed.
-const REPEAT_REASON: &str = "another alert was already open for this";
-
-/// One open alert from each rule about each host and series. A host as a whole has
-/// no series, which counts as one of its own.
-async fn one_open_alert(db: &impl ConnectionTrait) -> Result<(), DbErr> {
-    if db.get_database_backend() == DatabaseBackend::MySql {
-        db.execute_unprepared(&format!(
-            "UPDATE alerts later JOIN alerts earlier \
-             ON earlier.rule_id = later.rule_id AND earlier.host_id = later.host_id \
-             AND BINARY COALESCE(earlier.series, '') = BINARY COALESCE(later.series, '') \
-             AND earlier.resolved_at IS NULL AND earlier.id < later.id \
-             SET later.resolved_at = later.started_at, later.resolve_reason = '{REPEAT_REASON}' \
-             WHERE later.resolved_at IS NULL"
-        ))
-        .await?;
-        if !mysql_has_column(db, "alerts", "open_series").await? {
-            db.execute_unprepared(
-                "ALTER TABLE alerts ADD COLUMN open_series varchar(255) \
-                 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin \
-                 AS (CASE WHEN resolved_at IS NULL THEN COALESCE(series, '') END) STORED, \
-                 ADD UNIQUE INDEX idx_alerts_open (rule_id, host_id, open_series)",
-            )
-            .await?;
-        }
-        return Ok(());
-    }
-    db.execute_unprepared(&format!(
-        "UPDATE alerts SET resolved_at = started_at, resolve_reason = '{REPEAT_REASON}' \
-         WHERE resolved_at IS NULL AND EXISTS (SELECT 1 FROM alerts earlier \
-         WHERE earlier.rule_id = alerts.rule_id AND earlier.host_id = alerts.host_id \
-         AND COALESCE(earlier.series, '') = COALESCE(alerts.series, '') \
-         AND earlier.resolved_at IS NULL AND earlier.id < alerts.id)"
-    ))
-    .await?;
-    db.execute_unprepared(
-        "CREATE UNIQUE INDEX idx_alerts_open ON alerts (rule_id, host_id, COALESCE(series, '')) \
-         WHERE resolved_at IS NULL",
-    )
-    .await?;
-    Ok(())
-}
-
-async fn names_and_uniqueness_down(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let backend = manager.get_database_backend();
-    let mysql = backend == DatabaseBackend::MySql;
-    let dropped = |index: &str, table: &str| match backend {
-        DatabaseBackend::MySql => format!("DROP INDEX {index} ON {table}"),
-        _ => format!("DROP INDEX {index}"),
-    };
-
-    for (index, table, _) in CLEARING_INDEXES {
-        db.execute_unprepared(&dropped(index, table)).await?;
-    }
-    if mysql {
-        for sql in [
-            "ALTER TABLE alerts DROP INDEX idx_alerts_open, DROP COLUMN open_series",
-            "ALTER TABLE host_facts DROP INDEX idx_host_facts_current, DROP COLUMN current_name",
-        ] {
-            db.execute_unprepared(sql).await?;
-        }
-    } else {
-        db.execute_unprepared(&dropped("idx_alerts_open", "alerts"))
-            .await?;
-        db.execute_unprepared(&dropped("idx_host_facts_current", "host_facts"))
-            .await?;
-    }
-    db.execute_unprepared(&dropped("idx_host_facts_current_name", "host_facts"))
-        .await?;
-    db.execute_unprepared("CREATE INDEX idx_host_facts_name_value ON host_facts (name, value)")
-        .await?;
-
-    for named in &NAMED_TABLES {
-        let (table, index) = (named.table, named.index);
-        match (backend, table) {
-            (_, "config_rules") => {
-                db.execute_unprepared(&dropped(index, table)).await?;
-            }
-            (DatabaseBackend::MySql, "remote_checks") => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE {table} DROP INDEX {index}, ADD UNIQUE INDEX {index} (host_id, name)"
-                ))
-                .await?;
-            }
-            (_, "remote_checks") => {
-                db.execute_unprepared(&dropped(index, table)).await?;
-                db.execute_unprepared(&format!(
-                    "CREATE UNIQUE INDEX {index} ON {table} (host_id, name)"
-                ))
-                .await?;
-            }
-            (DatabaseBackend::MySql, _) => {
-                db.execute_unprepared(&format!(
-                    "ALTER TABLE {table} DROP INDEX {index}, DROP COLUMN live_name, \
-                     ADD COLUMN live_name varchar(255) \
-                     AS (CASE WHEN deleted_at IS NULL THEN name END) STORED, \
-                     ADD UNIQUE INDEX {index} (live_name)"
-                ))
-                .await?;
-            }
-            _ => {
-                db.execute_unprepared(&dropped(index, table)).await?;
-                db.execute_unprepared(&format!(
-                    "CREATE UNIQUE INDEX {index} ON {table} (name) WHERE deleted_at IS NULL"
-                ))
-                .await?;
-            }
-        }
-        db.execute_unprepared(&format!("ALTER TABLE {table} DROP COLUMN name_key"))
-            .await?;
-    }
-    match backend {
-        DatabaseBackend::MySql => {
-            db.execute_unprepared("ALTER TABLE config_rules ADD UNIQUE INDEX `name` (name)")
-                .await?;
-        }
-        DatabaseBackend::Postgres => {
-            db.execute_unprepared(
-                "ALTER TABLE config_rules ADD CONSTRAINT config_rules_name_key UNIQUE (name)",
-            )
-            .await?;
-        }
-        _ => {
-            remake_sqlite_table(db, "config_rules", |definition| {
-                replace_once(
-                    definition,
-                    CONFIG_RULE_NAME,
-                    &format!("{CONFIG_RULE_NAME} UNIQUE"),
-                )
-            })
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-/// Whether one of a MySQL table's indexes has this column.
-async fn mysql_index_has_column(
-    db: &impl ConnectionTrait,
-    table: &str,
-    index: &str,
-    name: &str,
-) -> Result<bool, DbErr> {
-    let count: i64 = one_value(
-        db,
-        &format!(
-            "SELECT COUNT(*) FROM information_schema.statistics \
-             WHERE table_schema = DATABASE() AND table_name = '{table}' \
-             AND index_name = '{index}' AND column_name = '{name}'"
-        ),
-    )
-    .await?;
-    Ok(count > 0)
-}
-
-/// Whether a column MySQL works out is worked out from `from`.
-async fn mysql_generates_from(
-    db: &impl ConnectionTrait,
-    table: &str,
-    name: &str,
-    from: &str,
-) -> Result<bool, DbErr> {
-    let count: i64 = one_value(
-        db,
-        &format!(
-            "SELECT COUNT(*) FROM information_schema.columns \
-             WHERE table_schema = DATABASE() AND table_name = '{table}' \
-             AND column_name = '{name}' AND generation_expression LIKE '%{from}%'"
-        ),
-    )
-    .await?;
-    Ok(count > 0)
-}
-
-struct ExactFactsAndEndedAlerts;
-
-impl MigrationName for ExactFactsAndEndedAlerts {
-    fn name(&self) -> &str {
-        "m20261119_000005_exact_facts_and_ended_alerts"
-    }
-}
-
-/// The columns of `host_facts` that agents fill in.
-const FACT_TEXT: [&str; 2] = ["name", "value"];
-
-/// Facts are what agents report, so `os.Family` isn't `os.family`, and `Ubuntu` isn't
-/// `ubuntu`. PostgreSQL and SQLite compare them exactly. MySQL and MariaDB compared
-/// them by the table's collation, usually ignoring case and accents, so looking one
-/// up, or listing each value once, found or merged others. They compare them
-/// exactly now too, and going back gives them the table's collation again. Nothing
-/// changes on the other databases.
-///
-/// Ended alerts are listed by when they ended, newest first, so the index of when
-/// alerts ended takes their IDs too, for ones that ended at the same moment.
-///
-/// MySQL commits each change as it's made, so each can be made again.
-#[async_trait::async_trait]
-impl MigrationTrait for ExactFactsAndEndedAlerts {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        fact_text_collation(manager, "CHARACTER SET utf8mb4 COLLATE utf8mb4_bin").await?;
-        index_when_alerts_ended(manager, &["resolved_at", "id"]).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        index_when_alerts_ended(manager, &["resolved_at"]).await?;
-        fact_text_collation(manager, "").await
-    }
-}
-
-/// Makes `idx_alerts_resolved` of these columns, unless MySQL already has.
-async fn index_when_alerts_ended(
-    manager: &SchemaManager<'_>,
-    columns: &[&str],
-) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let (index, list) = ("idx_alerts_resolved", columns.join(", "));
-    if manager.get_database_backend() == DatabaseBackend::MySql {
-        let with_id = mysql_index_has_column(db, "alerts", index, "id").await?;
-        if with_id != columns.contains(&"id") {
-            db.execute_unprepared(&format!(
-                "ALTER TABLE alerts DROP INDEX {index}, ADD INDEX {index} ({list})"
-            ))
-            .await?;
-        }
-        return Ok(());
-    }
-    db.execute_unprepared(&format!("DROP INDEX {index}"))
-        .await?;
-    db.execute_unprepared(&format!("CREATE INDEX {index} ON alerts ({list})"))
-        .await?;
-    Ok(())
-}
-
-/// Defines MySQL's fact names and values with `collation`, or the table's own when
-/// it's empty.
-async fn fact_text_collation(manager: &SchemaManager<'_>, collation: &str) -> Result<(), DbErr> {
-    if manager.get_database_backend() != DatabaseBackend::MySql {
-        return Ok(());
-    }
-    let changes: Vec<String> = FACT_TEXT
-        .iter()
-        .map(|column| format!("MODIFY {column} varchar(255) {collation} NOT NULL"))
-        .collect();
-    manager
-        .get_connection()
-        .execute_unprepared(&format!("ALTER TABLE host_facts {}", changes.join(", ")))
-        .await?;
-    Ok(())
-}
-
-struct DurationsInSeconds;
-
-impl MigrationName for DurationsInSeconds {
-    fn name(&self) -> &str {
-        "m20261119_000006_durations_in_seconds"
-    }
-}
-
-/// How long an action ran is a number of seconds, as every other length is, with a
-/// fraction, as many take less than one: `duration_secs` takes the place of
-/// `duration_ms`.
-///
-/// MySQL commits each change as it's made, so each can be made again.
-#[async_trait::async_trait]
-impl MigrationTrait for DurationsInSeconds {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let seconds = ColumnDef::new(ActionRuns::DurationSecs).double().to_owned();
-        let from_ms = "duration_ms / 1000.0";
-        move_column(manager, "duration_ms", seconds, from_ms).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let ms = ColumnDef::new(ActionRuns::DurationMs)
-            .big_integer()
-            .to_owned();
-        let from_secs = "ROUND(duration_secs * 1000)";
-        move_column(manager, "duration_secs", ms, from_secs).await
-    }
-}
-
-/// Replaces an action run's column `old` with `new`, worked out from it by `value`.
-async fn move_column(
-    manager: &SchemaManager<'_>,
-    old: &str,
-    mut new: ColumnDef,
-    value: &str,
-) -> Result<(), DbErr> {
-    let db = manager.get_connection();
-    let is_mysql = manager.get_database_backend() == DatabaseBackend::MySql;
-    let name = new.get_column_name();
-    if !is_mysql || !mysql_has_column(db, "action_runs", &name).await? {
-        let add = Table::alter()
-            .table(ActionRuns::Table)
-            .add_column(&mut new)
-            .to_owned();
-        manager.alter_table(add).await?;
-    }
-    if !is_mysql || mysql_has_column(db, "action_runs", old).await? {
-        db.execute_unprepared(&format!("UPDATE action_runs SET {name} = {value}"))
-            .await?;
-        let drop = Table::alter()
-            .table(ActionRuns::Table)
-            .drop_column(Alias::new(old))
-            .to_owned();
-        manager.alter_table(drop).await?;
-    }
-    Ok(())
-}
-
-struct RefusedAgents;
-
-impl MigrationName for RefusedAgents {
-    fn name(&self) -> &str {
-        "m20261120_000001_refused_agents"
-    }
-}
-
-/// Why the server refuses a host's agent, while it does, for speaking a version of
-/// the protocol the server doesn't take: when it began, what the agent was told, and
-/// the protocol it speaks. Each is NULL while it isn't refused, and always for a host
-/// with no agent.
-///
-/// MySQL commits each change as it's made, so each can be made again.
-#[async_trait::async_trait]
-impl MigrationTrait for RefusedAgents {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-        let columns = [
-            moment(backend, Hosts::RefusedAt),
-            ColumnDef::new(Hosts::RefusedReason).text().to_owned(),
-            ColumnDef::new(Hosts::RefusedProtocol)
-                .big_integer()
-                .to_owned(),
-        ];
-        let db = manager.get_connection();
-        for mut column in columns {
-            let name = column.get_column_name();
-            if backend == DatabaseBackend::MySql && mysql_has_column(db, "hosts", &name).await? {
-                continue;
-            }
-            let add = Table::alter()
-                .table(Hosts::Table)
-                .add_column(&mut column)
-                .to_owned();
-            manager.alter_table(add).await?;
-        }
-        Ok(())
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let backend = manager.get_database_backend();
-        let db = manager.get_connection();
-        for name in ["refused_at", "refused_reason", "refused_protocol"] {
-            if backend == DatabaseBackend::MySql && !mysql_has_column(db, "hosts", name).await? {
-                continue;
-            }
-            let drop = Table::alter()
-                .table(Hosts::Table)
-                .drop_column(Alias::new(name))
-                .to_owned();
-            manager.alter_table(drop).await?;
-        }
-        Ok(())
-    }
-}
-
-struct SkippedCollectors;
-
-impl MigrationName for SkippedCollectors {
-    fn name(&self) -> &str {
-        "m20261120_000002_skipped_collectors"
-    }
-}
-
-/// The collectors in a config that a host's agent doesn't know, as it's older than
-/// the server, one to a line, or NULL for none.
-///
-/// MySQL commits each change as it's made, so it can be made again.
-#[async_trait::async_trait]
-impl MigrationTrait for SkippedCollectors {
-    fn use_transaction(&self) -> Option<bool> {
-        Some(true)
-    }
-
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        if manager.get_database_backend() == DatabaseBackend::MySql
-            && mysql_has_column(db, "host_config_status", "skipped_collectors").await?
-        {
-            return Ok(());
-        }
-        let add = Table::alter()
-            .table(HostConfigStatus::Table)
-            .add_column(ColumnDef::new(HostConfigStatus::SkippedCollectors).text())
-            .to_owned();
-        manager.alter_table(add).await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let db = manager.get_connection();
-        if manager.get_database_backend() == DatabaseBackend::MySql
-            && !mysql_has_column(db, "host_config_status", "skipped_collectors").await?
-        {
-            return Ok(());
-        }
-        let drop = Table::alter()
-            .table(HostConfigStatus::Table)
-            .drop_column(HostConfigStatus::SkippedCollectors)
-            .to_owned();
-        manager.alter_table(drop).await
-    }
-}
-
-/// How SQLite's definition of a table writes a foreign key, before what it does on
-/// delete.
-fn sqlite_key(key: &KeyChange) -> String {
-    format!(
-        "FOREIGN KEY (\"{}\") REFERENCES \"{}\" (\"id\")",
-        key.column, key.parent
-    )
-}
-
-/// A SQLite table's definition with what one of its foreign keys does on delete
-/// changed from `from` to `to`. The key has to be there just once, doing `from`, or
-/// the table isn't the one this was written for and nothing is changed.
-fn with_on_delete(
-    definition: &str,
-    key: &KeyChange,
-    from: OnDelete,
-    to: OnDelete,
-) -> Result<String, DbErr> {
-    let old = format!("{}{}", sqlite_key(key), from.sqlite());
-    // A key ends where the next one starts or the table does.
-    let found: Vec<usize> = definition
-        .match_indices(&old)
-        .map(|(at, _)| at)
-        .filter(|at| {
-            let after = definition[at + old.len()..].trim_start();
-            after.starts_with(',') || after.starts_with(')')
-        })
-        .collect();
-    let [at] = found[..] else {
-        return Err(DbErr::Migration(format!(
-            "{}.{} isn't the foreign key expected",
-            key.table, key.column
-        )));
-    };
-    Ok(format!(
-        "{}{}{}{}",
-        &definition[..at],
-        sqlite_key(key),
-        to.sqlite(),
-        &definition[at + old.len()..]
-    ))
-}
-
-/// A SQLite table's definition with a foreign key added after everything else.
-fn with_key_added(definition: &str, key: &KeyChange) -> Result<String, DbErr> {
-    if definition.contains(&sqlite_key(key)) {
-        return Err(DbErr::Migration(format!(
-            "{}.{} already has a foreign key",
-            key.table, key.column
-        )));
-    }
-    let end = definition
-        .rfind(')')
-        .ok_or_else(|| DbErr::Migration(format!("{} has no columns", key.table)))?;
-    Ok(format!(
-        "{}, {}{} {}",
-        definition[..end].trim_end(),
-        sqlite_key(key),
-        key.now.sqlite(),
-        &definition[end..]
-    ))
-}
-
-/// A SQLite table's definition without the foreign key [`with_key_added`] added.
-fn without_key_added(definition: &str, key: &KeyChange) -> Result<String, DbErr> {
-    let added = format!(", {}{}", sqlite_key(key), key.now.sqlite());
-    if definition.matches(&added).count() != 1 {
-        return Err(DbErr::Migration(format!(
-            "{}.{} isn't the foreign key expected",
-            key.table, key.column
-        )));
-    }
-    Ok(definition.replacen(&added, "", 1))
-}
-
-/// Makes a SQLite table again from its own definition as `edit` changes it, the way
-/// SQLite's documentation gives for what `ALTER TABLE` can't change, like a foreign
-/// key: a new table made, the rows copied, the old one dropped and the new one
-/// renamed, and its indexes made again. Its numbering carries on from where it was,
-/// so a deleted row's ID is never used again. Foreign keys have to be off, or
-/// dropping the old table would delete what points at it; see
-/// [`without_foreign_keys`].
-async fn remake_sqlite_table(
-    db: &impl ConnectionTrait,
-    table: &str,
-    edit: impl FnOnce(&str) -> Result<String, DbErr>,
-) -> Result<(), DbErr> {
-    let definition: String = one_value(
-        db,
-        &format!("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '{table}'"),
-    )
-    .await?;
-    // Indexes SQLite made itself, for a unique column, have no SQL, and come back
-    // with the table.
-    let indexes: Vec<String> = all_values(
-        db,
-        &format!(
-            "SELECT sql FROM sqlite_master \
-             WHERE type = 'index' AND tbl_name = '{table}' AND sql IS NOT NULL"
-        ),
-    )
-    .await?;
-    let made = format!("CREATE TABLE \"{table}\" ");
-    let new = format!("{table}_new");
-    let changed = edit(&definition)?;
-    let columns = changed.strip_prefix(&made).ok_or_else(|| {
-        DbErr::Migration(format!("{table} isn't made the way it's expected to be"))
-    })?;
-    db.execute_unprepared(&format!("CREATE TABLE \"{new}\" {columns}"))
-        .await?;
-    db.execute_unprepared(&format!("INSERT INTO \"{new}\" SELECT * FROM \"{table}\""))
-        .await?;
-    db.execute_unprepared(&format!("DELETE FROM sqlite_sequence WHERE name = '{new}'"))
-        .await?;
-    db.execute_unprepared(&format!(
-        "INSERT INTO sqlite_sequence (name, seq) \
-         SELECT '{new}', seq FROM sqlite_sequence WHERE name = '{table}'"
-    ))
-    .await?;
-    db.execute_unprepared(&format!("DROP TABLE \"{table}\""))
-        .await?;
-    db.execute_unprepared(&format!("ALTER TABLE \"{new}\" RENAME TO \"{table}\""))
-        .await?;
-    for index in indexes {
-        db.execute_unprepared(&index).await?;
-    }
-    Ok(())
-}
-
-type Step<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send + 'a>>;
-
-/// Runs `step` in a transaction, with SQLite's foreign keys off around it, as its way of
-/// making a table again needs. They're checked before it commits instead, and turned
-/// back on whether it worked or not. The server's SQLite has one connection, so the
-/// transaction is on the connection they were turned off for, which is checked too.
-/// MySQL commits each change to a table as it's made, whatever the transaction.
-async fn without_foreign_keys<F>(manager: &SchemaManager<'_>, step: F) -> Result<(), DbErr>
-where
-    F: for<'a> FnOnce(&'a SchemaManager<'static>) -> Step<'a>,
-{
-    let sqlite = manager.get_database_backend() == DatabaseBackend::Sqlite;
-    let db = manager.get_connection();
-    if sqlite {
-        db.execute_unprepared("PRAGMA foreign_keys = OFF").await?;
-    }
-    let result = async {
-        let transaction = manager.begin().await?;
-        if sqlite {
-            let on: i64 = one_value(transaction.get_connection(), "PRAGMA foreign_keys").await?;
-            if on != 0 {
-                return Err(DbErr::Migration(
-                    "SQLite's foreign keys have to be off to make tables again".to_string(),
-                ));
-            }
-        }
-        step(&transaction).await?;
-        if sqlite {
-            let broken: Vec<String> =
-                all_values(transaction.get_connection(), "PRAGMA foreign_key_check").await?;
-            if !broken.is_empty() {
-                return Err(DbErr::Migration(format!(
-                    "rows in {} would break a foreign key",
-                    broken.join(", ")
-                )));
-            }
-        }
-        transaction.commit().await
-    }
-    .await;
-    if sqlite {
-        db.execute_unprepared("PRAGMA foreign_keys = ON").await?;
-    }
-    result
-}
-
-/// One column of a row a query gave.
-fn column<T: sea_orm::TryGetable>(row: &sea_orm::QueryResult, index: usize) -> Result<T, DbErr> {
-    row.try_get_by_index(index)
-        .map_err(|error| DbErr::Migration(error.to_string()))
-}
-
-/// The first column of the one row `sql` gives.
-async fn one_value<T: sea_orm::TryGetable>(
-    db: &impl ConnectionTrait,
-    sql: &str,
-) -> Result<T, DbErr> {
-    let row = db
-        .query_one_raw(Statement::from_string(db.get_database_backend(), sql))
-        .await?
-        .ok_or_else(|| DbErr::Migration(format!("no answer to {sql}")))?;
-    row.try_get_by_index(0)
-        .map_err(|error| DbErr::Migration(error.to_string()))
-}
-
-/// The first column of every row `sql` gives.
-async fn all_values<T: sea_orm::TryGetable>(
-    db: &impl ConnectionTrait,
-    sql: &str,
-) -> Result<Vec<T>, DbErr> {
-    db.query_all_raw(Statement::from_string(db.get_database_backend(), sql))
-        .await?
-        .iter()
-        .map(|row| {
-            row.try_get_by_index(0)
-                .map_err(|error| DbErr::Migration(error.to_string()))
-        })
-        .collect()
 }
 
 #[derive(Iden)]
@@ -3323,6 +1834,7 @@ enum AlertRules {
     Table,
     Id,
     Name,
+    NameKey,
     Warning,
     Critical,
     Summary,
@@ -3611,7 +2123,6 @@ enum ActionRuns {
     Error,
     Output,
     Truncated,
-    DurationMs,
     DurationSecs,
     FinishedAt,
 }
@@ -3630,43 +2141,18 @@ mod tests {
     }
 
     /// An empty database of its own on the server `MAXNINES_TEST_DATABASE_URL` names,
-    /// or SQLite in memory.
-    async fn empty() -> sea_orm::DatabaseConnection {
-        match std::env::var("MAXNINES_TEST_DATABASE_URL") {
+    /// or SQLite in memory, with the tables made.
+    async fn migrated() -> sea_orm::DatabaseConnection {
+        let connection = match std::env::var("MAXNINES_TEST_DATABASE_URL") {
             Ok(server) => {
                 let url = crate::models::fresh_test_database(&server).await;
                 let options = ConnectOptions::new(url).max_connections(1).to_owned();
                 Database::connect(options).await.unwrap()
             }
             Err(_) => fresh().await,
-        }
-    }
-
-    /// Where a migration comes in the list.
-    fn place(migration: &dyn MigrationName) -> u32 {
-        let name = migration.name();
-        let place = Migrator::migrations()
-            .iter()
-            .position(|each| each.name() == name)
-            .unwrap_or_else(|| panic!("{name} isn't in the list"));
-        <u32 as std::convert::TryFrom<usize>>::try_from(place).unwrap()
-    }
-
-    async fn applied(connection: &sea_orm::DatabaseConnection) -> u32 {
-        let applied = Migrator::get_applied_migrations(connection).await.unwrap();
-        <u32 as std::convert::TryFrom<usize>>::try_from(applied.len()).unwrap()
-    }
-
-    /// Runs the migrations up to and including `migration`, whatever comes after it.
-    async fn up_to(connection: &sea_orm::DatabaseConnection, migration: &dyn MigrationName) {
-        let steps = place(migration) + 1 - applied(connection).await;
-        Migrator::up(connection, Some(steps)).await.unwrap();
-    }
-
-    /// Rolls back `migration` and everything after it, however many came after.
-    async fn down_through(connection: &sea_orm::DatabaseConnection, migration: &dyn MigrationName) {
-        let steps = applied(connection).await - place(migration);
-        Migrator::down(connection, Some(steps)).await.unwrap();
+        };
+        Migrator::up(&connection, None).await.unwrap();
+        connection
     }
 
     async fn texts(connection: &impl ConnectionTrait, sql: &str) -> Vec<String> {
@@ -3677,10 +2163,29 @@ mod tests {
             .collect()
     }
 
+    async fn run(connection: &impl ConnectionTrait, sql: &str) {
+        if let Err(error) = connection.execute_unprepared(sql).await {
+            panic!("{sql}: {error}");
+        }
+    }
+
+    async fn refused(connection: &impl ConnectionTrait, sql: &str) {
+        assert!(connection.execute_unprepared(sql).await.is_err(), "{sql}");
+    }
+
+    async fn count(connection: &impl ConnectionTrait, table: &str) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        let query = Statement::from_string(connection.get_database_backend(), sql);
+        let row = connection.query_one_raw(query).await.unwrap().unwrap();
+        row.try_get_by_index(0).unwrap()
+    }
+
+    /// A moment every database reads.
+    const AT: &str = "'2026-11-19 00:00:00+00:00'";
+
     #[tokio::test]
     async fn a_new_database_starts_with_the_built_ins() {
-        let connection = empty().await;
-        Migrator::up(&connection, None).await.unwrap();
+        let connection = migrated().await;
 
         let hosts = texts(&connection, "SELECT hostname FROM hosts ORDER BY id").await;
         assert_eq!(hosts, ["Fleet", "MaxNines server"]);
@@ -3700,70 +2205,13 @@ mod tests {
                 "Host sending no metrics",
             ]
         );
-        let settings = "SELECT s.name FROM config_rule_settings s
-                        JOIN config_rules r ON r.id = s.rule_id
-                        WHERE r.name = 'Default' ORDER BY s.id";
-        let names = texts(&connection, settings).await;
-        assert_eq!(names.len(), DEFAULT_SETTINGS.len());
-        assert_eq!(names[0], "interval_secs");
-    }
-
-    #[tokio::test]
-    async fn a_server_made_before_the_no_metrics_rule_gets_it_on_upgrading() {
-        let connection = empty().await;
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        up_to(&connection, &AddNoMetricsRule).await;
-
-        let added = "SELECT critical FROM alert_rules
-                     WHERE name = 'Host sending no metrics' AND for_secs = 300
-                     AND warning IS NULL AND enabled AND all_channels";
-        assert_eq!(texts(&connection, added).await, ["!reporting"]);
-    }
-
-    #[tokio::test]
-    async fn a_rule_of_its_own_by_that_name_is_kept_instead() {
-        let connection = empty().await;
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        connection
-            .execute_unprepared(
-                "UPDATE alert_rules SET name = 'Host sending no metrics'
-                 WHERE name = 'Clock is wrong'",
-            )
-            .await
-            .unwrap();
-
-        up_to(&connection, &AddNoMetricsRule).await;
-
-        let named = "SELECT critical FROM alert_rules WHERE name = 'Host sending no metrics'";
+        let keys = texts(&connection, "SELECT name_key FROM alert_rules ORDER BY id").await;
+        assert_eq!(keys[0], "host offline");
         assert_eq!(
-            texts(&connection, named).await,
-            ["clock.difference > duration('30s')"]
+            count(&connection, "config_rules").await,
+            0,
+            "the server writes the built-in config rules as it starts"
         );
-    }
-
-    #[tokio::test]
-    async fn the_tables_can_be_dropped_and_made_again() {
-        let connection = empty().await;
-        Migrator::up(&connection, None).await.unwrap();
-        Migrator::down(&connection, None).await.unwrap();
-        let tables = match connection.get_database_backend() {
-            DatabaseBackend::Postgres => {
-                "SELECT table_name::text FROM information_schema.tables
-                 WHERE table_schema = current_schema()"
-            }
-            DatabaseBackend::MySql => {
-                "SELECT CAST(table_name AS CHAR) FROM information_schema.tables
-                 WHERE table_schema = DATABASE()"
-            }
-            _ => "SELECT name FROM sqlite_master WHERE type = 'table'",
-        };
-        let left: Vec<String> = texts(&connection, tables)
-            .await
-            .into_iter()
-            .filter(|table| !["seaql_migrations", "sqlite_sequence"].contains(&table.as_str()))
-            .collect();
-        assert!(left.is_empty(), "{left:?}");
-        Migrator::up(&connection, None).await.unwrap();
     }
 
     #[tokio::test]
@@ -3815,590 +2263,222 @@ mod tests {
         assert_eq!(texts(&connection, left).await, ["server"]);
     }
 
-    async fn run(connection: &impl ConnectionTrait, sql: &str) {
-        if let Err(error) = connection.execute_unprepared(sql).await {
-            panic!("{sql}: {error}");
-        }
-    }
+    /// Every table a host or user has rows in.
+    const KEPT_ABOUT_THEM: [&str; 12] = [
+        "host_facts",
+        "host_config_status",
+        "host_boots",
+        "metrics_pages",
+        "remote_checks",
+        "alerts",
+        "action_runs",
+        "user_sessions",
+        "api_keys",
+        "app_sign_ins",
+        "recovery_codes",
+        "sign_in_challenges",
+    ];
 
-    async fn number(connection: &impl ConnectionTrait, sql: &str) -> i64 {
-        let query = Statement::from_string(connection.get_database_backend(), sql);
-        let row = connection.query_one_raw(query).await.unwrap().unwrap();
-        row.try_get_by_index(0).unwrap()
-    }
-
-    async fn count(connection: &impl ConnectionTrait, table: &str) -> i64 {
-        number(connection, &format!("SELECT COUNT(*) FROM {table}")).await
-    }
-
-    /// Something in every table a foreign key changes on, as a server before the
-    /// keys and indexes migration kept it, with two rules and two channels sharing
-    /// names, and a notification whose action run has gone.
-    async fn fill_before_keys_and_indexes(connection: &impl ConnectionTrait) {
-        // A moment every database reads.
-        let at = "'2026-11-19 00:00:00+00:00'";
+    #[tokio::test]
+    async fn what_is_kept_about_a_host_or_user_goes_with_them() {
+        let connection = migrated().await;
         for sql in [
             format!(
                 "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
-                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
+                 VALUES ('h1', 'agent', 'web', 'approved', {AT})"
             ),
             format!(
                 "INSERT INTO host_facts (host_id, name, value, value_type, valid_from)
-                 VALUES ('h1', 'os.family', 'linux', 'string', {at})"
+                 VALUES ('h1', 'os.family', 'linux', 'string', {AT})"
             ),
             format!(
                 "INSERT INTO host_config_status (host_id, version, reported_at)
-                 VALUES ('h1', 'v1', {at})"
+                 VALUES ('h1', 'v1', {AT})"
             ),
-            format!("INSERT INTO host_boots (host_id, booted_at) VALUES ('h1', {at})"),
+            format!("INSERT INTO host_boots (host_id, booted_at) VALUES ('h1', {AT})"),
             "INSERT INTO metrics_pages (host_id, url, interval_secs, enabled)
              VALUES ('h1', 'http://web/metrics', 60, TRUE)"
                 .to_string(),
-            "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
-             VALUES ('Ping', 'ping', 'web', 60, TRUE, 'h1')"
+            "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled,
+                 host_id)
+             VALUES ('Ping', 'ping', 'ping', 'web', 60, TRUE, 'h1')"
+                .to_string(),
+            "INSERT INTO notification_channels (name, name_key, kind, target)
+             VALUES ('Ops', 'ops', 'webhook', 'http://ops')"
                 .to_string(),
             format!(
-                "INSERT INTO alert_rules (name, critical, for_secs, enabled, deleted_at)
-                 VALUES ('Twice', '!online', 60, TRUE, NULL),
-                        ('Twice', '!online', 60, TRUE, NULL),
-                        ('Gone', '!online', 60, TRUE, {at}),
-                        ('Gone', '!online', 60, TRUE, NULL)"
-            ),
-            format!(
-                "INSERT INTO notification_channels (name, kind, target, deleted_at)
-                 VALUES ('Ops', 'webhook', 'http://ops', NULL),
-                        ('Ops', 'webhook', 'http://ops', NULL),
-                        ('Old', 'webhook', 'http://old', {at})"
-            ),
-            format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
-                 VALUES (1, 'critical', 'h1', 'web is offline', {at}, {at}),
-                        (1, 'critical', 'h1', 'deleted below', {at}, {at})"
+                 VALUES (1, 'critical', 'h1', 'web is offline', {AT}, {AT})"
             ),
-            "DELETE FROM alerts WHERE id = 2".to_string(),
             format!(
                 "INSERT INTO action_runs (host_id, alert_id, action, run_on, variables,
                      requested_at, timeout_secs, output, truncated)
-                 VALUES ('h1', 1, 'restart', 'first', '{{}}', {at}, 60, '', FALSE)"
+                 VALUES ('h1', 1, 'restart', 'first', '{{}}', {AT}, 60, '', FALSE)"
             ),
             format!(
                 "INSERT INTO notifications (alert_id, channel_id, event, state, attempts,
                      next_attempt_at, created_at, action_run_id)
-                 VALUES (1, 1, 'firing', 'sent', 1, {at}, {at}, NULL),
-                        (1, 1, 'action', 'pending', 0, {at}, {at}, 1),
-                        (1, 1, 'action', 'pending', 0, {at}, {at}, 99),
-                        (1, 3, 'firing', 'sent', 1, {at}, {at}, NULL)"
+                 VALUES (1, 1, 'firing', 'sent', 1, {AT}, {AT}, NULL),
+                        (1, 1, 'action', 'pending', 0, {AT}, {AT}, 1)"
             ),
             format!(
                 "INSERT INTO users (email, name, created_at)
-                 VALUES ('ann@example.com', 'Ann', {at})"
+                 VALUES ('ann@example.com', 'Ann', {AT})"
             ),
             format!(
                 "INSERT INTO user_sessions (user_id, token_hash, created_at, expires_at)
-                 VALUES (1, 'session', {at}, {at})"
+                 VALUES (1, 'session', {AT}, {AT})"
             ),
             format!(
                 "INSERT INTO api_keys (user_id, name, hint, token_hash, created_at)
-                 VALUES (1, 'ci', 'mx_1', 'key', {at})"
+                 VALUES (1, 'ci', 'mx_1', 'key', {AT})"
             ),
             format!(
                 "INSERT INTO app_sign_ins (user_id, client_id, role, access_hash,
                      access_expires_at, refresh_hash, refresh_expires_at, created_at)
-                 VALUES (1, 'cli', 'admin', 'access', {at}, 'refresh', {at}, {at})"
+                 VALUES (1, 'cli', 'admin', 'access', {AT}, 'refresh', {AT}, {AT})"
             ),
             "INSERT INTO recovery_codes (user_id, code_hash) VALUES (1, 'code')".to_string(),
             format!(
                 "INSERT INTO sign_in_challenges (user_id, token_hash, expires_at)
-                 VALUES (1, 'challenge', {at})"
+                 VALUES (1, 'challenge', {AT})"
             ),
         ] {
-            run(connection, &sql).await;
+            run(&connection, &sql).await;
         }
-    }
 
-    /// Every table a host or user has rows in, with how many each has.
-    const KEPT: [(&str, i64); 13] = [
-        ("hosts", 3),
-        ("host_facts", 1),
-        ("host_config_status", 1),
-        ("host_boots", 1),
-        ("metrics_pages", 1),
-        ("remote_checks", 1),
-        ("alerts", 1),
-        ("action_runs", 1),
-        ("users", 1),
-        ("user_sessions", 1),
-        ("api_keys", 1),
-        ("app_sign_ins", 1),
-        ("recovery_codes", 1),
-    ];
-
-    async fn assert_kept(connection: &impl ConnectionTrait) {
-        for (table, rows) in KEPT {
-            assert_eq!(count(connection, table).await, rows, "{table}");
-        }
-        assert_eq!(count(connection, "sign_in_challenges").await, 1);
-    }
-
-    #[tokio::test]
-    async fn keys_and_indexes_keep_what_was_there_and_are_enforced() {
-        let connection = empty().await;
-        Migrator::up(&connection, Some(2)).await.unwrap();
-        fill_before_keys_and_indexes(&connection).await;
-        Migrator::up(&connection, Some(1)).await.unwrap();
-
-        assert_kept(&connection).await;
-        let notifications = "SELECT event FROM notifications ORDER BY id";
-        assert_eq!(
-            texts(&connection, notifications).await,
-            ["firing", "action", "firing"],
-            "only the one whose action run had gone goes"
-        );
-        let rules = "SELECT name FROM alert_rules WHERE id > 8 ORDER BY id";
-        assert_eq!(
-            texts(&connection, rules).await,
-            ["Twice", "Twice (10)", "Gone", "Gone"]
-        );
-        let channels = "SELECT name FROM notification_channels ORDER BY id";
-        assert_eq!(
-            texts(&connection, channels).await,
-            ["Ops", "Ops (2)", "Old"]
-        );
-        // A deleted alert's ID isn't used again.
-        run(
+        // A notification of what an action printed points at its run, and a channel
+        // can't be deleted while anything was sent through it, as it's only ever
+        // marked deleted.
+        refused(
             &connection,
-            "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
-             SELECT rule_id, severity, host_id, summary, started_at, breached_at
-             FROM alerts WHERE id = 1",
+            &format!(
+                "INSERT INTO notifications (alert_id, channel_id, event, state, attempts,
+                     next_attempt_at, created_at, action_run_id)
+                 VALUES (1, 1, 'action', 'pending', 0, {AT}, {AT}, 99)"
+            ),
         )
         .await;
-        assert_eq!(number(&connection, "SELECT MAX(id) FROM alerts").await, 3);
-        run(&connection, "DELETE FROM alerts WHERE id = 3").await;
-
-        // A name is used once among rules and channels that aren't deleted.
-        let rule = |name: &str, deleted: &str| {
-            format!(
-                "INSERT INTO alert_rules (name, critical, for_secs, enabled, deleted_at)
-                 VALUES ('{name}', '!online', 60, TRUE, {deleted})"
-            )
-        };
-        let at = "'2026-11-19 00:00:00+00:00'";
-        assert!(
-            connection
-                .execute_unprepared(&rule("Twice", "NULL"))
-                .await
-                .is_err()
-        );
-        run(&connection, &rule("Twice", at)).await;
-        run(&connection, &rule("Twice (2)", "NULL")).await;
-        assert!(
-            connection
-                .execute_unprepared(
-                    "INSERT INTO notification_channels (name, kind, target)
-                     VALUES ('Ops', 'webhook', 'http://ops')"
-                )
-                .await
-                .is_err()
-        );
-        run(
+        refused(
             &connection,
-            "INSERT INTO notification_channels (name, kind, target)
-             VALUES ('Old', 'webhook', 'http://old')",
+            "DELETE FROM notification_channels WHERE id = 1",
         )
         .await;
-
-        // A notification's action run has to be there, and a channel can't be
-        // deleted while anything was sent through it.
-        assert!(
-            connection
-                .execute_unprepared(&format!(
-                    "INSERT INTO notifications (alert_id, channel_id, event, state, attempts,
-                         next_attempt_at, created_at, action_run_id)
-                     VALUES (1, 1, 'action', 'pending', 0, {at}, {at}, 99)"
-                ))
-                .await
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute_unprepared("DELETE FROM notification_channels WHERE id = 3")
-                .await
-                .is_err()
-        );
-
-        // Back down, everything is still there, and a host can't be deleted while
-        // anything is kept about it.
-        Migrator::down(&connection, Some(1)).await.unwrap();
-        assert_kept(&connection).await;
-        assert!(
-            connection
-                .execute_unprepared("DELETE FROM hosts WHERE id = 'h1'")
-                .await
-                .is_err()
-        );
-        assert!(
-            connection
-                .execute_unprepared("DELETE FROM users WHERE id = 1")
-                .await
-                .is_err()
-        );
-        run(&connection, &rule("Twice", "NULL")).await;
-        run(&connection, "DELETE FROM alert_rules WHERE name = 'Twice'").await;
-
-        // Up again, a host's or user's rows go with them, and an action run's
-        // notifications with it.
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        assert_kept(&connection).await;
         run(&connection, "DELETE FROM action_runs WHERE id = 1").await;
-        assert_eq!(count(&connection, "notifications").await, 2);
+        assert_eq!(count(&connection, "notifications").await, 1);
+
         run(&connection, "DELETE FROM hosts WHERE id = 'h1'").await;
         run(&connection, "DELETE FROM users WHERE id = 1").await;
-        for (table, _) in KEPT.iter().skip(1) {
+        for table in KEPT_ABOUT_THEM.iter().chain(&["notifications"]) {
             assert_eq!(count(&connection, table).await, 0, "{table}");
         }
-        assert_eq!(count(&connection, "sign_in_challenges").await, 0);
-        assert_eq!(count(&connection, "notifications").await, 0);
     }
 
     #[tokio::test]
-    async fn a_live_name_made_for_a_repeat_is_never_one_already_taken() {
-        let connection = empty().await;
-        Migrator::up(&connection, Some(2)).await.unwrap();
-        run(
-            &connection,
-            "INSERT INTO alert_rules (name, critical, for_secs, enabled)
-             VALUES ('Disk', '!online', 60, TRUE),
-                    ('Disk (11)', '!online', 60, TRUE),
-                    ('Disk', '!online', 60, TRUE)",
-        )
-        .await;
-
-        Migrator::up(&connection, Some(1)).await.unwrap();
-
-        let rules = "SELECT name FROM alert_rules WHERE id > 8 ORDER BY id";
-        assert_eq!(
-            texts(&connection, rules).await,
-            ["Disk", "Disk (11)", "Disk (11, 2)"]
-        );
-    }
-
-    /// A server before names were compared ignoring case and the spaces around them,
-    /// with names that are the same but for those, facts that are current twice and
-    /// alerts open twice. MySQL already compared case, by its collation, but not
-    /// spaces before a name.
-    async fn fill_before_names_and_uniqueness(connection: &impl ConnectionTrait) {
-        let at = "'2026-11-19 00:00:00+00:00'";
+    async fn names_facts_and_open_alerts_are_each_kept_unique() {
+        let connection = migrated().await;
         let later = "'2026-11-19 00:01:00+00:00'";
         for sql in [
             format!(
                 "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
-                 VALUES ('h1', 'agentless', 'web', 'approved', {at})"
+                 VALUES ('h1', 'agentless', 'web', 'approved', {AT})"
             ),
             format!(
-                "INSERT INTO alert_rules (name, critical, for_secs, enabled, deleted_at)
-                 VALUES ('Disk', '!online', 60, TRUE, NULL),
-                        (' disk', '!online', 60, TRUE, NULL),
-                        ('disk (10)', '!online', 60, TRUE, NULL),
-                        ('DISK', '!online', 60, TRUE, {at})"
+                "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled,
+                     deleted_at)
+                 VALUES ('Disk', 'disk', '!online', 60, TRUE, NULL),
+                        ('DISK', 'disk', '!online', 60, TRUE, {AT})"
             ),
-            "INSERT INTO notification_channels (name, kind, target)
-             VALUES ('Ops', 'webhook', 'http://ops'), (' OPS', 'webhook', 'http://ops')"
+            "INSERT INTO notification_channels (name, name_key, kind, target)
+             VALUES ('Ops', 'ops', 'webhook', 'http://ops')"
                 .to_string(),
-            "INSERT INTO config_rules (name, priority, enabled) VALUES (' default', 1, TRUE)"
+            "INSERT INTO config_rules (name, name_key, priority, enabled)
+             VALUES ('Linux', 'linux', 1, TRUE)"
                 .to_string(),
-            "INSERT INTO remote_checks (name, kind, target, interval_secs, enabled, host_id)
-             VALUES ('Ping', 'ping', 'web', 60, TRUE, 'h1'),
-                    (' PING', 'ping', 'web', 60, TRUE, 'h1'),
-                    ('ping', 'ping', 'web', 60, TRUE, 'server')"
+            "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled,
+                 host_id)
+             VALUES ('Ping', 'ping', 'ping', 'web', 60, TRUE, 'h1'),
+                    ('ping', 'ping', 'ping', 'web', 60, TRUE, 'server')"
+                .to_string(),
+            // A fact's name is compared exactly, so these are two facts.
+            format!(
+                "INSERT INTO host_facts (host_id, name, value, value_type, valid_from, valid_to)
+                 VALUES ('h1', 'os.family', 'bsd', 'string', {AT}, {later}),
+                        ('h1', 'os.family', 'linux', 'string', {later}, NULL),
+                        ('h1', 'OS.family', 'linux', 'string', {AT}, NULL)"
+            ),
+            // So is a series, and a host as a whole counts as a series of its own.
+            format!(
+                "INSERT INTO alerts (rule_id, severity, host_id, series, summary, started_at,
+                     breached_at, resolved_at)
+                 VALUES (9, 'critical', 'h1', NULL, 'over', {AT}, {AT}, {later}),
+                        (9, 'critical', 'h1', NULL, 'first', {later}, {later}, NULL),
+                        (9, 'critical', 'h1', '/data', 'a disk', {AT}, {AT}, NULL),
+                        (9, 'critical', 'h1', '/Data', 'another', {AT}, {AT}, NULL)"
+            ),
+        ] {
+            run(&connection, &sql).await;
+        }
+
+        for sql in [
+            "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled)
+             VALUES ('disk ', 'disk', '!online', 60, TRUE)"
+                .to_string(),
+            "INSERT INTO notification_channels (name, name_key, kind, target)
+             VALUES ('OPS', 'ops', 'webhook', 'http://ops')"
+                .to_string(),
+            "INSERT INTO config_rules (name, name_key, priority, enabled)
+             VALUES ('LINUX', 'linux', 1, TRUE)"
+                .to_string(),
+            "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled,
+                 host_id)
+             VALUES ('PING', 'ping', 'ping', 'web', 60, TRUE, 'h1')"
                 .to_string(),
             format!(
                 "INSERT INTO host_facts (host_id, name, value, value_type, valid_from)
-                 VALUES ('h1', 'os.family', 'linux', 'string', {at}),
-                        ('h1', 'os.family', 'bsd', 'string', {later}),
-                        ('h1', 'OS.family', 'linux', 'string', {at})"
+                 VALUES ('h1', 'os.family', 'linux', 'string', {AT})"
+            ),
+            format!(
+                "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
+                 VALUES (9, 'critical', 'h1', 'second', {AT}, {AT})"
             ),
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, series, summary, started_at,
                      breached_at)
-                 VALUES (9, 'critical', 'h1', NULL, 'first', {at}, {at}),
-                        (9, 'critical', 'h1', NULL, 'again', {later}, {later}),
-                        (9, 'critical', 'h1', '/', 'a disk', {at}, {at}),
-                        (9, 'critical', 'h1', '/data', 'a disk', {at}, {at}),
-                        (9, 'critical', 'h1', '/Data', 'another', {at}, {at})"
+                 VALUES (9, 'critical', 'h1', '/data', 'again', {AT}, {AT})"
             ),
         ] {
-            run(connection, &sql).await;
+            refused(&connection, &sql).await;
         }
-    }
 
-    #[tokio::test]
-    async fn names_and_uniqueness_keep_what_was_there_and_are_enforced() {
-        let connection = empty().await;
-        Migrator::up(&connection, Some(3)).await.unwrap();
-        fill_before_names_and_uniqueness(&connection).await;
-        Migrator::up(&connection, Some(1)).await.unwrap();
-
-        let rules = "SELECT name FROM alert_rules WHERE id > 8 ORDER BY id";
-        assert_eq!(
-            texts(&connection, rules).await,
-            ["Disk", " disk (10, 2)", "disk (10)", "DISK"],
-            "a repeat gets its ID, and more when that's taken, and deleted ones don't count"
-        );
-        let keys = "SELECT name_key FROM alert_rules WHERE id > 8 ORDER BY id";
-        assert_eq!(
-            texts(&connection, keys).await,
-            ["disk", "disk (10, 2)", "disk (10)", "disk"]
-        );
-        let channels = "SELECT name FROM notification_channels ORDER BY id";
-        assert_eq!(texts(&connection, channels).await, ["Ops", " OPS (2)"]);
-        let rules = "SELECT name FROM config_rules ORDER BY id";
-        assert_eq!(texts(&connection, rules).await, ["Default", " default (2)"]);
-        let checks = "SELECT name FROM remote_checks ORDER BY id";
-        assert_eq!(
-            texts(&connection, checks).await,
-            ["Ping", " PING (2)", "ping"],
-            "each host's names are its own"
-        );
-        let current = "SELECT value FROM host_facts WHERE valid_to IS NULL ORDER BY id";
-        assert_eq!(
-            texts(&connection, current).await,
-            ["bsd", "linux"],
-            "the value said last stays current, and a name differing in case is another fact"
-        );
-        let open = "SELECT summary FROM alerts WHERE resolved_at IS NULL ORDER BY id";
-        assert_eq!(
-            texts(&connection, open).await,
-            ["first", "a disk", "a disk", "another"]
-        );
-
-        // Each is enforced, whatever the case.
-        let at = "'2026-11-19 00:00:00+00:00'";
-        let refused = [
-            "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled)
-             VALUES ('DISK', 'disk', '!online', 60, TRUE)"
-                .to_string(),
-            "INSERT INTO notification_channels (name, name_key, kind, target)
-             VALUES ('ops', 'ops', 'webhook', 'http://ops')"
-                .to_string(),
-            "INSERT INTO config_rules (name, name_key, priority, enabled)
-             VALUES ('DEFAULT', 'default', 1, TRUE)"
-                .to_string(),
-            "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled,
-                 host_id)
-             VALUES ('ping', 'ping', 'ping', 'web', 60, TRUE, 'h1')"
-                .to_string(),
-            format!(
-                "INSERT INTO host_facts (host_id, name, value, value_type, valid_from)
-                 VALUES ('h1', 'os.family', 'linux', 'string', {at})"
-            ),
-            format!(
-                "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
-                 VALUES (9, 'critical', 'h1', 'third', {at}, {at})"
-            ),
-        ];
-        for sql in &refused {
-            assert!(connection.execute_unprepared(sql).await.is_err(), "{sql}");
-        }
+        // Deleted rules and channels, past facts and ended alerts don't count.
         for sql in [
             format!(
                 "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled,
                      deleted_at)
-                 VALUES ('DISK', 'disk', '!online', 60, TRUE, {at})"
+                 VALUES ('Disk', 'disk', '!online', 60, TRUE, {AT})"
+            ),
+            format!(
+                "INSERT INTO notification_channels (name, name_key, kind, target, deleted_at)
+                 VALUES ('Ops', 'ops', 'webhook', 'http://ops', {AT})"
             ),
             format!(
                 "INSERT INTO host_facts (host_id, name, value, value_type, valid_from, valid_to)
-                 VALUES ('h1', 'os.family', 'linux', 'string', {at}, {at})"
+                 VALUES ('h1', 'os.family', 'linux', 'string', {AT}, {AT})"
             ),
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at,
                      resolved_at)
-                 VALUES (9, 'critical', 'h1', 'over', {at}, {at}, {at})"
+                 VALUES (9, 'critical', 'h1', 'over', {AT}, {AT}, {AT})"
             ),
         ] {
             run(&connection, &sql).await;
         }
-
-        // Back down and up again, everything is still there.
-        Migrator::down(&connection, Some(1)).await.unwrap();
-        assert_eq!(count(&connection, "remote_checks").await, 3);
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        assert_eq!(texts(&connection, open).await.len(), 4);
-    }
-
-    /// MySQL commits each change to a table as it's made, so a migration that stopped
-    /// before it was recorded runs again over what it already did. Each of its steps
-    /// leaves alone what's already done, which this tries at its hardest: all of it.
-    #[tokio::test]
-    async fn on_mysql_a_migration_that_stopped_carries_on_when_run_again() {
-        let connection = empty().await;
-        if connection.get_database_backend() != DatabaseBackend::MySql {
-            return;
-        }
-        Migrator::up(&connection, Some(2)).await.unwrap();
-        fill_before_keys_and_indexes(&connection).await;
-        keys_and_indexes_up(&SchemaManager::new(&connection))
-            .await
-            .unwrap();
-        Migrator::up(&connection, Some(1)).await.unwrap();
-        assert_kept(&connection).await;
-
-        let connection = empty().await;
-        Migrator::up(&connection, Some(3)).await.unwrap();
-        fill_before_names_and_uniqueness(&connection).await;
-        names_and_uniqueness_up(&SchemaManager::new(&connection))
-            .await
-            .unwrap();
-        Migrator::up(&connection, None).await.unwrap();
-        let channels = "SELECT name FROM notification_channels ORDER BY id";
-        assert_eq!(texts(&connection, channels).await, ["Ops", " OPS (2)"]);
-
-        let manager = SchemaManager::new(&connection);
-        ExactFactsAndEndedAlerts.up(&manager).await.unwrap();
-        let indexed = "SELECT CAST(column_name AS CHAR) FROM information_schema.statistics
-                       WHERE table_schema = DATABASE() AND index_name = 'idx_alerts_resolved'
-                       ORDER BY seq_in_index";
-        assert_eq!(texts(&connection, indexed).await, ["resolved_at", "id"]);
-    }
-
-    #[tokio::test]
-    async fn how_long_an_action_ran_is_kept_in_seconds_going_up_and_down() {
-        let connection = empty().await;
-        up_to(&connection, &ExactFactsAndEndedAlerts).await;
-        let at = "'2026-11-19 00:00:00+00:00'";
-        run(
-            &connection,
-            &format!(
-                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
-                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
-            ),
-        )
-        .await;
-        for duration in ["1500", "NULL"] {
-            run(
-                &connection,
-                &format!(
-                    "INSERT INTO action_runs (host_id, action, run_on, variables, requested_at,
-                         timeout_secs, output, truncated, duration_ms)
-                     VALUES ('h1', 'restart', 'manual', '{{}}', {at}, 30, '', FALSE, {duration})"
-                ),
-            )
-            .await;
-        }
-
-        Migrator::up(&connection, None).await.unwrap();
-        let seconds = "SELECT CAST(duration_secs * 1000 AS CHAR(20)) FROM action_runs
-                       WHERE duration_secs IS NOT NULL";
-        let seconds = match connection.get_database_backend() {
-            DatabaseBackend::MySql => seconds.to_string(),
-            _ => seconds.replace("CHAR(20)", "TEXT"),
-        };
-        let kept: Vec<f64> = texts(&connection, &seconds)
-            .await
-            .iter()
-            .map(|text| text.parse().unwrap())
-            .collect();
-        assert_eq!(kept, [1500.0]);
-        let empty = "SELECT COUNT(*) FROM action_runs WHERE duration_secs IS NULL";
-        assert_eq!(number(&connection, empty).await, 1);
-
-        // Running it again where MySQL stopped partway changes nothing more.
-        if connection.get_database_backend() == DatabaseBackend::MySql {
-            DurationsInSeconds
-                .up(&SchemaManager::new(&connection))
-                .await
-                .unwrap();
-        }
-        down_through(&connection, &DurationsInSeconds).await;
-        let ms = "SELECT duration_ms FROM action_runs WHERE duration_ms IS NOT NULL";
-        assert_eq!(number(&connection, ms).await, 1500);
-    }
-
-    #[tokio::test]
-    async fn why_an_agent_is_refused_is_kept_with_its_host() {
-        let connection = empty().await;
-        up_to(&connection, &DurationsInSeconds).await;
-        let at = "'2026-11-20 00:00:00+00:00'";
-        run(
-            &connection,
-            &format!(
-                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
-                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
-            ),
-        )
-        .await;
-
-        Migrator::up(&connection, None).await.unwrap();
-        let empty = "SELECT COUNT(*) FROM hosts WHERE id = 'h1' AND refused_at IS NULL
-                     AND refused_reason IS NULL AND refused_protocol IS NULL";
-        assert_eq!(number(&connection, empty).await, 1);
-        run(
-            &connection,
-            &format!(
-                "UPDATE hosts SET refused_at = {at}, refused_reason = 'Upgrade the agent.',
-                     refused_protocol = 0
-                 WHERE id = 'h1'"
-            ),
-        )
-        .await;
-        let reason = "SELECT refused_reason FROM hosts WHERE id = 'h1'";
-        assert_eq!(texts(&connection, reason).await, ["Upgrade the agent."]);
-
-        // Running it again where MySQL stopped partway changes nothing more.
-        if connection.get_database_backend() == DatabaseBackend::MySql {
-            RefusedAgents
-                .up(&SchemaManager::new(&connection))
-                .await
-                .unwrap();
-        }
-        down_through(&connection, &RefusedAgents).await;
-        assert_eq!(count(&connection, "hosts").await, 3);
-        Migrator::up(&connection, None).await.unwrap();
-        assert_eq!(number(&connection, empty).await, 1);
-    }
-
-    #[tokio::test]
-    async fn the_collectors_an_agent_does_not_know_are_kept_with_its_config_status() {
-        let connection = empty().await;
-        up_to(&connection, &RefusedAgents).await;
-        let at = "'2026-11-20 00:00:00+00:00'";
-        for sql in [
-            format!(
-                "INSERT INTO hosts (id, kind, hostname, state, first_seen_at)
-                 VALUES ('h1', 'agent', 'web', 'approved', {at})"
-            ),
-            format!(
-                "INSERT INTO host_config_status (host_id, version, reported_at)
-                 VALUES ('h1', 'v1', {at})"
-            ),
-        ] {
-            run(&connection, &sql).await;
-        }
-
-        Migrator::up(&connection, None).await.unwrap();
-        let none = "SELECT COUNT(*) FROM host_config_status WHERE skipped_collectors IS NULL";
-        assert_eq!(number(&connection, none).await, 1);
-        run(
-            &connection,
-            "UPDATE host_config_status SET skipped_collectors = 'zfs' WHERE host_id = 'h1'",
-        )
-        .await;
-
-        // Running it again where MySQL stopped partway changes nothing more.
-        if connection.get_database_backend() == DatabaseBackend::MySql {
-            SkippedCollectors
-                .up(&SchemaManager::new(&connection))
-                .await
-                .unwrap();
-        }
-        down_through(&connection, &SkippedCollectors).await;
-        assert_eq!(count(&connection, "host_config_status").await, 1);
-        Migrator::up(&connection, None).await.unwrap();
-        assert_eq!(number(&connection, none).await, 1);
     }
 
     #[test]
     fn every_built_in_alert_rule_is_one_this_server_takes() {
-        for rule in BUILT_IN_RULES.iter().chain([&NO_METRICS_RULE]) {
+        for rule in &BUILT_IN_RULES {
             let input = crate::alerting::AlertRuleInput {
                 summary: rule.summary.map(str::to_string),
                 resolved_summary: rule.resolved_summary.map(str::to_string),

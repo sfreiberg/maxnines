@@ -168,50 +168,6 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
 }
 
 #[tokio::test]
-async fn an_unchanged_default_rule_becomes_the_built_in_one_and_a_changed_one_stays_theirs() {
-    let database = Database::for_test().await;
-    let default = database.list_rules().await.unwrap().remove(0);
-    assert_eq!(
-        default.built_in, None,
-        "a new database's Default isn't marked yet"
-    );
-    database
-        .sync_built_in_rules(&all(), crate::times::now())
-        .await
-        .unwrap();
-    let rules = database.list_rules().await.unwrap();
-    assert_eq!(rules[0].id, default.id);
-    assert_eq!(rules[0].built_in.as_deref(), Some("default"));
-    assert_eq!(
-        rules[0].built_in_changed_at, None,
-        "adopting it isn't a change"
-    );
-
-    let changed = Database::for_test().await;
-    let mut edited = changed.list_rules().await.unwrap().remove(0);
-    edited.rule.settings["interval_secs"] = json!(60);
-    changed.update_rule(edited.id, &edited.rule).await.unwrap();
-    changed
-        .sync_built_in_rules(&all(), crate::times::now())
-        .await
-        .unwrap();
-    let rules = changed.list_rules().await.unwrap();
-    let theirs = rules.iter().find(|rule| rule.id == edited.id).unwrap();
-    assert_eq!(theirs.rule.name, "Default (yours)");
-    assert_eq!(theirs.rule.settings["interval_secs"], 60);
-    let built_in = rules
-        .iter()
-        .find(|rule| rule.rule.name == "Default")
-        .unwrap();
-    assert_eq!(built_in.built_in.as_deref(), Some("default"));
-    // Theirs still wins, being the same priority but not built in.
-    assert!(
-        rules.iter().position(|rule| rule.id == built_in.id)
-            < rules.iter().position(|rule| rule.id == edited.id)
-    );
-}
-
-#[tokio::test]
 async fn a_built_in_rule_can_only_be_turned_on_or_off_through_the_api() {
     let server = with_every_built_in_rule().await;
     let mac = rule_named(&server, "macOS").await;
