@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -233,22 +233,26 @@ impl Presence {
 
     /// Forgets the pages that aren't read any more.
     pub fn keep_pages(&self, read: &HashSet<i64>) {
-        self.keep_reached(|what| !matches!(what, Reached::Page(id) if !read.contains(id)));
+        self.keep_reached(|_, what| !matches!(what, Reached::Page(id) if !read.contains(id)));
     }
 
-    /// Forgets the checks that aren't run any more.
-    pub fn keep_checks(&self, run: &HashSet<i64>) {
-        self.keep_reached(|what| !matches!(what, Reached::Check(id) if !run.contains(id)));
+    /// Forgets the checks that aren't run any more, and what a check said about a host
+    /// it's no longer about. `run` is each check that is, by its ID, with its host's.
+    pub fn keep_checks(&self, run: &HashMap<i64, String>) {
+        self.keep_reached(|host, what| match what {
+            Reached::Check(id) => run.get(id).is_some_and(|about| about == host),
+            _ => true,
+        });
     }
 
     /// A host that loses what it had is judged by what's left, and one left with
     /// nothing is neither online nor offline.
-    fn keep_reached(&self, keep: impl Fn(&Reached) -> bool) {
+    fn keep_reached(&self, keep: impl Fn(&str, &Reached) -> bool) {
         let mut state = self.state();
         let mut changed = Vec::new();
         for (id, reached) in &mut state.reached {
             let before = reached.len();
-            reached.retain(|what, _| keep(what));
+            reached.retain(|what, _| keep(id, what));
             if reached.len() != before {
                 changed.push(id.clone());
             }
@@ -360,8 +364,9 @@ mod tests {
         presence.reached("cache", Reached::Check(2), true);
 
         // Pages and checks are counted separately, so 1 here is only the page.
+        let cache = |id: i64| HashMap::from([(id, "cache".to_string())]);
         presence.keep_pages(&HashSet::from([1]));
-        presence.keep_checks(&HashSet::from([2]));
+        presence.keep_checks(&cache(2));
 
         // What was keeping it online is gone, and its page isn't answering.
         assert!(!presence.get("db").unwrap().online);
@@ -371,8 +376,16 @@ mod tests {
         presence.keep_pages(&HashSet::new());
         assert!(presence.get("db").is_none());
         presence.forget("cache");
-        presence.keep_checks(&HashSet::from([2]));
+        presence.keep_checks(&cache(2));
         assert!(presence.get("cache").is_none());
+    }
+
+    #[test]
+    fn a_check_moved_to_another_host_says_nothing_more_of_the_one_it_left() {
+        let presence = Presence::default();
+        presence.reached("db", Reached::Check(1), true);
+        presence.keep_checks(&HashMap::from([(1, "cache".to_string())]));
+        assert!(presence.get("db").is_none());
     }
 
     fn is_online(presence: &Presence, id: &str) -> bool {

@@ -3,7 +3,7 @@
 //! a built-in host. Results are saved as samples from that host, so charts and
 //! alert rules treat them like anything else.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -434,10 +434,10 @@ impl Scheduler {
                 .map(|host| (host.id.clone(), host.hostname.clone()))
                 .collect()
         });
-        let about_hosts: HashSet<i64> = checks
+        let about_hosts: HashMap<i64, String> = checks
             .iter()
             .filter(|check| check.input.enabled && agentless.contains_key(&check.input.host_id))
-            .map(|check| check.id)
+            .map(|check| (check.id, check.input.host_id.clone()))
             .collect();
         self.presence.keep_checks(&about_hosts);
 
