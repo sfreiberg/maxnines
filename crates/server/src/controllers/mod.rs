@@ -36,6 +36,7 @@ mod sessions;
 mod settings;
 mod sign_ins;
 mod silences;
+mod suggestions;
 mod template_form;
 mod templates;
 mod update_notice;
@@ -245,6 +246,7 @@ pub fn app(state: AppState) -> Router {
         .merge(compressed(metrics::routes()))
         .merge(rules::routes())
         .merge(templates::routes())
+        .merge(suggestions::routes())
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),

@@ -148,6 +148,20 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 }
 ```
 
+## Suggestions for conditions
+
+`GET /api/v1/conditions/suggestions`
+
+What the pages suggest while a condition is typed: every metric in the catalog, with
+the `series` of those that have fixed ones; the `facts` hosts report, without
+`facts.`; the `variables` conditions know, `functions` and `methods`, each with what's
+`insert`ed, a word `about` it and where it's `used_in`: `condition`, `calculation`,
+`value`, `when` or `applies_to`.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/conditions/suggestions"
+```
+
 ## Get an alert rule
 
 `GET /api/v1/alert-rules/{id}`

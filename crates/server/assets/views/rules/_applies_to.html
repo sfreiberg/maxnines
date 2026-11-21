@@ -9,7 +9,7 @@
     <input type="hidden" name="clause_kind_{{ loop.index0 }}" value="{{ clause.kind }}">
     {% endfor %}
     <label>Expression
-      <input type="text" name="applies_to" value="{{ rule.applies_to }}" spellcheck="false" placeholder='facts.os.family == "linux"'>
+      <input type="text" name="applies_to" value="{{ rule.applies_to }}" spellcheck="false" autocomplete="off" data-cel="applies_to" placeholder='facts.os.family == "linux"'>
       <small>Leave empty for every host. Facts are available as <code>facts</code>, such as <code>facts.custom.role == "web"</code>.</small>
     </label>
     <div class="actions">

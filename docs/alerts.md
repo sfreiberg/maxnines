@@ -36,7 +36,11 @@ later**, or tell only the channels chosen.
 
 A rule alerts when its **Warning when** or **Critical when** condition is true, or both.
 Each is [CEL](https://cel.dev), the same language as a config rule's `applies_to`, over
-metrics by their names in the [catalog](api-metrics.md#list-metrics):
+metrics by their names in the [catalog](api-metrics.md#list-metrics). As you type one,
+the form suggests what can come next: metrics a step at a time through their dots, the
+series in brackets of a metric that has fixed ones, such as `cpu.load['5 minutes']`,
+facts hosts report, and the names and functions conditions know. Use the arrow keys and
+Enter or Tab to pick one, and Escape to close them.
 
 | Condition | Alerts when |
 | --- | --- |

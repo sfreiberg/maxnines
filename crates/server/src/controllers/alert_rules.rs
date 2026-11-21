@@ -333,6 +333,8 @@ struct TemplateOf {
     alert: String,
     /// The fields changed from the template's values, as the form labels them.
     changed: Vec<&'static str>,
+    /// Its own metrics, for suggesting as conditions are typed.
+    local_metrics: String,
 }
 
 #[derive(Serialize)]
@@ -396,6 +398,7 @@ async fn form_page_with(
     let template = match id {
         Some(id) => match state.database.template_rule(id).await {
             Ok(Some((stored, alert, overrides, _))) => Some(TemplateOf {
+                local_metrics: super::templates::local_suggestions(&stored.template),
                 id: stored.id,
                 name: stored.template.name,
                 alert: alert.key,

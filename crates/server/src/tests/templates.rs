@@ -908,3 +908,101 @@ async fn the_api_covers_what_the_templates_pages_do() {
     .await;
     assert_eq!(status, 204);
 }
+
+#[tokio::test]
+async fn cel_fields_get_suggestions_from_the_real_catalog() {
+    let server = with_built_in_templates().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/conditions/suggestions").await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let suggestions: Value = serde_json::from_str(&page.body).unwrap();
+    let load = suggestions["metrics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metric| metric["name"] == "cpu.load")
+        .unwrap();
+    assert_eq!(
+        load["series"],
+        json!(["1 minute", "5 minutes", "15 minutes"])
+    );
+    let names = |part: &str| -> Vec<String> {
+        suggestions[part]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|each| each["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    for expected in [
+        "online",
+        "reporting",
+        "hostname",
+        "series",
+        "value",
+        "facts",
+    ] {
+        assert!(
+            names("variables").contains(&expected.to_string()),
+            "{expected}"
+        );
+    }
+    for expected in ["forecast", "duration", "kib", "mib", "gib", "tib"] {
+        assert!(
+            names("functions").contains(&expected.to_string()),
+            "{expected}"
+        );
+    }
+
+    // The API has the same, and the forms say where to use it.
+    let (status, from_api) = api(
+        &server,
+        "GET",
+        "/api/v1/conditions/suggestions",
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(from_api, suggestions);
+    let rule = rule(&server.state.database, "Disk filling up").await;
+    let form = browser
+        .get(&server, &format!("/alerts/rules/{}/edit", rule.id))
+        .await;
+    assert!(
+        form.body.contains(r#"name="warning""#) && form.body.contains(r#"data-cel="condition""#)
+    );
+    assert!(
+        form.body.contains("data-cel-local="),
+        "a template's rule knows its metrics"
+    );
+    assert!(
+        form.body
+            .contains(r#"<script src="/assets/js/cel_complete.js""#)
+    );
+
+    let postgres = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
+    let template = crate::templates::load(postgres, &json!({})).unwrap();
+    let id = server
+        .state
+        .database
+        .create_template(&template, postgres, crate::times::now())
+        .await
+        .unwrap();
+    let form = browser.get(&server, &format!("/templates/{id}/edit")).await;
+    let start = form.body.find("data-cel-local=\"").unwrap() + "data-cel-local=\"".len();
+    let end = start + form.body[start..].find('"').unwrap();
+    let local: Value =
+        serde_json::from_str(&form.body[start..end].replace("&quot;", "\"")).unwrap();
+    assert_eq!(local["prefix"], "postgres");
+    assert!(
+        local["metrics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["name"] == "lag")
+    );
+    assert_eq!(
+        local["discovered"],
+        json!(["version", "role", "archiving", "sees_all_sessions"])
+    );
+}

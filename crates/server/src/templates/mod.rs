@@ -197,6 +197,27 @@ fn dialect_for(target: Option<&Target>) -> Box<dyn Dialect> {
     }
 }
 
+/// What a template's discovery finds, by the names `when` uses: its SQL's columns,
+/// its registry values and its counter sets.
+pub fn discovered_names(template: &Template) -> Vec<String> {
+    let Some(discover) = &template.discover else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = discover
+        .sql
+        .as_deref()
+        .and_then(|sql| columns(dialect_for(template.target.as_ref()).as_ref(), sql).ok())
+        .unwrap_or_default();
+    names.extend(
+        discover
+            .registry
+            .iter()
+            .flat_map(|read| read.values.keys().cloned()),
+    );
+    names.extend(discover.counter_sets.keys().cloned());
+    names
+}
+
 /// The columns a template's query gives, or none if they can't be read.
 pub fn query_columns_of(
     template: &Template,

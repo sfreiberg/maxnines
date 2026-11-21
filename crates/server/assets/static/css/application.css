@@ -680,9 +680,9 @@ form.notice button { min-height: 32px; padding: 0 12px; }
 pre.error { white-space: pre-wrap; font-family: var(--mono); }
 .notice form { margin: 8px 0 0; }
 
-/* Suggestions while typing CEL */
-.cel-field { position: relative; display: block; min-width: 0; }
-.cel-suggestions { position: absolute; z-index: 30; left: 0; right: 0; max-height: 240px; margin: 4px 0 0; padding: 4px; overflow-y: auto; list-style: none; background: var(--raised); border: 1px solid var(--border-strong); border-radius: var(--radius-small); }
-.cel-suggestions li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-family: var(--mono); font-size: 13px; }
-.cel-suggestions li span { color: var(--muted); font-family: var(--font); font-size: 12px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cel-suggestions li[aria-selected="true"] { background: var(--accent-surface); color: var(--accent-ink); }
+/* Suggestions while typing CEL, like the host filter's */
+.cel-host { position: relative; }
+.cel-suggestions { position: absolute; z-index: 10; right: 0; left: 0; max-height: 320px; margin: 0; padding: 4px; overflow-y: auto; border: 1px solid var(--border-strong); border-radius: var(--radius-small); background: var(--surface); list-style: none; font-weight: 400; }
+.cel-suggestions li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 12px; padding: 8px 10px; border-radius: 7px; font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere; cursor: pointer; }
+.cel-suggestions li span { color: var(--muted); font-family: var(--font); font-size: 12px; }
+.cel-suggestions li.active, .cel-suggestions li:hover { background: var(--accent-surface); color: var(--accent-ink); }

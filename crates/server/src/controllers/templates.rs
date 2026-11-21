@@ -378,7 +378,7 @@ struct LocalSuggestion {
     labels: Vec<String>,
 }
 
-fn local_suggestions(template: &Template) -> String {
+pub(super) fn local_suggestions(template: &Template) -> String {
     let local = local_metrics(template);
     let metrics: Vec<LocalSuggestion> = local
         .metrics
@@ -389,7 +389,12 @@ fn local_suggestions(template: &Template) -> String {
             labels: metric.labels.clone(),
         })
         .collect();
-    json!({ "prefix": local.prefix, "metrics": metrics }).to_string()
+    json!({
+        "prefix": local.prefix,
+        "metrics": metrics,
+        "discovered": crate::templates::discovered_names(template),
+    })
+    .to_string()
 }
 
 async fn form_page(

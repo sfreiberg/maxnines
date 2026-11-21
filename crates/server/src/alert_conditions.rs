@@ -684,7 +684,7 @@ static BASE: LazyLock<CelContext<'static, 'static>> = LazyLock::new(|| {
 });
 
 /// Whether CEL, or what's added here, has a function by this name, called either way.
-fn is_function(name: &str) -> bool {
+pub fn is_function(name: &str) -> bool {
     let null = IdedExpr {
         id: 0,
         expr: Expr::Literal(LiteralValue::Null),
