@@ -69,8 +69,6 @@ from everything, and alongside names to keep they take away from those:
 !promhttp_*
 ```
 
-An agent older than this doesn't know the `!`, and turns down a rule that uses it.
-
 ## Alerting
 
 Two more metrics are there to alert on, and aren't charted:

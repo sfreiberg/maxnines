@@ -89,7 +89,7 @@ erDiagram
         timestamp decided_at
         timestamp refused_at "while its agent is refused for its protocol, since when"
         text refused_reason "what its agent was told"
-        int refused_protocol "the protocol its agent speaks, 0 from before protocol versions"
+        int refused_protocol "the protocol its agent speaks"
     }
     metrics_pages {
         int id PK

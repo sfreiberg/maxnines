@@ -37,12 +37,6 @@ use serde_json::Value;
 /// agent off, and [`OLDEST_SUPPORTED_PROTOCOL`] moves up by one each release.
 /// An agent older than that is refused with a message saying to upgrade it, and
 /// one newer than the server with a message saying to upgrade the server first.
-///
-/// Version 1 is the protocol as it was when versions began, and the release's grace
-/// starts from it. An agent from before then sends none, which reads as 0, and is
-/// refused: those agents speak an older protocol than version 1, as durations were
-/// renamed to `_secs` when versions began, so they have to be upgraded along with
-/// the first server that has protocol versions.
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The oldest version of the protocol a server takes from its agents. See
@@ -1163,13 +1157,9 @@ pub enum AgentMessage {
         /// Enrollment token, for automatic approval rules.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
-        /// The [`PROTOCOL_VERSION`] the agent speaks. An agent from before protocol
-        /// versions sends none, which reads as 0.
-        #[serde(default)]
+        /// The [`PROTOCOL_VERSION`] the agent speaks.
         protocol: u32,
-        /// The agent's own version, as [`BuildInfo::version`], which an agent from
-        /// before protocol versions doesn't send either.
-        #[serde(default)]
+        /// The agent's own version, as [`BuildInfo::version`].
         agent_version: String,
     },
     Sample(Sample),
@@ -1208,12 +1198,8 @@ pub enum AgentMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// The first message on every connection, with the versions of the protocol the
-    /// server takes. A server from before protocol versions doesn't say them.
-    Challenge {
-        nonce: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        protocols: Option<Protocols>,
-    },
+    /// server takes.
+    Challenge { nonce: String, protocols: Protocols },
     /// The handshake result. The server closes the connection unless approved.
     Registration { status: RegistrationStatus },
     /// The other handshake result: the server won't take this agent until one of the
@@ -1789,25 +1775,6 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_from_before_protocol_versions_reads_as_protocol_0() {
-        let hello: AgentMessage = serde_json::from_value(json!({
-            "type": "hello", "hostname": "web-1", "public_key": "ab", "signature": "cd",
-        }))
-        .unwrap();
-        let AgentMessage::Hello {
-            protocol,
-            agent_version,
-            ..
-        } = hello
-        else {
-            panic!("{hello:?}");
-        };
-        assert_eq!(protocol, 0);
-        assert_eq!(agent_version, "");
-        assert_eq!(Protocols::SUPPORTED.fit(protocol), ProtocolFit::TooOld);
-    }
-
-    #[test]
     fn a_hello_and_challenge_carry_the_protocol() {
         let hello = AgentMessage::Hello {
             hostname: "web-1".to_string(),
@@ -1826,29 +1793,14 @@ mod tests {
         );
         let challenge = ServerMessage::Challenge {
             nonce: "n".to_string(),
-            protocols: Some(Protocols {
+            protocols: Protocols {
                 oldest: 1,
                 newest: 2,
-            }),
+            },
         };
         assert_eq!(
             serde_json::to_value(&challenge).unwrap(),
             json!({ "type": "challenge", "nonce": "n", "protocols": { "oldest": 1, "newest": 2 } })
-        );
-    }
-
-    /// A newer agent can still tell what an older server says, and that it didn't
-    /// say which protocols it takes.
-    #[test]
-    fn a_challenge_from_before_protocol_versions_says_none() {
-        let challenge: ServerMessage =
-            serde_json::from_value(json!({ "type": "challenge", "nonce": "n" })).unwrap();
-        assert_eq!(
-            challenge,
-            ServerMessage::Challenge {
-                nonce: "n".to_string(),
-                protocols: None,
-            }
         );
     }
 
@@ -2030,7 +1982,7 @@ mod tests {
         let messages = [
             ServerMessage::Challenge {
                 nonce: "ab".to_string(),
-                protocols: Some(Protocols::SUPPORTED),
+                protocols: Protocols::SUPPORTED,
             },
             ServerMessage::Registration {
                 status: RegistrationStatus::Pending,

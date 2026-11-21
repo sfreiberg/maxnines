@@ -142,8 +142,7 @@ pub struct Refusal {
     pub refused_at: Option<Timestamp>,
     /// What the agent was told, which names the side to upgrade.
     pub refused_reason: Option<String>,
-    /// The version of the protocol it speaks, which is 0 for an agent from before
-    /// protocol versions.
+    /// The version of the protocol it speaks.
     pub refused_protocol: Option<u32>,
 }
 

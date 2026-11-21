@@ -49,11 +49,6 @@ const CONFIG_QUEUE_SIZE: usize = 8;
 /// refused together don't all come back together.
 const REFUSED_WAIT: Duration = Duration::from_secs(600);
 
-/// Said when a server that didn't say which protocol versions it takes answers in a
-/// way this agent doesn't expect, as one from before protocol versions would.
-const OLD_SERVER: &str = "the server didn't say which protocol versions it takes, so it may be \
-                          from before protocol versions and need upgrading";
-
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// How often to report facts until the server says otherwise.
@@ -562,14 +557,11 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
         bail!("expected a challenge from the server");
     };
     // The server says whether it takes this agent's, after the hello.
-    match protocols {
-        Some(protocols) => debug!(
-            oldest = protocols.oldest,
-            newest = protocols.newest,
-            "the server takes these protocol versions"
-        ),
-        None => debug!("the server didn't say which protocol versions it takes"),
-    }
+    debug!(
+        oldest = protocols.oldest,
+        newest = protocols.newest,
+        "the server takes these protocol versions"
+    );
 
     let hello = AgentMessage::Hello {
         hostname: connection.hostname.clone(),
@@ -583,16 +575,7 @@ async fn authenticate(socket: &mut Socket, connection: &Connection) -> Result<()
         .send(Message::text(serde_json::to_string(&hello)?))
         .await?;
 
-    let answer = registration(socket, connection).await;
-    // A server from before protocol versions says none, and can't be told apart
-    // from one that's broken except by what it does next.
-    match answer {
-        Err(error) if protocols.is_none() => match error.downcast::<Refused>() {
-            Ok(Refused(reason)) => Err(Refused(format!("{reason} ({OLD_SERVER}.)")).into()),
-            Err(error) => Err(error.context(OLD_SERVER)),
-        },
-        answer => answer,
-    }
+    registration(socket, connection).await
 }
 
 /// Reads how the server took the hello, returning once the agent is approved.
@@ -721,7 +704,7 @@ mod tests {
     {
         let challenge = ServerMessage::Challenge {
             nonce: "test-nonce".to_string(),
-            protocols: Some(maxnines_protocol::Protocols::SUPPORTED),
+            protocols: maxnines_protocol::Protocols::SUPPORTED,
         };
         send_to_agent(socket, &challenge).await;
 
@@ -990,14 +973,6 @@ mod tests {
             "nonce": "n",
             "protocols": maxnines_protocol::Protocols::SUPPORTED,
         });
-        session_challenged_and_answered_with(challenge, replies).await
-    }
-
-    /// As [`session_answered_with`], from a server that sends `challenge`.
-    async fn session_challenged_and_answered_with(
-        challenge: Value,
-        replies: Vec<Value>,
-    ) -> anyhow::Error {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
         let (_link, connection) = ServerLink::new(&config(&url), "web-1", identity()).unwrap();
@@ -1034,48 +1009,6 @@ mod tests {
         let error = format!("{error:#}");
         assert!(error.contains("status this agent doesn't know"), "{error}");
         assert!(error.contains("may need upgrading"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_server_that_does_not_say_its_protocols_is_one_that_may_need_upgrading() {
-        let challenge = json!({ "type": "challenge", "nonce": "n" });
-        let error = session_challenged_and_answered_with(
-            challenge.clone(),
-            vec![json!({ "type": "registration", "status": "quarantined" })],
-        )
-        .await;
-        let error = format!("{error:#}");
-        assert!(error.starts_with(OLD_SERVER), "{error}");
-
-        let error = session_challenged_and_answered_with(
-            challenge.clone(),
-            vec![
-                json!({ "type": "something_new" }),
-                json!({ "type": "ask_time", "nonce": "x" }),
-            ],
-        )
-        .await;
-        assert!(format!("{error:#}").starts_with(OLD_SERVER), "{error:#}");
-
-        let error = session_challenged_and_answered_with(
-            challenge,
-            vec![json!({ "type": "refused", "reason": "No." })],
-        )
-        .await;
-        let refused = error.downcast_ref::<Refused>().expect("a refusal");
-        assert_eq!(refused.0, format!("No. ({OLD_SERVER}.)"));
-    }
-
-    /// Approval doesn't depend on the server saying its protocols.
-    #[tokio::test]
-    async fn a_server_that_does_not_say_its_protocols_can_still_approve() {
-        let challenge = json!({ "type": "challenge", "nonce": "n" });
-        let error = session_challenged_and_answered_with(
-            challenge,
-            vec![json!({ "type": "registration", "status": "approved" })],
-        )
-        .await;
-        assert!(!format!("{error:#}").contains(OLD_SERVER), "{error:#}");
     }
 
     #[tokio::test]
@@ -1137,7 +1070,7 @@ mod tests {
         let mut socket = accept_async(stream).await.unwrap();
         let challenge = ServerMessage::Challenge {
             nonce: "n".to_string(),
-            protocols: Some(maxnines_protocol::Protocols::SUPPORTED),
+            protocols: maxnines_protocol::Protocols::SUPPORTED,
         };
         send_to_agent(&mut socket, &challenge).await;
         socket.next().await.unwrap().unwrap();

@@ -58,9 +58,8 @@ reached, and sent when it's back.
   so it shouldn't be readable by others either, unless those come from the
   environment.
 - **Upgrade the server first.** Agents a release behind keep working with a newer
-  server, but a newer agent may need things an older server doesn't have. Agents from
-  before protocol versions are the exception, and have to be upgraded along with the
-  server. See [Upgrading](#upgrading).
+  server, but a newer agent may need things an older server doesn't have. See
+  [Upgrading](#upgrading).
 - **macOS and downloads:** a file that came through a browser or AirDrop is blocked
   until you run `xattr -d com.apple.quarantine maxnines-agent`.
 - **Other commands:** `./maxnines-agent facts` prints what it reports about the
@@ -234,8 +233,7 @@ warns at 5 seconds and is critical at 30. The reading is dated by the server, as
 host's clock is the one in question. It compares with the server's clock, so the
 server's own has to be right.
 
-Nothing needs turning on, and the agent needs no access to a time server. An agent
-from before this was added doesn't answer, so its host has no reading.
+Nothing needs turning on, and the agent needs no access to a time server.
 
 ## Processes and logins
 
@@ -412,8 +410,8 @@ The helper keeps what `disk_space` saw last time in `/var/lib/maxnines-agent-hel
 
 The agent's own folder, `state_dir`, has to belong to the user it becomes. A new one
 is made that way. If one is already there and belongs to someone else, such as root
-from an agent that used to stay root, the agent says so and doesn't start, with the
-`chown` command that hands it over.
+after the agent ran as root, the agent says so and doesn't start, with the `chown`
+command that hands it over.
 
 Two settings in the agent's config change this: `run_as = "someone"` chooses who it
 becomes, and `privileged_helper = false` gives up root without keeping a helper.
@@ -450,8 +448,7 @@ else:
 
 - **The server's own version, or the one before.** The agent works as usual. When the
   protocol's version goes up, a server keeps taking the version before its own for one
-  release, so agents carry on while you upgrade them. Versions began at protocol 1, so
-  this holds from there on.
+  release, so agents carry on while you upgrade them.
 - **Older than that.** The server refuses the agent with a message that names the
   agent's version, the versions the server takes, and the version to upgrade the
   agent to. The agent logs it and tries again after 5 to 10 minutes. The host shows
@@ -460,14 +457,6 @@ else:
 - **Newer than the server.** The agent is refused the same way, and the host shows
   **Server needs upgrading**. Upgrade the server, and the agent connects on its next
   try.
-
-Agents from before protocol versions don't say which version they speak, and the
-server refuses them, as they speak an older protocol than version 1. Upgrade them
-along with the first server that has protocol versions. They don't know what being
-refused means, so they don't log the server's message: they log that its answer was
-invalid, or that it closed the connection, and try again as they do while it's
-unreachable, as often as every 30 seconds. Their hosts still show **Agent needs
-upgrading**, with the server's message on their pages.
 
 Most releases don't change the protocol's version, as adding something doesn't. An
 agent given a kind of [check](checks.md) it doesn't know reports that check as down,

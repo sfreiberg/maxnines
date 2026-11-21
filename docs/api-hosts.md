@@ -12,7 +12,7 @@ The server refuses an agent that speaks a version of the protocol it doesn't tak
 described under [upgrading](agents.md#upgrading). While it does, the host's `health` is
 `offline`, `needs_upgrading` says what to upgrade first, `agent` or `server`,
 `refused_reason` is what the agent was told, `refused_at` is when that began, and
-`refused_protocol` is the protocol the agent speaks, `0` from before protocol versions.
+`refused_protocol` is the protocol the agent speaks.
 Otherwise all four are `null`, as they always are for a host with no agent or a revoked
 one. The agent's own version is in its [facts](#get-a-hosts-facts), as `agent.version`.
 
@@ -64,8 +64,8 @@ fields shown:
   "hostname": "db-1",
   "state": "approved",
   "refused_at": "2026-11-20T18:02:11.408Z",
-  "refused_reason": "This agent (from before protocol versions) is too old for this server (version 0.1.0), which takes agent protocol 1. Upgrade the agent to 0.1.0.",
-  "refused_protocol": 0,
+  "refused_reason": "This agent (version 0.1.0, protocol 1) is too old for this server (version 0.3.0), which takes agent protocols 2 to 3. Upgrade the agent to 0.3.0.",
+  "refused_protocol": 1,
   "online": false,
   "health": "offline",
   "needs_upgrading": "agent"

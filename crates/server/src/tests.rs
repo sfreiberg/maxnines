@@ -444,26 +444,13 @@ async fn is_closed(client: &mut Client) -> bool {
 
 // ---- registration
 
-/// Answers the challenge as an agent speaking `protocol`, or as one from before
-/// protocol versions that says nothing of it, and gives the server's answer.
-async fn hello_speaking(
-    client: &mut Client,
-    host: &Identity,
-    protocol: Option<u32>,
-) -> ServerMessage {
+/// Answers the challenge as an agent speaking `protocol`, and gives the server's
+/// answer.
+async fn hello_speaking(client: &mut Client, host: &Identity, protocol: u32) -> ServerMessage {
     let nonce = read_nonce(client).await;
     let signature = host.sign(AUDIENCE, &nonce);
     let mut said = serde_json::to_value(hello(host, "web-1", signature, None)).unwrap();
-    let fields = said.as_object_mut().unwrap();
-    match protocol {
-        Some(protocol) => {
-            fields.insert("protocol".to_string(), json!(protocol));
-        }
-        None => {
-            fields.remove("protocol");
-            fields.remove("agent_version");
-        }
-    }
+    said["protocol"] = json!(protocol);
     client.send(Message::text(said.to_string())).await.unwrap();
     read_server_message(client).await
 }
@@ -483,7 +470,7 @@ async fn the_challenge_says_which_protocols_the_server_takes() {
     let ServerMessage::Challenge { protocols, .. } = read_server_message(&mut client).await else {
         panic!("expected a challenge");
     };
-    assert_eq!(protocols, Some(maxnines_protocol::Protocols::SUPPORTED));
+    assert_eq!(protocols, maxnines_protocol::Protocols::SUPPORTED);
 }
 
 /// The host as the API gives it.
@@ -493,7 +480,7 @@ async fn host_from_api(server: &TestServer, id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn an_agent_from_before_protocol_versions_is_refused_saying_to_upgrade_it() {
+async fn an_approved_agent_too_old_for_the_server_is_refused_saying_to_upgrade_it() {
     let server = start().await;
     let host = identity();
     let id = host.id();
@@ -501,9 +488,9 @@ async fn an_agent_from_before_protocol_versions_is_refused_saying_to_upgrade_it(
     server.wait_for_online(&id, false).await;
 
     let mut client = server.connect().await;
-    let reason = reason(hello_speaking(&mut client, &host, None).await);
+    let reason = reason(hello_speaking(&mut client, &host, 0).await);
 
-    assert!(reason.contains("from before protocol versions"), "{reason}");
+    assert!(reason.contains("too old"), "{reason}");
     assert!(reason.contains("Upgrade the agent"), "{reason}");
     assert!(is_closed(&mut client).await);
     assert!(!server.state.presence.get(&id).unwrap().online);
@@ -552,7 +539,7 @@ async fn an_upgraded_agent_is_no_longer_refused() {
     let host = identity();
     let id = host.id();
     let mut client = server.connect().await;
-    reason(hello_speaking(&mut client, &host, Some(0)).await);
+    reason(hello_speaking(&mut client, &host, 0).await);
     assert_eq!(
         server
             .state
@@ -589,12 +576,12 @@ async fn a_refusal_is_kept_from_when_it_began_while_its_reason_stays_the_same() 
     let host = identity();
     let id = host.id();
     let mut client = server.connect().await;
-    let first_reason = reason(hello_speaking(&mut client, &host, Some(0)).await);
+    let first_reason = reason(hello_speaking(&mut client, &host, 0).await);
     let first = refusal_of(&server, &id).await;
     assert_eq!(first.refused_reason.as_deref(), Some(first_reason.as_str()));
 
     let mut client = server.connect().await;
-    reason(hello_speaking(&mut client, &host, Some(0)).await);
+    reason(hello_speaking(&mut client, &host, 0).await);
     assert_eq!(refusal_of(&server, &id).await, first);
     let registry = &server.state.registry;
     assert!(!registry.refused(&id, 0, &first_reason).await.unwrap());
@@ -602,7 +589,7 @@ async fn a_refusal_is_kept_from_when_it_began_while_its_reason_stays_the_same() 
     // A different reason is a new refusal.
     let newer = maxnines_protocol::PROTOCOL_VERSION + 1;
     let mut client = server.connect().await;
-    let reason = reason(hello_speaking(&mut client, &host, Some(newer)).await);
+    let reason = reason(hello_speaking(&mut client, &host, newer).await);
     let now = refusal_of(&server, &id).await;
     assert_eq!(now.refused_reason.as_deref(), Some(reason.as_str()));
     assert_eq!(now.refused_protocol, Some(newer));
@@ -620,7 +607,7 @@ async fn a_refusal_is_not_kept_for_an_agent_trying_too_often() {
     while server.state.presence.allow_connection(&id) {}
 
     let mut client = server.connect().await;
-    let reason = reason(hello_speaking(&mut client, &host, Some(0)).await);
+    let reason = reason(hello_speaking(&mut client, &host, 0).await);
 
     assert!(reason.contains("Upgrade the agent"), "{reason}");
     assert_eq!(
@@ -637,7 +624,7 @@ async fn revoking_a_host_forgets_that_its_agent_was_refused() {
     drop(server.connect_approved(&host, "web-1").await);
     server.wait_for_online(&id, false).await;
     let mut client = server.connect().await;
-    reason(hello_speaking(&mut client, &host, Some(0)).await);
+    reason(hello_speaking(&mut client, &host, 0).await);
     assert!(refusal_of(&server, &id).await.refused_at.is_some());
 
     let revoked = server
@@ -666,7 +653,7 @@ async fn a_new_agent_too_old_for_the_server_waits_for_approval_and_is_told_to_up
     let host = identity();
     let mut client = server.connect().await;
 
-    let reason = reason(hello_speaking(&mut client, &host, Some(0)).await);
+    let reason = reason(hello_speaking(&mut client, &host, 0).await);
 
     assert!(reason.contains("too old"), "{reason}");
     assert!(is_closed(&mut client).await);
@@ -690,7 +677,7 @@ async fn an_agent_newer_than_the_server_is_told_to_upgrade_the_server_first() {
 
     let mut client = server.connect().await;
     let newer = maxnines_protocol::PROTOCOL_VERSION + 1;
-    let reason = reason(hello_speaking(&mut client, &host, Some(newer)).await);
+    let reason = reason(hello_speaking(&mut client, &host, newer).await);
 
     assert!(reason.contains(&format!("protocol {newer}")), "{reason}");
     assert!(reason.contains("Upgrade the server first"), "{reason}");
@@ -718,7 +705,7 @@ async fn a_revoked_agent_is_only_told_it_is_rejected_whatever_it_speaks() {
         .unwrap();
 
     let mut client = server.connect().await;
-    let answer = hello_speaking(&mut client, &host, None).await;
+    let answer = hello_speaking(&mut client, &host, 0).await;
 
     assert_eq!(
         answer,

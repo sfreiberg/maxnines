@@ -178,7 +178,7 @@ async fn authenticate(
     let nonce = auth::new_nonce()?;
     let challenge = ServerMessage::Challenge {
         nonce: nonce.clone(),
-        protocols: Some(Protocols::SUPPORTED),
+        protocols: Protocols::SUPPORTED,
     };
     send(socket, &challenge).await?;
 
@@ -284,11 +284,7 @@ async fn authenticate(
 /// it.
 fn refusal(protocol: u32, agent_version: &str) -> Option<String> {
     let supported = Protocols::SUPPORTED;
-    let agent = match (agent_version, protocol) {
-        ("", 0) => "from before protocol versions".to_string(),
-        ("", protocol) => format!("protocol {protocol}"),
-        (version, protocol) => format!("version {version}, protocol {protocol}"),
-    };
+    let agent = format!("version {agent_version}, protocol {protocol}");
     let server = env!("CARGO_PKG_VERSION");
     let takes = supported.describe();
     match supported.fit(protocol) {
@@ -898,17 +894,15 @@ mod tests {
         assert_eq!(refusal(PROTOCOL_VERSION, "1.0.0"), None);
 
         let server = env!("CARGO_PKG_VERSION");
-        let old = refusal(0, "").unwrap();
+        let old = refusal(0, "0.0.1").unwrap();
         assert_eq!(
             old,
             format!(
-                "This agent (from before protocol versions) is too old for this server \
+                "This agent (version 0.0.1, protocol 0) is too old for this server \
                  (version {server}), which takes agent {}. Upgrade the agent to {server}.",
                 Protocols::SUPPORTED.describe()
             )
         );
-        let unnamed = refusal(PROTOCOL_VERSION + 1, "").unwrap();
-        assert!(unnamed.starts_with("This agent (protocol "), "{unnamed}");
         let newer = PROTOCOL_VERSION + 1;
         let new = refusal(newer, "9.0.0").unwrap();
         assert_eq!(
