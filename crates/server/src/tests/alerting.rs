@@ -8734,19 +8734,6 @@ mod server_page {
     }
 
     #[tokio::test]
-    async fn the_old_address_of_the_server_page_still_works() {
-        let server = start().await;
-        let response = server
-            .http("GET", "/settings/server", Some(&server.api_key))
-            .await;
-        assert!(response.starts_with("HTTP/1.1 308"), "{response}");
-        assert!(
-            response.to_lowercase().contains("location: /server"),
-            "{response}"
-        );
-    }
-
-    #[tokio::test]
     async fn settings_links_to_the_server_page() {
         let server = start().await;
         let page = Browser::default().get(&server, "/settings").await;

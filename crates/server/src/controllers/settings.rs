@@ -1,6 +1,6 @@
 use axum::Router;
 use axum::extract::State;
-use axum::response::{Redirect, Response};
+use axum::response::Response;
 use axum::routing::get;
 use axum_csrf::CsrfToken;
 
@@ -8,13 +8,7 @@ use super::{Page, server_error};
 use crate::app_state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/settings", get(index))
-        // Where the Server page used to be.
-        .route(
-            "/settings/server",
-            get(|| async { Redirect::permanent("/server") }),
-        )
+    Router::new().route("/settings", get(index))
 }
 
 async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
