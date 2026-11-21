@@ -638,9 +638,16 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         .iter()
         .map(|(id, facts)| Host::new(facts, id))
         .collect();
-    let rows: Vec<RuleRow> = rules
+    let compiled = match rules
         .into_iter()
         .map(CompiledRule::new)
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(compiled) => compiled,
+        Err(error) => return server_error(&error),
+    };
+    let rows: Vec<RuleRow> = compiled
+        .into_iter()
         .map(|compiled| {
             (
                 hosts.iter().filter(|host| compiled.matches(host)).count(),

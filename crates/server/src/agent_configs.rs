@@ -56,7 +56,7 @@ impl AgentConfigs {
         {
             return Ok(rules.clone());
         }
-        let rules = Arc::new(ConfigRules::new(self.database.list_rules().await?));
+        let rules = Arc::new(ConfigRules::new(self.database.list_rules().await?)?);
         *kept = Some((revision, rules.clone()));
         Ok(rules)
     }

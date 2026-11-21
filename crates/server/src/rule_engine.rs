@@ -153,21 +153,22 @@ pub fn evaluate(condition: &str, facts: &Value, host_id: &str) -> Result<bool> {
     Condition::compile(condition)?.check(&Host::new(facts, host_id))
 }
 
-/// A config rule with its condition compiled. One that doesn't compile never matches,
-/// which saving a rule doesn't allow, so it can only be one saved by an older server.
+/// A config rule with its condition compiled.
 pub struct CompiledRule {
     pub rule: ConfigRule,
-    condition: Option<Result<Condition, String>>,
+    condition: Option<Condition>,
 }
 
 impl CompiledRule {
-    pub fn new(rule: ConfigRule) -> Self {
+    pub fn new(rule: ConfigRule) -> Result<Self> {
         let condition = rule
             .rule
             .applies_to
             .as_deref()
-            .map(|text| Condition::compile(text).map_err(|error| format!("{error:#}")));
-        Self { rule, condition }
+            .map(Condition::compile)
+            .transpose()
+            .with_context(|| format!("the config rule {:?}", rule.rule.name))?;
+        Ok(Self { rule, condition })
     }
 
     /// A condition that can't be evaluated doesn't match. That's the normal case
@@ -185,12 +186,10 @@ impl CompiledRule {
                 return false;
             }
         }
-        let checked = match &self.condition {
-            None => return true,
-            Some(Ok(condition)) => condition.check(host),
-            Some(Err(error)) => Err(anyhow!("{error}")),
+        let Some(condition) = &self.condition else {
+            return true;
         };
-        match checked {
+        match condition.check(host) {
             Ok(result) => result,
             Err(error) => {
                 debug!(rule = rule.name, %error, "condition didn't match");
@@ -205,8 +204,12 @@ impl CompiledRule {
 pub struct ConfigRules(Vec<CompiledRule>);
 
 impl ConfigRules {
-    pub fn new(rules: impl IntoIterator<Item = ConfigRule>) -> Self {
-        Self(rules.into_iter().map(CompiledRule::new).collect())
+    pub fn new(rules: impl IntoIterator<Item = ConfigRule>) -> Result<Self> {
+        rules
+            .into_iter()
+            .map(CompiledRule::new)
+            .collect::<Result<_>>()
+            .map(Self)
     }
 
     /// Works out the config for one agent.
@@ -238,7 +241,7 @@ impl ConfigRules {
 /// tests.
 #[cfg(test)]
 pub fn resolve(rules: &[ConfigRule], facts: &Value, host_id: &str) -> Result<ResolvedConfig> {
-    ConfigRules::new(rules.iter().cloned()).resolve(&Host::new(facts, host_id))
+    ConfigRules::new(rules.iter().cloned())?.resolve(&Host::new(facts, host_id))
 }
 
 fn merge(base: &mut Value, overlay: &Value) {
@@ -314,6 +317,14 @@ mod tests {
 
     fn resolve_for(rules: &[ConfigRule], facts: &Value) -> ResolvedConfig {
         resolve(rules, facts, "host-1").unwrap()
+    }
+
+    /// Saving a rule doesn't allow one, so one that's stored is a fault to report.
+    #[test]
+    fn a_stored_condition_that_does_not_compile_is_an_error() {
+        let broken = rule("Broken", Some("os.family =="), json!({}));
+        let error = resolve(&[base(), broken], &linux(), "host-1").unwrap_err();
+        assert!(format!("{error:#}").contains("\"Broken\""), "{error:#}");
     }
 
     #[test]

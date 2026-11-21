@@ -209,7 +209,7 @@ impl AppState {
         // Evaluating every agent can take a while, and a panic stays in here.
         tokio::task::spawn_blocking(move || rule_preview::preview(&rules, id, &rule, &hosts))
             .await
-            .context("working out the preview")
+            .context("working out the preview")?
     }
 
     /// Everything that has to be true for an alert rule to be saved, giving its
