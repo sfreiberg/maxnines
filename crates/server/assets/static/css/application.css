@@ -223,6 +223,8 @@ button.danger:hover { border-color: var(--bad); background: var(--bad-surface); 
 
 /* Tables */
 .tablebox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; }
+/* A table inside a card scrolls on its own when it's wider than a phone, rather than widening the page. */
+.table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 12px 18px; text-align: left; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }

@@ -110,7 +110,7 @@
   </form>
   {% endif %}
   {% if events %}
-  <table class="event-list">
+  <div class="table-scroll"><table class="event-list">
     <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Added by</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
     <tbody>
       {% for event in events %}
@@ -132,7 +132,7 @@
       </tr>
       {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
   <p class="empty">Nothing in this range.</p>
   {% endif %}

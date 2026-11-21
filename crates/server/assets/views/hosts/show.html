@@ -109,7 +109,7 @@
     {% if can_edit %}<a class="button secondary" href="/hosts/{{ host.id }}/pages/new">Add page</a>{% endif %}
   </div>
   {% if pages %}
-  <table>
+  <div class="table-scroll"><table>
     <thead>
     <tr><th>Page</th><th>Read</th><th>Signs in</th><th>Status</th><th></th></tr>
     </thead>
@@ -134,7 +134,7 @@
     </tr>
     {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
   <p class="empty">Nothing is read for this host yet. Add an OpenMetrics page, and the server will read it and chart what it says.</p>
   {% endif %}
@@ -147,7 +147,7 @@
     {% if can_edit %}<a class="button secondary" href="/checks/new?host={{ host.id }}">Add check</a>{% endif %}
   </div>
   {% if checks %}
-  <table>
+  <div class="table-scroll"><table>
     <thead>
     <tr><th>Check</th><th>Run</th><th>Status</th></tr>
     </thead>
@@ -160,7 +160,7 @@
     </tr>
     {% endfor %}
     </tbody>
-  </table>
+  </table></div>
   {% else %}
   <p class="empty">No checks are about this host yet. A check tries reaching it, as a website, a port, a certificate, a name or a ping.</p>
   {% endif %}
