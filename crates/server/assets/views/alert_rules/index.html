@@ -1,0 +1,29 @@
+{% extends "layouts/application.html" %}
+{% block title %}Alert rules · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
+<div class="title-row">
+  <h1>Alert rules</h1>
+  {% if can_edit %}<div class="actions"><a class="button" href="/alerts/rules/new">Add rule</a></div>{% endif %}
+</div>
+{% if rules %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th>Name</th><th>Alerts when</th><th>Applies to</th><th>Notifies</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for rule in rules %}
+    <tr{% if not rule.enabled %} class="disabled"{% endif %}>
+      <td><a href="/alerts/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
+      <td>{% for condition in rule.conditions %}<div class="condition">{% if condition.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %} <code>{{ condition.text }}</code></div>{% endfor %}{% if rule.watches %}<div class="hint">{{ rule.watches }}</div>{% endif %}</td>
+      <td>{{ rule.applies_to }}</td>
+      <td>{% if rule.channels %}{{ rule.channels }}{% else %}<span class="hint">Only this site</span>{% endif %}</td>
+      <td>{% if not rule.enabled %}<span class="badge neutral">Disabled</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">There are no alert rules, so nothing will alert.</p>
+{% endif %}
+{% endblock content %}

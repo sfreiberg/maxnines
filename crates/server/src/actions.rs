@@ -1,0 +1,509 @@
+//! Actions: asking a host's agent to run something, for an alert or for a person,
+//! and keeping what it printed.
+//!
+//! The server only names an action and passes a few values from the alert. What
+//! runs is built into the agent or written in its own config, and each agent says
+//! which actions it has in its facts, so nothing is asked of a host that lacks it.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
+
+use anyhow::{Result, ensure};
+use chrono::TimeDelta;
+use maxnines_protocol::ServerMessage;
+use maxnines_protocol::actions::{
+    ActionOutcome, ActionResult, DEFAULT_ACTION_TIMEOUT, MAX_ACTION_TIMEOUT, check_variable,
+    is_action_name,
+};
+use maxnines_protocol::time::{optional_seconds, seconds};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::alert_conditions::Conditions;
+use crate::alerting::{Alert, AlertRule, AlertRuleInput, Severity};
+use crate::metrics::{Metric, Source};
+use crate::models::Database;
+use crate::times::Timestamp;
+
+/// How many actions one rule can run.
+pub const MAX_RULE_ACTIONS: usize = 8;
+
+/// How many requests can wait for one agent's connection to take them.
+const REQUEST_QUEUE_SIZE: usize = 16;
+
+/// How long past its time limit an action's answer is waited for, which covers
+/// waiting its turn on the agent and the trip back.
+const ANSWER_GRACE: TimeDelta = TimeDelta::minutes(1);
+
+/// Who asked for a run that a person started.
+pub const RUN_BY_HAND: &str = "manual";
+
+/// When in an alert's life a rule's action runs. Each runs once per alert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOn {
+    /// When the alert starts, whatever it starts at.
+    First,
+    /// The first time the alert is a warning.
+    Warning,
+    /// The first time the alert is critical, whether it starts there or gets there.
+    Critical,
+}
+
+impl RunOn {
+    pub const ALL: [Self; 3] = [Self::First, Self::Warning, Self::Critical];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::Warning => "warning",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|run_on| run_on.as_str() == text)
+    }
+
+    /// Whether this is the moment, for an alert that just started or changed to
+    /// `severity`.
+    fn is_due(self, started: bool, severity: Severity) -> bool {
+        match self {
+            Self::First => started,
+            Self::Warning => severity == Severity::Warning,
+            Self::Critical => severity == Severity::Critical,
+        }
+    }
+}
+
+fn first() -> RunOn {
+    RunOn::First
+}
+
+/// One action an alert rule runs on the alert's host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleAction {
+    /// The action's name, as agents report it.
+    pub action: String,
+    #[serde(default = "first")]
+    pub run_on: RunOn,
+    /// How long it gets. 30 seconds if left out.
+    #[serde(
+        default,
+        rename = "timeout_secs",
+        with = "optional_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub timeout: Option<Duration>,
+}
+
+impl RuleAction {
+    pub fn timeout(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_ACTION_TIMEOUT)
+    }
+}
+
+pub fn check_timeout(timeout: Duration) -> Result<()> {
+    ensure!(
+        (Duration::from_secs(1)..=MAX_ACTION_TIMEOUT).contains(&timeout),
+        "an action's time limit has to be from 1 to {} seconds",
+        MAX_ACTION_TIMEOUT.as_secs()
+    );
+    Ok(())
+}
+
+/// Checks a rule's actions by themselves. Whether any host has them, and whether
+/// the rule's alerts can give them what they need, is [`check_against_hosts`].
+pub fn check_rule_actions(rule: &AlertRuleInput) -> Result<()> {
+    let actions = &rule.actions;
+    if actions.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        !rule.is_calculation(),
+        "a rule with a calculation can't run actions, as they run on the alert's host"
+    );
+    ensure!(
+        actions.len() <= MAX_RULE_ACTIONS,
+        "a rule can run at most {MAX_RULE_ACTIONS} actions"
+    );
+    for (index, wanted) in actions.iter().enumerate() {
+        let name = &wanted.action;
+        ensure!(is_action_name(name), "{name:?} isn't an action's name");
+        check_timeout(wanted.timeout())?;
+        let again = actions[..index]
+            .iter()
+            .any(|other| other.action == *name && other.run_on == wanted.run_on);
+        ensure!(
+            !again,
+            "the action {name:?} is listed twice for the same moment"
+        );
+    }
+    Ok(())
+}
+
+/// What each action needs to be given, by name, across every host that has it.
+pub type KnownActions = BTreeMap<String, Vec<String>>;
+
+/// Checks a rule's actions against what hosts report: each has to exist on some
+/// host, and need nothing this rule's alerts can't give.
+pub fn check_against_hosts(
+    rule: &AlertRuleInput,
+    conditions: &Conditions,
+    known: &KnownActions,
+) -> Result<()> {
+    let given = rule_variables(rule, conditions);
+    for wanted in &rule.actions {
+        let name = &wanted.action;
+        let Some(needed) = known.get(name) else {
+            anyhow::bail!("no host has an action called {name:?}");
+        };
+        for variable in needed {
+            ensure!(
+                given.contains(&variable.as_str()),
+                "the action {name:?} needs {{{variable}}}, which this rule's alerts don't have"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What a metric's series are, as an action's variable, where they're one of the
+/// kinds actions know about.
+pub fn series_variable(metric: &Metric) -> Option<&'static str> {
+    if matches!(metric.source, Source::Fields(_)) {
+        return None;
+    }
+    match (metric.name, metric.collector) {
+        // Only these two are named by where the disk is mounted.
+        ("disk.usage" | "disk.inodes", _) => Some("disk"),
+        (_, "network") => Some("interface"),
+        (_, "containers") => Some("container"),
+        (_, "checks") => Some("check"),
+        (_, "processes" | "top_processes") => Some("process"),
+        _ => None,
+    }
+}
+
+/// Which variables an alert from this rule can give an action.
+pub fn rule_variables(rule: &AlertRuleInput, conditions: &Conditions) -> Vec<&'static str> {
+    let mut given = vec!["hostname", "rule", "severity", "value"];
+    if rule.watched(conditions).is_some() {
+        given.push("metric");
+    }
+    // Only a rule worked out for each disk or such has alerts about a series.
+    if let Some(each) = conditions.fanned_out().first().map(|used| used.metric) {
+        given.push("series");
+        given.extend(series_variable(each));
+    }
+    given
+}
+
+/// The values an alert gives an action. Ones without a value are left out.
+pub fn alert_variables(rule: &AlertRule, alert: &Alert) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    let mut set = |name: &str, value: String| {
+        if !value.is_empty() {
+            values.insert(name.to_string(), value);
+        }
+    };
+    set("hostname", alert.hostname.clone());
+    set("rule", alert.rule_name.clone());
+    set("severity", alert.severity.as_str().to_string());
+    if let Some(value) = alert.value {
+        set("value", value.to_string());
+    }
+    if let Some((metric, _)) = rule.watched() {
+        set("metric", metric.name.to_string());
+    }
+    // An alert about the host as a whole has no series, so it gives none, and an
+    // action that needs one is refused for it, saying so, rather than run with
+    // nothing in its place.
+    let each = rule
+        .conditions
+        .as_ref()
+        .and_then(|conditions| conditions.fanned_out().first().map(|used| used.metric));
+    if let Some(each) = each {
+        let series = alert.series.clone().unwrap_or_default();
+        set("series", series.clone());
+        if let Some(kind) = series_variable(each) {
+            set(kind, series);
+        }
+    }
+    values
+}
+
+/// One time an action was asked for, and how it went once that's known.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActionRun {
+    pub id: i64,
+    pub host_id: String,
+    /// The alert it ran for, if it wasn't started by a person.
+    pub alert_id: Option<i64>,
+    pub action: String,
+    /// `first`, `warning` or `critical` for an alert's, and `manual` for a person's.
+    pub run_on: String,
+    /// What it was given.
+    pub variables: BTreeMap<String, String>,
+    /// Who asked, for one a person started.
+    pub requested_by: Option<String>,
+    pub requested_at: Timestamp,
+    #[serde(rename = "timeout_secs", serialize_with = "seconds::serialize")]
+    pub timeout: Duration,
+    /// Empty until the agent answers or is given up on.
+    pub outcome: Option<ActionOutcome>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub output: String,
+    pub truncated: bool,
+    /// How long it took, as the agent timed it.
+    #[serde(
+        rename = "duration_secs",
+        serialize_with = "crate::times::optional_fractional_seconds::serialize"
+    )]
+    pub duration: Option<Duration>,
+    pub finished_at: Option<Timestamp>,
+}
+
+/// What's needed to ask for an action.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRun {
+    pub host_id: String,
+    pub alert_id: Option<i64>,
+    pub action: String,
+    pub run_on: String,
+    pub variables: BTreeMap<String, String>,
+    pub requested_by: Option<String>,
+    pub requested_at: Timestamp,
+    pub timeout: Duration,
+}
+
+/// How a run ended.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Finished {
+    pub outcome: ActionOutcome,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub output: String,
+    pub truncated: bool,
+    pub duration: Option<Duration>,
+}
+
+impl Finished {
+    /// For one the agent was never asked to run, or never answered.
+    fn without_running(outcome: ActionOutcome, error: impl Into<String>) -> Self {
+        Self {
+            outcome,
+            exit_code: None,
+            error: Some(error.into()),
+            output: String::new(),
+            truncated: false,
+            duration: None,
+        }
+    }
+}
+
+/// An agent's connection, as far as asking it for actions goes.
+struct Link {
+    connection: u64,
+    requests: mpsc::Sender<String>,
+}
+
+/// Asks connected agents to run actions, and records how each went.
+pub struct Actions {
+    database: Database,
+    links: Mutex<HashMap<String, Link>>,
+    connections: AtomicU64,
+}
+
+impl Actions {
+    pub fn new(database: Database) -> Arc<Self> {
+        Arc::new(Self {
+            database,
+            links: Mutex::default(),
+            connections: AtomicU64::new(0),
+        })
+    }
+
+    /// A panic elsewhere while it was held leaves nothing half done, so it carries on,
+    /// as a connection ending has to be forgotten.
+    fn links(&self) -> MutexGuard<'_, HashMap<String, Link>> {
+        self.links.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Called when an agent connects. Gives what to send it, and a number to
+    /// hand back when the connection ends.
+    pub fn connected(&self, host_id: &str) -> (u64, mpsc::Receiver<String>) {
+        let connection = self.connections.fetch_add(1, Ordering::Relaxed) + 1;
+        let (requests, receiver) = mpsc::channel(REQUEST_QUEUE_SIZE);
+        let link = Link {
+            connection,
+            requests,
+        };
+        self.links().insert(host_id.to_string(), link);
+        (connection, receiver)
+    }
+
+    /// Ignored if the agent has already reconnected on a newer connection.
+    pub fn disconnected(&self, host_id: &str, connection: u64) {
+        let mut links = self.links();
+        if links
+            .get(host_id)
+            .is_some_and(|link| link.connection == connection)
+        {
+            links.remove(host_id);
+        }
+    }
+
+    /// Records a run and asks the host's agent for it. Always leaves a record:
+    /// one that can't be asked for is finished at once, saying why.
+    pub async fn run(&self, mut new: NewRun) -> Result<i64> {
+        let available = self.database.host_actions(&new.host_id).await?;
+        let needed = available.get(&new.action);
+        // Only what it needs leaves the server.
+        if let Some(needed) = needed {
+            new.variables.retain(|name, _| needed.contains(name));
+        }
+        let id = self.database.create_action_run(&new).await?;
+
+        let refusal = match needed {
+            None => Some(Finished::without_running(
+                ActionOutcome::NotDefined,
+                "this host's agent doesn't have it",
+            )),
+            Some(needed) => self.ask(id, &new, needed),
+        };
+        if let Some(finished) = refusal {
+            self.database
+                .finish_action_run(id, &new.host_id, &finished, new.requested_at)
+                .await?;
+        } else {
+            info!(
+                host_id = new.host_id,
+                action = new.action,
+                "asked for an action"
+            );
+        }
+        Ok(id)
+    }
+
+    /// Sends the request, or says why it can't be sent.
+    fn ask(&self, id: i64, new: &NewRun, needed: &[String]) -> Option<Finished> {
+        let refused = |why: String| Some(Finished::without_running(ActionOutcome::Refused, why));
+        for name in needed {
+            let Some(value) = new.variables.get(name) else {
+                return refused(format!("it needs {{{name}}}, which there's no value for"));
+            };
+            if let Err(error) = check_variable(name, value) {
+                return refused(error.to_string());
+            }
+        }
+        let message = ServerMessage::RunAction {
+            id: id.to_string(),
+            action: new.action.clone(),
+            variables: new.variables.clone(),
+            timeout: new.timeout,
+        };
+        let Ok(text) = serde_json::to_string(&message) else {
+            return refused("the request couldn't be written".to_string());
+        };
+        let links = self.links();
+        let Some(link) = links.get(&new.host_id) else {
+            return refused("the host's agent isn't connected".to_string());
+        };
+        match link.requests.try_send(text) {
+            Ok(()) => None,
+            Err(_) => refused("too many actions are waiting to be sent to this host".to_string()),
+        }
+    }
+
+    /// Records an agent's answer. One for a run that isn't waiting, or isn't that
+    /// host's, is ignored, so an agent can only answer for itself.
+    pub async fn finished(
+        &self,
+        host_id: &str,
+        result: ActionResult,
+        now: Timestamp,
+    ) -> Result<()> {
+        let Ok(id) = result.id.parse::<i64>() else {
+            warn!(host_id, "ignoring an action result with an invalid ID");
+            return Ok(());
+        };
+        let finished = Finished {
+            outcome: result.outcome,
+            exit_code: result.exit_code,
+            error: result.error,
+            output: result.output,
+            truncated: result.truncated,
+            duration: Some(result.duration),
+        };
+        let recorded = self
+            .database
+            .finish_action_run(id, host_id, &finished, now)
+            .await?;
+        if !recorded {
+            warn!(
+                host_id,
+                id, "ignoring an action result nothing is waiting for"
+            );
+        }
+        Ok(())
+    }
+
+    /// Finishes runs whose agents never answered, so nothing waits for ever.
+    pub async fn give_up_on_unanswered(&self, now: Timestamp) -> Result<()> {
+        for run in self.database.unanswered_action_runs().await? {
+            let waited_for = TimeDelta::from_std(run.timeout)
+                .ok()
+                .and_then(|timeout| timeout.checked_add(&ANSWER_GRACE));
+            if waited_for.is_none_or(|waited_for| now - run.requested_at < waited_for) {
+                continue;
+            }
+            let finished =
+                Finished::without_running(ActionOutcome::Failed, "the agent never answered");
+            self.database
+                .finish_action_run(run.id, &run.host_id, &finished, now)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Runs whichever of a rule's actions are due, for an alert that just started
+    /// or changed severity. Each runs once per alert.
+    pub async fn run_for_alert(
+        &self,
+        rule: &AlertRule,
+        alert: &Alert,
+        started: bool,
+        now: Timestamp,
+    ) -> Result<()> {
+        for wanted in &rule.rule.actions {
+            if !wanted.run_on.is_due(started, alert.severity) {
+                continue;
+            }
+            let run_on = wanted.run_on.as_str();
+            if self
+                .database
+                .has_action_run(alert.id, &wanted.action, run_on)
+                .await?
+            {
+                continue;
+            }
+            let new = NewRun {
+                host_id: alert.host_id.clone(),
+                alert_id: Some(alert.id),
+                action: wanted.action.clone(),
+                run_on: run_on.to_string(),
+                variables: alert_variables(rule, alert),
+                requested_by: None,
+                requested_at: now,
+                timeout: wanted.timeout(),
+            };
+            self.run(new).await?;
+        }
+        Ok(())
+    }
+}

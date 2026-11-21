@@ -1,0 +1,170 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit alert rule{% else %}Add alert rule{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts/rules">Alert rules</a></p>
+<h1>{% if id %}Edit alert rule{% else %}Add alert rule{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/alerts/rules/{{ id }}{% else %}/alerts/rules{% endif %}" class="stacked alert-rule">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {# Pressing Enter uses the first button in a form, so it has to be Save. #}
+  {% if can_edit %}<button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save rule</button>{% endif %}
+
+  <label>Name
+    <input type="text" name="name" value="{{ rule.name }}" required maxlength="255">
+  </label>
+
+  <fieldset>
+    <legend>Alert when</legend>
+    <label>Warning when
+      <input type="text" name="warning" value="{{ rule.warning }}" maxlength="2000" spellcheck="false" autocomplete="off" placeholder="disk.usage > 80">
+    </label>
+
+    <label>Critical when
+      <input type="text" name="critical" value="{{ rule.critical }}" maxlength="2000" spellcheck="false" autocomplete="off" placeholder="disk.usage > 90">
+      <small>Fill in either or both, in <a href="/docs/alerts#conditions">CEL</a>. With both, one alert starts as a warning and becomes critical, and only the worse of the two is sent. Use metrics by their names, <code>facts.</code>, <code>online</code>, <code>reporting</code>, <code>hostname</code> and <code>series</code>, such as:
+        <code>disk.usage &gt; 90</code>,
+        <code>series != '/boot' &amp;&amp; disk.usage &gt; 90</code>,
+        <code>cpu.load['5 minutes'] &gt; facts.cpu.logical_cores</code>,
+        <code>clock.difference &gt; duration('30s')</code>,
+        <code>process.memory &gt; gib(2)</code>,
+        <code>!online</code>,
+        <code>!reporting</code>,
+        <code>forecast(disk.usage, duration('4h')) &gt;= 100</code>.
+        A metric with a series for each disk, interface or service is checked for each one. With a calculation, use <code>value</code>, like <code>value &gt; 80</code>.</small>
+    </label>
+
+    <label>Summary
+      <input type="text" name="summary" value="{{ rule.summary }}" maxlength="1000" spellcheck="false" autocomplete="off" placeholder="{{ '{{' }} hostname }}: {{ '{{' }} series }} is {{ '{{' }} disk.usage }} full">
+    </label>
+
+    <label>Summary when it clears
+      <input type="text" name="resolved_summary" value="{{ rule.resolved_summary }}" maxlength="1000" spellcheck="false" autocomplete="off">
+      <small>What alerts say, with <code>{{ '{{' }} hostname }}</code>, <code>{{ '{{' }} series }}</code>, <code>{{ '{{' }} value }}</code> and the metrics the conditions use, like <code>{{ '{{' }} disk.usage }}</code>, written in their units. Leave empty for the rule's name and the reading.</small>
+    </label>
+
+    <label>For at least (seconds)
+      <input type="number" name="for_secs" value="{{ rule.for_secs }}" min="0" required>
+      <small>The problem has to last this long to alert. The alert resolves as soon as it's gone. A host isn't <code>reporting</code> until it's sent nothing for three of its intervals, and at least a minute.</small>
+    </label>
+
+    <label>Remind every (minutes)
+      <input type="number" name="remind_every_minutes" value="{{ rule.remind_every_minutes }}" min="5" step="any">
+      <small>Says it's still firing until someone acknowledges it, on every channel but on-call services, which repeat for themselves. Leave empty for no reminders.</small>
+    </label>
+
+    <label>Actions
+      <textarea name="actions" rows="3" spellcheck="false" placeholder="disk_space on=critical timeout=120">{{ rule.actions }}</textarea>
+      <small>Not for a calculation. What to run on the alert's host, one per line, with what it prints kept with the alert. Each runs once per alert: when it starts, or with <code>on=warning</code> or <code>on=critical</code> the first time it's that severe. It gets 30 seconds unless <code>timeout=</code> says otherwise, up to 600. {% if known_actions %}Hosts have: {% for action in known_actions %}<code>{{ action }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.{% else %}No host has reported any actions yet.{% endif %}</small>
+    </label>
+
+    <label>Looking back (seconds)
+      <input type="number" name="window_secs" value="{{ rule.window_secs }}" min="60" max="86400" placeholder="Usual">
+      <small>For a calculation, how far back it combines, so one busy moment isn't a problem: 5 minutes unless set. For <code>forecast()</code>, how much of the past its straight line is drawn through: 6 hours unless set, at least one. A forecast needs readings from half of it, so a new host waits that long.</small>
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Calculation across hosts</legend>
+    <label>Combine hosts using
+      <select name="calculation">
+        <option value=""{% if rule.calculation == "" %} selected{% endif %}>Nothing: check each host on its own</option>
+        {% for calculation in calculations %}
+        <option value="{{ calculation.value }}"{% if calculation.value == rule.calculation %} selected{% endif %}>{{ calculation.label }}</option>
+        {% endfor %}
+      </select>
+      <small>A calculation's conditions are about its <code>value</code>, such as the average CPU of every Linux host.</small>
+    </label>
+
+    <div class="calculation-fields">
+      <label>Metric
+        <select name="metric">
+          {% for metric in metrics %}
+          <option value="{{ metric.name }}"{% if metric.name == rule.metric %} selected{% endif %}>{{ metric.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+
+      <label>Watch separately
+        <select name="group_by">
+          <option value="nothing"{% if rule.group_by == "nothing" %} selected{% endif %}>Nothing, combine everything</option>
+          <option value="host"{% if rule.group_by == "host" %} selected{% endif %}>Each host</option>
+          <option value="series"{% if rule.group_by == "series" %} selected{% endif %}>Each series, such as each disk</option>
+          <option value="fact"{% if rule.group_by == "fact" %} selected{% endif %}>Each value of a fact</option>
+        </select>
+        <small>Metrics that measure several things, like memory and swap, use the first unless you watch each series.</small>
+      </label>
+
+      <label>Fact
+        <input type="text" name="fact" value="{{ rule.fact }}" maxlength="200" spellcheck="false" placeholder="os.name">
+        <small>Only for watching each value of a fact.</small>
+      </label>
+
+      <label>Hosts
+        <input type="text" name="filter" value="{{ rule.filter }}" maxlength="500" spellcheck="false" placeholder="os=linux">
+        <small>The same filter as the Hosts list. Leave empty for every host.</small>
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="applies-to">
+    <legend>Applies to</legend>
+    {% include "rules/_applies_to.html" %}
+  </fieldset>
+
+  <fieldset>
+    <legend>Notify</legend>
+    <label class="checkbox">
+      <input type="checkbox" name="all_channels"{% if rule.all_channels %} checked{% endif %}> Every channel, including ones added later
+    </label>
+    {% if channels %}
+    {% for channel in channels %}
+    <label class="checkbox">
+      <input type="checkbox" name="channel_{{ channel.id }}"{% if channel.selected %} checked{% endif %}> {{ channel.name }}
+    </label>
+    {% endfor %}
+    <small class="hint">Or choose some of them. With none chosen, alerts only show on the Alerts page.</small>
+    {% else %}
+    <p class="hint">There are no <a href="/alerts/channels">notification channels</a> yet, so alerts will only show on the Alerts page.</p>
+    {% endif %}
+  </fieldset>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if rule.enabled %} checked{% endif %}> Enabled
+  </label>
+
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save rule</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <button type="submit" name="form_action" value="replay" class="secondary" formaction="{% if id %}/alerts/rules/{{ id }}{% else %}/alerts/rules{% endif %}#replay">Try it on the last day</button>
+    <a class="button secondary" href="/alerts/rules">Cancel</a>
+  </div>
+</form>
+
+{% if replay %}
+<section id="replay" class="preview">
+  <h2>The last day</h2>
+  <p>Nothing has been saved.
+  {% if replay.tried == 0 %}Nothing stored in the last 24 hours covers this rule, so it couldn't be tried.{% elif replay.warned == 0 and replay.critical == 0 %}Over the last 24 hours, this wouldn't have alerted on any of the {{ replay.tried }} {% if rule.calculation %}lines{% else %}hosts{% endif %} it was tried on.{% else %}Over the last 24 hours, this would have warned {{ replay.warned }} {% if replay.warned == 1 %}time{% else %}times{% endif %} and gone critical {{ replay.critical }} {% if replay.critical == 1 %}time{% else %}times{% endif %}.{% endif %}</p>
+  {% if replay.alerted %}
+  <div class="tablebox"><table>
+    <thead><tr><th>{% if rule.calculation %}Line{% else %}Host{% endif %}</th><th>Warned</th><th>Critical</th></tr></thead>
+    <tbody>
+      {% for each in replay.alerted %}
+      <tr><td>{{ each.name }}</td><td>{{ each.warned }}</td><td>{{ each.critical }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  <p class="hint">Tried on each {{ replay.step_minutes }} minutes' average, so something shorter may not show.{% for note in replay.notes %} {{ note }}{% endfor %}</p>
+</section>
+{% endif %}
+
+{% if id and can_edit %}
+<form method="post" action="/alerts/rules/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

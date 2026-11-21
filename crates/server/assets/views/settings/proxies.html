@@ -1,0 +1,71 @@
+{% extends "layouts/application.html" %}
+{% block title %}Proxies · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a></p>
+<div>
+  <h1>Proxies</h1>
+  <p class="subtitle">A proxy or load balancer in front of MaxNines passes on each person's address in an <code>X-Forwarded-For</code> header. Anyone can send that header, so MaxNines only believes it from a proxy you trust. Until then, it sees every person at the proxy's address: one person's wrong passwords can lock everyone out for a minute, and the audit log can't say where anyone was.</p>
+</div>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+{% if waiting %}
+<section class="card">
+  <h2>Waiting for you to decide</h2>
+  <p class="hint">These passed on someone's address but aren't trusted, so what they said is shown as unconfirmed. Trust one only if it's a proxy you run or chose, such as your load balancer or Cloudflare.</p>
+  {% for proxy in waiting %}
+  <div class="card">
+    <h3><code>{{ proxy.address }}</code></h3>
+    <p>{{ proxy.kind }}</p>
+    {% if proxy.yours %}
+    <p><strong>Your own request just now came through it</strong>, and it said you're at <code>{{ proxy.forwarded_for }}</code>. If that's your address, this is a proxy in front of MaxNines that your requests go through.</p>
+    {% else %}
+    <p>It last said it was passing on <code>{{ proxy.forwarded_for }}</code>.</p>
+    {% endif %}
+    <p class="hint">{{ proxy.requests }} signed-in request{% if proxy.requests != 1 %}s{% endif %} by {{ proxy.people | join(sep=", ") }}, from {{ proxy.first_seen }} to {{ proxy.last_seen }}.</p>
+    <div class="actions">
+      <form method="post" action="/settings/proxies"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><input type="hidden" name="address" value="{{ proxy.suggested }}"><input type="hidden" name="trusted" value="true"><button type="submit">Trust {{ proxy.suggested_label }}</button></form>
+      {% if proxy.wider %}<form method="post" action="/settings/proxies"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><input type="hidden" name="address" value="{{ proxy.address }}"><input type="hidden" name="trusted" value="true"><button type="submit" class="secondary">Trust only {{ proxy.address }}</button></form>{% endif %}
+      <form method="post" action="/settings/proxies"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><input type="hidden" name="address" value="{{ proxy.address }}"><input type="hidden" name="trusted" value="false"><button type="submit" class="secondary">Not a proxy</button></form>
+    </div>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>Trusted</h2>
+  {% if from_config %}
+  <p class="hint">From <code>trusted_proxies</code> in the server's config: {% for network in configured %}<code>{{ network }}</code>{% if not loop.last %}, {% endif %}{% else %}none{% endfor %}.</p>
+  {% else %}
+  <p class="hint">A proxy on this machine is trusted, as <code>trusted_proxies</code> isn't set in the server's config. Setting it replaces that.</p>
+  {% endif %}
+  {% if decisions %}
+  <div class="tablebox"><table>
+    <thead><tr><th>Address</th><th>Decided</th><th>Since</th><th></th></tr></thead>
+    <tbody>
+      {% for decision in decisions %}
+      <tr>
+        <td><code>{{ decision.label }}</code></td>
+        <td>{% if decision.trusted %}Trusted{% else %}Not a proxy{% endif %}</td>
+        <td class="nowrap">{{ decision.created }}</td>
+        <td><form method="post" action="/settings/proxies/{{ decision.id }}/delete"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><button type="submit" class="danger">Delete</button></form></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Add</h2>
+  <p class="hint">An address, a range such as your load balancer's subnet <code>10.0.1.0/24</code>, or a provider's published ranges. AWS and Azure load balancers connect from addresses in your own subnet that change, so trust the subnet.</p>
+  <form method="post" action="/settings/proxies" class="host-filter">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="hidden" name="trusted" value="true">
+    <div class="host-filter-box"><input type="text" name="address" aria-label="Address or range" placeholder="10.0.1.0/24" list="providers" maxlength="64" required autocapitalize="none" spellcheck="false"></div>
+    <datalist id="providers">{% for provider in providers %}<option value="{{ provider.key }}">{{ provider.name }}</option>{% endfor %}</datalist>
+    <button type="submit">Trust</button>
+  </form>
+</section>
+{% endblock content %}

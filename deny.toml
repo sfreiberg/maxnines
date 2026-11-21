@@ -1,0 +1,9 @@
+[advisories]
+ignore = [
+    # chrono and chrono-tz are unmaintained. jiff would replace both, but
+    # sqlx, sea-orm, DuckDB, ClickHouse, arrow, cel, rustls-acme and async-imap
+    # all use chrono themselves, and none of the database libraries can read or
+    # write jiff types yet. Revisit once sqlx and sea-orm support jiff.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; no replacement our database libraries support yet" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained; goes with chrono" },
+]

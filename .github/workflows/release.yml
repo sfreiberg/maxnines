@@ -1,0 +1,505 @@
+# Builds the agent and server for every supported platform, packages them, and
+# publishes a GitHub release when a version tag is pushed.
+#
+# Every MaxNines repo releases the same way. A tag v1.2.3 is a production release,
+# and v1.2.3-alpha.N, v1.2.3-beta.N or v1.2.3-rc.N a pre-release, published as one;
+# only production releases become the latest. The tag has to match the version in
+# the workspace Cargo.toml. Each release is titled "MaxNines 1.2.3", with notes
+# from the commits, its files, and their SHA256SUMS.
+#
+# It runs only for a version tag, or by hand from the Actions tab, which runs
+# everything except publishing, to try the release machinery before a tag needs
+# it. Either way it runs the whole of CI on that commit first, and nothing is
+# pushed or published unless that passes.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # The repository's .cargo/config.toml builds here.
+  TARGET_DIR: target.nosync
+
+jobs:
+  check:
+    name: Version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Work out the version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "maxnines-server") | .version')
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[1-9][0-9]*)?$'; then
+            echo "::error::$version can't be released: a version is 1.2.3, or 1.2.3-alpha.N, -beta.N or -rc.N"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml, $version"
+            exit 1
+          fi
+          case $version in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  # The whole of CI, on every system, for this commit. It runs alongside the
+  # builds, and nothing is pushed or published unless it passes.
+  tests:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  # Built on Rocky Linux 9, so it runs on any distribution with glibc 2.34 or
+  # later: RHEL 9, Ubuntu 22.04 and Debian 12 onwards.
+  linux-server:
+    name: Server for Linux ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rockylinux:9
+      # The rockylinux:9 image published on 2026-11-13 no longer sets PATH.
+      # Commands still run on Docker's default PATH until a step adds to
+      # GITHUB_PATH (the Rust setup adds Cargo's bin folder); the runner then
+      # builds PATH from the added folders plus the image's own, which is now
+      # empty, and every later step fails with "bash: executable file not found".
+      # Setting PATH here, as the older image did, keeps the default folders in.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-gnu
+    steps:
+      - name: Install build tools
+        run: |
+          dnf install -y gcc gcc-c++ make git
+      - uses: actions/checkout@v5
+      # The build records its commit, which git refuses to read for another user.
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          workspaces: ". -> ${{ env.TARGET_DIR }}"
+      - run: cargo build --release --locked -p maxnines-server --target "$TARGET"
+      - run: packaging/archive.sh maxnines-server "${{ needs.check.outputs.version }}" "$TARGET" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-server-${{ matrix.arch }}
+          path: |
+            dist/
+            ${{ env.TARGET_DIR }}/${{ env.TARGET }}/release/maxnines-server
+
+  # Fully static, so it runs on any Linux, Alpine and older distributions included.
+  linux-agent:
+    name: Agent for Linux ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+    steps:
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          workspaces: ". -> ${{ env.TARGET_DIR }}"
+      - run: cargo build --release --locked -p maxnines-agent --target "$TARGET"
+      - name: Check it needs nothing else
+        run: |
+          file "$TARGET_DIR/$TARGET/release/maxnines-agent" | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
+      - run: packaging/archive.sh maxnines-agent "${{ needs.check.outputs.version }}" "$TARGET" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-agent-${{ matrix.arch }}
+          path: |
+            dist/
+            ${{ env.TARGET_DIR }}/${{ env.TARGET }}/release/maxnines-agent
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          # Built on Apple Silicon for both: GitHub's Intel Macs take over twice
+          # as long.
+          - { arch: aarch64, runner: macos-15 }
+          - { arch: x86_64, runner: macos-15 }
+    env:
+      TARGET: ${{ matrix.arch }}-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          workspaces: ". -> ${{ env.TARGET_DIR }}"
+      - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+      - run: |
+          for program in maxnines-agent maxnines-server; do
+            packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, wix_arch: x64, runner: windows-2025 }
+          - { arch: aarch64, wix_arch: arm64, runner: windows-11-arm }
+    env:
+      TARGET: ${{ matrix.arch }}-pc-windows-msvc
+      VERSION: ${{ needs.check.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+          workspaces: ". -> ${{ env.TARGET_DIR }}"
+      # ring builds its Arm assembly with clang.
+      - name: Make sure clang is there
+        if: matrix.arch == 'aarch64'
+        run: |
+          if ! command -v clang >/dev/null; then
+            choco install -y llvm
+            printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+          fi
+      - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+      - run: |
+          packaging/check-windows-dlls.sh \
+            "$TARGET_DIR/$TARGET/release/maxnines-agent.exe" \
+            "$TARGET_DIR/$TARGET/release/maxnines-server.exe"
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      # WiX asks anyone earning US$10,000 a year or more from it to pay its Open
+      # Source Maintenance Fee, and won't build until its terms are accepted.
+      - name: Install WiX
+        run: |
+          printf '%s\n' "$USERPROFILE\.dotnet\tools" >> "$GITHUB_PATH"
+          dotnet tool install --global wix --version 7.0.1
+          export PATH="$USERPROFILE/.dotnet/tools:$PATH"
+          # Before anything else, as every command refuses to run until then.
+          wix eula accept wix7
+          for extension in UI Util Firewall; do
+            wix extension add -g "WixToolset.$extension.wixext/7.0.1"
+          done
+      # An MSI version is three numbers, so a pre-release's number goes in a
+      # fourth, which Windows shows but doesn't compare.
+      - name: Build the installers
+        run: |
+          base=${VERSION%%-*}
+          case $VERSION in
+            *-*) number=$(echo "${VERSION#*-}" | tr -cd 0-9); msi_version=$base.${number:-0} ;;
+            *) msi_version=$base ;;
+          esac
+          IFS=. read -r major minor patch _ <<< "$base"
+          mkdir -p msi/upgrade msi/x64 dist
+          for program in agent server; do
+            build() {
+              wix build -arch "${3:-${{ matrix.wix_arch }}}" \
+                -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext \
+                -d Version="$1" -d Program="$TARGET_DIR/$TARGET/release/maxnines-$program.exe" -d License=LICENSE \
+                -o "$2" "packaging/windows/$program.wxs"
+            }
+            build "$msi_version" "msi/maxnines-$program-$VERSION-$TARGET.msi"
+            # The same program as a later version, to test upgrading.
+            build "$major.$minor.$((patch + 1))" "msi/upgrade/maxnines-$program.msi"
+            # An x64 installer, to test that it refuses on Arm. What's in it
+            # doesn't matter, as it stops before installing anything.
+            if [ "${{ matrix.wix_arch }}" = arm64 ]; then
+              build "$msi_version" "msi/x64/maxnines-$program.msi" x64
+            fi
+            cp "msi/maxnines-$program-$VERSION-$TARGET.msi" dist/
+          done
+      - name: Test the agent's installer
+        shell: pwsh
+        run: |
+          $x64 = if (Test-Path msi/x64/maxnines-agent.msi) { @{ X64OnArm = 'msi/x64/maxnines-agent.msi' } } else { @{} }
+          packaging/windows/test-agent-install.ps1 `
+            -Msi "msi/maxnines-agent-$env:VERSION-$env:TARGET.msi" `
+            -Upgrade msi/upgrade/maxnines-agent.msi @x64
+      - name: Test the server's installer
+        shell: pwsh
+        run: |
+          $x64 = if (Test-Path msi/x64/maxnines-server.msi) { @{ X64OnArm = 'msi/x64/maxnines-server.msi' } } else { @{} }
+          packaging/windows/test-server-install.ps1 `
+            -Msi "msi/maxnines-server-$env:VERSION-$env:TARGET.msi" `
+            -Upgrade msi/upgrade/maxnines-server.msi @x64
+      # Windows on Arm runs x64 programs by translating them, and tells them the
+      # processor is an x64 one. An x64 agent installed there before its installer
+      # refused still has to report the real processor.
+      - name: Check an emulated agent reports the real processor
+        if: matrix.arch == 'aarch64'
+        shell: pwsh
+        run: |
+          rustup target add x86_64-pc-windows-msvc
+          cargo build --locked -p maxnines-agent --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $config = Join-Path $env:RUNNER_TEMP 'facts.hcl'
+          Set-Content $config "server {`n  url = `"ws://127.0.0.1:9/ws`"`n}`n"
+          $facts = & "$env:TARGET_DIR/x86_64-pc-windows-msvc/debug/maxnines-agent.exe" -c $config facts | ConvertFrom-Json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $processor = (Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0').ProcessorNameString.Trim()
+          Write-Host "host.arch = $($facts.host.arch), cpu.model = $($facts.cpu.model), the processor is $processor"
+          if ($facts.host.arch -ne 'arm64' -or $facts.cpu.model -ne $processor) {
+            throw 'the emulated agent reported the x64 processor it was shown'
+          }
+      - name: Keep the installer's logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-msi-logs
+          path: ${{ runner.temp }}/msi-logs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/
+
+  # GitHub has no FreeBSD runners, so this builds in a FreeBSD virtual machine.
+  freebsd:
+    name: FreeBSD x86_64
+    needs: check
+    runs-on: ubuntu-24.04
+    env:
+      TARGET: x86_64-unknown-freebsd
+    steps:
+      - uses: actions/checkout@v5
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          # Linking the server with full LTO takes several GB.
+          mem: 10240
+          envs: TARGET
+          usesh: true
+          copyback: true
+          prepare: |
+            pkg install -y curl git
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            git config --global --add safe.directory "$PWD"
+            cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+            # Nothing else runs the agent on FreeBSD, so its tests for giving up
+            # root and for reading who holds sockets run here, and then the real thing: started as root, it becomes
+            # maxnines, and its helper reads what only root can.
+            cargo test --locked -p maxnines-agent --target "$TARGET" -- privileges connections
+            # Ping checks run FreeBSD's own ping, so they're tried here for real.
+            cargo test --locked -p maxnines-checks --target "$TARGET" -- ping
+            pw useradd maxnines -d /nonexistent -s /usr/sbin/nologin
+            cat >/tmp/agent.hcl <<'CONFIG'
+            server {
+              url = "ws://127.0.0.1:9000/ws"
+            }
+            state_dir = "/tmp/maxnines-agent"
+            action "who" {
+              command = ["/usr/bin/id", "-un"]
+            }
+            CONFIG
+            agent="target.nosync/$TARGET/release/maxnines-agent"
+            test "$("$agent" --config /tmp/agent.hcl action who)" = "maxnines"
+            install -d -m 0700 /tmp/only-root
+            head -c 4194304 /dev/zero >/tmp/only-root/file
+            "$agent" --config /tmp/agent.hcl action disk_space disk=/tmp/only-root | grep -q "/tmp/only-root"
+            test -f /var/db/maxnines-agent-helper/disk_space.json
+            "$agent" --config /tmp/agent.hcl action connections | grep -q "hold sockets"
+            for program in maxnines-agent maxnines-server; do
+              packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
+            done
+            # Copyback brings the whole folder out of the VM, and the build's
+            # intermediate files are far bigger than the archives and needed by
+            # nothing: copying them took long enough for the VM to drop the connection.
+            rm -rf target.nosync
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-x86_64
+          path: dist/
+
+  linux-packages:
+    name: Linux packages for ${{ matrix.arch }}
+    needs: [check, linux-server, linux-agent]
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-*-${{ matrix.arch }}
+          merge-multiple: true
+      - name: Build .deb and .rpm packages
+        env:
+          SERVER: ${{ matrix.arch }}-unknown-linux-gnu
+          AGENT: ${{ matrix.arch }}-unknown-linux-musl
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          chmod 755 "$TARGET_DIR"/*/release/maxnines-*
+          mkdir -p packages
+          cargo deb -p maxnines-server --no-build --no-strip --target "$SERVER" -o packages/
+          cargo deb -p maxnines-agent --no-build --no-strip --target "$AGENT" -o packages/
+          # RPM versions can't contain "-". A "~" sorts a pre-release before the
+          # release, as cargo deb does for Debian.
+          rpm_metadata="version = \"$(echo "$VERSION" | tr - '~')\""
+          cargo generate-rpm -p crates/server --target "$SERVER" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
+          cargo generate-rpm -p crates/agent --target "$AGENT" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
+          ls -l packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages/
+
+  # Installs every package on the oldest of each system it's meant for, and the
+  # newest Ubuntu, and runs what it installed.
+  test-packages:
+    name: Install on ${{ matrix.image }} ${{ matrix.arch }}
+    needs: linux-packages
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "rockylinux:9"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages-${{ matrix.arch }}
+          path: packages
+      - run: docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" sh packaging/linux/test-install.sh
+
+  docker:
+    name: Docker image
+    # On a tag this pushes the image, so it waits until everything else has
+    # passed, as publishing does.
+    needs: [check, tests, linux-server, test-packages, macos, windows, freebsd]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-server-x86_64
+          path: amd64
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-server-aarch64
+          path: arm64
+      - name: Put each server where the Dockerfile expects it
+        run: |
+          for arch in amd64 arm64; do
+            mkdir -p "dist/docker/$arch"
+            install -m 755 "$arch/$TARGET_DIR"/*/release/maxnines-server "dist/docker/$arch/"
+          done
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        env:
+          # Otherwise it uploads a build record as an artifact, which isn't an
+          # ordinary one: downloading every artifact to publish then fails.
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          file: packaging/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref_type == 'tag' }}
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/maxnines-server:${{ needs.check.outputs.version }}
+            ${{ needs.check.outputs.prerelease == 'false' && format('ghcr.io/{0}/maxnines-server:latest', github.repository_owner) || '' }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=MaxNines monitoring server
+            org.opencontainers.image.licenses=MIT
+
+  release:
+    name: Publish the release
+    if: github.ref_type == 'tag'
+    needs: [check, tests, linux-packages, test-packages, macos, windows, freebsd, docker]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Gather everything to publish
+        run: |
+          mkdir release
+          # Everything but the bare binaries, which are only there for packaging.
+          find artifacts -type f ! -path '*/target.nosync/*' -exec cp {} release/ \;
+          cd release
+          sha256sum -- * > SHA256SUMS
+          ls -l
+      # Lets anyone check a download was built here, from this repository.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: release/*
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=
+          if [ "${{ needs.check.outputs.prerelease }}" = true ]; then
+            flags=--prerelease
+          fi
+          gh release create "$GITHUB_REF_NAME" release/* \
+            --verify-tag --generate-notes --title "MaxNines ${{ needs.check.outputs.version }}" $flags

@@ -1,0 +1,71 @@
+{% extends "layouts/application.html" %}
+{% block title %}Annotations · MaxNines{% endblock title %}
+{% block content %}
+<div>
+  <p class="eyebrow">Metrics</p>
+  <h1>Annotations</h1>
+  <p class="subtitle">Deploys, upgrades and notes, marked on the charts of every host their filter picks. Scripts can add them <a href="/docs/api-annotations">through the API</a>.</p>
+</div>
+{% set metrics_tab = "annotations" %}{% include "metrics/_tabs.html" %}
+
+{% if can_respond %}
+<section class="card">
+  <h2>Add an annotation</h2>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form method="post" action="/metrics/annotations" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Kind
+      <select name="kind">
+        <option value="note"{% if annotation.kind != "deploy" %} selected{% endif %}>Note</option>
+        <option value="deploy"{% if annotation.kind == "deploy" %} selected{% endif %}>Deploy</option>
+      </select>
+    </label>
+    <label>What happened
+      <input type="text" name="title" value="{{ annotation.title }}" required maxlength="200" autocomplete="off" placeholder="Shop v2.3, or Upgraded Postgres to 17">
+    </label>
+    <label>Detail
+      <input type="text" name="detail" value="{{ annotation.detail }}" maxlength="2000" autocomplete="off" placeholder="Optional">
+    </label>
+    <label>Hosts
+      <input type="text" name="filter" value="{{ annotation.filter }}" maxlength="500" spellcheck="false" autocomplete="off" placeholder="role=web">
+      <small>The same filter as the Hosts list. Leave empty for every host. It picks hosts by their facts whenever a chart is drawn, so one added later shows it too.</small>
+    </label>
+    <label>When
+      <input type="datetime-local" name="when" value="{{ annotation.when }}">
+      <small>In {{ time_zone }}. Leave empty for now.</small>
+    </label>
+    <div class="actions"><button type="submit">Add annotation</button></div>
+  </form>
+</section>
+{% endif %}
+
+<section class="card">
+  <h2>The last {{ list_days }} days</h2>
+  {% if annotations %}
+  <div class="tablebox"><table class="event-list">
+    <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Hosts</th><th>Added by</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>
+    <tbody>
+      {% for annotation in annotations %}
+      <tr>
+        <td class="nowrap">{{ annotation.time }}</td>
+        <td><span class="event-kind k-{{ annotation.kind }}">{{ annotation.kind_label }}</span></td>
+        <td>{{ annotation.title }}{% if annotation.detail %}<div class="hint">{{ annotation.detail }}</div>{% endif %}</td>
+        <td>{% if annotation.filter %}<code>{{ annotation.filter }}</code>{% else %}<span class="hint">Every host</span>{% endif %}</td>
+        <td>{{ annotation.created_by }}</td>
+        {% if can_respond %}
+        <td>
+          <form method="post" action="/metrics/annotations/{{ annotation.id }}/delete">
+            <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="empty">No annotations in the last {{ list_days }} days.</p>
+  {% endif %}
+</section>
+{% endblock content %}

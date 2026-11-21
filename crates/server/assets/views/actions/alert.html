@@ -1,0 +1,16 @@
+{% extends "layouts/live.html" %}
+{% block title %}Actions · {{ rule_name }} · MaxNines{% endblock title %}
+{% block refresh_every %}5s{% endblock refresh_every %}
+{% block content %}
+<p class="breadcrumb"><a href="/alerts">Alerts</a></p>
+<div>
+  <h1>Actions for an alert</h1>
+  <p class="subtitle">{{ summary }}<br><span class="note">{{ rule_name }} · started {{ started }} · <a href="/hosts/{{ host_id }}/actions">{{ hostname }}</a></span></p>
+</div>
+
+{% if runs %}
+{% include "actions/_runs.html" %}
+{% else %}
+<p class="empty">This alert's rule didn't run any actions.</p>
+{% endif %}
+{% endblock content %}

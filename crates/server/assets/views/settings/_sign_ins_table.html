@@ -1,0 +1,18 @@
+<div class="tablebox"><table>
+  <thead>
+    <tr>{% if show_person %}<th>Person</th>{% endif %}<th>Signed in with</th><th>From</th><th>Since</th><th>Last used</th><th>Expires</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for sign_in in sign_ins %}
+    <tr>
+      {% if show_person %}<td>{{ sign_in.user }}<span class="under">{{ sign_in.role }}</span></td>{% endif %}
+      <td><strong>{{ sign_in.name }}</strong><span class="under">{{ sign_in.kind_label }}{% if not show_person %} · {{ sign_in.role }}{% endif %}{% if sign_in.current %} · this browser{% endif %}</span>{% if sign_in.user_agent %}<details class="agent"><summary>What it says it is</summary><code>{{ sign_in.user_agent }}</code></details>{% endif %}</td>
+      <td>{% if sign_in.forwarded_for %}<code class="nowrap">{{ sign_in.forwarded_for }}</code><span class="under">unconfirmed, through {{ sign_in.address }}</span>{% else %}<code class="nowrap">{{ sign_in.address }}</code>{% endif %}</td>
+      <td class="nowrap"><span title="{{ sign_in.since_at }}">{{ sign_in.since }}</span></td>
+      <td class="nowrap">{% if sign_in.last_used %}<span title="{{ sign_in.last_used_at }}">{{ sign_in.last_used }}</span>{% else %}Never{% endif %}</td>
+      <td class="nowrap">{{ sign_in.expires }}</td>
+      <td><form method="post" action="/profile/sign-ins/{{ sign_in.kind }}/{{ sign_in.id }}/end"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><input type="hidden" name="back" value="{{ back }}"><button type="submit" class="danger">{% if sign_in.current %}Sign out{% elif sign_in.kind == "browser" %}End{% else %}Revoke{% endif %}</button></form></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>

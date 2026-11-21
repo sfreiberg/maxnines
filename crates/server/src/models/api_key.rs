@@ -1,0 +1,31 @@
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+#[sea_orm(table_name = "api_keys")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i64,
+    pub name: String,
+    /// Who it acts as.
+    pub user_id: i64,
+    /// `viewer`, `responder`, `editor` or `admin`.
+    pub role: String,
+    /// The start of the key, to tell keys apart once the key itself is gone.
+    pub hint: String,
+    /// Only the hash is kept, so reading the database doesn't give anyone a key.
+    pub token_hash: String,
+    pub created_at: DateTimeUtc,
+    /// Empty means it never expires.
+    pub expires_at: Option<DateTimeUtc>,
+    pub last_used_at: Option<DateTimeUtc>,
+    /// The address it was last used from.
+    pub last_address: Option<String>,
+    /// The address an untrusted proxy said it was passing on, so unconfirmed.
+    pub last_forwarded_for: Option<String>,
+    pub revoked_at: Option<DateTimeUtc>,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

@@ -1,0 +1,165 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit check{% else %}Add check{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/checks">Checks</a></p>
+<h1>{% if id %}Edit check{% else %}Add check{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="{% if id %}/checks/{{ id }}{% else %}/checks{% endif %}" class="stacked remote-check">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Name
+    <input type="text" name="name" value="{{ check.name }}" required maxlength="64">
+  </label>
+
+  <label>Host
+    <select name="host_id">
+      {% for host in hosts %}
+      <option value="{{ host.id }}"{% if host.id == check.host_id %} selected{% endif %}>{{ host.hostname }}</option>
+      {% endfor %}
+    </select>
+    <small>What the check is about. Its results and alerts go under that host, and a <a href="/docs/agentless-hosts">host without an agent</a> is online while any of its checks passes. Leave it as the server for a check that isn't about any one host.</small>
+  </label>
+
+  <label>Kind
+    <select name="kind">
+      {% for kind in kinds %}
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% else %}Mailbox (POP3){% endif %}</option>
+      {% endfor %}
+    </select>
+  </label>
+
+  <label>Target
+    <input type="text" name="target" value="{{ check.target }}" required maxlength="255" spellcheck="false">
+    <small>A web address for websites, a host name for DNS and ping, and <code>host:port</code> for the rest, such as <code>db.example.com:5432</code>.</small>
+  </label>
+
+  <label>Run every (seconds)
+    <input type="number" name="interval_secs" value="{{ check.interval_secs }}" min="10" max="86400" required>
+  </label>
+
+  <label>Timeout (seconds)
+    <input type="number" name="timeout_secs" value="{{ check.timeout_secs }}" min="1" max="60">
+    <small>Leave empty for 10 seconds.</small>
+  </label>
+
+  <fieldset class="for-http">
+    <legend>Website options</legend>
+    <label>Method
+      <input type="text" name="method" value="{{ check.method }}" spellcheck="false" placeholder="GET">
+    </label>
+    <label>Body
+      <input type="text" name="body" value="{{ check.body }}" spellcheck="false">
+    </label>
+    <label>Page has to match
+      <input type="text" name="regex" value="{{ check.regex }}" spellcheck="false">
+      <small>A regular expression. Leave empty to skip this.</small>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="domain_expiry"{% if check.domain_expiry %} checked{% endif %}> Look up when the domain expires
+      <small>Asked of the domain's registry over RDAP about twice a day, never counting against the check.</small>
+    </label>
+  </fieldset>
+
+  <label class="for-database">Database
+    <input type="text" name="database" value="{{ check.database }}" maxlength="63" spellcheck="false">
+    <small>For PostgreSQL, which database to sign in to, or empty for <code>postgres</code>. For MongoDB, the database the account was made in, or empty for <code>admin</code>.</small>
+  </label>
+
+  <fieldset class="for-stats">
+    <legend>Database stats</legend>
+    <label class="checkbox">
+      <input type="checkbox" name="read_stats"{% if check.read_stats %} checked{% endif %}> Read its health and replication
+      <small>As an agent reads a database it's allowed, using the login below, and charted on the host's metrics page. See <a href="/docs/database-stats">Database stats</a> for what's read and the account it needs.</small>
+    </label>
+    {% for extra in database_extras %}
+    <label class="checkbox">
+      <input type="checkbox" name="extra_{{ extra }}"{% if extra in check.extras %} checked{% endif %}> Also read {% if extra == "sizes" %}sizes{% elif extra == "queries" %}query latency{% else %}{{ extra }}{% endif %}
+      {% if extra == "sizes" %}<small>Each database's size on disk, which costs more to read.</small>{% elif extra == "queries" %}<small>ClickHouse only: how long queries took over the last five minutes, and how many failed, from its query log, which can be large.</small>{% endif %}
+    </label>
+    {% endfor %}
+  </fieldset>
+
+  <label class="checkbox for-tls-option">
+    <input type="checkbox" name="tls"{% if check.tls %} checked{% endif %}> Use TLS from the start
+    <small>For mail, as on ports 465, 993 and 995. Otherwise a mail check upgrades with STARTTLS before signing in, and never sends a password without TLS. PostgreSQL uses TLS whenever it's offered, and with this ticked, only over TLS.</small>
+  </label>
+
+  <label class="checkbox for-certificate">
+    <input type="checkbox" name="insecure"{% if check.insecure %} checked{% endif %}> Don't count a bad certificate as down
+  </label>
+
+  <label class="for-ssh">Expected host key
+    <input type="text" name="host_key" value="{{ check.host_key }}" maxlength="100" spellcheck="false" placeholder="SHA256:…">
+    <small>Optional. A different key counts as down, as after a reinstall or with someone in the middle. The check's page shows the key it sees, to copy here.</small>
+  </label>
+
+  <fieldset class="for-sign-in">
+    <legend>Signing in</legend>
+    <p class="hint">Without signing in, a check only sees that the server answers. Give it an account that can do no more than sign in; <a href="/docs/checks#monitoring-accounts">Monitoring accounts</a> says how.</p>
+    <label>Sign in
+      <select name="sign_in">
+        <option value="none"{% if check.sign_in == "none" or not check.sign_in %} selected{% endif %}>Don't sign in</option>
+        <option value="password"{% if check.sign_in == "password" %} selected{% endif %}>With a password</option>
+        <option value="key"{% if check.sign_in == "key" %} selected{% endif %}>With a private key (SSH)</option>
+      </select>
+    </label>
+    <label class="username-field">Username
+      <input type="text" name="username" value="{{ check.username }}" maxlength="255" autocomplete="off" spellcheck="false">
+      <small>Redis before version 6 has no usernames, so leave it empty there.</small>
+    </label>
+    <div class="password-fields">
+      <label>Password
+        <input type="password" name="password" value="" maxlength="1024" autocomplete="new-password"{% if check.has_password %} placeholder="Saved. Leave empty to keep it"{% endif %}>
+        <small>Kept in the database and never shown again.</small>
+      </label>
+      <label>Or the environment variable that holds it
+        <input type="text" name="password_env" value="{{ check.password_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}ORDERS_DB">
+        <small>A variable in the server's own environment, read each time the check runs. Its name has to start with <code>{{ env_prefix }}</code>, so that only what's been set aside for this can be sent anywhere.</small>
+      </label>
+    </div>
+    <div class="key-fields">
+      <label>Private key
+        <textarea name="private_key" rows="4" spellcheck="false" autocomplete="off"{% if check.has_private_key %} placeholder="Saved. Leave empty to keep it"{% endif %}></textarea>
+        <small>In OpenSSH's format, without a passphrase. Kept in the database and never shown again.</small>
+      </label>
+      <label>Or the environment variable that holds it
+        <input type="text" name="private_key_env" value="{{ check.private_key_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}BASTION_KEY">
+      </label>
+    </div>
+  </fieldset>
+
+  <fieldset class="for-dns">
+    <legend>DNS options</legend>
+    <label>Server
+      <input type="text" name="server" value="{{ check.server }}" spellcheck="false" placeholder="8.8.8.8">
+      <small>Leave empty to use this host's resolver.</small>
+    </label>
+    <label>Record type
+      <input type="text" name="record" value="{{ check.record }}" spellcheck="false" placeholder="A">
+    </label>
+  </fieldset>
+
+  <label class="for-ping">Packets to send
+    <input type="number" name="count" value="{{ check.count }}" min="1" max="20">
+  </label>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if check.enabled %} checked{% endif %}> Enabled
+  </label>
+
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save check</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="{{ back }}">Cancel</a>
+  </div>
+</form>
+
+{% if id and can_edit %}
+<form method="post" action="/checks/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

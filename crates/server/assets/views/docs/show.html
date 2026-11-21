@@ -1,0 +1,10 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ title }} · Docs · MaxNines{% endblock title %}
+{% block content %}
+<div class="docs-layout">
+  {% include "docs/_contents.html" %}
+  {# The one place a template takes HTML as it is: it's made from the Markdown built
+     into the server, with any HTML in that Markdown turned into text. #}
+  <article class="docs-page">{{ html | safe }}</article>
+</div>
+{% endblock content %}

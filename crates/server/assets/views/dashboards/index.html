@@ -1,0 +1,34 @@
+{% extends "layouts/application.html" %}
+{% block title %}Dashboards · MaxNines{% endblock title %}
+{% block content %}
+<h1>Dashboards</h1>
+<p class="subtitle">Charts and numbers you choose, across any group of hosts. Everyone signed in shares them.</p>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+{% if dashboards %}
+<div class="wall">
+  {% for dashboard in dashboards %}
+  <a class="tile" href="/dashboards/{{ dashboard.id }}">
+    <h2>{{ dashboard.name }}</h2>
+    <span class="note">{{ dashboard.widgets }} widget{% if dashboard.widgets != 1 %}s{% endif %}</span>
+  </a>
+  {% endfor %}
+</div>
+{% else %}
+<p class="empty">No dashboards yet.</p>
+{% endif %}
+
+{% if can_edit %}
+<section class="card">
+  <h2>Add a dashboard</h2>
+  <form method="post" action="/dashboards" class="stacked">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Name
+      <input type="text" name="name" required maxlength="100">
+    </label>
+    <button type="submit">Add dashboard</button>
+  </form>
+</section>
+{% endif %}
+{% endblock content %}
