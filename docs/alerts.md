@@ -76,6 +76,13 @@ number, is refused with what's wrong.
 A rule with a calculation across hosts, as in the [API](api-alert-rules.md), has
 conditions about the calculated `value` instead, like `value > 80`.
 
+**Try it on the last day**, on the rule's form, works the rule out on the last 24 hours
+of what's stored, without saving it, and says how many times it would have warned and
+gone critical, and on which hosts, waiting its **For at least** time as it would. It's
+tried on each stored step's average, 10 minutes for a day, so something shorter may not
+show. `forecast()` can't be tried on the past, and hosts are taken to have been
+`online` and `reporting`, as that isn't kept.
+
 ### What alerts say
 
 Without a **Summary**, an alert says the rule's name, the host, and the first metric's

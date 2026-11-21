@@ -16,6 +16,7 @@ use maxnines_protocol::actions::DEFAULT_ACTION_TIMEOUT;
 use super::condition_form::{ConditionForm, operators};
 use super::{CsrfForm, Page, server_error};
 use crate::actions::{RuleAction, RunOn};
+use crate::alert_replay::{Replay, replay};
 use crate::alerting::{AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
@@ -344,6 +345,18 @@ async fn form_page(
     form: &AlertRuleForm,
     error: Option<&str>,
 ) -> Response {
+    form_page_with(state, token, id, form, error, None).await
+}
+
+/// The form, with how often the rule as typed would have alerted, if that was asked.
+async fn form_page_with(
+    state: &AppState,
+    token: &CsrfToken,
+    id: Option<i64>,
+    form: &AlertRuleForm,
+    error: Option<&str>,
+    replay: Option<&Replay>,
+) -> Response {
     let channels = match state.database.list_channels().await {
         Ok(channels) => channels,
         Err(error) => return server_error(&error),
@@ -378,6 +391,7 @@ async fn form_page(
         .with("operators", &operators())
         .with("known_facts", &known)
         .with("known_actions", &known_actions)
+        .with("replay", &replay)
         .with("error", &error);
     match error {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
@@ -501,6 +515,22 @@ async fn without_saving(
     form: &CsrfForm,
 ) -> Option<Response> {
     let action = form.fields.get("form_action").cloned().unwrap_or_default();
+    if action == "replay" {
+        // Tried as it would be saved, so a mistake says what it would on saving.
+        let replayed = match validate(state, fields).await {
+            Ok(input) => replay(&state.sources(), &input, crate::times::now()).await,
+            Err(error) => Err(error),
+        };
+        return Some(match replayed {
+            Ok(replayed) => {
+                form_page_with(state, &form.token, id, fields, None, Some(&replayed)).await
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                form_page(state, &form.token, id, fields, Some(&message)).await
+            }
+        });
+    }
     fields
         .applies_to
         .apply_action(&action, &known_facts(state).await)

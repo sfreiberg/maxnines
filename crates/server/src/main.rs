@@ -4,6 +4,7 @@ mod agent_versions;
 mod alert_charts;
 mod alert_conditions;
 mod alert_evaluator;
+mod alert_replay;
 mod alerting;
 mod app_sign_ins;
 mod app_state;

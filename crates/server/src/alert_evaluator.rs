@@ -116,7 +116,7 @@ impl Key {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Change {
+pub(crate) enum Change {
     Fire(Severity),
     /// An open alert getting worse, or better without being over.
     Become(Severity),
@@ -155,7 +155,7 @@ type Stamp = (Timestamp, bool, bool);
 
 /// How long each of a rule's levels has been crossed, or not.
 #[derive(Debug, Default)]
-struct Tracker {
+pub(crate) struct Tracker {
     /// One for each level, mildest first.
     holds: Vec<Hold>,
     /// Each sample is only counted once, as checks run more often than some
@@ -192,7 +192,7 @@ impl Tracker {
     }
 
     /// As [`Self::observe`], with when each level's problem began if it's new.
-    fn observe_from(
+    pub(crate) fn observe_from(
         &mut self,
         levels: &[(Severity, bool)],
         began: &[Timestamp],
@@ -1447,7 +1447,7 @@ impl Change {
 }
 
 /// Whether each of a rule's conditions holds, mildest first.
-fn holds(conditions: &Conditions, inputs: &Inputs) -> Vec<(Severity, bool)> {
+pub(crate) fn holds(conditions: &Conditions, inputs: &Inputs) -> Vec<(Severity, bool)> {
     let bindings = inputs.bind();
     conditions
         .levels()

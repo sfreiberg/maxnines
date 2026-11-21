@@ -137,9 +137,29 @@
 
   <div class="actions">
     {% if can_edit %}<button type="submit">Save rule</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <button type="submit" name="form_action" value="replay" class="secondary" formaction="{% if id %}/alerts/rules/{{ id }}{% else %}/alerts/rules{% endif %}#replay">Try it on the last day</button>
     <a class="button secondary" href="/alerts/rules">Cancel</a>
   </div>
 </form>
+
+{% if replay %}
+<section id="replay" class="preview">
+  <h2>The last day</h2>
+  <p>Nothing has been saved.
+  {% if replay.warned == 0 and replay.critical == 0 %}Over the last 24 hours, this wouldn't have alerted on any of the {{ replay.tried }} {% if rule.calculation %}lines{% else %}hosts{% endif %} it covers.{% else %}Over the last 24 hours, this would have warned {{ replay.warned }} {% if replay.warned == 1 %}time{% else %}times{% endif %} and gone critical {{ replay.critical }} {% if replay.critical == 1 %}time{% else %}times{% endif %}.{% endif %}</p>
+  {% if replay.alerted %}
+  <div class="tablebox"><table>
+    <thead><tr><th>{% if rule.calculation %}Line{% else %}Host{% endif %}</th><th>Warned</th><th>Critical</th></tr></thead>
+    <tbody>
+      {% for each in replay.alerted %}
+      <tr><td>{{ each.name }}</td><td>{{ each.warned }}</td><td>{{ each.critical }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  <p class="hint">Tried on each {{ replay.step_minutes }} minutes' average, so something shorter may not show.{% for note in replay.notes %} {{ note }}{% endfor %}</p>
+</section>
+{% endif %}
 
 {% if id and can_edit %}
 <form method="post" action="/alerts/rules/{{ id }}/delete" class="delete-form">

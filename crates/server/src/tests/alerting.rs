@@ -31,6 +31,8 @@ const MINUTE: TimeDelta = TimeDelta::minutes(1);
 #[derive(Clone, Default)]
 struct Script {
     readings: Arc<Mutex<Vec<NewestReading>>>,
+    /// What's stored over time, by metric, for charts and trying rules on the past.
+    stored: Arc<Mutex<BTreeMap<String, Vec<crate::metrics::Series>>>>,
     /// Readings for one metric in particular, where every other has `readings`.
     by_metric: Arc<Mutex<BTreeMap<String, Vec<NewestReading>>>>,
     trends: Arc<Mutex<Vec<crate::metrics::Trend>>>,
@@ -74,9 +76,13 @@ impl Script {
 impl MetricsReader for Script {
     fn series(
         &self,
-        _query: &crate::metrics::SeriesQuery,
+        query: &crate::metrics::SeriesQuery,
     ) -> anyhow::Result<crate::metrics::SeriesResult> {
-        Ok(Default::default())
+        let stored = self.stored.lock().unwrap();
+        Ok(crate::metrics::SeriesResult {
+            series: stored.get(query.metric.name).cloned().unwrap_or_default(),
+            hidden: 0,
+        })
     }
 
     fn last_samples(
@@ -535,6 +541,81 @@ async fn lengths_of_time_and_sizes_are_compared_in_their_units() {
     assert_eq!(
         clock.summary,
         "Clock on web-1: Clock difference from the server is 31 s"
+    );
+}
+
+#[tokio::test]
+async fn a_rule_can_be_tried_on_the_last_day_before_it_is_saved() {
+    let test = Harness::start().await;
+    // Every ten minutes of the last hour: the root disk fills past 80% and then 90%
+    // once, and the data disk never.
+    let stored = |percents: &[f64]| {
+        percents
+            .iter()
+            .enumerate()
+            .map(|(step, avg)| crate::metrics::Point {
+                time: test.now - MINUTE * 60 + MINUTE * 10 * step as i32,
+                avg: *avg,
+                min: *avg,
+                max: *avg,
+            })
+            .collect()
+    };
+    let disks = vec![
+        crate::metrics::Series {
+            name: "/".to_string(),
+            points: stored(&[50.0, 85.0, 95.0, 95.0, 50.0, 85.0]),
+        },
+        crate::metrics::Series {
+            name: "/data".to_string(),
+            points: stored(&[10.0, 10.0, 10.0, 10.0, 10.0, 10.0]),
+        },
+    ];
+    test.script
+        .stored
+        .lock()
+        .unwrap()
+        .insert("disk.usage".to_string(), disks);
+
+    let fields = [
+        ("name", "Disk"),
+        ("warning", "disk.usage > 80"),
+        ("critical", "disk.usage > 90"),
+        ("calculation", ""),
+        ("metric", "cpu.usage"),
+        ("for_secs", "0"),
+        ("enabled", "on"),
+        ("form_action", "replay"),
+    ];
+    let mut browser = Browser::default();
+    let page = browser
+        .submit(&test.server, "/alerts/rules/new", "/alerts/rules", &fields)
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body
+            .contains("this would have warned 2 times and gone critical 1 time"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body
+            .contains("<tr><td>web-1</td><td>2</td><td>1</td></tr>"),
+        "{}",
+        page.body
+    );
+    assert!(test.database().list_alert_rules().await.unwrap().is_empty());
+
+    // A rule with a mistake says so instead.
+    let mut wrong = fields.to_vec();
+    wrong[2] = ("critical", "disk.usag > 90");
+    let page = browser
+        .submit(&test.server, "/alerts/rules/new", "/alerts/rules", &wrong)
+        .await;
+    assert!(
+        page.body.contains("did you mean disk.usage?"),
+        "{}",
+        page.body
     );
 }
 
