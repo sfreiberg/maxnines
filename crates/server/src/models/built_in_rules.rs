@@ -25,7 +25,7 @@ pub fn same_rule(a: &RuleInput, b: &RuleInput) -> bool {
     let stored = |rule: &RuleInput| flatten(&rule.settings).map(|flat| unflatten(&flat)).ok();
     a.name == b.name
         && a.priority == b.priority
-        && a.condition == b.condition
+        && a.applies_to == b.applies_to
         && a.operating_systems == b.operating_systems
         && stored(a) == stored(b)
 }
@@ -123,7 +123,7 @@ impl Database {
                 active.name = Set(built_in.rule.name.clone());
                 active.name_key = Set(key);
                 active.priority = Set(built_in.rule.priority);
-                active.condition_expr = Set(built_in.rule.condition.clone());
+                active.applies_to = Set(built_in.rule.applies_to.clone());
                 active.operating_systems = Set(systems_text(&built_in.rule.operating_systems));
                 active.built_in_changed_at = Set(Some(now));
                 active
@@ -145,7 +145,7 @@ impl Database {
                 name: Set(built_in.rule.name.clone()),
                 name_key: Set(key),
                 priority: Set(built_in.rule.priority),
-                condition_expr: Set(built_in.rule.condition.clone()),
+                applies_to: Set(built_in.rule.applies_to.clone()),
                 enabled: Set(built_in.rule.enabled),
                 operating_systems: Set(systems_text(&built_in.rule.operating_systems)),
                 built_in: Set(Some(built_in.key.to_string())),

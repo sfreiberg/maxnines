@@ -126,9 +126,9 @@ pub struct RuleInput {
     pub name: String,
     /// Higher priorities apply later, so they win.
     pub priority: i32,
-    /// A CEL expression. No condition matches every agent.
+    /// Which hosts, as a CEL expression over facts. None is every host.
     #[serde(default, deserialize_with = "crate::text::optional")]
-    pub condition: Option<String>,
+    pub applies_to: Option<String>,
     /// The operating systems it's for, by `os.family`, or none for all of them.
     #[serde(default)]
     pub operating_systems: Vec<String>,
@@ -990,7 +990,7 @@ impl Database {
             name: Set(input.name.clone()),
             name_key: Set(name_key(&input.name)),
             priority: Set(input.priority),
-            condition_expr: Set(input.condition.clone()),
+            applies_to: Set(input.applies_to.clone()),
             enabled: Set(input.enabled),
             operating_systems: Set(systems_text(&input.operating_systems)),
             ..Default::default()
@@ -1024,7 +1024,7 @@ impl Database {
         row.name = Set(input.name.clone());
         row.name_key = Set(name_key(&input.name));
         row.priority = Set(input.priority);
-        row.condition_expr = Set(input.condition.clone());
+        row.applies_to = Set(input.applies_to.clone());
         row.enabled = Set(input.enabled);
         row.operating_systems = Set(systems_text(&input.operating_systems));
         row.update(&transaction).await.map_err(|error| {
@@ -1197,7 +1197,7 @@ fn to_rule<'a>(
         rule: RuleInput {
             name: row.name,
             priority: row.priority,
-            condition: row.condition_expr,
+            applies_to: row.applies_to,
             operating_systems: row
                 .operating_systems
                 .as_deref()
@@ -2063,7 +2063,7 @@ mod tests {
         RuleInput {
             name: name.to_string(),
             priority,
-            condition: Some("facts.os.family == \"linux\"".to_string()),
+            applies_to: Some("facts.os.family == \"linux\"".to_string()),
             operating_systems: Vec::new(),
             enabled: true,
             settings: json!({
@@ -2155,7 +2155,7 @@ mod tests {
         // A new install has a default rule, from the migration.
         let rules = database.list_rules().await.unwrap();
         assert_eq!(rules[0].rule.name, "Default");
-        assert_eq!(rules[0].rule.condition, None);
+        assert_eq!(rules[0].rule.applies_to, None);
         assert_eq!(rules[0].rule.settings["interval_secs"], 15);
         assert_eq!(rules[0].rule.settings["collectors"]["cpu"]["enabled"], true);
 
@@ -2183,7 +2183,7 @@ mod tests {
 
         // Updating replaces the settings instead of adding to them.
         let mut changed = rule_input("renamed", 300);
-        changed.condition = None;
+        changed.applies_to = None;
         changed.enabled = false;
         changed.settings = json!({ "interval_secs": 5 });
         assert!(database.update_rule(later, &changed).await.unwrap());

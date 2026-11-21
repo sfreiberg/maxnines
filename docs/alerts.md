@@ -31,7 +31,7 @@ later**, or tell only the channels chosen.
 ## Conditions
 
 A rule alerts when its **Warning when** or **Critical when** condition is true, or both.
-Each is [CEL](https://cel.dev), the same language as a config rule's condition, over
+Each is [CEL](https://cel.dev), the same language as a config rule's `applies_to`, over
 metrics by their names in the [catalog](api-metrics.md#list-metrics):
 
 | Condition | Alerts when |

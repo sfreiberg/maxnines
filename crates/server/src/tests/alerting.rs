@@ -2503,7 +2503,7 @@ async fn an_agent_that_sends_seldom_has_a_few_of_its_intervals_to_send_in() {
     let every_ten_minutes = RuleInput {
         name: "Every ten minutes".to_string(),
         priority: 10,
-        condition: None,
+        applies_to: None,
         operating_systems: Vec::new(),
         enabled: true,
         settings: json!({ "interval_secs": 600 }),

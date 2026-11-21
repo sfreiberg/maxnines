@@ -10,7 +10,7 @@ pub struct Model {
     /// [`super::name_key`].
     pub name_key: String,
     pub priority: i32,
-    pub condition_expr: Option<String>,
+    pub applies_to: Option<String>,
     pub enabled: bool,
     /// The systems it's for, comma separated, or nothing for all of them.
     pub operating_systems: Option<String>,

@@ -165,7 +165,7 @@ impl RuleForm {
                 }
                 .to_string()
             }),
-            applies_to: ConditionForm::from_condition(rule.condition.as_deref()),
+            applies_to: ConditionForm::from_condition(rule.applies_to.as_deref()),
             operating_systems: systems(|key| rule.operating_systems.iter().any(|os| os == key)),
             built_in: false,
             built_in_changed: None,
@@ -187,7 +187,7 @@ impl RuleForm {
         Self {
             name: format!("{} changes", saved.rule.name),
             priority: (saved.rule.priority + 1).to_string(),
-            applies_to: ConditionForm::from_condition(saved.rule.condition.as_deref()),
+            applies_to: ConditionForm::from_condition(saved.rule.applies_to.as_deref()),
             operating_systems: systems(|key| {
                 saved.rule.operating_systems.iter().any(|os| os == key)
             }),
@@ -313,7 +313,7 @@ impl RuleForm {
                 .trim()
                 .parse()
                 .context("priority must be a whole number")?,
-            condition: self.applies_to.expression(known)?,
+            applies_to: self.applies_to.expression(known)?,
             operating_systems: self
                 .operating_systems
                 .iter()
@@ -564,8 +564,8 @@ struct RuleRow {
     id: i64,
     name: String,
     priority: i32,
-    condition: Option<String>,
-    /// The condition in plain words, if it's simple enough.
+    applies_to: Option<String>,
+    /// Which hosts in plain words, if it's simple enough.
     description: Option<String>,
     enabled: bool,
     summary: String,
@@ -656,13 +656,13 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             built_in_changed: rule.built_in_changed_at.map(local_date),
             description: rule
                 .rule
-                .condition
+                .applies_to
                 .as_deref()
                 .and_then(Builder::from_expression)
                 .map(|builder| builder.describe()),
             name: rule.rule.name,
             priority: rule.rule.priority,
-            condition: rule.rule.condition,
+            applies_to: rule.rule.applies_to,
             enabled: rule.rule.enabled,
         })
         .collect();
@@ -924,7 +924,7 @@ mod tests {
         RuleInput {
             name: "web".to_string(),
             priority: 100,
-            condition: Some("true".to_string()),
+            applies_to: Some("true".to_string()),
             operating_systems: Vec::new(),
             enabled: false,
             settings,
@@ -1069,9 +1069,9 @@ mod tests {
     fn an_empty_condition_means_every_agent() {
         let mut form = RuleForm::blank();
         form.applies_to.use_expression = true;
-        form.applies_to.condition = "   ".to_string();
+        form.applies_to.text = "   ".to_string();
 
-        assert_eq!(form.to_rule(&BTreeMap::new()).unwrap().condition, None);
+        assert_eq!(form.to_rule(&BTreeMap::new()).unwrap().applies_to, None);
     }
 
     #[test]
@@ -1120,7 +1120,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            form.to_rule(&known()).unwrap().condition.as_deref(),
+            form.to_rule(&known()).unwrap().applies_to.as_deref(),
             Some(r#"facts.os.family == "linux" && facts.host.name.startsWith("web-")"#)
         );
     }
@@ -1133,14 +1133,14 @@ mod tests {
         ]);
 
         assert_eq!(
-            form.to_rule(&known()).unwrap().condition.as_deref(),
+            form.to_rule(&known()).unwrap().applies_to.as_deref(),
             Some(r#"facts.os.family == "linux""#)
         );
         assert_eq!(
             built(vec![ClauseRow::blank()])
                 .to_rule(&known())
                 .unwrap()
-                .condition,
+                .applies_to,
             None
         );
     }
@@ -1148,7 +1148,7 @@ mod tests {
     #[test]
     fn a_simple_condition_opens_in_the_builder() {
         let mut input = rule(json!({}));
-        input.condition = Some(r#"facts.os.family == "linux""#.to_string());
+        input.applies_to = Some(r#"facts.os.family == "linux""#.to_string());
 
         let form = RuleForm::from_rule(&input);
 
@@ -1161,7 +1161,7 @@ mod tests {
     #[test]
     fn a_complex_condition_stays_as_written() {
         let mut input = rule(json!({}));
-        input.condition = Some(r#"(facts.a == "x" || facts.b == "y") && true"#.to_string());
+        input.applies_to = Some(r#"(facts.a == "x" || facts.b == "y") && true"#.to_string());
 
         let form = RuleForm::from_rule(&input);
 
@@ -1202,25 +1202,25 @@ mod tests {
         form.applies_to.apply_action("use_expression", &known());
 
         assert!(form.applies_to.use_expression);
-        assert_eq!(form.applies_to.condition, r#"facts.os.family == "linux""#);
+        assert_eq!(form.applies_to.text, r#"facts.os.family == "linux""#);
     }
 
     #[test]
     fn switching_back_reads_the_expression_or_explains_why_not() {
         let mut form = RuleForm::blank();
         form.applies_to.use_expression = true;
-        form.applies_to.condition = r#"facts.os.family == "linux""#.to_string();
+        form.applies_to.text = r#"facts.os.family == "linux""#.to_string();
         form.applies_to.apply_action("use_builder", &known());
         assert!(!form.applies_to.use_expression);
         assert_eq!(form.applies_to.clauses[0].value, "linux");
 
         let mut form = RuleForm::blank();
         form.applies_to.use_expression = true;
-        form.applies_to.condition = "1 + 1 == 2".to_string();
+        form.applies_to.text = "1 + 1 == 2".to_string();
         form.applies_to.apply_action("use_builder", &known());
         assert!(form.applies_to.use_expression);
         assert!(form.applies_to.note.is_some());
-        assert_eq!(form.applies_to.condition, "1 + 1 == 2");
+        assert_eq!(form.applies_to.text, "1 + 1 == 2");
     }
 
     #[test]

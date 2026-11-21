@@ -1690,7 +1690,7 @@ impl TestServer {
         let input = RuleInput {
             name: name.to_string(),
             priority,
-            condition: Some(condition.to_string()),
+            applies_to: Some(condition.to_string()),
             operating_systems: Vec::new(),
             enabled: true,
             settings,
@@ -1890,7 +1890,7 @@ async fn collectors_an_agent_does_not_know_are_kept_and_shown() {
 async fn rules_can_be_managed_through_the_api() {
     let server = start().await;
 
-    let body = r#"{"name":"web","priority":100,"condition":"facts.custom.role == \"web\"","settings":{"interval_secs":5}}"#;
+    let body = r#"{"name":"web","priority":100,"applies_to":"facts.custom.role == \"web\"","settings":{"interval_secs":5}}"#;
     let created = server.request("POST", "/api/v1/rules", body).await;
     assert!(created.starts_with("HTTP/1.1 201"), "{created}");
     let id: Value = serde_json::from_str(created.split("\r\n\r\n").nth(1).unwrap()).unwrap();
@@ -1899,7 +1899,8 @@ async fn rules_can_be_managed_through_the_api() {
     let shown = server.request("GET", &path, "").await;
     assert!(shown.contains(r#""interval_secs":5"#), "{shown}");
 
-    let changed = r#"{"name":"web","priority":100,"condition":null,"enabled":false,"settings":{}}"#;
+    let changed =
+        r#"{"name":"web","priority":100,"applies_to":null,"enabled":false,"settings":{}}"#;
     let updated = server.request("PUT", &path, changed).await;
     assert!(updated.starts_with("HTTP/1.1 204"), "{updated}");
 
@@ -1918,27 +1919,27 @@ async fn invalid_rules_are_refused_with_a_reason() {
 
     let cases = [
         (
-            r#"{"name":"","priority":1,"condition":null,"settings":{}}"#,
+            r#"{"name":"","priority":1,"applies_to":null,"settings":{}}"#,
             "name",
         ),
         (
-            r#"{"name":"a","priority":1,"condition":"1 +","settings":{}}"#,
+            r#"{"name":"a","priority":1,"applies_to":"1 +","settings":{}}"#,
             "condition",
         ),
         (
-            r#"{"name":"a","priority":1,"condition":null,"settings":{"intervl":5}}"#,
+            r#"{"name":"a","priority":1,"applies_to":null,"settings":{"intervl":5}}"#,
             "settings",
         ),
         (
-            r#"{"name":"a","priority":1,"condition":null,"settings":{"interval_secs":0}}"#,
+            r#"{"name":"a","priority":1,"applies_to":null,"settings":{"interval_secs":0}}"#,
             "at least 1",
         ),
         (
-            r#"{"name":"a","priority":1,"condition":null,"settings":{"collectors":{"nope":{}}}}"#,
+            r#"{"name":"a","priority":1,"applies_to":null,"settings":{"collectors":{"nope":{}}}}"#,
             "unknown collector",
         ),
         (
-            r#"{"name":"Default","priority":1,"condition":null,"settings":{}}"#,
+            r#"{"name":"Default","priority":1,"applies_to":null,"settings":{}}"#,
             "already exists",
         ),
     ];
@@ -2514,7 +2515,7 @@ async fn a_rule_can_be_edited_and_deleted_in_the_browser() {
         .rule;
     assert_eq!(rule.name, "Renamed");
     assert!(!rule.enabled);
-    assert_eq!(rule.condition, None);
+    assert_eq!(rule.applies_to, None);
     assert_eq!(
         rule.settings,
         json!({ "collectors": { "cpu": { "enabled": false } } })
@@ -2540,7 +2541,7 @@ async fn an_invalid_rule_shows_why_and_keeps_what_was_typed() {
                 ("name", "a"),
                 ("priority", "1"),
                 ("condition_mode", "expression"),
-                ("condition", "1 +"),
+                ("applies_to", "1 +"),
             ],
             "invalid condition",
         ),
@@ -2563,7 +2564,7 @@ async fn an_invalid_rule_shows_why_and_keeps_what_was_typed() {
         ("name", "Keep me"),
         ("priority", "1"),
         ("condition_mode", "expression"),
-        ("condition", "1 +"),
+        ("applies_to", "1 +"),
     ];
     let page = browser
         .submit(&server, "/rules/new", "/rules", &typed)
@@ -2704,7 +2705,7 @@ async fn text_in_a_rule_can_not_inject_html() {
         ("name", attack),
         ("priority", "1"),
         ("condition_mode", "expression"),
-        ("condition", "true"),
+        ("applies_to", "true"),
     ];
     browser
         .submit(&server, "/rules/new", "/rules", &fields)
@@ -2749,7 +2750,7 @@ async fn a_rule_built_with_form_fields_stores_a_real_expression() {
     assert_eq!(page.status, 303, "{}", page.body);
 
     assert_eq!(
-        only_custom_rule(&server).await.condition.as_deref(),
+        only_custom_rule(&server).await.applies_to.as_deref(),
         Some(r#"facts.os.family == "linux" && facts.host.name.startsWith("web-")"#)
     );
 
@@ -2856,7 +2857,7 @@ async fn saving_a_complex_rule_from_its_form_leaves_the_expression_unchanged() {
         ("priority", "100"),
         ("enabled", "on"),
         ("condition_mode", "expression"),
-        ("condition", condition),
+        ("applies_to", condition),
     ];
     let page = browser
         .submit(&server, &edit, &format!("/rules/{id}"), &fields)
@@ -2864,7 +2865,7 @@ async fn saving_a_complex_rule_from_its_form_leaves_the_expression_unchanged() {
     assert_eq!(page.status, 303, "{}", page.body);
 
     assert_eq!(
-        only_custom_rule(&server).await.condition.as_deref(),
+        only_custom_rule(&server).await.applies_to.as_deref(),
         Some(condition)
     );
 }
@@ -3335,7 +3336,7 @@ async fn a_rule_can_be_previewed_before_it_has_a_name() {
 #[tokio::test]
 async fn a_preview_of_a_broken_rule_explains_what_is_wrong() {
     let server = start().await;
-    for (name, value) in [("condition", "facts.os =="), ("interval_secs", "soon")] {
+    for (name, value) in [("applies_to", "facts.os =="), ("interval_secs", "soon")] {
         let fields = [
             ("name", "Broken"),
             ("priority", "100"),
@@ -5026,7 +5027,7 @@ async fn the_api_can_preview_a_rule_without_saving_it() {
     let rule = json!({
         "name": "Linux only",
         "priority": 100,
-        "condition": "facts.os.family == \"linux\"",
+        "applies_to": "facts.os.family == \"linux\"",
         "settings": { "interval_secs": 60 },
     });
 
@@ -5049,7 +5050,7 @@ async fn the_api_refuses_to_preview_a_bad_rule() {
     let rule = json!({
         "name": "Broken",
         "priority": 100,
-        "condition": "facts.os.family ==",
+        "applies_to": "facts.os.family ==",
         "settings": {},
     });
 

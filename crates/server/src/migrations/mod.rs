@@ -248,7 +248,7 @@ impl MigrationTrait for CreateTables {
                             .unique_key(),
                     )
                     .col(ColumnDef::new(ConfigRules::Priority).integer().not_null())
-                    .col(ColumnDef::new(ConfigRules::ConditionExpr).text())
+                    .col(ColumnDef::new(ConfigRules::AppliesTo).text())
                     .col(ColumnDef::new(ConfigRules::Enabled).boolean().not_null())
                     .col(ColumnDef::new(ConfigRules::OperatingSystems).string_len(64))
                     .col(ColumnDef::new(ConfigRules::BuiltIn).string_len(32))
@@ -3210,7 +3210,7 @@ enum ConfigRules {
     Id,
     Name,
     Priority,
-    ConditionExpr,
+    AppliesTo,
     Enabled,
     OperatingSystems,
     BuiltIn,

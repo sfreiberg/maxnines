@@ -277,7 +277,7 @@ erDiagram
         string name
         string name_key UK
         int priority
-        text condition_expr "CEL, over facts"
+        text applies_to "CEL, over facts"
         boolean enabled
         string operating_systems "comma separated, or null for all"
         string built_in "key of a rule that ships with the server"

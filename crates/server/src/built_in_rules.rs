@@ -21,7 +21,7 @@ pub fn all() -> Vec<BuiltInRule> {
             rule: RuleInput {
                 name: "Default".to_string(),
                 priority: 0,
-                condition: None,
+                applies_to: None,
                 operating_systems: Vec::new(),
                 enabled: true,
                 settings: json!({
@@ -43,7 +43,7 @@ pub fn all() -> Vec<BuiltInRule> {
             rule: RuleInput {
                 name: "macOS".to_string(),
                 priority: 0,
-                condition: None,
+                applies_to: None,
                 operating_systems: vec!["macos".to_string()],
                 enabled: true,
                 settings: json!({ "collectors": { "gpu": { "enabled": true } } }),

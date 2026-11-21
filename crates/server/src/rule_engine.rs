@@ -46,8 +46,9 @@ pub fn check_rule(rule: &RuleInput) -> Result<()> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
 
-    if let Some(condition) = &rule.condition {
-        Program::compile(condition).map_err(|error| anyhow!("invalid condition: {error}"))?;
+    if let Some(condition) = &rule.applies_to {
+        Program::compile(condition)
+            .map_err(|error| anyhow!("invalid condition for which hosts: {error}"))?;
     }
     for (index, system) in rule.operating_systems.iter().enumerate() {
         ensure!(
@@ -163,7 +164,7 @@ impl CompiledRule {
     pub fn new(rule: ConfigRule) -> Self {
         let condition = rule
             .rule
-            .condition
+            .applies_to
             .as_deref()
             .map(|text| Condition::compile(text).map_err(|error| format!("{error:#}")));
         Self { rule, condition }
@@ -283,7 +284,7 @@ mod tests {
             rule: RuleInput {
                 name: name.to_string(),
                 priority: 0,
-                condition: condition.map(String::from),
+                applies_to: condition.map(String::from),
                 operating_systems: Vec::new(),
                 enabled: true,
                 settings,

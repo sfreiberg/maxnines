@@ -58,7 +58,7 @@ pub fn preview(
     let compiled = Compiled {
         before: ConfigRules::new(rules.iter().cloned()),
         after: ConfigRules::new(with_rule(rules, id, rule)),
-        condition: rule.condition.as_deref().map(Condition::compile),
+        condition: rule.applies_to.as_deref().map(Condition::compile),
     };
     let mut previews: Vec<HostPreview> = hosts
         .iter()
@@ -366,7 +366,7 @@ mod tests {
         RuleInput {
             name: name.to_string(),
             priority,
-            condition: condition.map(String::from),
+            applies_to: condition.map(String::from),
             operating_systems: Vec::new(),
             enabled: true,
             settings,

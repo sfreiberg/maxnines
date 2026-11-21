@@ -108,7 +108,7 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
         rule: RuleInput {
             name: "Linux".to_string(),
             priority: 0,
-            condition: None,
+            applies_to: None,
             operating_systems: vec!["linux".to_string()],
             enabled: true,
             settings: json!({ "collectors": { "sensors": { "enabled": true } } }),
@@ -317,7 +317,7 @@ async fn a_rule_can_be_limited_to_some_operating_systems() {
     assert_eq!(page.status, 303, "{}", page.body);
     let rule = rule_named(&server, "Unix-like").await;
     assert_eq!(rule.rule.operating_systems, ["freebsd", "linux"]);
-    assert_eq!(rule.rule.condition, None);
+    assert_eq!(rule.rule.applies_to, None);
 
     let list = browser.get(&server, "/rules").await;
     assert!(list.body.contains("FreeBSD and Linux"), "{}", list.body);
@@ -332,7 +332,7 @@ async fn a_rule_can_be_limited_to_some_operating_systems() {
     let unknown = json!({
         "name": "Plan 9",
         "priority": 1,
-        "condition": null,
+        "applies_to": null,
         "operating_systems": ["plan9"],
         "settings": {},
     });
@@ -347,7 +347,7 @@ async fn a_rule_named_like_another_whatever_the_case_is_refused() {
     let rule = json!({
         "name": " MACOS ",
         "priority": 5,
-        "condition": "true",
+        "applies_to": "true",
         "operating_systems": [],
         "enabled": true,
         "settings": { "interval_secs": 9 },

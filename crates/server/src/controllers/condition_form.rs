@@ -18,7 +18,8 @@ const TOO_COMPLEX: &str = "This condition is too complex for the builder, so it'
 #[derive(Serialize, Default)]
 pub struct ConditionForm {
     /// The expression, when it's being written by hand.
-    pub condition: String,
+    #[serde(rename = "applies_to")]
+    pub text: String,
     /// Whether the expression box is showing instead of the builder.
     pub use_expression: bool,
     /// Why the builder can't show this condition.
@@ -93,7 +94,7 @@ impl ConditionForm {
 
     /// Shows a condition in the builder if it fits there, or as text if not.
     pub fn set_condition(&mut self, condition: Option<&str>) {
-        self.condition = condition.unwrap_or_default().to_string();
+        self.text = condition.unwrap_or_default().to_string();
         match condition.map(Builder::from_expression) {
             None => self.clauses = vec![ClauseRow::blank()],
             Some(Some(builder)) => {
@@ -136,7 +137,7 @@ impl ConditionForm {
 
     pub fn expression(&self, known: &BTreeMap<String, String>) -> Result<Option<String>> {
         if self.use_expression {
-            let condition = self.condition.trim();
+            let condition = self.text.trim();
             return Ok((!condition.is_empty()).then(|| condition.to_string()));
         }
         self.builder()?.to_expression(known)
@@ -145,7 +146,7 @@ impl ConditionForm {
     pub fn from_fields(fields: &BTreeMap<String, String>) -> Self {
         let text = |name: &str| fields.get(name).cloned().unwrap_or_default();
         Self {
-            condition: text("condition"),
+            text: text("applies_to"),
             use_expression: text("condition_mode") == "expression",
             note: None,
             match_any: text("match") == "any",
@@ -191,14 +192,14 @@ impl ConditionForm {
             "use_expression" => {
                 // Keep what's been built, if it's complete enough to write out.
                 if let Ok(expression) = self.builder().and_then(|b| b.to_expression(known)) {
-                    self.condition = expression.unwrap_or_default();
+                    self.text = expression.unwrap_or_default();
                 }
                 self.use_expression = true;
                 self.note = None;
                 true
             }
             "use_builder" => {
-                let condition = self.condition.trim().to_string();
+                let condition = self.text.trim().to_string();
                 self.use_expression = false;
                 self.set_condition((!condition.is_empty()).then_some(condition.as_str()));
                 true

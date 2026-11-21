@@ -625,7 +625,7 @@ mod tests {
         let mut form = AlertRuleForm::from_rule(original);
         if original.applies_to.is_some() {
             form.applies_to.use_expression = true;
-            form.applies_to.condition = "true".to_string();
+            form.applies_to.text = "true".to_string();
         }
         form.to_rule(&BTreeMap::new()).unwrap()
     }
