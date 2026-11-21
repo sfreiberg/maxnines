@@ -26,11 +26,6 @@ MaxNines keeps its data in two places:
     and that protocol.
   - `m20261120_000002_skipped_collectors` keeps which collectors in its config a
     host's agent doesn't know, as it's older than the server.
-  - `m20261120_000003_alert_conditions` gives alert rules a `warning` and a `critical`
-    condition, in CEL over metrics by name, and summaries, in place of a kind, a
-    series, a comparison, thresholds, a severity and how far ahead a forecast looks.
-    Each rule is said the new way, `condition_expr` becomes `applies_to`, and only a
-    calculation keeps a metric.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
   server or ClickHouse for a big one, and only one of them is used. Each has a
   migration, `0001_create_tables`, which makes its tables, and a second: in

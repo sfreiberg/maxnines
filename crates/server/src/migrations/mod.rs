@@ -7,10 +7,6 @@
 use sea_orm::{DatabaseBackend, Statement};
 use sea_orm_migration::prelude::*;
 
-mod alert_conditions;
-
-use alert_conditions::AlertConditions;
-
 pub struct Migrator;
 
 impl MigratorTrait for Migrator {
@@ -24,7 +20,6 @@ impl MigratorTrait for Migrator {
             Box::new(DurationsInSeconds),
             Box::new(RefusedAgents),
             Box::new(SkippedCollectors),
-            Box::new(AlertConditions),
         ]
     }
 }
@@ -587,19 +582,12 @@ impl MigrationTrait for CreateTables {
                     .table(AlertRules::Table)
                     .col(id(AlertRules::Id))
                     .col(ColumnDef::new(AlertRules::Name).string_len(255).not_null())
-                    .col(ColumnDef::new(AlertRules::Kind).string_len(16).not_null())
-                    .col(ColumnDef::new(AlertRules::Metric).string_len(64))
-                    .col(ColumnDef::new(AlertRules::Series).string_len(255))
-                    .col(ColumnDef::new(AlertRules::Comparison).string_len(16))
-                    .col(ColumnDef::new(AlertRules::Threshold).double())
-                    .col(ColumnDef::new(AlertRules::WarningThreshold).double())
+                    .col(ColumnDef::new(AlertRules::Warning).text())
+                    .col(ColumnDef::new(AlertRules::Critical).text())
+                    .col(ColumnDef::new(AlertRules::Summary).text())
+                    .col(ColumnDef::new(AlertRules::ResolvedSummary).text())
                     .col(ColumnDef::new(AlertRules::ForSecs).big_integer().not_null())
-                    .col(
-                        ColumnDef::new(AlertRules::Severity)
-                            .string_len(16)
-                            .not_null(),
-                    )
-                    .col(ColumnDef::new(AlertRules::ConditionExpr).text())
+                    .col(ColumnDef::new(AlertRules::AppliesTo).text())
                     .col(ColumnDef::new(AlertRules::Enabled).boolean().not_null())
                     .col(
                         ColumnDef::new(AlertRules::AllChannels)
@@ -608,12 +596,11 @@ impl MigrationTrait for CreateTables {
                             .default(false),
                     )
                     .col(ColumnDef::new(AlertRules::Calculation).string_len(16))
+                    .col(ColumnDef::new(AlertRules::Metric).string_len(64))
                     .col(ColumnDef::new(AlertRules::GroupBy).string_len(255))
                     .col(ColumnDef::new(AlertRules::Filter).string_len(500))
                     .col(ColumnDef::new(AlertRules::WindowSecs).big_integer())
                     .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
-                    .col(ColumnDef::new(AlertRules::ForecastSecs).big_integer())
-                    .col(ColumnDef::new(AlertRules::WarningForecastSecs).big_integer())
                     .col(moment(backend, AlertRules::DeletedAt))
                     .to_owned(),
             )
@@ -1352,107 +1339,70 @@ const DEFAULT_SETTINGS: [(&str, &str, &str); 8] = [
     ("collectors.system.enabled", "true", "boolean"),
 ];
 
-/// One built-in alert rule. Each tells every channel, and is critical, with a warning
-/// first where it has a warning threshold or a longer forecast.
+/// One built-in alert rule. Each tells every channel.
 struct BuiltInRule {
     name: &'static str,
-    kind: &'static str,
-    metric: Option<&'static str>,
-    comparison: Option<&'static str>,
-    threshold: Option<f64>,
-    warning_threshold: Option<f64>,
+    warning: Option<&'static str>,
+    critical: Option<&'static str>,
+    summary: Option<&'static str>,
+    resolved_summary: Option<&'static str>,
     for_secs: i64,
     window_secs: Option<i64>,
-    forecast_secs: Option<i64>,
-    warning_forecast_secs: Option<i64>,
+}
+
+const fn built_in(
+    name: &'static str,
+    warning: Option<&'static str>,
+    critical: Option<&'static str>,
+    for_secs: i64,
+) -> BuiltInRule {
+    BuiltInRule {
+        name,
+        warning,
+        critical,
+        summary: None,
+        resolved_summary: None,
+        for_secs,
+        window_secs: None,
+    }
 }
 
 const BUILT_IN_RULES: [BuiltInRule; 7] = [
     BuiltInRule {
-        name: "Host offline",
-        kind: "offline",
-        metric: None,
-        comparison: None,
-        threshold: None,
-        warning_threshold: None,
-        for_secs: 60,
-        window_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
+        summary: Some("{{ hostname }} is offline"),
+        resolved_summary: Some("{{ hostname }} is back online"),
+        ..built_in("Host offline", None, Some("!online"), 60)
     },
+    built_in(
+        "Disk filling up",
+        Some("disk.usage > 80"),
+        Some("disk.usage > 90"),
+        300,
+    ),
+    built_in("Container down", None, Some("container.up < 1"), 60),
     BuiltInRule {
-        name: "Disk filling up",
-        kind: "metric",
-        metric: Some("disk.usage"),
-        comparison: Some("above"),
-        threshold: Some(90.0),
-        warning_threshold: Some(80.0),
-        for_secs: 300,
-        window_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
-    },
-    BuiltInRule {
-        name: "Container down",
-        kind: "metric",
-        metric: Some("container.up"),
-        comparison: Some("below"),
-        threshold: Some(1.0),
-        warning_threshold: None,
-        for_secs: 60,
-        window_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
-    },
-    BuiltInRule {
-        name: "Disk will be full soon",
-        kind: "forecast",
-        metric: Some("disk.usage"),
-        comparison: Some("above"),
-        threshold: Some(100.0),
-        warning_threshold: None,
-        for_secs: 1800,
         window_secs: Some(21_600),
-        forecast_secs: Some(14_400),
-        warning_forecast_secs: Some(86_400),
+        ..built_in(
+            "Disk will be full soon",
+            Some("forecast(disk.usage, duration('24h')) >= 100"),
+            Some("forecast(disk.usage, duration('4h')) >= 100"),
+            1800,
+        )
     },
-    BuiltInRule {
-        name: "Disk running out of inodes",
-        kind: "metric",
-        metric: Some("disk.inodes"),
-        comparison: Some("above"),
-        threshold: Some(90.0),
-        warning_threshold: Some(80.0),
-        for_secs: 300,
-        window_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
-    },
-    BuiltInRule {
-        name: "Clock is wrong",
-        kind: "metric",
-        metric: Some("clock.difference"),
-        comparison: Some("above"),
-        threshold: Some(30.0),
-        warning_threshold: Some(5.0),
-        for_secs: 60,
-        window_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
-    },
-    BuiltInRule {
-        name: "Service stopped",
-        kind: "metric",
-        metric: Some("service.running"),
-        comparison: Some("below"),
-        threshold: Some(1.0),
-        warning_threshold: None,
-        // Long enough for a restart, and no longer: a service that's down is down.
-        for_secs: 60,
-        window_secs: None,
-        forecast_secs: None,
-        warning_forecast_secs: None,
-    },
+    built_in(
+        "Disk running out of inodes",
+        Some("disk.inodes > 80"),
+        Some("disk.inodes > 90"),
+        300,
+    ),
+    built_in(
+        "Clock is wrong",
+        Some("clock.difference > duration('5s')"),
+        Some("clock.difference > duration('30s')"),
+        60,
+    ),
+    // Long enough for a restart, and no longer: a service that's down is down.
+    built_in("Service stopped", None, Some("service.running < 1"), 60),
 ];
 
 async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
@@ -1521,42 +1471,32 @@ async fn add_built_ins(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 }
 
 async fn add_built_in_rule(manager: &SchemaManager<'_>, rule: &BuiltInRule) -> Result<(), DbErr> {
-    {
-        let insert = Query::insert()
-            .into_table(AlertRules::Table)
-            .columns([
-                AlertRules::Name,
-                AlertRules::Kind,
-                AlertRules::Metric,
-                AlertRules::Comparison,
-                AlertRules::Threshold,
-                AlertRules::WarningThreshold,
-                AlertRules::ForSecs,
-                AlertRules::Severity,
-                AlertRules::Enabled,
-                AlertRules::AllChannels,
-                AlertRules::WindowSecs,
-                AlertRules::ForecastSecs,
-                AlertRules::WarningForecastSecs,
-            ])
-            .values_panic([
-                rule.name.into(),
-                rule.kind.into(),
-                rule.metric.into(),
-                rule.comparison.into(),
-                rule.threshold.into(),
-                rule.warning_threshold.into(),
-                rule.for_secs.into(),
-                "critical".into(),
-                true.into(),
-                true.into(),
-                rule.window_secs.into(),
-                rule.forecast_secs.into(),
-                rule.warning_forecast_secs.into(),
-            ])
-            .to_owned();
-        manager.exec_stmt(insert).await
-    }
+    let insert = Query::insert()
+        .into_table(AlertRules::Table)
+        .columns([
+            AlertRules::Name,
+            AlertRules::Warning,
+            AlertRules::Critical,
+            AlertRules::Summary,
+            AlertRules::ResolvedSummary,
+            AlertRules::ForSecs,
+            AlertRules::Enabled,
+            AlertRules::AllChannels,
+            AlertRules::WindowSecs,
+        ])
+        .values_panic([
+            rule.name.into(),
+            rule.warning.into(),
+            rule.critical.into(),
+            rule.summary.into(),
+            rule.resolved_summary.into(),
+            rule.for_secs.into(),
+            true.into(),
+            true.into(),
+            rule.window_secs.into(),
+        ])
+        .to_owned();
+    manager.exec_stmt(insert).await
 }
 
 struct AddNoMetricsRule;
@@ -1570,16 +1510,9 @@ impl MigrationName for AddNoMetricsRule {
 /// A connected agent whose samples all stop being stored, such as after a change to
 /// what agents send, never goes offline, so nothing else notices.
 const NO_METRICS_RULE: BuiltInRule = BuiltInRule {
-    name: "Host sending no metrics",
-    kind: "no_metrics",
-    metric: None,
-    comparison: None,
-    threshold: None,
-    warning_threshold: None,
-    for_secs: 300,
-    window_secs: None,
-    forecast_secs: None,
-    warning_forecast_secs: None,
+    summary: Some("{{ hostname }} is connected but sending no metrics"),
+    resolved_summary: Some("{{ hostname }} is sending metrics again"),
+    ..built_in("Host sending no metrics", None, Some("!reporting"), 300)
 };
 
 /// Adds the built-in rule for an agent that's connected but sending no metrics, to
@@ -1600,7 +1533,7 @@ impl MigrationTrait for AddNoMetricsRule {
             .and_where(
                 Expr::col(AlertRules::Name)
                     .eq(NO_METRICS_RULE.name)
-                    .or(Expr::col(AlertRules::Kind).eq(NO_METRICS_RULE.kind)),
+                    .or(Expr::col(AlertRules::Critical).eq(NO_METRICS_RULE.critical)),
             )
             .limit(1)
             .to_owned();
@@ -1616,7 +1549,7 @@ impl MigrationTrait for AddNoMetricsRule {
         let rules = Query::select()
             .column(AlertRules::Id)
             .from(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Kind).eq(NO_METRICS_RULE.kind))
+            .and_where(Expr::col(AlertRules::Critical).eq(NO_METRICS_RULE.critical))
             .to_owned();
         let alerts = Query::delete()
             .from_table(Alerts::Table)
@@ -1625,7 +1558,7 @@ impl MigrationTrait for AddNoMetricsRule {
         manager.exec_stmt(alerts).await?;
         let rules = Query::delete()
             .from_table(AlertRules::Table)
-            .and_where(Expr::col(AlertRules::Kind).eq(NO_METRICS_RULE.kind))
+            .and_where(Expr::col(AlertRules::Critical).eq(NO_METRICS_RULE.critical))
             .to_owned();
         manager.exec_stmt(rules).await
     }
@@ -3390,24 +3323,20 @@ enum AlertRules {
     Table,
     Id,
     Name,
-    Kind,
-    Metric,
-    Series,
-    Comparison,
-    Threshold,
-    WarningThreshold,
+    Warning,
+    Critical,
+    Summary,
+    ResolvedSummary,
     ForSecs,
-    Severity,
-    ConditionExpr,
+    AppliesTo,
     Enabled,
     AllChannels,
     Calculation,
+    Metric,
     GroupBy,
     Filter,
     WindowSecs,
     RemindEverySecs,
-    ForecastSecs,
-    WarningForecastSecs,
     DeletedAt,
 }
 
@@ -3785,10 +3714,10 @@ mod tests {
         Migrator::up(&connection, Some(1)).await.unwrap();
         up_to(&connection, &AddNoMetricsRule).await;
 
-        let added = "SELECT kind FROM alert_rules
+        let added = "SELECT critical FROM alert_rules
                      WHERE name = 'Host sending no metrics' AND for_secs = 300
-                     AND severity = 'critical' AND enabled AND all_channels";
-        assert_eq!(texts(&connection, added).await, ["no_metrics"]);
+                     AND warning IS NULL AND enabled AND all_channels";
+        assert_eq!(texts(&connection, added).await, ["!reporting"]);
     }
 
     #[tokio::test]
@@ -3805,8 +3734,11 @@ mod tests {
 
         up_to(&connection, &AddNoMetricsRule).await;
 
-        let named = "SELECT kind FROM alert_rules WHERE name = 'Host sending no metrics'";
-        assert_eq!(texts(&connection, named).await, ["metric"]);
+        let named = "SELECT critical FROM alert_rules WHERE name = 'Host sending no metrics'";
+        assert_eq!(
+            texts(&connection, named).await,
+            ["clock.difference > duration('30s')"]
+        );
     }
 
     #[tokio::test]
@@ -3926,11 +3858,11 @@ mod tests {
              VALUES ('Ping', 'ping', 'web', 60, TRUE, 'h1')"
                 .to_string(),
             format!(
-                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled, deleted_at)
-                 VALUES ('Twice', 'offline', 60, 'critical', TRUE, NULL),
-                        ('Twice', 'offline', 60, 'critical', TRUE, NULL),
-                        ('Gone', 'offline', 60, 'critical', TRUE, {at}),
-                        ('Gone', 'offline', 60, 'critical', TRUE, NULL)"
+                "INSERT INTO alert_rules (name, critical, for_secs, enabled, deleted_at)
+                 VALUES ('Twice', '!online', 60, TRUE, NULL),
+                        ('Twice', '!online', 60, TRUE, NULL),
+                        ('Gone', '!online', 60, TRUE, {at}),
+                        ('Gone', '!online', 60, TRUE, NULL)"
             ),
             format!(
                 "INSERT INTO notification_channels (name, kind, target, deleted_at)
@@ -4046,8 +3978,8 @@ mod tests {
         // A name is used once among rules and channels that aren't deleted.
         let rule = |name: &str, deleted: &str| {
             format!(
-                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled, deleted_at)
-                 VALUES ('{name}', 'offline', 60, 'critical', TRUE, {deleted})"
+                "INSERT INTO alert_rules (name, critical, for_secs, enabled, deleted_at)
+                 VALUES ('{name}', '!online', 60, TRUE, {deleted})"
             )
         };
         let at = "'2026-11-19 00:00:00+00:00'";
@@ -4134,10 +4066,10 @@ mod tests {
         Migrator::up(&connection, Some(2)).await.unwrap();
         run(
             &connection,
-            "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled)
-             VALUES ('Disk', 'offline', 60, 'critical', TRUE),
-                    ('Disk (11)', 'offline', 60, 'critical', TRUE),
-                    ('Disk', 'offline', 60, 'critical', TRUE)",
+            "INSERT INTO alert_rules (name, critical, for_secs, enabled)
+             VALUES ('Disk', '!online', 60, TRUE),
+                    ('Disk (11)', '!online', 60, TRUE),
+                    ('Disk', '!online', 60, TRUE)",
         )
         .await;
 
@@ -4163,11 +4095,11 @@ mod tests {
                  VALUES ('h1', 'agentless', 'web', 'approved', {at})"
             ),
             format!(
-                "INSERT INTO alert_rules (name, kind, for_secs, severity, enabled, deleted_at)
-                 VALUES ('Disk', 'offline', 60, 'critical', TRUE, NULL),
-                        (' disk', 'offline', 60, 'critical', TRUE, NULL),
-                        ('disk (10)', 'offline', 60, 'critical', TRUE, NULL),
-                        ('DISK', 'offline', 60, 'critical', TRUE, {at})"
+                "INSERT INTO alert_rules (name, critical, for_secs, enabled, deleted_at)
+                 VALUES ('Disk', '!online', 60, TRUE, NULL),
+                        (' disk', '!online', 60, TRUE, NULL),
+                        ('disk (10)', '!online', 60, TRUE, NULL),
+                        ('DISK', '!online', 60, TRUE, {at})"
             ),
             "INSERT INTO notification_channels (name, kind, target)
              VALUES ('Ops', 'webhook', 'http://ops'), (' OPS', 'webhook', 'http://ops')"
@@ -4242,8 +4174,8 @@ mod tests {
         // Each is enforced, whatever the case.
         let at = "'2026-11-19 00:00:00+00:00'";
         let refused = [
-            "INSERT INTO alert_rules (name, name_key, kind, for_secs, severity, enabled)
-             VALUES ('DISK', 'disk', 'offline', 60, 'critical', TRUE)"
+            "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled)
+             VALUES ('DISK', 'disk', '!online', 60, TRUE)"
                 .to_string(),
             "INSERT INTO notification_channels (name, name_key, kind, target)
              VALUES ('ops', 'ops', 'webhook', 'http://ops')"
@@ -4269,9 +4201,9 @@ mod tests {
         }
         for sql in [
             format!(
-                "INSERT INTO alert_rules (name, name_key, kind, for_secs, severity, enabled,
+                "INSERT INTO alert_rules (name, name_key, critical, for_secs, enabled,
                      deleted_at)
-                 VALUES ('DISK', 'disk', 'offline', 60, 'critical', TRUE, {at})"
+                 VALUES ('DISK', 'disk', '!online', 60, TRUE, {at})"
             ),
             format!(
                 "INSERT INTO host_facts (host_id, name, value, value_type, valid_from, valid_to)
@@ -4464,146 +4396,22 @@ mod tests {
         assert_eq!(number(&connection, none).await, 1);
     }
 
-    /// What `name`'s columns say, joined with " | ", NULL as "-".
-    async fn said(
-        connection: &sea_orm::DatabaseConnection,
-        name: &str,
-        columns: &[&str],
-    ) -> String {
-        let mut said = Vec::new();
-        for column in columns {
-            let sql = format!(
-                "SELECT COALESCE(CAST({column} AS CHAR(2000)), '-') FROM alert_rules WHERE name = '{name}'"
-            );
-            let sql = match connection.get_database_backend() {
-                DatabaseBackend::MySql => sql,
-                _ => sql.replace("CHAR(2000)", "TEXT"),
+    #[test]
+    fn every_built_in_alert_rule_is_one_this_server_takes() {
+        for rule in BUILT_IN_RULES.iter().chain([&NO_METRICS_RULE]) {
+            let input = crate::alerting::AlertRuleInput {
+                summary: rule.summary.map(str::to_string),
+                resolved_summary: rule.resolved_summary.map(str::to_string),
+                window: rule.window_secs.map(chrono::TimeDelta::seconds),
+                hold: chrono::TimeDelta::seconds(rule.for_secs),
+                ..crate::alerting::AlertRuleInput::with_conditions(
+                    rule.name,
+                    rule.warning,
+                    rule.critical,
+                )
             };
-            let found = texts(connection, &sql).await;
-            said.push(
-                found
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| "missing".to_string()),
-            );
+            crate::alerting::check_rule(&input)
+                .unwrap_or_else(|error| panic!("{}: {error:#}", rule.name));
         }
-        said.join(" | ")
-    }
-
-    #[tokio::test]
-    async fn every_alert_rule_becomes_conditions_and_goes_back_again() {
-        let connection = empty().await;
-        up_to(&connection, &SkippedCollectors).await;
-        let at = "'2026-11-20 00:00:00+00:00'";
-        for sql in [
-            "INSERT INTO alert_rules (name, name_key, kind, metric, series, comparison, threshold,
-                 warning_threshold, for_secs, severity, condition_expr, enabled)
-             VALUES ('Data', 'data', 'metric', 'disk.usage', '/data*', 'above', 95, 85, 60,
-                 'critical', 'facts.os.family == ''linux''', TRUE)"
-                .to_string(),
-            "INSERT INTO alert_rules (name, name_key, kind, metric, comparison, threshold,
-                 for_secs, severity, enabled, calculation, group_by, window_secs)
-             VALUES ('Fleet', 'fleet', 'calculation', 'cpu.usage', 'above', 80, 0, 'warning',
-                 TRUE, 'avg', 'host', 600)"
-                .to_string(),
-            "INSERT INTO alert_rules (name, name_key, kind, metric, comparison, threshold,
-                 for_secs, severity, enabled, forecast_secs)
-             VALUES ('Shrinking', 'shrinking', 'forecast', 'disk.usage', 'below', 5, 0,
-                 'warning', TRUE, 3600)"
-                .to_string(),
-            format!(
-                "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
-                 VALUES (1, 'critical', 'server', 'gone', {at}, {at})"
-            ),
-        ] {
-            run(&connection, &sql).await;
-        }
-
-        Migrator::up(&connection, None).await.unwrap();
-        let columns = ["warning", "critical", "applies_to", "metric", "window_secs"];
-        for (name, expected) in [
-            (
-                "Data",
-                "series.matches('^/data.*$') && disk.usage > 85 | series.matches('^/data.*$') && disk.usage > 95 | facts.os.family == 'linux' | - | -",
-            ),
-            ("Fleet", "value > 80 | - | - | cpu.usage | 600"),
-            (
-                "Shrinking",
-                "forecast(disk.usage, duration('1h')) <= 5 | - | - | - | -",
-            ),
-            ("Host offline", "- | !online | - | - | -"),
-            ("Host sending no metrics", "- | !reporting | - | - | -"),
-            (
-                "Clock is wrong",
-                "clock.difference > duration('5s') | clock.difference > duration('30s') | - | - | -",
-            ),
-            (
-                "Disk will be full soon",
-                "forecast(disk.usage, duration('24h')) >= 100 | forecast(disk.usage, duration('4h')) >= 100 | - | - | 21600",
-            ),
-        ] {
-            assert_eq!(said(&connection, name, &columns).await, expected, "{name}");
-        }
-        assert_eq!(
-            said(
-                &connection,
-                "Host offline",
-                &["summary", "resolved_summary"]
-            )
-            .await,
-            "{{ hostname }} is offline | {{ hostname }} is back online"
-        );
-        assert_eq!(count(&connection, "alerts").await, 1);
-
-        // Running it again where MySQL stopped partway changes nothing more.
-        if connection.get_database_backend() == DatabaseBackend::MySql {
-            AlertConditions
-                .up(&SchemaManager::new(&connection))
-                .await
-                .unwrap();
-        }
-        // A rule only this version can say goes on the way down, with its alerts.
-        run(
-            &connection,
-            "UPDATE alert_rules SET critical = 'disk.usage > 90 && disk.inodes > 90'
-             WHERE name = 'Host offline'",
-        )
-        .await;
-        down_through(&connection, &AlertConditions).await;
-        let columns = [
-            "kind",
-            "metric",
-            "series",
-            "comparison",
-            "threshold",
-            "warning_threshold",
-            "severity",
-            "forecast_secs",
-            "condition_expr",
-        ];
-        let numbers = |text: String| text.replace(".0 ", " ").replace(".0 |", " |");
-        for (name, expected) in [
-            (
-                "Data",
-                "metric | disk.usage | /data* | above | 95 | 85 | critical | - | facts.os.family == 'linux'",
-            ),
-            (
-                "Fleet",
-                "calculation | cpu.usage | - | above | 80 | - | warning | - | -",
-            ),
-            (
-                "Shrinking",
-                "forecast | disk.usage | - | below | 5 | - | warning | 3600 | -",
-            ),
-            (
-                "Host offline",
-                "missing | missing | missing | missing | missing | missing | missing | missing | missing",
-            ),
-        ] {
-            let found = numbers(said(&connection, name, &columns).await);
-            assert_eq!(found, expected, "{name}");
-        }
-        assert_eq!(count(&connection, "alerts").await, 0);
-        Migrator::up(&connection, None).await.unwrap();
     }
 }
