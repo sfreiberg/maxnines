@@ -9,22 +9,12 @@ MaxNines keeps its data in two places:
   [`crates/server/src/migrations`](../crates/server/src/migrations/mod.rs), makes its
   tables and adds the built-in hosts and alert rules.
 - **The metrics store** holds the numbers hosts report. It's DuckDB for a single
-  server or ClickHouse for a big one, and only one of them is used. Each has a
-  migration, `0001_create_tables`, which makes its tables, and a second: in
+  server or ClickHouse for a big one, and only one of them is used. Each has one
+  migration, `0001_create_tables`, which makes its tables: in
   [`crates/server/src/store/migrations`](../crates/server/src/store/migrations) for
-  DuckDB, where `0002_keys` gives the numbered tables their primary keys, and at the
-  top of
+  DuckDB, and at the top of
   [`crates/server/src/store/clickhouse.rs`](../crates/server/src/store/clickhouse.rs)
-  for ClickHouse, where `0002_data_type` renames `samples.kind` to `data_type`, as
-  DuckDB calls it, and a third, `0003_migration_times`, keeps when each migration
-  was applied as a `DateTime64(3, 'UTC')` like every other moment.
-  - DuckDB's `0003_timings_in_seconds`, and ClickHouse's `0004_timings_in_seconds`
-    with `0005` and `0006` for its rollups, make timings that were kept in
-    milliseconds seconds, and rename their metrics to match, such as a check's
-    `response_ms` to `response_secs`. They change no table.
-  - DuckDB's `0004_postgres_metric_names` and ClickHouse's `0007_postgres_metric_names`
-    move PostgreSQL's stats from under `pg` to under `postgres`, as its check is
-    named, such as `pg.connections` to `postgres.connections`. They change no table.
+  for ClickHouse.
 
 The two only meet through a host's ID: the main database's `hosts.id` is the
 metrics store's `host_id`.

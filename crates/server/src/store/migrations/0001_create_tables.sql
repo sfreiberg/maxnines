@@ -1,12 +1,19 @@
 -- What a number is: a collector reports metrics, and each metric on each host, for
 -- each thing it describes, is a series. A new collector only ever adds rows here.
+--
+-- What the writer numbers is numbered once, which the database makes sure of rather
+-- than the writer alone. Only these small tables have keys: they gain rows only for
+-- something new, and DuckDB leaves each key's index on disk until a lookup needs it.
+-- The tables of numbers have none, as sorting them is what makes reading them quick.
+-- A unique index of a name would stop the table being altered until it was dropped,
+-- as DuckDB won't change a table an index depends on, which a key doesn't.
 CREATE TABLE collectors (
-    id   INTEGER NOT NULL,
+    id   INTEGER NOT NULL PRIMARY KEY,
     name VARCHAR NOT NULL
 );
 
 CREATE TABLE metrics (
-    id           INTEGER NOT NULL,
+    id           INTEGER NOT NULL PRIMARY KEY,
     collector_id INTEGER NOT NULL,
     name         VARCHAR NOT NULL,
     data_type    VARCHAR NOT NULL
@@ -15,12 +22,12 @@ CREATE TABLE metrics (
 -- A host is known here by a number, to keep series small, and by the main
 -- database's ID, as everywhere else.
 CREATE TABLE hosts (
-    number  INTEGER NOT NULL,
+    number  INTEGER NOT NULL PRIMARY KEY,
     host_id VARCHAR NOT NULL
 );
 
 CREATE TABLE series (
-    id          BIGINT  NOT NULL,
+    id          BIGINT  NOT NULL PRIMARY KEY,
     metric_id   INTEGER NOT NULL,
     host_number INTEGER NOT NULL
 );

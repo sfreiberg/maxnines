@@ -46,26 +46,27 @@ const MAX_QUERY_BYTES: &str = "67108864";
 
 /// Tables are made here, as ClickHouse has no transactions to make them all at once,
 /// so each statement can safely run again, and so can a migration stopped partway.
+/// Until the first release there are no upgrade steps: a change to a table is made to
+/// the migration that makes it, and a store made before the change is made again.
 /// Months keep partitions to a number that can't grow out of hand, whatever times
 /// agents send. The hour in the sort order lets a query for what's recent skip
 /// everything older.
-const MIGRATIONS: &[(&str, &[&str])] = &[
-    (
-        "0001_create_tables",
-        &[
-            "CREATE TABLE IF NOT EXISTS samples (
-             metric  String,
-             host_id String,
-             labels  Map(String, String),
-             time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
-             value   Float64 CODEC(Gorilla, ZSTD(1)),
-             kind    String
+const MIGRATIONS: &[(&str, &[&str])] = &[(
+    "0001_create_tables",
+    &[
+        "CREATE TABLE IF NOT EXISTS samples (
+             metric    String,
+             host_id   String,
+             labels    Map(String, String),
+             time      DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
+             value     Float64 CODEC(Gorilla, ZSTD(1)),
+             data_type String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, toStartOfHour(time), host_id, labels, time)",
-            // Text, only when it changes. Nothing means it stopped being reported.
-            "CREATE TABLE IF NOT EXISTS texts (
+        // Text, only when it changes. Nothing means it stopped being reported.
+        "CREATE TABLE IF NOT EXISTS texts (
              metric  String,
              host_id String,
              labels  Map(String, String),
@@ -75,27 +76,27 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (host_id, metric, labels, time)",
-            // What exists, to limit what a host can create without reading the samples.
-            "CREATE TABLE IF NOT EXISTS series (
+        // What exists, to limit what a host can create without reading the samples.
+        "CREATE TABLE IF NOT EXISTS series (
              host_id String,
              metric  String,
              labels  Map(String, String)
          )
          ENGINE = ReplacingMergeTree
          ORDER BY (host_id, metric, labels)",
-            // When each host reported, so asking who's current doesn't read the samples.
-            "CREATE TABLE IF NOT EXISTS reports (
+        // When each host reported, so asking who's current doesn't read the samples.
+        "CREATE TABLE IF NOT EXISTS reports (
              time    DateTime64(3, 'UTC') CODEC(Delta, ZSTD(1)),
              host_id String
          )
          ENGINE = ReplacingMergeTree
          PARTITION BY toStartOfMonth(time)
          ORDER BY (time, host_id)",
-            // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
-            // lowest, highest and total value and how many there were. A span rolled up
-            // again is written again with a higher version, which replaces the old rows
-            // when ClickHouse merges them, and reads say FINAL until then.
-            "CREATE TABLE IF NOT EXISTS rollups_five_minute (
+        // What each chart in the catalog showed, 5 minutes and an hour at a time, as the
+        // lowest, highest and total value and how many there were. A span rolled up
+        // again is written again with a higher version, which replaces the old rows
+        // when ClickHouse merges them, and reads say FINAL until then.
+        "CREATE TABLE IF NOT EXISTS rollups_five_minute (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -109,7 +110,7 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfMonth(time)
          ORDER BY (metric, host_id, series, time)",
-            "CREATE TABLE IF NOT EXISTS rollups_hour (
+        "CREATE TABLE IF NOT EXISTS rollups_hour (
              metric  LowCardinality(String),
              host_id String,
              series  String,
@@ -123,221 +124,21 @@ const MIGRATIONS: &[(&str, &[&str])] = &[
          ENGINE = ReplacingMergeTree(version)
          PARTITION BY toStartOfYear(time)
          ORDER BY (metric, host_id, series, time)",
-            // How far each metric is rolled up: every hour before this.
-            "CREATE TABLE IF NOT EXISTS rollup_progress (
+        // How far each metric is rolled up: every hour before this.
+        "CREATE TABLE IF NOT EXISTS rollup_progress (
              metric     String,
              done_until DateTime64(3, 'UTC'),
              version    UInt64
          )
          ENGINE = ReplacingMergeTree(version)
          ORDER BY metric",
-            // Hours that got samples after they were rolled up, to roll up again, by
-            // when each starts.
-            "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
+        // Hours that got samples after they were rolled up, to roll up again, by
+        // when each starts.
+        "CREATE TABLE IF NOT EXISTS rollup_redo (hour DateTime64(3, 'UTC'))
          ENGINE = ReplacingMergeTree
          ORDER BY hour",
-        ],
-    ),
-    // What a number really is goes by the name the other store gives it.
-    (
-        "0002_data_type",
-        &["ALTER TABLE samples RENAME COLUMN IF EXISTS kind TO data_type"],
-    ),
-    // When each migration was applied is a moment like any other, which the table
-    // made before this kept to the second in the server's time zone.
-    (
-        "0003_migration_times",
-        &["ALTER TABLE schema_migrations
-         MODIFY COLUMN applied_at DateTime64(3, 'UTC') DEFAULT now64(3)"],
-    ),    // Timings were milliseconds, named so, and are now seconds: checks' stages and
-    // pings, disks' latency, and databases' latencies and waits. Each is copied under
-    // its new name as seconds, then the old is deleted, so a stop partway can run
-    // again. The catalog's names don't change, so what's rolled up is only made
-    // seconds, each table in a migration of its own, as that can't safely be repeated.
-    (
-        "0004_timings_in_seconds",
-        &[
-            "INSERT INTO samples (metric, host_id, labels, time, value, data_type)
-             SELECT transform(metric, ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
-             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
-             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
-             'disk.read_latency_ms', 'disk.write_latency_ms',
-             'databases.mongodb.reads_latency_ms',
-             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
-             'databases.clickhouse.select_latency_ms',
-             'databases.clickhouse.insert_latency_ms',
-             'databases.clickhouse.keeper_latency_ms',
-             'databases.clickhouse.overcommit_wait_ms',
-             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
-             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms'],
-             ['checks.response_secs', 'checks.dns_secs', 'checks.connect_secs',
-             'checks.tls_secs', 'checks.first_byte_secs', 'checks.download_secs',
-             'checks.rtt_min_secs', 'checks.rtt_max_secs', 'checks.rtt_stddev_secs',
-             'disk.read_latency_secs', 'disk.write_latency_secs',
-             'databases.mongodb.reads_latency_secs',
-             'databases.mongodb.writes_latency_secs',
-             'databases.clickhouse.latency_secs',
-             'databases.clickhouse.select_latency_secs',
-             'databases.clickhouse.insert_latency_secs',
-             'databases.clickhouse.keeper_latency_secs',
-             'databases.clickhouse.overcommit_wait_secs',
-             'databases.clickhouse.insert_delay_secs', 'databases.clickhouse.p50_secs',
-             'databases.clickhouse.p95_secs', 'databases.clickhouse.p99_secs']),
-             host_id, labels, time, value / 1000, data_type
-             FROM samples
-             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
-             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
-             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
-             'disk.read_latency_ms', 'disk.write_latency_ms',
-             'databases.mongodb.reads_latency_ms',
-             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
-             'databases.clickhouse.select_latency_ms',
-             'databases.clickhouse.insert_latency_ms',
-             'databases.clickhouse.keeper_latency_ms',
-             'databases.clickhouse.overcommit_wait_ms',
-             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
-             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']",
-            "ALTER TABLE samples DELETE
-             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
-             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
-             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
-             'disk.read_latency_ms', 'disk.write_latency_ms',
-             'databases.mongodb.reads_latency_ms',
-             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
-             'databases.clickhouse.select_latency_ms',
-             'databases.clickhouse.insert_latency_ms',
-             'databases.clickhouse.keeper_latency_ms',
-             'databases.clickhouse.overcommit_wait_ms',
-             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
-             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']
-             SETTINGS mutations_sync = 2",
-            "INSERT INTO series (host_id, metric, labels)
-             SELECT host_id, transform(metric, ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
-             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
-             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
-             'disk.read_latency_ms', 'disk.write_latency_ms',
-             'databases.mongodb.reads_latency_ms',
-             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
-             'databases.clickhouse.select_latency_ms',
-             'databases.clickhouse.insert_latency_ms',
-             'databases.clickhouse.keeper_latency_ms',
-             'databases.clickhouse.overcommit_wait_ms',
-             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
-             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms'],
-             ['checks.response_secs', 'checks.dns_secs', 'checks.connect_secs',
-             'checks.tls_secs', 'checks.first_byte_secs', 'checks.download_secs',
-             'checks.rtt_min_secs', 'checks.rtt_max_secs', 'checks.rtt_stddev_secs',
-             'disk.read_latency_secs', 'disk.write_latency_secs',
-             'databases.mongodb.reads_latency_secs',
-             'databases.mongodb.writes_latency_secs',
-             'databases.clickhouse.latency_secs',
-             'databases.clickhouse.select_latency_secs',
-             'databases.clickhouse.insert_latency_secs',
-             'databases.clickhouse.keeper_latency_secs',
-             'databases.clickhouse.overcommit_wait_secs',
-             'databases.clickhouse.insert_delay_secs', 'databases.clickhouse.p50_secs',
-             'databases.clickhouse.p95_secs', 'databases.clickhouse.p99_secs']),
-             labels
-             FROM series
-             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
-             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
-             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
-             'disk.read_latency_ms', 'disk.write_latency_ms',
-             'databases.mongodb.reads_latency_ms',
-             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
-             'databases.clickhouse.select_latency_ms',
-             'databases.clickhouse.insert_latency_ms',
-             'databases.clickhouse.keeper_latency_ms',
-             'databases.clickhouse.overcommit_wait_ms',
-             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
-             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']",
-            "ALTER TABLE series DELETE
-             WHERE metric IN ['checks.response_ms', 'checks.dns_ms', 'checks.connect_ms',
-             'checks.tls_ms', 'checks.first_byte_ms', 'checks.download_ms',
-             'checks.rtt_min_ms', 'checks.rtt_max_ms', 'checks.rtt_stddev_ms',
-             'disk.read_latency_ms', 'disk.write_latency_ms',
-             'databases.mongodb.reads_latency_ms',
-             'databases.mongodb.writes_latency_ms', 'databases.clickhouse.latency_ms',
-             'databases.clickhouse.select_latency_ms',
-             'databases.clickhouse.insert_latency_ms',
-             'databases.clickhouse.keeper_latency_ms',
-             'databases.clickhouse.overcommit_wait_ms',
-             'databases.clickhouse.insert_delay_ms', 'databases.clickhouse.p50_ms',
-             'databases.clickhouse.p95_ms', 'databases.clickhouse.p99_ms']
-             SETTINGS mutations_sync = 2",
-        ],
-    ),
-    (
-        "0005_timings_in_seconds_five_minutes",
-        &["ALTER TABLE rollups_five_minute
-         UPDATE low = low / 1000, high = high / 1000, summed = summed / 1000
-         WHERE metric IN ['check.response', 'check.first_byte', 'check.dns', 'check.connect',
-             'check.tls', 'check.download', 'disk.read_latency', 'disk.write_latency',
-             'mongodb.read_latency', 'mongodb.write_latency', 'clickhouse.latency',
-             'clickhouse.select_latency', 'clickhouse.insert_latency',
-             'clickhouse.insert_delay', 'clickhouse.overcommit_wait',
-             'clickhouse.keeper_latency', 'clickhouse.query_p50',
-             'clickhouse.query_p95', 'clickhouse.query_p99']
-         SETTINGS mutations_sync = 2"],
-    ),
-    (
-        "0006_timings_in_seconds_hours",
-        &["ALTER TABLE rollups_hour
-         UPDATE low = low / 1000, high = high / 1000, summed = summed / 1000
-         WHERE metric IN ['check.response', 'check.first_byte', 'check.dns', 'check.connect',
-             'check.tls', 'check.download', 'disk.read_latency', 'disk.write_latency',
-             'mongodb.read_latency', 'mongodb.write_latency', 'clickhouse.latency',
-             'clickhouse.select_latency', 'clickhouse.insert_latency',
-             'clickhouse.insert_delay', 'clickhouse.overcommit_wait',
-             'clickhouse.keeper_latency', 'clickhouse.query_p50',
-             'clickhouse.query_p95', 'clickhouse.query_p99']
-         SETTINGS mutations_sync = 2"],
-    ),
-    // PostgreSQL's database stats were kept under `pg`, and are now under
-    // `postgres`, as its check is named everywhere else. Names are in the tables'
-    // keys, so each row is copied under its new name and the old deleted, which can
-    // run again if it stops partway.
-    (
-        "0007_postgres_metric_names",
-        &[
-            "INSERT INTO samples (metric, host_id, labels, time, value, data_type)
-             SELECT concat('databases.postgres.', substring(metric, 14)),
-             host_id, labels, time, value, data_type
-             FROM samples WHERE startsWith(metric, 'databases.pg.')",
-            "ALTER TABLE samples DELETE WHERE startsWith(metric, 'databases.pg.')
-             SETTINGS mutations_sync = 2",
-            "INSERT INTO texts (metric, host_id, labels, time, value)
-             SELECT concat('databases.postgres.', substring(metric, 14)),
-             host_id, labels, time, value
-             FROM texts WHERE startsWith(metric, 'databases.pg.')",
-            "ALTER TABLE texts DELETE WHERE startsWith(metric, 'databases.pg.')
-             SETTINGS mutations_sync = 2",
-            "INSERT INTO series (host_id, metric, labels)
-             SELECT host_id,
-             concat('databases.postgres.', substring(metric, 14)), labels
-             FROM series WHERE startsWith(metric, 'databases.pg.')",
-            "ALTER TABLE series DELETE WHERE startsWith(metric, 'databases.pg.')
-             SETTINGS mutations_sync = 2",
-            "INSERT INTO rollups_five_minute
-             SELECT concat('postgres.', substring(metric, 4)), host_id, series, time,
-             low, high, summed, samples, version
-             FROM rollups_five_minute WHERE startsWith(metric, 'pg.')",
-            "ALTER TABLE rollups_five_minute DELETE WHERE startsWith(metric, 'pg.')
-             SETTINGS mutations_sync = 2",
-            "INSERT INTO rollups_hour
-             SELECT concat('postgres.', substring(metric, 4)), host_id, series, time,
-             low, high, summed, samples, version
-             FROM rollups_hour WHERE startsWith(metric, 'pg.')",
-            "ALTER TABLE rollups_hour DELETE WHERE startsWith(metric, 'pg.')
-             SETTINGS mutations_sync = 2",
-            "INSERT INTO rollup_progress
-             SELECT concat('postgres.', substring(metric, 4)), done_until, version
-             FROM rollup_progress WHERE startsWith(metric, 'pg.')",
-            "ALTER TABLE rollup_progress DELETE WHERE startsWith(metric, 'pg.')
-             SETTINGS mutations_sync = 2",
-        ],
-    ),
-];
+    ],
+)];
 
 /// One runtime for every store, as the client is async and stores aren't. It's never
 /// shut down, because that isn't allowed from the async code a store can be dropped in.
@@ -2077,182 +1878,6 @@ mod tests {
         assert_eq!(
             count(&store, "SELECT count() FROM schema_migrations"),
             MIGRATIONS.len() as u64
-        );
-    }
-
-    /// A store made before samples said `data_type` keeps what it has under the
-    /// new name, and a migration stopped partway can run again.
-    #[test]
-    fn samples_kept_as_kind_are_read_as_data_type() {
-        let database = new_database();
-        let client = Client::default().with_url(url());
-        wait(async {
-            client
-                .query_raw(&format!("CREATE DATABASE `{database}`"))
-                .execute()
-                .await?;
-            let client = client.with_database(&database);
-            migrate(&client, &MIGRATIONS[..1]).await?;
-            client
-                .query_raw(
-                    "INSERT INTO samples (metric, host_id, labels, time, value, kind)
-                     VALUES ('cpu.usage_percent', 'a', map(), fromUnixTimestamp64Milli(1000), 5, 'int')",
-                )
-                .execute()
-                .await?;
-            client
-                .query_raw("INSERT INTO series VALUES ('a', 'cpu.usage_percent', map())")
-                .execute()
-                .await?;
-            // As if it stopped after renaming the column and before recording it.
-            for (_, statements) in &MIGRATIONS[1..] {
-                for statement in *statements {
-                    client.query_raw(statement).execute().await?;
-                }
-            }
-            anyhow::Ok(())
-        })
-        .unwrap();
-
-        let store = opened(&database);
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count() FROM samples WHERE data_type = 'int'"
-            ),
-            1
-        );
-        let output = store
-            .reader()
-            .unwrap()
-            .latest_output("a", "cpu", at(0), at(2000))
-            .unwrap()
-            .unwrap();
-        assert_eq!(output, json!({ "usage_percent": 5 }));
-    }
-
-    /// Timings kept in milliseconds are made seconds, under their new names, and
-    /// so is what was rolled up of them.
-    #[test]
-    fn timings_kept_in_milliseconds_become_seconds() {
-        let database = new_database();
-        let client = Client::default().with_url(url());
-        wait(async {
-            client
-                .query_raw(&format!("CREATE DATABASE `{database}`"))
-                .execute()
-                .await?;
-            let client = client.with_database(&database);
-            migrate(&client, &MIGRATIONS[..3]).await?;
-            for statement in [
-                "INSERT INTO samples (metric, host_id, labels, time, value, data_type) VALUES
-                 ('checks.response_ms', 'a', map('name', 'site'), fromUnixTimestamp64Milli(1000), 120, 'float'),
-                 ('checks.status', 'a', map('name', 'site'), fromUnixTimestamp64Milli(1000), 200, 'int')",
-                "INSERT INTO series VALUES ('a', 'checks.response_ms', map('name', 'site'))",
-                "INSERT INTO rollups_hour VALUES
-                 ('check.response', 'a', 'site', fromUnixTimestamp64Milli(0), 100, 300, 400, 2, 1),
-                 ('cpu.usage', 'a', '', fromUnixTimestamp64Milli(0), 40, 60, 100, 2, 1)",
-            ] {
-                client.query_raw(statement).execute().await?;
-            }
-            anyhow::Ok(())
-        })
-        .unwrap();
-
-        let store = opened(&database);
-        let value: f64 = wait(
-            store
-                .client
-                .query("SELECT value FROM samples FINAL WHERE metric = 'checks.response_secs'")
-                .fetch_one(),
-        )
-        .unwrap();
-        assert_eq!(value, 0.12);
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count() FROM samples WHERE metric LIKE '%_ms'"
-            ),
-            0
-        );
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count() FROM samples WHERE metric = 'checks.status'"
-            ),
-            1
-        );
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count() FROM series WHERE metric = 'checks.response_secs'"
-            ),
-            1
-        );
-        let rolled: Vec<(String, f64)> = wait(
-            store
-                .client
-                .query("SELECT metric, low FROM rollups_hour FINAL ORDER BY metric")
-                .fetch_all(),
-        )
-        .unwrap();
-        assert_eq!(
-            rolled,
-            [
-                ("check.response".to_string(), 0.1),
-                ("cpu.usage".to_string(), 40.0)
-            ]
-        );
-    }
-
-    /// PostgreSQL's stats kept under `pg` are found under `postgres`, rolled up too.
-    #[test]
-    fn postgres_stats_kept_as_pg_take_its_name() {
-        let database = new_database();
-        let client = Client::default().with_url(url());
-        wait(async {
-            client
-                .query_raw(&format!("CREATE DATABASE `{database}`"))
-                .execute()
-                .await?;
-            let client = client.with_database(&database);
-            migrate(&client, &MIGRATIONS[..6]).await?;
-            for statement in [
-                "INSERT INTO samples (metric, host_id, labels, time, value, data_type) VALUES
-                 ('databases.pg.connections', 'a', map('name', 'orders'), fromUnixTimestamp64Milli(1000), 3, 'int'),
-                 ('databases.mysql.connections', 'a', map('name', 'shop'), fromUnixTimestamp64Milli(1000), 5, 'int')",
-                "INSERT INTO texts VALUES
-                 ('databases.pg.version', 'a', map('name', 'orders'), fromUnixTimestamp64Milli(1000), '16.4')",
-                "INSERT INTO series VALUES ('a', 'databases.pg.connections', map('name', 'orders'))",
-                "INSERT INTO rollups_hour VALUES
-                 ('pg.connections', 'a', 'orders', fromUnixTimestamp64Milli(0), 1, 3, 4, 2, 1)",
-                "INSERT INTO rollup_progress VALUES ('pg.connections', fromUnixTimestamp64Milli(0), 1)",
-            ] {
-                client.query_raw(statement).execute().await?;
-            }
-            anyhow::Ok(())
-        })
-        .unwrap();
-
-        let store = opened(&database);
-        for (table, renamed) in [
-            ("samples", "databases.postgres.connections"),
-            ("texts", "databases.postgres.version"),
-            ("series", "databases.postgres.connections"),
-            ("rollups_hour", "postgres.connections"),
-            ("rollup_progress", "postgres.connections"),
-        ] {
-            let sql = format!("SELECT count() FROM {table} FINAL WHERE metric = '{renamed}'");
-            assert_eq!(count(&store, &sql), 1, "{table}");
-            let sql = format!("SELECT count() FROM {table} WHERE metric LIKE '%pg.%'");
-            assert_eq!(count(&store, &sql), 0, "{table}");
-        }
-        assert_eq!(
-            count(
-                &store,
-                "SELECT count() FROM samples WHERE metric = 'databases.mysql.connections'"
-            ),
-            1
         );
     }
 

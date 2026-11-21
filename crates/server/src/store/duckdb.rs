@@ -32,26 +32,13 @@ struct Migration {
     sql: &'static str,
 }
 
-/// Every schema change, in order. Applied ones are recorded in the database, so
-/// never edit one that has shipped: add a new one instead.
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        name: "0001_create_tables",
-        sql: include_str!("migrations/0001_create_tables.sql"),
-    },
-    Migration {
-        name: "0002_keys",
-        sql: include_str!("migrations/0002_keys.sql"),
-    },
-    Migration {
-        name: "0003_timings_in_seconds",
-        sql: include_str!("migrations/0003_timings_in_seconds.sql"),
-    },
-    Migration {
-        name: "0004_postgres_metric_names",
-        sql: include_str!("migrations/0004_postgres_metric_names.sql"),
-    },
-];
+/// Every schema change, in order. Until the first release there are no upgrade
+/// steps: a change to a table is made to the migration that makes it, and a store
+/// made before the change is deleted and made again.
+const MIGRATIONS: &[Migration] = &[Migration {
+    name: "0001_create_tables",
+    sql: include_str!("migrations/0001_create_tables.sql"),
+}];
 
 /// Only the bookkeeping table is created outside a migration, because it is
 /// what records them.
@@ -2645,12 +2632,12 @@ mod tests {
     }
 
     #[test]
-    fn the_keys_keep_what_was_there_and_refuse_a_number_used_twice() {
+    fn a_number_is_used_once_and_the_writer_carries_on_from_what_is_there() {
         let folder = tempfile::tempdir().unwrap();
         let path = folder.path().join("db");
-        let mut connection = Connection::open(&path).unwrap();
-        migrate(&mut connection, &MIGRATIONS[..1]).unwrap();
-        connection
+        let store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
+        store
+            .connection
             .execute_batch(
                 "INSERT INTO collectors VALUES (1, 'cpu');
                  INSERT INTO metrics VALUES (1, 1, 'usage', 'float');
@@ -2658,22 +2645,9 @@ mod tests {
                  INSERT INTO series VALUES (1, 1, 1);",
             )
             .unwrap();
-        drop(connection);
+        drop(store);
 
         let mut store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
-        assert_eq!(
-            applied_migrations(&store.connection),
-            MIGRATIONS.len() as i64
-        );
-        for table in ["collectors", "metrics", "hosts", "series"] {
-            let rows: i64 = store
-                .connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 1, "{table}");
-        }
         for repeat in [
             "INSERT INTO collectors VALUES (1, 'memory')",
             "INSERT INTO metrics VALUES (1, 1, 'idle', 'float')",
@@ -2682,8 +2656,6 @@ mod tests {
         ] {
             assert!(store.connection.execute_batch(repeat).is_err(), "{repeat}");
         }
-
-        // The writer carries on numbering from what's there.
         write_one(&mut store, "host-1", "web-1", &sample()).unwrap();
         write_one(&mut store, "host-2", "web-2", &sample()).unwrap();
         let hosts: i64 = store
@@ -2691,109 +2663,6 @@ mod tests {
             .query_row("SELECT count(*) FROM hosts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(hosts, 2);
-    }
-
-    /// Timings kept in milliseconds are made seconds, under their new names, and
-    /// so is what was rolled up of them.
-    #[test]
-    fn timings_kept_in_milliseconds_become_seconds() {
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("db");
-        let mut connection = Connection::open(&path).unwrap();
-        migrate(&mut connection, &MIGRATIONS[..2]).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO collectors VALUES (1, 'checks'), (2, 'cpu');
-                 INSERT INTO metrics VALUES (1, 1, 'response_ms', 'float'),
-                     (2, 1, 'status', 'int'), (3, 2, 'usage_percent', 'float');
-                 INSERT INTO hosts VALUES (1, 'host-1');
-                 INSERT INTO series VALUES (1, 1, 1), (2, 2, 1), (3, 3, 1);
-                 INSERT INTO samples VALUES ('2026-11-20 10:00:00', 1, 1, 120.0),
-                     ('2026-11-20 10:00:00', 2, 2, 200), ('2026-11-20 10:00:00', 3, 3, 50);
-                 INSERT INTO samples_recent VALUES ('2026-11-20 11:00:00', 1, 1, 80.0);
-                 INSERT INTO rollups_hour VALUES
-                     ('check.response', 1, 'site', '2026-11-20 10:00:00', 100, 300, 400, 2),
-                     ('cpu.usage', 1, '', '2026-11-20 10:00:00', 40, 60, 100, 2);",
-            )
-            .unwrap();
-        drop(connection);
-
-        let store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
-        let names: Vec<String> = store
-            .connection
-            .prepare("SELECT name FROM metrics ORDER BY id")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(names, ["response_secs", "status", "usage_percent"]);
-        let values: Vec<f64> = store
-            .connection
-            .prepare("SELECT value FROM all_samples ORDER BY metric_id, time")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(values, [0.12, 0.08, 200.0, 50.0]);
-        let rolled: Vec<(f64, f64, f64)> = store
-            .connection
-            .prepare("SELECT low, high, summed FROM rollups_hour ORDER BY metric")
-            .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(rolled, [(0.1, 0.3, 0.4), (40.0, 60.0, 100.0)]);
-    }
-
-    /// PostgreSQL's stats kept under `pg` are found under `postgres`, rolled up too.
-    #[test]
-    fn postgres_stats_kept_as_pg_take_its_name() {
-        let folder = tempfile::tempdir().unwrap();
-        let path = folder.path().join("db");
-        let mut connection = Connection::open(&path).unwrap();
-        migrate(&mut connection, &MIGRATIONS[..3]).unwrap();
-        connection
-            .execute_batch(
-                "INSERT INTO collectors VALUES (1, 'databases'), (2, 'other');
-                 INSERT INTO metrics VALUES (1, 1, 'pg.connections', 'int'),
-                     (2, 1, 'mysql.connections', 'int'), (3, 2, 'pg.connections', 'int');
-                 INSERT INTO rollups_hour VALUES
-                     ('pg.connections', 1, 'orders', '2026-11-20 10:00:00', 1, 3, 4, 2);
-                 INSERT INTO rollup_progress VALUES ('pg.connections', '2026-11-20 10:00:00');",
-            )
-            .unwrap();
-        drop(connection);
-
-        let store = DuckDbStore::open(&path, "1GB", Retention::default()).unwrap();
-        let names = |sql: &str| -> Vec<String> {
-            store
-                .connection
-                .prepare(sql)
-                .unwrap()
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .map(Result::unwrap)
-                .collect()
-        };
-        assert_eq!(
-            names("SELECT name FROM metrics ORDER BY id"),
-            [
-                "postgres.connections",
-                "mysql.connections",
-                "pg.connections"
-            ]
-        );
-        assert_eq!(
-            names("SELECT metric FROM rollups_hour"),
-            ["postgres.connections"]
-        );
-        assert_eq!(
-            names("SELECT metric FROM rollup_progress"),
-            ["postgres.connections"]
-        );
     }
 
     #[test]
