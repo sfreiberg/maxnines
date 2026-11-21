@@ -171,7 +171,8 @@ impl Database {
         Ok(true)
     }
 
-    /// Annotations people and their scripts recorded between two times, newest first.
+    /// Annotations people and their scripts recorded between two times, both included,
+    /// so one made the moment `to` is now still counts, newest first.
     pub async fn list_annotations(
         &self,
         from: Timestamp,
@@ -180,7 +181,7 @@ impl Database {
     ) -> Result<Vec<Event>> {
         let rows = event::Entity::find()
             .filter(event::Column::OccurredAt.gte(from))
-            .filter(event::Column::OccurredAt.lt(to))
+            .filter(event::Column::OccurredAt.lte(to))
             .filter(event::Column::CreatedBy.ne(SERVER))
             .order_by_desc(event::Column::OccurredAt)
             .order_by_desc(event::Column::Id)
@@ -191,9 +192,9 @@ impl Database {
         Ok(rows.into_iter().map(to_event).collect())
     }
 
-    /// Everything that happened to a host between two times, newest first: the events
-    /// whose filter `picks`, its alerts starting and ending, and its agent, OS and
-    /// kernel being updated.
+    /// Everything that happened to a host between two times, both included, newest
+    /// first: the events whose filter `picks`, its alerts starting and ending, and its
+    /// agent, OS and kernel being updated.
     pub async fn timeline(
         &self,
         host_id: &str,
@@ -207,7 +208,7 @@ impl Database {
         // as the list of annotations has them, and the sort below keeps that.
         let recorded = event::Entity::find()
             .filter(event::Column::OccurredAt.gte(from))
-            .filter(event::Column::OccurredAt.lt(to))
+            .filter(event::Column::OccurredAt.lte(to))
             .order_by_desc(event::Column::OccurredAt)
             .order_by_desc(event::Column::Id)
             .limit(MAX_CANDIDATES)
@@ -230,7 +231,7 @@ impl Database {
         );
 
         let in_range =
-            |column: alert::Column| Condition::all().add(column.gte(from)).add(column.lt(to));
+            |column: alert::Column| Condition::all().add(column.gte(from)).add(column.lte(to));
         let alerts = alert::Entity::find()
             .filter(alert::Column::HostId.eq(host_id))
             .filter(
@@ -245,7 +246,7 @@ impl Database {
             .context("loading a host's alerts")?;
         for row in to_alerts(&self.connection, alerts).await? {
             let title = format!("{} ({})", row.rule_name, row.severity.as_str());
-            if (from..to).contains(&row.started_at) {
+            if (from..=to).contains(&row.started_at) {
                 timeline.push(TimelineEvent {
                     occurred_at: row.started_at,
                     kind: EventKind::Alert,
@@ -255,7 +256,7 @@ impl Database {
                     id: None,
                 });
             }
-            if let Some(resolved) = row.resolved_at.filter(|time| (from..to).contains(time)) {
+            if let Some(resolved) = row.resolved_at.filter(|time| (from..=to).contains(time)) {
                 timeline.push(TimelineEvent {
                     occurred_at: resolved,
                     kind: EventKind::Resolved,
@@ -275,7 +276,7 @@ impl Database {
         let rows = host_fact::Entity::find()
             .filter(host_fact::Column::HostId.eq(host_id))
             .filter(host_fact::Column::Name.is_in(names))
-            .filter(host_fact::Column::ValidFrom.lt(to))
+            .filter(host_fact::Column::ValidFrom.lte(to))
             .order_by_asc(host_fact::Column::ValidFrom)
             .all(&self.connection)
             .await

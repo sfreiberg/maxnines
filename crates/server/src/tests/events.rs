@@ -247,7 +247,32 @@ async fn a_list_of_events_has_to_be_one_that_can_be_answered() {
 }
 
 #[tokio::test]
-async fn a_timeline_gives_the_newest_of_what_it_holds() {
+async fn a_timeline_gives_the_newest_of_what_it_holds_from_and_to_included() {
+    let server = start().await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let (from, to) = ("2026-11-20T09:00:00Z", "2026-11-20T10:00:00Z");
+    for (title, occurred_at) in [
+        ("before", "2026-11-20T08:59:59.999Z"),
+        ("first", from),
+        ("second", to),
+        ("after", "2026-11-20T10:00:00.001Z"),
+    ] {
+        let annotation = json!({ "title": title, "occurred_at": occurred_at });
+        let (status, _) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
+        assert_eq!(status, 201);
+    }
+
+    let path = format!("/api/v1/hosts/{}/events?from={from}&to={to}", web.id());
+    let (_, events) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(titles(events.as_array().unwrap()), ["second", "first"]);
+    let (_, events) = api(&server, "GET", &format!("{path}&limit=1"), &Value::Null).await;
+    assert_eq!(titles(events.as_array().unwrap()), ["second"]);
+}
+
+/// Asked for without a `to`, a timeline runs up to now, now included, so what was
+/// added in the same millisecond as the question is there.
+#[tokio::test]
+async fn an_annotation_made_just_now_is_on_the_timeline_at_once() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     for title in ["first", "second"] {
@@ -258,8 +283,9 @@ async fn a_timeline_gives_the_newest_of_what_it_holds() {
 
     let path = format!("/api/v1/hosts/{}/events?limit=1", web.id());
     let (_, events) = api(&server, "GET", &path, &Value::Null).await;
-
     assert_eq!(titles(events.as_array().unwrap()), ["second"]);
+    let (_, listed) = api(&server, "GET", "/api/v1/annotations?limit=1", &Value::Null).await;
+    assert_eq!(titles(listed.as_array().unwrap()), ["second"]);
 }
 
 #[tokio::test]
