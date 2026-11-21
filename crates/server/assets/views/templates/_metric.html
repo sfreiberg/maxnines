@@ -1,0 +1,40 @@
+<div class="repeat">
+  {% set e = errors | get(key=mp, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+  <div class="field-row">
+    <label>Metric
+      <input type="text" name="{{ mp }}key" value="{{ metric.key }}" spellcheck="false">
+      {% set e = errors | get(key=mp ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Counter
+      <input type="text" name="{{ mp }}counter" value="{{ metric.counter }}" spellcheck="false">
+      {% set e = errors | get(key=mp ~ "counter", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Unit
+      <select name="{{ mp }}unit">
+        <option value=""{% if metric.unit == "" %} selected{% endif %}>From its name or type</option>
+        {% for unit in units %}<option value="{{ unit }}"{% if metric.unit == unit %} selected{% endif %}>{{ unit }}</option>{% endfor %}
+      </select>
+      {% set e = errors | get(key=mp ~ "unit", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </div>
+  <label>Worked out as
+    <input type="text" name="{{ mp }}value" value="{{ metric.value }}" spellcheck="false" autocomplete="off" data-cel="value" placeholder="value / 1000">
+    {% set e = errors | get(key=mp ~ "value", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Description
+    <input type="text" name="{{ mp }}description" value="{{ metric.description }}" maxlength="1000">
+    {% set e = errors | get(key=mp ~ "description", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <div class="field-row">
+    <label>Since version
+      <input type="text" name="{{ mp }}since" value="{{ metric.since }}" spellcheck="false">
+      {% set e = errors | get(key=mp ~ "since", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>States
+      <textarea name="{{ mp }}states" rows="1" spellcheck="false" placeholder="3 = Running">{{ metric.states }}</textarea>
+      {% set e = errors | get(key=mp ~ "states", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </div>
+  <label class="checkbox"><input type="checkbox" name="{{ mp }}total"{% if metric.total %} checked{% endif %}> A running total, kept as a rate</label>
+  <button type="submit" name="form_action" value="remove:{{ remove }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove metric</button>
+</div>

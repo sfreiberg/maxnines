@@ -325,6 +325,16 @@ fn metric_options() -> Vec<MetricOption> {
         .collect()
 }
 
+/// The template a rule is one of the alerts of.
+#[derive(Serialize)]
+struct TemplateOf {
+    id: i64,
+    name: String,
+    alert: String,
+    /// The fields changed from the template's values, as the form labels them.
+    changed: Vec<&'static str>,
+}
+
 #[derive(Serialize)]
 struct ChannelChoice {
     id: i64,
@@ -382,8 +392,25 @@ async fn form_page_with(
         Err(error) => return server_error(&error),
     };
 
+    // One of a template's alerts says so, and what's been changed of it.
+    let template = match id {
+        Some(id) => match state.database.template_rule(id).await {
+            Ok(Some((stored, alert, overrides, _))) => Some(TemplateOf {
+                id: stored.id,
+                name: stored.template.name,
+                alert: alert.key,
+                changed: super::templates::changed_labels(
+                    &overrides.keys().cloned().collect::<Vec<_>>(),
+                ),
+            }),
+            Ok(None) => None,
+            Err(error) => return server_error(&error),
+        },
+        None => None,
+    };
     let page = Page::new(state, token, "alert_rules/form.html")
         .with("id", &id)
+        .with("template", &template)
         .with("rule", form)
         .with("metrics", &metric_options())
         .with("calculations", &calculation_options())
@@ -410,6 +437,9 @@ struct RuleRow {
     applies_to: String,
     channels: String,
     enabled: bool,
+    /// The template it's one of the alerts of, by name.
+    template: Option<String>,
+    template_id: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -422,9 +452,16 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let rows = async {
         let rules = state.database.list_alert_rules().await?;
         let channels = state.database.list_channels().await?;
-        anyhow::Ok((rules, channels))
+        let templates: BTreeMap<i64, String> = state
+            .database
+            .list_templates()
+            .await?
+            .into_iter()
+            .map(|stored| (stored.id, stored.template.name))
+            .collect();
+        anyhow::Ok((rules, channels, templates))
     };
-    let (rules, channels) = match rows.await {
+    let (rules, channels, templates) = match rows.await {
         Ok(rows) => rows,
         Err(error) => return server_error(&error),
     };
@@ -469,6 +506,11 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                     names.join(", ")
                 },
                 enabled: rule.rule.enabled,
+                template_id: rule.template.as_ref().map(|t| t.id),
+                template: rule
+                    .template
+                    .as_ref()
+                    .and_then(|t| templates.get(&t.id).cloned()),
                 name: rule.rule.name,
             }
         })
@@ -489,9 +531,15 @@ fn not_found(state: &AppState, token: &CsrfToken) -> Response {
 }
 
 async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfToken) -> Response {
+    // A template's alert shows its own values, which its template being off doesn't
+    // change.
+    let own = match state.database.template_rule(id).await {
+        Ok(found) => found.map(|(.., own)| own),
+        Err(error) => return server_error(&error),
+    };
     match state.database.get_alert_rule(id).await {
         Ok(Some(rule)) => {
-            let form = AlertRuleForm::from_rule(&rule.rule);
+            let form = AlertRuleForm::from_rule(own.as_ref().unwrap_or(&rule.rule));
             form_page(&state, &token, Some(id), &form, None).await
         }
         Ok(None) => not_found(&state, &token),

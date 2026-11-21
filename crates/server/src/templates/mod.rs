@@ -138,8 +138,16 @@ pub fn check(template: &Template, facts: &Value) -> Vec<Problem> {
         }
     }
     for (index, alert) in template.alerts.iter().enumerate() {
-        let Ok(rule) = alert_rule(template, alert) else {
-            // Its lengths of time are wrong, which the format's checks have said.
+        // Lengths of time that are wrong, which the format's checks have said, are
+        // left out, so the rest is still checked.
+        let without_lengths = Alert {
+            hold: None,
+            window: None,
+            ..alert.clone()
+        };
+        let Ok(rule) =
+            alert_rule(template, alert).or_else(|_| alert_rule(template, &without_lengths))
+        else {
             continue;
         };
         if let Err(error) = check_rule_in(&rule, facts, Some(&local)) {
@@ -187,6 +195,14 @@ fn dialect_for(target: Option<&Target>) -> Box<dyn Dialect> {
         },
         _ => Box::new(GenericDialect {}),
     }
+}
+
+/// The columns a template's query gives, or none if they can't be read.
+pub fn query_columns_of(
+    template: &Template,
+    query: &maxnines_protocol::templates::Query,
+) -> Vec<String> {
+    query_columns(dialect_for(template.target.as_ref()).as_ref(), query).unwrap_or_default()
 }
 
 /// The columns of a query, with each version's fills filled in, each once.

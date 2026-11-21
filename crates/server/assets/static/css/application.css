@@ -667,3 +667,22 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .check-key .check-bar { flex: none; width: 10px; height: 10px; border-radius: 3px; }
 .check-rules { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; list-style: none; }
 .check-rules li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; }
+
+/* Templates: the form's repeated blocks, problems beside their fields, and the notice of
+   an upgrade with its button */
+.repeat { display: flex; flex-direction: column; gap: 12px; min-width: 0; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius-small); background: var(--background); }
+.repeat > button, fieldset > button { align-self: flex-start; }
+.field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(180px, 100%), 1fr)); gap: 12px; align-items: end; }
+.checks { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+form.stacked small.field-error, .field-error { margin: 0; color: var(--bad); font-size: 13px; font-weight: 500; overflow-wrap: anywhere; }
+form.notice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+form.notice button { min-height: 32px; padding: 0 12px; }
+pre.error { white-space: pre-wrap; font-family: var(--mono); }
+.notice form { margin: 8px 0 0; }
+
+/* Suggestions while typing CEL */
+.cel-field { position: relative; display: block; min-width: 0; }
+.cel-suggestions { position: absolute; z-index: 30; left: 0; right: 0; max-height: 240px; margin: 4px 0 0; padding: 4px; overflow-y: auto; list-style: none; background: var(--raised); border: 1px solid var(--border-strong); border-radius: var(--radius-small); }
+.cel-suggestions li { display: flex; justify-content: space-between; gap: 12px; padding: 6px 10px; border-radius: 6px; cursor: pointer; font-family: var(--mono); font-size: 13px; }
+.cel-suggestions li span { color: var(--muted); font-family: var(--font); font-size: 12px; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cel-suggestions li[aria-selected="true"] { background: var(--accent-surface); color: var(--accent-ink); }

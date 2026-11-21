@@ -68,15 +68,17 @@ impl Role {
     }
 }
 
-/// Paths only admins use, by how they start: people, the audit log and proxies. They're
+/// Paths only admins use, by how they start: people, the audit log, proxies and the
+/// notice of what an upgrade changed in the built-in templates. They're
 /// given as the pages have them and as the API does.
-const ADMIN_ONLY: [&str; 6] = [
+const ADMIN_ONLY: [&str; 7] = [
     "/settings/users",
     "/users",
     "/settings/audit-log",
     "/audit-log",
     "/settings/proxies",
     "/proxies",
+    "/templates/upgrades",
 ];
 
 /// Paths open to everyone signed in, by how they start. Each acts only on what's

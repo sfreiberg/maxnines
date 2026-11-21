@@ -6,6 +6,18 @@
 <h1>{% if id %}Edit alert rule{% else %}Add alert rule{% endif %}</h1>
 
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if template %}
+<div class="notice" role="note">
+  <p>One of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>. What you change is kept apart from the template, so a new version of it never undoes it. Its conditions can use the template's own metrics by their short names.{% if template.changed %} Changed from the template: {{ template.changed | join(sep=", ") }}.{% endif %}</p>
+  {% if template.changed and can_edit %}
+  <form method="post" action="/templates/{{ template.id }}/alerts/{{ id }}/reset">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="hidden" name="back" value="rule">
+    <button type="submit" class="secondary">Reset to template</button>
+  </form>
+  {% endif %}
+</div>
+{% endif %}
 
 <form method="post" action="{% if id %}/alerts/rules/{{ id }}{% else %}/alerts/rules{% endif %}" class="stacked alert-rule">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
@@ -66,6 +78,7 @@
     </label>
   </fieldset>
 
+  {% if not template %}
   <fieldset>
     <legend>Calculation across hosts</legend>
     <label>Combine hosts using
@@ -108,6 +121,8 @@
       </label>
     </div>
   </fieldset>
+
+  {% endif %}
 
   <fieldset class="applies-to">
     <legend>Applies to</legend>
@@ -161,7 +176,7 @@
 </section>
 {% endif %}
 
-{% if id and can_edit %}
+{% if id and can_edit and not template %}
 <form method="post" action="/alerts/rules/{{ id }}/delete" class="delete-form">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   <button type="submit" class="danger">Delete</button>

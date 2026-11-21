@@ -228,6 +228,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/users/two-factor",
             get(two_factor_requirement).put(require_two_factor),
         )
+        .merge(super::templates::api_routes())
         .route_layer(middleware::from_fn_with_state(state, require_token))
         .fallback(no_such_route)
 }
@@ -2281,7 +2282,7 @@ fn refuse_rule(input: &RuleInput) -> Option<Response> {
         .map(|error| refused(&error))
 }
 
-fn server_error(error: &anyhow::Error) -> Response {
+pub(super) fn server_error(error: &anyhow::Error) -> Response {
     error!(error = format!("{error:#}"), "admin request failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }

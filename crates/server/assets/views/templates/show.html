@@ -1,0 +1,101 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ template.name }} · Templates · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a></p>
+<div id="template">
+<div class="title-row">
+  <div>
+    <h1>{{ template.name }}{% if not enabled %} <span class="badge neutral">Disabled</span>{% endif %}</h1>
+    <p class="hint">{% if built_in %}Comes with MaxNines{% if upgraded %} · updated {{ upgraded }}{% endif %}{% else %}Yours{% endif %} · <code>{{ template.key }}</code> · {{ target }}</p>
+  </div>
+  {% if can_edit %}
+  <div class="actions">
+    <form method="post" action="/templates/{{ id }}/{% if enabled %}disable{% else %}enable{% endif %}" hx-post="/templates/{{ id }}/{% if enabled %}disable{% else %}enable{% endif %}" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">{% if enabled %}Disable{% else %}Enable{% endif %}</button>
+    </form>
+    {% if not built_in %}<a class="button" href="/templates/{{ id }}/edit">Edit</a>{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% if template.description %}<p>{{ template.description }}</p>{% endif %}
+{% if built_in %}<p class="hint">Upgrades replace what this template says. Change its alerts here, or disable it: what you change is kept apart, so an upgrade never undoes it.</p>{% endif %}
+
+<section class="card">
+  <h2>Alerts</h2>
+  {% if alerts %}
+  <div class="table-scroll"><table>
+    <thead><tr><th>Name</th><th>Alerts when</th><th>For</th><th></th><th></th></tr></thead>
+    <tbody>
+      {% for alert in alerts %}
+      <tr{% if not alert.enabled %} class="disabled"{% endif %}>
+        <td><a href="/alerts/rules/{{ alert.rule_id }}/edit">{{ alert.name }}</a><span class="under"><code>{{ alert.key }}</code></span>{% if "name" in alert.changed %}<span class="under">Template: {{ alert.template_values.name }}</span>{% endif %}</td>
+        <td>
+          {% if alert.warning %}<div class="condition"><span class="badge warn">Warning</span> <code>{{ alert.warning }}</code>{% if "warning" in alert.changed %} <span class="badge hollow">Changed</span>{% endif %}</div>{% if "warning" in alert.changed %}<div class="hint">Template: {% if alert.template_values.warning %}<code>{{ alert.template_values.warning }}</code>{% else %}none{% endif %}</div>{% endif %}{% endif %}
+          {% if alert.critical %}<div class="condition"><span class="badge bad">Critical</span> <code>{{ alert.critical }}</code>{% if "critical" in alert.changed %} <span class="badge hollow">Changed</span>{% endif %}</div>{% if "critical" in alert.changed %}<div class="hint">Template: {% if alert.template_values.critical %}<code>{{ alert.template_values.critical }}</code>{% else %}none{% endif %}</div>{% endif %}{% endif %}
+          {% for change in alert.other_changes %}<div class="hint">Changed: {{ change[0] }}{% if change[1] %} (template: {{ change[1] }}){% endif %}</div>{% endfor %}
+          {% if alert.waits_for_agents %}<div class="hint">Not checked yet: it needs what agents running this template would send.</div>{% endif %}
+        </td>
+        <td class="nowrap">{{ alert.hold }}{% if "for_secs" in alert.changed %}<span class="under">Template: {{ alert.template_values.for_secs }}</span>{% endif %}</td>
+        <td>{% if not alert.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if alert.changed %} <span class="badge hollow">Changed</span>{% endif %}</td>
+        <td>
+          {% if can_edit %}
+          <div class="actions row-actions">
+            <form method="post" action="/templates/{{ id }}/alerts/{{ alert.rule_id }}/{% if alert.enabled %}disable{% else %}enable{% endif %}" hx-post="/templates/{{ id }}/alerts/{{ alert.rule_id }}/{% if alert.enabled %}disable{% else %}enable{% endif %}" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">{% if alert.enabled %}Disable{% else %}Enable{% endif %}</button>
+            </form>
+            <a class="button secondary" href="/alerts/rules/{{ alert.rule_id }}/edit">Change</a>
+            {% if alert.changed %}
+            <form method="post" action="/templates/{{ id }}/alerts/{{ alert.rule_id }}/reset" hx-post="/templates/{{ id }}/alerts/{{ alert.rule_id }}/reset" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">Reset to template</button>
+            </form>
+            {% endif %}
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="empty">This template has no alerts.</p>
+  {% endif %}
+</section>
+
+{% if metrics %}
+<section class="card">
+  <h2>Metrics</h2>
+  <p class="hint">Its alerts use these by their short names, like <code>{{ metrics[0].short }}</code>, and anything else by its full name, like <code>{{ metrics[0].name }}</code>.</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Name</th><th>Kind</th><th>Labels</th><th>Unit</th><th>From</th></tr></thead>
+    <tbody>
+      {% for metric in metrics %}
+      <tr>
+        <td><code>{{ metric.name }}</code>{% if metric.description %}<span class="under">{{ metric.description }}</span>{% endif %}</td>
+        <td>{{ metric.kind }}</td>
+        <td>{{ metric.labels }}</td>
+        <td>{{ metric.unit }}</td>
+        <td>{{ metric.from }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+</div>
+
+<section class="card">
+  <h2>HCL</h2>
+  {% if not built_in and can_edit %}<p class="hint"><a href="/templates/{{ id }}/edit/hcl">Edit as HCL</a></p>{% endif %}
+  <pre class="table-scroll"><code>{{ source }}</code></pre>
+</section>
+
+{% if not built_in and can_edit %}
+<form method="post" action="/templates/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

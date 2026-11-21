@@ -1,0 +1,23 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit template{% else %}Add template{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a></p>
+<h1>{% if id %}Edit template{% else %}Add template{% endif %}</h1>
+<nav class="tabs" aria-label="How to edit">
+  <a href="{% if id %}/templates/{{ id }}/edit{% else %}/templates/new{% endif %}">Form</a>
+  <a class="selected" href="{% if id %}/templates/{{ id }}/edit/hcl{% else %}/templates/new/hcl{% endif %}" aria-current="page">HCL</a>
+</nav>
+{% if error %}<pre class="error" role="alert">{{ error }}</pre>{% endif %}
+<form method="post" action="{% if id %}/templates/{{ id }}/hcl{% else %}/templates/hcl{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <label>HCL
+    <textarea name="hcl" rows="24" spellcheck="false" class="mono">{{ hcl }}</textarea>
+    <small>One <code>template "key" {{ '{' }} … }</code> block, as <a href="/docs/templates">the docs</a> describe. Saving from the form writes it out again, without comments.</small>
+  </label>
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save template</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="{% if id %}/templates/{{ id }}{% else %}/templates{% endif %}">Cancel</a>
+  </div>
+</form>
+{% endblock content %}

@@ -14,7 +14,7 @@
   <tbody>
     {% for rule in rules %}
     <tr{% if not rule.enabled %} class="disabled"{% endif %}>
-      <td><a href="/alerts/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
+      <td><a href="/alerts/rules/{{ rule.id }}/edit">{{ rule.name }}</a>{% if rule.template %}<span class="under">From the <a href="/templates/{{ rule.template_id }}">{{ rule.template }}</a> template</span>{% endif %}</td>
       <td>{% for condition in rule.conditions %}<div class="condition">{% if condition.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %} <code>{{ condition.text }}</code></div>{% endfor %}{% if rule.watches %}<div class="hint">{{ rule.watches }}</div>{% endif %}</td>
       <td>{{ rule.applies_to }}</td>
       <td>{% if rule.channels %}{{ rule.channels }}{% else %}<span class="hint">Only this site</span>{% endif %}</td>

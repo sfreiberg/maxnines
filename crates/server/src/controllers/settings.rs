@@ -19,10 +19,19 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         let app_sign_ins = super::app_sign_ins::active_sign_ins(&state).await?;
         let channels = state.database.list_channels().await?.len();
         let users = state.database.user_count().await?;
-        anyhow::Ok((rules, alert_rules, channels, api_keys, app_sign_ins, users))
+        let templates = state.database.list_templates().await?.len();
+        anyhow::Ok((
+            rules,
+            alert_rules,
+            channels,
+            api_keys,
+            app_sign_ins,
+            users,
+            templates,
+        ))
     };
     match counts.await {
-        Ok((rules, alert_rules, channels, api_keys, app_sign_ins, users)) => {
+        Ok((rules, alert_rules, channels, api_keys, app_sign_ins, users, templates)) => {
             Page::new(&state, &token, "settings/index.html")
                 .with("rules", &rules)
                 .with("alert_rules", &alert_rules)
@@ -30,6 +39,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
                 .with("app_sign_ins", &app_sign_ins)
                 .with("users", &users)
                 .with("channels", &channels)
+                .with("templates", &templates)
                 .render()
         }
         Err(error) => server_error(&error),

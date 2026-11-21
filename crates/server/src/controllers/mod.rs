@@ -36,6 +36,8 @@ mod sessions;
 mod settings;
 mod sign_ins;
 mod silences;
+mod template_form;
+mod templates;
 mod update_notice;
 mod users;
 
@@ -242,6 +244,7 @@ pub fn app(state: AppState) -> Router {
         .merge(map::routes())
         .merge(compressed(metrics::routes()))
         .merge(rules::routes())
+        .merge(templates::routes())
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -307,7 +310,7 @@ fn section_of(template: &str) -> &'static str {
         "server" => "server",
         "map" => "map",
         "dashboards" => "dashboards",
-        "settings" | "rules" | "alert_rules" | "notification_channels" => "settings",
+        "settings" | "rules" | "alert_rules" | "notification_channels" | "templates" => "settings",
         "profile" => "profile",
         "docs" => "docs",
         _ => "",
@@ -365,6 +368,12 @@ impl<'a> Page<'a> {
         context.insert("is_admin", &(role >= Some(Role::Admin)));
         if role >= Some(Role::Admin) {
             context.insert("proxy_notice", &proxies::notice(state));
+            let upgraded = state
+                .template_upgrades
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            context.insert("template_upgrades", &upgraded);
         }
         let theme = user.as_deref().map_or(DEFAULT_THEME, |user| &user.theme);
         context.insert("theme", theme);

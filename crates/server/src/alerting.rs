@@ -72,7 +72,7 @@ pub struct AlertRule {
     #[serde(flatten)]
     pub rule: AlertRuleInput,
     /// The template whose alert it is, for one that's a template's.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub template: Option<TemplateLink>,
     /// Its conditions, read once as it's loaded. None for ones that can't be read,
     /// which saving a rule doesn't allow.

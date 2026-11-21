@@ -269,6 +269,26 @@ impl AppState {
         })
     }
 
+    /// Everything wrong with a template, with its conditions tried on a real host's
+    /// facts.
+    pub async fn check_template(
+        &self,
+        template: &maxnines_protocol::templates::Template,
+    ) -> Result<Vec<maxnines_protocol::templates::Problem>> {
+        let facts = self.example_facts().await?;
+        Ok(crate::templates::check(template, &facts))
+    }
+
+    /// Takes the notice of what an upgrade changed in the built-in templates down.
+    pub async fn dismiss_template_upgrades(&self) -> Result<()> {
+        self.database.dismiss_template_upgrades().await?;
+        self.template_upgrades
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        Ok(())
+    }
+
     async fn check_alert_rule_in(
         &self,
         input: &AlertRuleInput,

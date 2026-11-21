@@ -2,7 +2,8 @@
 
 ## The built-in rules
 
-Every server starts with eight alert rules:
+Every server starts with eight alert rules, from the built-in **Host**
+[template](templates.md):
 
 | Rule | Fires when | Severity |
 | --- | --- | --- |
@@ -21,8 +22,12 @@ recovering shows as doing that. A Host offline alert resolves within moments of 
 agent reconnecting, even just after the server restarts. They tell every notification channel, including ones added later, so they start working as soon
 as there's a channel to tell. Until then they show on the Alerts page and the overview.
 
-They're ordinary rules from then on: change them, turn them off or delete them under
-**Settings > Alert rules**, and upgrades leave them alone.
+They're ordinary rules, under **Settings > Alert rules**, that come from a template:
+an upgrade can bring a new version of them, and what you change of one is kept apart
+from the template, so an upgrade never undoes it. Change one, or turn it off, from its
+form or the template's page, and put it back to the template's values with **Reset to
+template**. They can't be deleted, but the whole template can be disabled under
+**Settings > Templates**.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.

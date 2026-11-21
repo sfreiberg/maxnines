@@ -24,6 +24,14 @@ Conditions are checked as a rule is saved: a mistake in one, a name that isn't a
 or something that can't work, such as a length of time compared with a number, gives
 `422` with what's wrong.
 
+A rule that's one of a [template's](api-templates.md) alerts has a `template` field,
+`null` for any other rule, with the template's `id`, the `alert`'s key, the fields
+`overridden` from the template's values, and whether it `waits_for_agents`. Updating it
+keeps what's different from the template's values apart from them, so an upgrade of the
+template keeps it; its conditions can use the template's own metrics by their short
+names, and it can't have a calculation. It can't be deleted, which gives `422`: turn it
+off, or the template.
+
 A rule for a host that's connected but whose samples have stopped, as in
 [connected but sending no metrics](alerts.md#connected-but-sending-no-metrics):
 
@@ -194,7 +202,8 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `DELETE /api/v1/alert-rules/{id}`
 
-The rule stops watching, its open alerts end, and its silences that haven't ended and its
+A template's rule can't be deleted, which gives `422`. Any other rule stops watching, its
+open alerts end, and its silences that haven't ended and its
 maintenance windows go. It's kept, marked deleted, so its alerts still say which rule
 raised them as `rule_id`, but it's no longer listed or found, and its name is free for a
 new rule.
