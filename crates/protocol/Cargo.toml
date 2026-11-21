@@ -11,6 +11,9 @@ anyhow.workspace = true
 chrono.workspace = true
 hcl-rs.workspace = true
 hex.workspace = true
+# Templates' lengths of time, such as "5m", and their maps in the order written.
+humantime = "2.3"
+indexmap = { version = "2.14.2", features = ["serde"] }
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -8,6 +8,7 @@ pub mod logging;
 #[cfg(windows)]
 pub mod service;
 pub mod stopping;
+pub mod templates;
 pub mod time;
 pub mod totals;
 

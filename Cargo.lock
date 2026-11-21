@@ -4063,6 +4063,8 @@ dependencies = [
  "clap",
  "hcl-rs",
  "hex",
+ "humantime",
+ "indexmap",
  "regex-lite",
  "ring",
  "serde",
