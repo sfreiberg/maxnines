@@ -64,7 +64,7 @@ state_dir = "data.nosync"
 # can pass in a few values from the alert, which a command uses by naming them in
 # braces in its arguments: {disk}, {interface}, {process}, {container}, {check}
 # or {series} for what the alert is about, and {hostname}, {rule}, {severity},
-# {metric}, {value} and {threshold}. A command runs as the agent's user, directly
+# {metric} and {value}. A command runs as the agent's user, directly
 # rather than through a shell, and each value stays inside its own argument. Keep
 # this file writable only by its owner, because what's here gets run.
 #

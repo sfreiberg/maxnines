@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// What an action can be told about the alert it runs for. A command uses one by
 /// writing its name in braces, like `{disk}`. Anything else in braces is left as
 /// it is, so a command can still hold `{print}` or JSON.
-pub const ACTION_VARIABLES: [&str; 12] = [
+pub const ACTION_VARIABLES: [&str; 11] = [
     // What the alert is about, under the name its metric gives it.
     "disk",
     "interface",
@@ -29,7 +29,6 @@ pub const ACTION_VARIABLES: [&str; 12] = [
     "severity",
     "metric",
     "value",
-    "threshold",
 ];
 
 /// How long an action gets when the server doesn't say.
