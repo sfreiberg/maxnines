@@ -83,6 +83,12 @@ async fn start() -> TestServer {
     start_with("").await
 }
 
+/// A host with no agent, added as Hosts → Add a host does, for checks to be about.
+async fn host_without_agent(server: &TestServer, hostname: &str) -> String {
+    let registry = &server.state.registry;
+    registry.add_agentless(hostname, "test").await.unwrap().id
+}
+
 async fn start_with(config: &str) -> TestServer {
     let saved = Saved::default();
     let store = Box::new(MemoryStore(saved.clone()));

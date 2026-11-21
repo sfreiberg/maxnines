@@ -6,7 +6,7 @@
 <div class="title-row">
   <div>
     <h1>{{ name }}</h1>
-    <p class="subtitle check-target"><span class="badge neutral">{{ kind }}</span> <code>{{ target }}</code> <span>· about {% if host %}<a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% else %}the server itself{% endif %}</span></p>
+    <p class="subtitle check-target"><span class="badge neutral">{{ kind }}</span> <code>{{ target }}</code> <span>{% if host %}· about <a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% endif %}</span></p>
   </div>
   <div class="actions">
     {% if can_respond and enabled %}
@@ -106,7 +106,7 @@
       </label>
       <button type="submit" class="secondary">Start maintenance</button>
     </form>
-    <p class="hint">Holds back every notification about this check, such as while its site is redeployed, and nothing else on {% if host %}{{ host.hostname }}{% else %}the server{% endif %}. It keeps running, and alerts still show.</p>
+    <p class="hint">Holds back every notification about this check, such as while its site is redeployed, and nothing else on {% if host %}{{ host.hostname }}{% else %}its host{% endif %}. It keeps running, and alerts still show.</p>
     {% else %}
     <p class="empty">Nothing is holding back notifications about this check.</p>
     {% endif %}

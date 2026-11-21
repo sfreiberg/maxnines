@@ -1,12 +1,13 @@
 # Remote checks API
 
-Checks the server runs itself, against remote sites. Each is about a host: a
-[host without an agent](agentless-hosts.md), or the server itself. Its results and
-alerts go under that host.
+Checks the server runs itself, against remote sites. Each is about a
+[host without an agent](agentless-hosts.md), and its results and alerts go under
+that host. A check added without a host gets a new host of its own.
 
 | Field | Description |
 | --- | --- |
-| `host_id` | The host it's about, which has to be one without an agent. Leave it out, or give `server`, for a check that isn't about any one host |
+| `host_id` | The host it's about, which has to be one without an agent. Leave it out, or give `null`, when adding a check, and a new host is made for it, as **Add a host** makes one. Left out when changing a check, the check stays on its host |
+| `hostname` | When adding a check without `host_id`: what the new host is called. Left out, it's named after the host the check reaches, as [Checks](checks.md#a-host-for-each-check) describes. Refused with `host_id` and when changing a check |
 | `check` | Required. What to check, as below |
 | `interval_secs` | Required. How often it runs |
 | `enabled` | Defaults to `true` |
@@ -70,9 +71,16 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/remote-checks"
 ```
 
+It answers with the check's `id` and the `host_id` of the host it's about, here a
+new one called `example.com`:
+
 ```json
-{ "id": 1 }
+{ "id": 1, "host_id": "5f0c1d6f2a8e4b7790d3c1a2b4e6f809" }
 ```
+
+Two checks added without a host get two hosts, even with the same name, as hosts
+are never matched by name. To add another check to the same host, give its
+`host_id`.
 
 ## Get a remote check
 
@@ -86,7 +94,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ```json
 {
   "id": 1,
-  "host_id": "server",
+  "host_id": "5f0c1d6f2a8e4b7790d3c1a2b4e6f809",
   "check": { "name": "Home page", "kind": "http", "target": "https://example.com" },
   "interval_secs": 60,
   "enabled": true,
@@ -102,7 +110,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `PUT /api/v1/remote-checks/{id}`
 
-Replaces the whole check.
+Replaces the whole check. Without `host_id` it stays on its host, and with one it
+moves there, keeping none of its history on the host it left.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -117,6 +126,9 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ## Delete a remote check
 
 `DELETE /api/v1/remote-checks/{id}`
+
+Its host stays, with everything the check found. Deleting the host deletes its
+checks with it.
 
 ```sh
 curl -X DELETE -H "Authorization: Bearer $MAXNINES_API_KEY" \

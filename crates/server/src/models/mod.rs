@@ -2401,10 +2401,16 @@ mod tests {
     async fn exercise_remote_checks(database: &Database) {
         use maxnines_protocol::{Check, CheckKind};
 
-        use crate::remote_checks::{LOCAL_HOST_ID, RemoteCheckInput};
+        use crate::remote_checks::RemoteCheckInput;
 
-        let hosts = database.load_hosts().await.unwrap();
-        assert!(hosts.iter().any(|host| host.id == LOCAL_HOST_ID));
+        let host = HostRecord {
+            kind: crate::registration::HostKind::Agentless,
+            public_key: None,
+            hostname: "example.com".to_string(),
+            state: HostState::Approved,
+            ..record("0123456789abcdef0123456789abcdef")
+        };
+        database.save_host(&host).await.unwrap();
 
         let name = format!("site {}", crate::times::now().timestamp_millis());
         let mut check = Check::new(&name, CheckKind::Http, "https://example.com/");
@@ -2414,7 +2420,7 @@ mod tests {
         check.regex = Some("Welcome".to_string());
         check.insecure = Some(true);
         let mut input = RemoteCheckInput {
-            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
+            host_id: host.id.clone(),
             check,
             interval: std::time::Duration::from_secs(60),
             enabled: true,
@@ -2435,6 +2441,11 @@ mod tests {
         assert_eq!(saved.input.interval, std::time::Duration::from_secs(120));
 
         assert!(database.delete_remote_check(id).await.unwrap());
+        assert!(database.get_remote_check(id).await.unwrap().is_none());
+
+        // A host's checks go with it.
+        let id = database.create_remote_check(&input).await.unwrap();
+        assert!(database.delete_host(&host.id).await.unwrap());
         assert!(database.get_remote_check(id).await.unwrap().is_none());
     }
 

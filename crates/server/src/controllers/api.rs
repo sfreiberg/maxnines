@@ -2072,6 +2072,14 @@ impl RemoteCheckView {
 /// only way to keep a saved password or key without sending it again.
 #[derive(Deserialize)]
 struct RemoteCheckRequest {
+    /// The host with no agent it's about. Adding a check without one makes a new
+    /// host for it, and changing one without one leaves it where it is.
+    #[serde(default)]
+    host_id: Option<String>,
+    /// The new host's name, when one is made. Left out, it's named after the host
+    /// the check reaches.
+    #[serde(default)]
+    hostname: Option<String>,
     #[serde(flatten)]
     input: RemoteCheckInput,
     #[serde(default)]
@@ -2103,12 +2111,23 @@ async fn create_remote_check(
     State(state): State<AppState>,
     Json(request): Json<RemoteCheckRequest>,
 ) -> Response {
-    let input = request.input;
-    if let Err(error) = state.check_remote_check(&input).await {
-        return refused(&error);
-    }
-    match state.database.create_remote_check(&input).await {
-        Ok(id) => (StatusCode::CREATED, Json(json!({ "id": id }))).into_response(),
+    let host = state.check_new_remote_check(
+        request.host_id.as_deref(),
+        request.hostname.as_deref(),
+        &request.input,
+    );
+    let host = match host.await {
+        Ok(host) => host,
+        Err(error) => return refused(&error),
+    };
+    match state
+        .add_remote_check(host, request.input, &super::recorded_by())
+        .await
+    {
+        Ok((id, host_id)) => {
+            let added = json!({ "id": id, "host_id": host_id });
+            (StatusCode::CREATED, Json(added)).into_response()
+        }
         Err(error) if error.is::<NameTaken>() => refused(&error),
         Err(error) => server_error(&error),
     }
@@ -2124,7 +2143,12 @@ async fn update_remote_check(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error(&error),
     };
+    if request.hostname.is_some() {
+        let error = anyhow::anyhow!("a hostname is only for a new host, made as a check is added");
+        return refused(&error);
+    }
     let mut input = request.input;
+    input.host_id = request.host_id.unwrap_or(saved.input.host_id);
     input.sign_in = input
         .sign_in
         .keeping_secrets_of(&saved.input.sign_in, request.sign_in);

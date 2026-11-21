@@ -76,6 +76,38 @@ const DNS_PORT: u16 = 53;
 /// The largest answer a plain UDP lookup returns.
 const DNS_BUFFER_BYTES: usize = 4096;
 
+/// The host a check reaches, as a name for a host to keep it under: the host in a
+/// website's address, what's before the port for a target given as `host:port`, and
+/// the name itself for DNS and ping. An IPv6 address comes without its brackets, and
+/// a name is in lower case, as hostnames are.
+pub fn host_reached(check: &Check) -> String {
+    let target = check.target.as_str();
+    let host = match check.kind {
+        CheckKind::Http => Uri::from_str(target)
+            .ok()
+            .and_then(|uri| uri.host().map(String::from))
+            .unwrap_or_else(|| target.to_string()),
+        CheckKind::Tcp
+        | CheckKind::Tls
+        | CheckKind::Postgres
+        | CheckKind::Mysql
+        | CheckKind::Redis
+        | CheckKind::Mongodb
+        | CheckKind::Clickhouse
+        | CheckKind::Ssh
+        | CheckKind::Smtp
+        | CheckKind::Imap
+        | CheckKind::Pop3 => target
+            .rsplit_once(':')
+            .map_or(target, |(host, _port)| host)
+            .to_string(),
+        CheckKind::Dns | CheckKind::Ping | CheckKind::Unknown => target.to_string(),
+    };
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_lowercase()
+}
+
 /// How long a check gets. A slower answer counts as down.
 pub fn limit(check: &Check) -> Duration {
     check.timeout.unwrap_or(DEFAULT_CHECK_TIMEOUT)
@@ -1084,6 +1116,43 @@ mod tests {
 
     fn check(kind: CheckKind, target: &str) -> Check {
         Check::new("a", kind, target)
+    }
+
+    #[test]
+    fn a_check_is_named_after_the_host_it_reaches() {
+        for (kind, target, host) in [
+            (
+                CheckKind::Http,
+                "https://www.example.com/health",
+                "www.example.com",
+            ),
+            (
+                CheckKind::Http,
+                "http://Shop.Example.com:8080/?a=1",
+                "shop.example.com",
+            ),
+            (
+                CheckKind::Http,
+                "https://user:secret@example.com/",
+                "example.com",
+            ),
+            (
+                CheckKind::Http,
+                "https://[2001:db8::1]:8443/",
+                "2001:db8::1",
+            ),
+            (CheckKind::Http, "http://192.0.2.10/", "192.0.2.10"),
+            (CheckKind::Tcp, "db1.internal:5432", "db1.internal"),
+            (CheckKind::Postgres, "10.0.0.5:5432", "10.0.0.5"),
+            (CheckKind::Ssh, "[2001:db8::2]:22", "2001:db8::2"),
+            (CheckKind::Tls, "mail.example.com:993", "mail.example.com"),
+            (CheckKind::Smtp, "SMTP.example.com:587", "smtp.example.com"),
+            (CheckKind::Dns, "example.com", "example.com"),
+            (CheckKind::Ping, "2001:db8::3", "2001:db8::3"),
+            (CheckKind::Ping, "192.0.2.1", "192.0.2.1"),
+        ] {
+            assert_eq!(host_reached(&check(kind, target)), host, "{target}");
+        }
     }
 
     /// Runs a check the way a collector does.

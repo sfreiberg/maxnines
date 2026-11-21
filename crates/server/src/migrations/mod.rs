@@ -1254,8 +1254,7 @@ impl MigrationTrait for CreateTables {
                     .col(
                         ColumnDef::new(RemoteChecks::HostId)
                             .string_len(32)
-                            .not_null()
-                            .default("server"),
+                            .not_null(),
                     )
                     .col(ColumnDef::new(RemoteChecks::Database).string_len(63))
                     .col(ColumnDef::new(RemoteChecks::Tls).boolean())
@@ -2238,29 +2237,39 @@ mod tests {
             .unwrap();
         add("Database", "abc").await.unwrap();
 
-        // One with no host given is the server's.
-        connection
-            .execute_unprepared(
-                "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs, enabled)
-                 VALUES ('Site', 'site', 'http', 'https://example.com', 60, TRUE)",
-            )
-            .await
-            .unwrap();
-        let about = "SELECT host_id FROM remote_checks WHERE name = 'Site'";
-        assert_eq!(texts(&connection, about).await, ["server"]);
+        // Every check names its host.
+        let hostless = "INSERT INTO remote_checks (name, name_key, kind, target, interval_secs,
+                            enabled)
+                        VALUES ('Site', 'site', 'http', 'https://example.com', 60, TRUE)";
+        assert!(connection.execute_unprepared(hostless).await.is_err());
 
         // A name only has to differ from the other checks about the same host, as
         // names are compared.
+        connection
+            .execute_unprepared(
+                "INSERT INTO hosts (id, hostname, public_key, state, first_seen_at, kind)
+                 VALUES ('def', 'web', '', 'approved', '1970-01-01T00:00:00.001+00:00', 'agentless')",
+            )
+            .await
+            .unwrap();
         add("Site", "abc").await.unwrap();
         assert!(add("Site", "abc").await.is_err(), "one to a host");
         assert!(add("SITE", "abc").await.is_err(), "whatever the case");
-        assert!(add("Site", "server").await.is_err());
+        add("Site", "def").await.unwrap();
 
-        // A host's checks go with it.
+        // A host's checks go with it, and only its own.
         let gone = "DELETE FROM hosts WHERE id = 'abc'";
         connection.execute_unprepared(gone).await.unwrap();
         let left = "SELECT host_id FROM remote_checks ORDER BY id";
-        assert_eq!(texts(&connection, left).await, ["server"]);
+        assert_eq!(texts(&connection, left).await, ["def"]);
+
+        // A check going leaves its host.
+        connection
+            .execute_unprepared("DELETE FROM remote_checks")
+            .await
+            .unwrap();
+        let host = "SELECT hostname FROM hosts WHERE id = 'def'";
+        assert_eq!(texts(&connection, host).await, ["web"]);
     }
 
     /// Every table a host or user has rows in.

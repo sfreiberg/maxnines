@@ -49,6 +49,15 @@ pub struct Heartbeat {
     pub clock_every: Duration,
 }
 
+/// The host a check that's being added is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckHost {
+    /// A host with no agent that's already there, by its ID.
+    Existing(String),
+    /// A new host with no agent, made for the check, by the name it'll have.
+    New(String),
+}
+
 /// What every request and connection shares.
 #[derive(Clone)]
 pub struct AppState {
@@ -269,17 +278,70 @@ impl AppState {
         Ok(())
     }
 
-    /// Everything that has to be true for a server check to be saved. A name another
-    /// check about the same host has is refused as the check is saved, as only the
-    /// database can tell for certain.
+    /// Everything that has to be true for a change to a check to be saved. A name
+    /// another check about the same host has is refused as the check is saved, as
+    /// only the database can tell for certain.
     pub async fn check_remote_check(&self, input: &RemoteCheckInput) -> Result<()> {
         remote_checks::check_input(input)?;
-        let about = &input.host_id;
+        self.check_host_of_check(&input.host_id).await
+    }
+
+    /// A check is about a host with no agent, never the server or a host with one.
+    async fn check_host_of_check(&self, id: &str) -> Result<()> {
         ensure!(
-            about == remote_checks::LOCAL_HOST_ID || self.agentless_host(about).await.is_some(),
-            "a check is about a host with no agent, or the server itself"
+            self.agentless_host(id).await.is_some(),
+            "a check is about a host with no agent: give the ID of one, or leave it out \
+             for a new host to be made for the check"
         );
         Ok(())
+    }
+
+    /// Where a check that's being added goes, or why it can't be added: the host
+    /// `host_id` names, or else a new host with no agent called `hostname`, or named
+    /// after the host the check reaches when that's left out too. Hostnames needn't
+    /// be unique, so a new host is never one already there by the same name.
+    pub async fn check_new_remote_check(
+        &self,
+        host_id: Option<&str>,
+        hostname: Option<&str>,
+        input: &RemoteCheckInput,
+    ) -> Result<CheckHost> {
+        remote_checks::check_input(input)?;
+        match host_id {
+            Some(id) => {
+                ensure!(
+                    hostname.is_none(),
+                    "a hostname is only for a new host, made when there's no host_id"
+                );
+                self.check_host_of_check(id).await?;
+                Ok(CheckHost::Existing(id.to_string()))
+            }
+            None => {
+                let name = hostname.map_or_else(
+                    || maxnines_checks::host_reached(&input.check),
+                    str::to_string,
+                );
+                Ok(CheckHost::New(crate::registration::checked_hostname(
+                    &name,
+                )?))
+            }
+        }
+    }
+
+    /// Adds a check, first adding its host, as Hosts → Add a host does and by `by`,
+    /// if it's a new one. Gives the check's ID and its host's.
+    pub async fn add_remote_check(
+        &self,
+        host: CheckHost,
+        mut input: RemoteCheckInput,
+        by: &str,
+    ) -> Result<(i64, String)> {
+        input.host_id = match host {
+            CheckHost::Existing(id) => id,
+            CheckHost::New(hostname) => self.registry.add_agentless(&hostname, by).await?.id,
+        };
+        let id = self.database.create_remote_check(&input).await?;
+        Ok((id, input.host_id))
     }
 
     /// A host with no agent, which is the only kind the server reads pages for.

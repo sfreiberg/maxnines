@@ -293,7 +293,7 @@ erDiagram
     }
     remote_checks {
         int id PK
-        string host_id FK "the host it's about, or server"
+        string host_id FK "the host without an agent it's about"
         string name
         string name_key "one to a host"
         string kind
@@ -469,7 +469,7 @@ erDiagram
 | `events` | Annotations people and automations add, and restarts the server notices |
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |
 | `location_rules` | Where hosts are on the map |
-| `remote_checks` | Checks the server runs itself, each about a host without an agent or the server, with a name no other check about that host has. A host's checks go with it |
+| `remote_checks` | Checks the server runs itself, each about a host without an agent, which is made for it if it's added without one, and with a name no other check about that host has. A host's checks go with it, and a check's host stays when the check goes |
 | `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys. Each browser session, key and app sign-in keeps where it was last used from, for the list of who's signed in |
 | `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
 | `audit_log` | Who changed what |

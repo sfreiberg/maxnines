@@ -6345,9 +6345,9 @@ mod remote {
         )
     }
 
-    fn tcp_input(name: &str, target: &str) -> RemoteCheckInput {
+    fn tcp_input(host: &str, name: &str, target: &str) -> RemoteCheckInput {
         RemoteCheckInput {
-            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
+            host_id: host.to_string(),
             check: Check::new(name, CheckKind::Tcp, target),
             interval: Duration::from_secs(60),
             enabled: true,
@@ -6375,8 +6375,9 @@ mod remote {
     #[tokio::test]
     async fn a_check_runs_when_due_and_waits_for_its_interval() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let (_listener, target) = open_port();
-        let input = tcp_input("db", &target);
+        let input = tcp_input(&host, "db", &target);
         let created = server.state.database.create_remote_check(&input).await;
         let id = created.unwrap();
         let mut scheduler = scheduler(&server);
@@ -6397,10 +6398,11 @@ mod remote {
     #[tokio::test]
     async fn a_changed_check_runs_at_once_and_then_on_its_new_interval() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let (_listener, target) = open_port();
         let input = RemoteCheckInput {
             interval: Duration::from_secs(86_400),
-            ..tcp_input("db", &target)
+            ..tcp_input(&host, "db", &target)
         };
         let database = &server.state.database;
         let id = database.create_remote_check(&input).await.unwrap();
@@ -6424,11 +6426,12 @@ mod remote {
     #[tokio::test]
     async fn checks_slower_than_their_interval_never_pile_up() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         // Connections are taken but never answered, so each check waits out its whole
         // time limit.
         let (_listener, target) = open_port();
         let address = format!("http://{target}/");
-        let input = tcp_input("slow", &target);
+        let input = tcp_input(&host, "slow", &target);
         let database = &server.state.database;
         let checks = crate::remote_checks::MAX_RUNNING + 1;
         for number in 0..checks {
@@ -6455,12 +6458,12 @@ mod remote {
     #[tokio::test]
     async fn a_disabled_check_does_not_run() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let (_listener, target) = open_port();
         let input = RemoteCheckInput {
-            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
             enabled: false,
             sign_in: Default::default(),
-            ..tcp_input("db", &target)
+            ..tcp_input(&host, "db", &target)
         };
         server
             .state
@@ -6478,8 +6481,9 @@ mod remote {
     #[tokio::test]
     async fn a_deleted_checks_result_is_forgotten() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let (_listener, target) = open_port();
-        let input = tcp_input("db", &target);
+        let input = tcp_input(&host, "db", &target);
         let id = server
             .state
             .database
@@ -6497,8 +6501,9 @@ mod remote {
     #[tokio::test]
     async fn a_failing_server_check_can_alert_like_anything_else() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let target = CLOSED_ADDRESS.to_string();
-        let input = tcp_input("db", &target);
+        let input = tcp_input(&host, "db", &target);
         server
             .state
             .database
@@ -6538,8 +6543,8 @@ mod remote {
         evaluator.evaluate(crate::times::now()).await.unwrap();
         let open = server.state.database.open_alerts().await.unwrap();
         assert_eq!(open.len(), 1);
-        assert_eq!(open[0].host_id, LOCAL_HOST_ID);
-        assert_eq!(open[0].summary, "Check failing on MaxNines server: db is 0");
+        assert_eq!(open[0].host_id, host);
+        assert_eq!(open[0].summary, "Check failing on orders-db: db is 0");
     }
 
     #[tokio::test]
@@ -6606,10 +6611,13 @@ mod remote {
     #[tokio::test]
     async fn a_check_can_be_managed_from_its_form() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let mut browser = Browser::default();
 
+        let mut fields = FIELDS.to_vec();
+        fields.push(("host_id", &host));
         let page = browser
-            .submit(&server, "/checks/new", "/checks", &FIELDS)
+            .submit(&server, "/checks/new", "/checks", &fields)
             .await;
         assert_eq!(page.status, 303, "{}", page.body);
         let saved = server.state.database.list_remote_checks().await.unwrap();
@@ -6629,7 +6637,6 @@ mod remote {
             page.body
         );
 
-        let mut fields = FIELDS.to_vec();
         fields[3] = ("interval_secs", "300");
         let page = browser
             .submit(&server, &edit, &format!("/checks/{id}"), &fields)
@@ -6638,9 +6645,13 @@ mod remote {
         let saved = server.state.database.get_remote_check(id).await.unwrap();
         assert_eq!(saved.unwrap().input.interval, Duration::from_secs(300));
 
+        // Its host stays, and is where it goes back to.
         let delete = format!("/checks/{id}/delete");
         let page = browser.submit(&server, &edit, &delete, &[]).await;
         assert_eq!(page.status, 303);
+        let host_page = format!("/hosts/{host}");
+        assert_eq!(page.header("location"), Some(host_page.as_str()));
+        assert!(server.state.registry.get(&host).await.is_some());
         assert!(
             server
                 .state
@@ -6667,14 +6678,17 @@ mod remote {
     }
 
     #[tokio::test]
-    async fn two_checks_cannot_share_a_name() {
+    async fn two_checks_about_one_host_cannot_share_a_name() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
+        let mut fields = FIELDS.to_vec();
+        fields.push(("host_id", &host));
         let mut browser = Browser::default();
         browser
-            .submit(&server, "/checks/new", "/checks", &FIELDS)
+            .submit(&server, "/checks/new", "/checks", &fields)
             .await;
         let page = browser
-            .submit(&server, "/checks/new", "/checks", &FIELDS)
+            .submit(&server, "/checks/new", "/checks", &fields)
             .await;
         assert_eq!(page.status, 422);
         assert!(page.body.contains("already exists"), "{}", page.body);
@@ -6683,7 +6697,8 @@ mod remote {
     #[tokio::test]
     async fn check_forms_refuse_a_bad_csrf_token() {
         let server = server().await;
-        let input = tcp_input("db", "example.com:80");
+        let host = host_without_agent(&server, "orders-db").await;
+        let input = tcp_input(&host, "db", "example.com:80");
         let id = server
             .state
             .database
@@ -6718,8 +6733,9 @@ mod remote {
     #[tokio::test]
     async fn results_show_on_the_checks_page_and_the_checks_own_page() {
         let server = server().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let target = CLOSED_ADDRESS.to_string();
-        let input = tcp_input("<b>db</b>", &target);
+        let input = tcp_input(&host, "<b>db</b>", &target);
         let created = server.state.database.create_remote_check(&input).await;
         let id = created.unwrap();
         run_due(&mut scheduler(&server), crate::times::now()).await;
@@ -6734,15 +6750,9 @@ mod remote {
             assert!(!page.body.contains("<b>db"), "{path}");
         }
 
-        // The server's own charts have none of its checks, which are each on a
-        // page of their own, and a chart's numbers can be asked for one check.
-        let page = browser.get(&server, "/hosts/server/metrics").await;
-        assert_eq!(page.status, 200);
-        for gone in ["Latest checks", "Checks passing", "Down"] {
-            assert!(!page.body.contains(gone), "{gone}: {}", page.body);
-        }
-        let data = "/hosts/server/metrics/check.up?range=1h&series=nothing-called-this";
-        let page = browser.get(&server, data).await;
+        // A chart's numbers can be asked for one check.
+        let data = format!("/hosts/{host}/metrics/check.up?range=1h&series=nothing-called-this");
+        let page = browser.get(&server, &data).await;
         assert_eq!(page.status, 200);
         assert!(page.body.contains("No data in this range"), "{}", page.body);
     }
@@ -8066,7 +8076,7 @@ mod pages {
     async fn the_overview_shows_agents_checks_and_who_is_waiting() {
         let test = Harness::start().await;
         let input = crate::remote_checks::RemoteCheckInput {
-            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
+            host_id: host_without_agent(&test.server, "orders-db").await,
             check: maxnines_protocol::Check::new("site", maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval: Duration::from_secs(60),
             enabled: true,
@@ -8381,8 +8391,9 @@ mod pages {
     #[tokio::test]
     async fn checks_can_be_filtered() {
         let server = start().await;
+        let host = host_without_agent(&server, "orders-db").await;
         let input = |name: &str, enabled| crate::remote_checks::RemoteCheckInput {
-            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
+            host_id: host.clone(),
             check: maxnines_protocol::Check::new(name, maxnines_protocol::CheckKind::Tcp, "a:1"),
             interval: Duration::from_secs(60),
             enabled,

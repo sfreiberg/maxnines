@@ -1,7 +1,7 @@
 //! Checks the server runs itself, against remote sites, with the same code agents
-//! use. Each is about a host: one with no agent, or the server itself, which is
-//! a built-in host. Results are saved as samples from that host, so charts and
-//! alert rules treat them like anything else.
+//! use. Each is about a host with no agent, made for it if it's added without one.
+//! Results are saved as samples from that host, so charts and alert rules treat them
+//! like anything else.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -26,7 +26,8 @@ use crate::registration::{HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
 use crate::times::{self, Timestamp};
 
-/// The built-in agent's ID. See the migration that creates it.
+/// The built-in host the server records its own metrics under. See the migration
+/// that creates it. No check is ever about it.
 pub const LOCAL_HOST_ID: &str = "server";
 
 pub const LOCAL_HOSTNAME: &str = "MaxNines server";
@@ -53,8 +54,9 @@ pub struct RemoteCheck {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteCheckInput {
-    /// The host it's about. Left out, it's the server itself.
-    #[serde(default = "local_host_id")]
+    /// The host it's about, which is always one with no agent. A request gives it
+    /// beside the check, or leaves it out for a new host to be made for the check.
+    #[serde(skip_deserializing)]
     pub host_id: String,
     pub check: Check,
     /// How often it runs.
@@ -269,10 +271,6 @@ fn default_enabled() -> bool {
     true
 }
 
-fn local_host_id() -> String {
-    LOCAL_HOST_ID.to_string()
-}
-
 pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     input.check.validate()?;
     input.sign_in.validate(input.check.kind)?;
@@ -451,11 +449,9 @@ impl Scheduler {
             if !check.input.enabled || due > now {
                 continue;
             }
-            let hostname = match agentless.get(&check.input.host_id) {
-                Some(hostname) => hostname.clone(),
-                None if check.input.host_id == LOCAL_HOST_ID => LOCAL_HOSTNAME.to_string(),
-                // Its host isn't one the server runs checks for any more.
-                None => continue,
+            // Its host isn't one the server runs checks for any more.
+            let Some(hostname) = agentless.get(&check.input.host_id).cloned() else {
+                continue;
             };
             let interval = TimeDelta::from_std(check.input.interval)?;
             self.next_run
@@ -561,7 +557,7 @@ pub async fn run(
     };
     results.set(check.id, result.clone());
     // One that's turned off says nothing about whether its host is there.
-    if host_id != LOCAL_HOST_ID && check.input.enabled {
+    if check.input.enabled {
         presence.reached(host_id, Reached::Check(check.id), result["up"] == 1);
     }
     save(writer, host_id.clone(), hostname, "checks", json!([result])).await;
@@ -596,7 +592,7 @@ mod tests {
 
     fn input(interval: Duration) -> RemoteCheckInput {
         RemoteCheckInput {
-            host_id: crate::remote_checks::LOCAL_HOST_ID.to_string(),
+            host_id: "5f0c1d6f2a8e4b7790d3c1a2b4e6f809".to_string(),
             check: Check::new("a", CheckKind::Tcp, "example.com:80"),
             interval,
             enabled: true,

@@ -659,8 +659,9 @@ async fn a_check_about_a_host_is_saved_under_it_and_says_whether_it_is_there() {
     assert!(!server.state.presence.get(&id).unwrap().online);
 
     // A check that's no longer about the host says nothing about it.
-    let about_server = tcp_check("server", "orders port", "127.0.0.1:1");
-    assert_eq!(api(&server, "PUT", &check_path, &about_server).await.0, 204);
+    let other = add_host(&server, "billing-db").await;
+    let moved = tcp_check(&other, "orders port", "127.0.0.1:1");
+    assert_eq!(api(&server, "PUT", &check_path, &moved).await.0, 204);
     assert_eq!(
         run_due(&mut scheduler, now + TimeDelta::minutes(2)).await,
         1
@@ -669,33 +670,27 @@ async fn a_check_about_a_host_is_saved_under_it_and_says_whether_it_is_there() {
 }
 
 #[tokio::test]
-async fn a_check_is_about_a_host_with_no_agent_or_the_server() {
+async fn a_check_is_about_a_host_with_no_agent_and_never_the_server() {
     let server = start().await;
     let id = add_host(&server, "orders-db").await;
     let agent = identity();
     let _client = server.connect_approved(&agent, "web-1").await;
 
-    for about in [agent.id(), "nobody".to_string()] {
+    for about in [agent.id(), "nobody".to_string(), "server".to_string()] {
         let check = tcp_check(&about, "port", "db.example.com:5432");
         let (status, refused) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
         assert_eq!(status, 422, "{about}: {refused}");
     }
-    // Left out, it's about the server, as every check used to be.
-    let own = json!({
-        "check": { "name": "site", "kind": "tcp", "target": "example.com:443" },
-        "interval_secs": 60
-    });
-    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &own).await;
-    assert_eq!(status, 201, "{added}");
-    let path = format!("/api/v1/remote-checks/{}", added["id"]);
-    assert_eq!(
-        api(&server, "GET", &path, &Value::Null).await.1["host_id"],
-        "server"
-    );
+    // A new host's name is only for a new host.
+    let mut named = tcp_check(&id, "port", "db.example.com:5432");
+    named["hostname"] = json!("orders");
+    let (status, refused) = api(&server, "POST", "/api/v1/remote-checks", &named).await;
+    assert_eq!(status, 422, "{refused}");
 
     // A host's checks go with it.
     let about_host = tcp_check(&id, "orders port", "db.example.com:5432");
-    let (_, added) = api(&server, "POST", "/api/v1/remote-checks", &about_host).await;
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &about_host).await;
+    assert_eq!((status, &added["host_id"]), (201, &json!(id)), "{added}");
     let host_path = format!("/api/v1/hosts/{id}");
     assert_eq!(
         api(&server, "DELETE", &host_path, &Value::Null).await.0,
@@ -704,7 +699,97 @@ async fn a_check_is_about_a_host_with_no_agent_or_the_server() {
     let path = format!("/api/v1/remote-checks/{}", added["id"]);
     assert_eq!(api(&server, "GET", &path, &Value::Null).await.0, 404);
     let (_, left) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
-    assert_eq!(left.as_array().unwrap().len(), 1, "{left}");
+    assert_eq!(left, json!([]));
+}
+
+/// The host a check reaches, as checks with no host are named after, and hosts by
+/// that name, which isn't anyone's to check.
+fn check_without_a_host(kind: &str, target: &str) -> Value {
+    json!({
+        "check": { "name": "site", "kind": kind, "target": target },
+        "interval_secs": 60
+    })
+}
+
+#[tokio::test]
+async fn a_check_added_without_a_host_gets_a_new_one_of_its_own() {
+    let server = start().await;
+    let add = |check: Value| {
+        let server = &server;
+        async move {
+            let (status, added) = api(server, "POST", "/api/v1/remote-checks", &check).await;
+            assert_eq!(status, 201, "{added}");
+            let host_id = added["host_id"].as_str().unwrap().to_string();
+            let (_, host) = api(
+                server,
+                "GET",
+                &format!("/api/v1/hosts/{host_id}"),
+                &Value::Null,
+            )
+            .await;
+            (added, host)
+        }
+    };
+
+    // Named after where it goes, unless it's given a name.
+    let (site, host) = add(check_without_a_host(
+        "http",
+        "https://www.example.com/health",
+    ))
+    .await;
+    assert_eq!(host["hostname"], "www.example.com");
+    assert_eq!(host["kind"], "agentless");
+    assert_eq!(host["state"], "approved");
+    let mut named = check_without_a_host("tcp", "db1.internal:5432");
+    named["hostname"] = json!("  Orders database ");
+    let (_, host) = add(named).await;
+    assert_eq!(host["hostname"], "Orders database");
+    let (_, host) = add(check_without_a_host("ping", "192.0.2.7")).await;
+    assert_eq!(host["hostname"], "192.0.2.7");
+    let mut nameless = check_without_a_host("ping", "192.0.2.8");
+    nameless["hostname"] = json!(" ");
+    let (status, _) = api(&server, "POST", "/api/v1/remote-checks", &nameless).await;
+    assert_eq!(status, 422);
+
+    // A host is never found by its name, so the same site again is another host.
+    let (again, host) = add(check_without_a_host(
+        "http",
+        "https://www.example.com/health",
+    ))
+    .await;
+    assert_eq!(host["hostname"], "www.example.com");
+    assert_ne!(again["host_id"], site["host_id"]);
+
+    // Made as one added by hand is, by whoever added the check.
+    let (_, log) = api(&server, "GET", "/api/v1/audit-log", &Value::Null).await;
+    let made: Vec<&Value> = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["subject"]["kind"] == "host" && entry["action"] == "created")
+        .collect();
+    assert_eq!(made.len(), 4, "{log}");
+    assert_eq!(made[0]["actor"]["name"], "test@example.com", "{log}");
+
+    // Without its check, the host and what it found stay.
+    let path = format!("/api/v1/remote-checks/{}", site["id"]);
+    assert_eq!(api(&server, "DELETE", &path, &Value::Null).await.0, 204);
+    let host_path = format!("/api/v1/hosts/{}", site["host_id"].as_str().unwrap());
+    assert_eq!(api(&server, "GET", &host_path, &Value::Null).await.0, 200);
+
+    // Changing a check leaves it on its host, and a new host's name is only for
+    // adding one.
+    let path = format!("/api/v1/remote-checks/{}", again["id"]);
+    let slower = json!({
+        "check": { "name": "site", "kind": "http", "target": "https://www.example.com/health" },
+        "interval_secs": 300
+    });
+    assert_eq!(api(&server, "PUT", &path, &slower).await.0, 204);
+    let (_, saved) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(saved["host_id"], again["host_id"]);
+    let mut renamed = slower.clone();
+    renamed["hostname"] = json!("shop");
+    assert_eq!(api(&server, "PUT", &path, &renamed).await.0, 422);
 }
 
 #[tokio::test]
@@ -712,13 +797,14 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
     let server = start().await;
     let orders = add_host(&server, "orders-db").await;
     let billing = add_host(&server, "billing-db").await;
+    let stock = add_host(&server, "stock-db").await;
     let served = serve(None).await;
     let add = |about: &str| {
         let check = tcp_check(about, "port", &served.address);
         let server = &server;
         async move { api(server, "POST", "/api/v1/remote-checks", &check).await }
     };
-    for about in [orders.as_str(), billing.as_str(), "server"] {
+    for about in [orders.as_str(), billing.as_str(), stock.as_str()] {
         let (status, added) = add(about).await;
         assert_eq!(status, 201, "{about}: {added}");
     }
@@ -758,7 +844,9 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
     // Moving one onto a host that has its name is refused too.
     let (_, checks) = api(&server, "GET", "/api/v1/remote-checks", &Value::Null).await;
     let mut all = checks.as_array().unwrap().iter();
-    let own = all.find(|check| check["host_id"] == "server").unwrap();
+    let own = all
+        .find(|check| check["host_id"] == stock.as_str())
+        .unwrap();
     let path = format!("/api/v1/remote-checks/{}", own["id"]);
     let moved = tcp_check(&billing, "port", &served.address);
     assert_eq!(api(&server, "PUT", &path, &moved).await.0, 422);
@@ -768,9 +856,10 @@ async fn two_hosts_can_each_have_a_check_of_the_same_name() {
 async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
     let server = start_with_metrics().await;
     let served = serve(None).await;
+    let host = add_host(&server, "sites").await;
     let mut ids = Vec::new();
     for name in ["alpha-site", "beta-site"] {
-        let check = tcp_check("server", name, &served.address);
+        let check = tcp_check(&host, name, &served.address);
         let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
         assert_eq!(status, 201, "{added}");
         ids.push(added["id"].as_i64().unwrap());
@@ -814,7 +903,7 @@ async fn a_check_has_a_page_of_its_own_with_only_its_charts() {
     assert!(!page.body.contains("beta-site"), "{}", page.body);
 
     // A chart's numbers are the one check's too.
-    let data = "/hosts/server/metrics/check.up?range=1h&series=alpha-site";
+    let data = format!("/hosts/{host}/metrics/check.up?range=1h&series=alpha-site");
     let link = data.replace('&', "&amp;");
     assert!(page.body.contains(&link), "{}", page.body);
 
@@ -1076,10 +1165,8 @@ async fn a_hosts_checks_are_added_from_its_page() {
     let form = browser.get(&server, &form_path).await;
     let chosen = format!(r#"<option value="{id}" selected>orders-db</option>"#);
     assert!(form.body.contains(&chosen), "{}", form.body);
-    assert!(
-        form.body
-            .contains(r#"<option value="server">MaxNines server</option>"#)
-    );
+    assert!(form.body.contains(r#"<option value="">New host</option>"#));
+    assert!(!form.body.contains("MaxNines server"), "{}", form.body);
 
     let fields = [
         ("host_id", id.as_str()),
@@ -1103,6 +1190,65 @@ async fn a_hosts_checks_are_added_from_its_page() {
     let checks = browser.get(&server, "/checks").await;
     let whose = format!(r#"<a href="/hosts/{id}">orders-db</a>"#);
     assert!(checks.body.contains(&whose), "{}", checks.body);
+}
+
+#[tokio::test]
+async fn a_check_added_from_the_checks_page_makes_its_own_host() {
+    let server = start().await;
+    let mut browser = Browser::default();
+
+    // A new host is what the form starts with, named after the target unless it's
+    // given a name.
+    let form = browser.get(&server, "/checks/new").await;
+    assert!(
+        form.body
+            .contains(r#"<option value="" selected>New host</option>"#),
+        "{}",
+        form.body
+    );
+    let named = browser
+        .get(
+            &server,
+            "/checks/new-host-name?kind=http&target=https%3A%2F%2FShop.example.com%2Fcart&hostname=",
+        )
+        .await;
+    assert!(
+        named.body.contains(r#"placeholder="shop.example.com""#),
+        "{}",
+        named.body
+    );
+
+    let mut fields = vec![
+        ("host_id", ""),
+        ("hostname", ""),
+        ("name", "shop"),
+        ("kind", "http"),
+        ("target", "https://shop.example.com/cart"),
+        ("interval_secs", "60"),
+        ("enabled", "on"),
+    ];
+    let saved = browser
+        .submit(&server, "/checks/new", "/checks", &fields)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let host_path = saved.header("location").unwrap().to_string();
+    let page = browser.get(&server, &host_path).await;
+    assert!(page.body.contains("shop.example.com"), "{}", page.body);
+    assert!(page.body.contains("No agent"), "{}", page.body);
+
+    fields[1] = ("hostname", "Shop");
+    let saved = browser
+        .submit(&server, "/checks/new", "/checks", &fields)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    assert_ne!(saved.header("location").unwrap(), host_path, "another host");
+    let checks = browser.get(&server, "/checks").await;
+    assert!(checks.body.contains(">Shop</a>"), "{}", checks.body);
+    assert!(
+        checks.body.contains(">shop.example.com</a>"),
+        "{}",
+        checks.body
+    );
 }
 
 #[tokio::test]

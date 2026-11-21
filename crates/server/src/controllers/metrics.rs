@@ -386,12 +386,9 @@ async fn show(
         return not_found(&state, &token);
     };
 
-    // Each check the server runs for itself has a page of its own, so its charts
-    // aren't among the server's.
     let shown: Vec<&'static Metric> = METRICS
         .iter()
         .filter(|metric| metric.chart != ShowChart::Never)
-        .filter(|metric| !(host.is_local() && metric.collector == "checks"))
         .collect();
     let charts = match charts_for(&state, &host.id, &shown, range, viewer_zone()).await {
         Ok(charts) => charts,
@@ -421,10 +418,7 @@ async fn show(
     let ranges = range_links(selected);
 
     // The server saves its checks one at a time, so no one sample has them all.
-    // Its own are on the Checks page, each with a page to itself.
-    let latest = if host.is_local() {
-        Ok(Vec::new())
-    } else if host.is_agentless() {
+    let latest = if host.is_agentless() {
         state.database.list_remote_checks().await.map(|checks| {
             let mut results = state.check_results.all();
             checks

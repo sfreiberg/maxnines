@@ -31,9 +31,12 @@ a ping. Press **Add check** under **Checks** on the host's page, or choose the h
 on any check's form. The check's results are the host's, so its charts are on the
 host's metrics page and an alert about it names the host.
 
-A check doesn't have to be about a host. One left on **MaxNines server** is the
-server's own, as every check was before hosts could have them, and those are all
-listed on the Checks page with the rest.
+Every check is about a host like this. A check added from the Checks page with
+**New host**, or through the API without a host, gets a host of its own, named
+as you say or after what it reaches, as [Checks](checks.md#a-host-for-each-check)
+describes. Hosts aren't matched by name, so two checks added that way are on two
+hosts: to put a second check on the same host, choose it on the form. Every check is
+listed on the Checks page with its host.
 
 Every check the server runs has a page of its own, opened by its name wherever
 it's listed. It shows:
@@ -45,8 +48,6 @@ it's listed. It shows:
 - any alerts open about it, and the alert rules that watch it;
 - its charts and nobody else's: whether it passed, its response time with where
   the time went, and whatever else its kind reports.
-
-The server's own checks are charted only there, not among the server's metrics.
 
 From the page, **Check now** runs it at once, **Pause** stops running it until it's
 resumed, and **Start maintenance** holds back notifications about this check alone
@@ -94,4 +95,5 @@ on the host's clock or services. Filters that pick hosts by their facts don't ma
 them, though one can still be picked by its name or ID.
 
 Deleting a host without an agent takes one step, as there's no agent to revoke
-first, and removes its pages, checks, metrics and alerts for good.
+first, and removes its pages, checks, metrics and alerts for good. Deleting a check
+leaves its host, and what the check found, in place.

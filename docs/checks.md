@@ -2,7 +2,7 @@
 
 A check tries reaching something and says whether it answered, how long it took, and
 whatever else it learned on the way. The server runs the ones on the **Checks** page,
-each about a [host without an agent](agentless-hosts.md) or the server itself. An
+each about a [host without an agent](agentless-hosts.md). An
 agent runs the ones a [config rule](api-config-rules.md) gives it, from where it is,
 which is how to check something that only listens on its own host. Ones that sign in
 are defined in the agent's own config, as [below](#on-an-agent).
@@ -25,6 +25,31 @@ are defined in the agent's own config, as [below](#on-an-agent).
 
 An agent older than a kind of check doesn't know it. It runs the rest of its checks,
 and reports that one as down, saying the agent needs upgrading.
+
+## A host for each check
+
+Every check the server runs is about a host without an agent, never the server
+itself. Choose one on the check's form, or leave it on **New host** and a new host
+is made for the check, as **Add a host** on the Hosts page makes one, and recorded
+in the audit log the same way. Type the new host's name, or leave it empty and it's
+named after what the check reaches, in lower case:
+
+| Kind | Named after | Example target | Host's name |
+|---|---|---|---|
+| `http` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
+| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3` | What's before the port | `db1.internal:5432` | `db1.internal` |
+| `dns` | The name it looks up | `example.com` | `example.com` |
+| `ping` | The host it pings | `192.0.2.7` | `192.0.2.7` |
+
+An address stays an address, and an IPv6 one loses its brackets, so
+`https://[2001:db8::1]:8443/` gives `2001:db8::1`. The form shows the name the host
+would get as you type the target.
+
+Hosts are never matched by name, as two can share one, so two checks added this way
+are on two hosts even when they reach the same place. To add a check to a host that's
+already there, choose it on the form, or press **Add check** on the host's page.
+Deleting a check leaves its host and what the check found, and deleting the host
+deletes its checks.
 
 ## What's timed
 
