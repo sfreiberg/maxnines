@@ -268,54 +268,8 @@ impl Database {
 
     /// Creates or replaces an agent's record.
     pub async fn save_host(&self, record: &HostRecord) -> Result<()> {
-        let row = host::ActiveModel {
-            id: Set(record.id.clone()),
-            kind: Set(record.kind.as_str().to_string()),
-            public_key: Set(record.public_key.clone()),
-            hostname: Set(record.hostname.clone()),
-            state: Set(record.state.as_str().to_string()),
-            decided_by: Set(record.decided_by.clone()),
-            first_seen_at: Set(record.first_seen_at),
-            decided_at: Set(record.decided_at),
-            refused_at: Set(record.refusal.refused_at),
-            refused_reason: Set(record.refusal.refused_reason.clone()),
-            refused_protocol: Set(record.refusal.refused_protocol.map(i64::from)),
-        };
-
-        // A refusal is saved apart, by `save_refusal`, so it's left as it is.
-
-        let on_conflict = OnConflict::column(host::Column::Id)
-            .update_columns([
-                host::Column::PublicKey,
-                host::Column::Hostname,
-                host::Column::State,
-                host::Column::DecidedBy,
-                host::Column::FirstSeenAt,
-                host::Column::DecidedAt,
-            ])
-            .to_owned();
-
         let transaction = self.connection.begin().await.context("saving host")?;
-        let before = host::Entity::find_by_id(&record.id)
-            .one(&transaction)
-            .await
-            .context("loading host")?;
-        host::Entity::insert(row)
-            .on_conflict(on_conflict)
-            .exec_without_returning(&transaction)
-            .await
-            .context("saving host")?;
-        let before = before.as_ref().map(host_snapshot);
-        let after = host_snapshot_of(record);
-        record_change(
-            &transaction,
-            Kind::Host,
-            &record.id,
-            before.as_ref(),
-            Some(&after),
-            None,
-        )
-        .await?;
+        save_host_in(&transaction, record).await?;
         transaction.commit().await.context("saving host")?;
         Ok(())
     }
@@ -1300,6 +1254,62 @@ fn to_fact_version(row: host_fact::Model) -> Result<FactVersion> {
 
 /// An agent as the audit log compares them: what it's called and whether it's
 /// allowed in. Its ID is its key, so neither can change.
+/// Creates or replaces a host's record, and records the change, in `connection`'s
+/// transaction.
+pub(crate) async fn save_host_in(
+    connection: &impl ConnectionTrait,
+    record: &HostRecord,
+) -> Result<()> {
+    let row = host::ActiveModel {
+        id: Set(record.id.clone()),
+        kind: Set(record.kind.as_str().to_string()),
+        public_key: Set(record.public_key.clone()),
+        hostname: Set(record.hostname.clone()),
+        state: Set(record.state.as_str().to_string()),
+        decided_by: Set(record.decided_by.clone()),
+        first_seen_at: Set(record.first_seen_at),
+        decided_at: Set(record.decided_at),
+        refused_at: Set(record.refusal.refused_at),
+        refused_reason: Set(record.refusal.refused_reason.clone()),
+        refused_protocol: Set(record.refusal.refused_protocol.map(i64::from)),
+    };
+
+    // A refusal is saved apart, by `save_refusal`, so it's left as it is.
+
+    let on_conflict = OnConflict::column(host::Column::Id)
+        .update_columns([
+            host::Column::PublicKey,
+            host::Column::Hostname,
+            host::Column::State,
+            host::Column::DecidedBy,
+            host::Column::FirstSeenAt,
+            host::Column::DecidedAt,
+        ])
+        .to_owned();
+
+    let before = host::Entity::find_by_id(&record.id)
+        .one(connection)
+        .await
+        .context("loading host")?;
+    host::Entity::insert(row)
+        .on_conflict(on_conflict)
+        .exec_without_returning(connection)
+        .await
+        .context("saving host")?;
+    let before = before.as_ref().map(host_snapshot);
+    let after = host_snapshot_of(record);
+    record_change(
+        connection,
+        Kind::Host,
+        &record.id,
+        before.as_ref(),
+        Some(&after),
+        None,
+    )
+    .await?;
+    Ok(())
+}
+
 fn host_snapshot(row: &host::Model) -> Snapshot {
     host_fields(&row.hostname, &row.state, row.decided_by.as_deref())
 }

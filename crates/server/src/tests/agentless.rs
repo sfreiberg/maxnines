@@ -792,6 +792,54 @@ async fn a_check_added_without_a_host_gets_a_new_one_of_its_own() {
     assert_eq!(api(&server, "PUT", &path, &renamed).await.0, 422);
 }
 
+/// The host made for a check and the check are saved together, so a check the
+/// database can't save leaves no host, and nothing in the audit log.
+#[tokio::test]
+async fn a_check_that_cannot_be_saved_leaves_no_new_host_behind() {
+    let server = start().await;
+    let hosts_before = server.state.registry.list().await.len();
+    let hosts = || async { server.state.database.load_hosts().await.unwrap().len() };
+    let saved_before = hosts().await;
+    // The checks' table isn't where the server looks, so saving one fails after
+    // its host is saved.
+    let connection = server.state.database.connection();
+    sea_orm::ConnectionTrait::execute_unprepared(
+        connection,
+        "ALTER TABLE remote_checks RENAME TO remote_checks_away",
+    )
+    .await
+    .unwrap();
+
+    let check = check_without_a_host("http", "https://www.example.com/health");
+    let (status, _) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+    assert_eq!(status, 500);
+    let mut browser = Browser::default();
+    let fields = [
+        ("host_id", ""),
+        ("hostname", "shop"),
+        ("name", "shop"),
+        ("kind", "http"),
+        ("target", "https://shop.example.com/"),
+        ("interval_secs", "60"),
+        ("enabled", "on"),
+    ];
+    let page = browser
+        .submit(&server, "/checks/new", "/checks", &fields)
+        .await;
+    assert_eq!(page.status, 500, "{}", page.body);
+
+    assert_eq!(hosts().await, saved_before);
+    assert_eq!(server.state.registry.list().await.len(), hosts_before);
+    let (_, log) = api(&server, "GET", "/api/v1/audit-log", &Value::Null).await;
+    let made = log
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["subject"]["kind"] == "host")
+        .count();
+    assert_eq!(made, 0, "{log}");
+}
+
 #[tokio::test]
 async fn two_hosts_can_each_have_a_check_of_the_same_name() {
     let server = start().await;

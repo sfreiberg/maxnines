@@ -521,6 +521,21 @@ impl Registry {
     /// agent to vouch for, so whoever adds it has approved it. Its ID is random,
     /// and looks like any other.
     pub async fn add_agentless(&self, hostname: &str, by: &str) -> Result<HostRecord> {
+        let database = self.database.clone();
+        let saving = async move |host: &HostRecord| database.save_host(host).await;
+        let (host, ()) = self.add_agentless_with(hostname, by, saving).await?;
+        Ok(host)
+    }
+
+    /// Adds a host with no agent as [`add_agentless`](Self::add_agentless) does, saved
+    /// by `save`, which can save more with it in the same transaction, and gives what
+    /// that gives. The host is only known here once `save` has succeeded.
+    pub async fn add_agentless_with<T>(
+        &self,
+        hostname: &str,
+        by: &str,
+        save: impl AsyncFnOnce(&HostRecord) -> Result<T>,
+    ) -> Result<(HostRecord, T)> {
         let hostname = checked_hostname(hostname)?;
         let mut id = [0_u8; 16];
         SystemRandom::new()
@@ -539,11 +554,12 @@ impl Registry {
             refusal: Refusal::default(),
         };
         let changing = self.changing.lock().await;
-        self.save(host.clone()).await?;
+        let saved = save(&host).await?;
+        self.remember(host.clone());
         drop(changing);
         info!(host_id = host.id, "added a host with no agent");
         self.revisions.send_modify(|revision| *revision += 1);
-        Ok(host)
+        Ok((host, saved))
     }
 
     /// Renames a host with no agent, as it has no agent to say what it's called.
@@ -611,14 +627,19 @@ impl Registry {
     /// Saves first, so memory never claims something the database doesn't have. Only
     /// while changing.
     /// Saves everything about a host but its refusal, which is saved apart.
-    async fn save(&self, mut host: HostRecord) -> Result<()> {
+    async fn save(&self, host: HostRecord) -> Result<()> {
         self.database.save_host(&host).await?;
+        self.remember(host);
+        Ok(())
+    }
+
+    /// Keeps a host that's been saved, with the refusal of the one it replaces.
+    fn remember(&self, mut host: HostRecord) {
         let mut hosts = self.write();
         if let Some(saved) = hosts.get(&host.id) {
             host.refusal = saved.refusal.clone();
         }
         hosts.insert(host.id.clone(), host);
-        Ok(())
     }
 }
 

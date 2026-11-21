@@ -336,12 +336,30 @@ impl AppState {
         mut input: RemoteCheckInput,
         by: &str,
     ) -> Result<(i64, String)> {
-        input.host_id = match host {
-            CheckHost::Existing(id) => id,
-            CheckHost::New(hostname) => self.registry.add_agentless(&hostname, by).await?.id,
-        };
-        let id = self.database.create_remote_check(&input).await?;
-        Ok((id, input.host_id))
+        match host {
+            CheckHost::Existing(host_id) => {
+                input.host_id = host_id;
+                let id = self.database.create_remote_check(&input).await?;
+                Ok((id, input.host_id))
+            }
+            // The host and its check are saved together, so a check that can't be
+            // saved leaves no host behind.
+            CheckHost::New(hostname) => {
+                let database = self.database.clone();
+                let saving = async move |host: &HostRecord| {
+                    let input = RemoteCheckInput {
+                        host_id: host.id.clone(),
+                        ..input
+                    };
+                    database.create_host_with_check(host, &input).await
+                };
+                let (host, id) = self
+                    .registry
+                    .add_agentless_with(&hostname, by, saving)
+                    .await?;
+                Ok((id, host.id))
+            }
+        }
     }
 
     /// A host with no agent, which is the only kind the server reads pages for.

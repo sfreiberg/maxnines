@@ -7,9 +7,10 @@ use maxnines_protocol::{Check, CheckKind};
 use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
 
 use super::audit::record_change;
-use super::{Database, name_key, name_taken_or, remote_check};
+use super::{Database, name_key, name_taken_or, remote_check, save_host_in};
 use crate::alerting::NameTaken;
 use crate::audit::{Kind, Snapshot};
+use crate::registration::HostRecord;
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn};
 
 fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
@@ -95,6 +96,17 @@ fn name_taken(input: &RemoteCheckInput) -> NameTaken {
     NameTaken::RemoteCheck(input.check.name.clone())
 }
 
+/// Adds a check, and records it, in `connection`'s transaction.
+async fn insert<C: ConnectionTrait>(connection: &C, input: &RemoteCheckInput) -> Result<i64> {
+    let id = remote_check::Entity::insert(to_row(input)?)
+        .exec(connection)
+        .await
+        .map_err(|error| name_taken_or(error, name_taken(input), "saving check"))?
+        .last_insert_id;
+    record(connection, id, None).await?;
+    Ok(id)
+}
+
 async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<RemoteCheck>> {
     let row = remote_check::Entity::find_by_id(id)
         .one(connection)
@@ -141,12 +153,21 @@ impl Database {
 
     pub async fn create_remote_check(&self, input: &RemoteCheckInput) -> Result<i64> {
         let transaction = self.connection.begin().await.context("saving check")?;
-        let id = remote_check::Entity::insert(to_row(input)?)
-            .exec(&transaction)
-            .await
-            .map_err(|error| name_taken_or(error, name_taken(input), "saving check"))?
-            .last_insert_id;
-        record(&transaction, id, None).await?;
+        let id = insert(&transaction, input).await?;
+        transaction.commit().await.context("saving check")?;
+        Ok(id)
+    }
+
+    /// Adds `host` and a check about it together, so that either both are saved, with
+    /// what the audit log says of each, or neither is.
+    pub async fn create_host_with_check(
+        &self,
+        host: &HostRecord,
+        input: &RemoteCheckInput,
+    ) -> Result<i64> {
+        let transaction = self.connection.begin().await.context("saving check")?;
+        save_host_in(&transaction, host).await?;
+        let id = insert(&transaction, input).await?;
         transaction.commit().await.context("saving check")?;
         Ok(id)
     }
