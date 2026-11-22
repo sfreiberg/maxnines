@@ -202,7 +202,9 @@ struct AlertRow {
     enabled: bool,
     /// Whether someone chose that, rather than the template shipping it so.
     enabled_chosen: bool,
-    waits_for_discovery: bool,
+    /// Whether it's only for the databases where discovery found what its `when`
+    /// or `since` says.
+    picks_by_discovery: bool,
     /// The built-in template's own rule, when the one in use is someone's copy.
     built_in: Option<BuiltInValues>,
     /// When an upgrade last changed the built-in rule under someone's copy.
@@ -263,7 +265,7 @@ fn alert_rows(alerts: &[TemplateAlert]) -> Vec<AlertRow> {
                     .template
                     .as_ref()
                     .is_some_and(|link| link.enabled_choice.is_some()),
-                waits_for_discovery: rule.waits_for_discovery(),
+                picks_by_discovery: rule.picks_by_discovery(),
                 built_in: alert
                     .copy
                     .as_ref()

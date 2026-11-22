@@ -70,6 +70,9 @@ erDiagram
     templates ||--o{ template_counters : "counts"
     template_queries |o--o{ template_metrics : "gives"
     templates ||--o{ template_hosts : "given by hand"
+    hosts ||--o{ template_instances : "runs templates for"
+    templates ||--o{ template_instances : "runs for"
+    template_instances ||--o{ template_instance_values : "found"
     hosts ||--o{ template_hosts : "given"
     templates ||--o{ template_renames : "was called"
     templates ||--o{ template_services : "watches"
@@ -195,6 +198,20 @@ erDiagram
         boolean upgrade_seen "whether admins dismissed the notice of it"
         text upgrade_note "what else that notice says, such as what became of copies"
         timestamp deleted_at "kept so its rules can name it"
+    }
+    template_instances {
+        int id PK
+        string host_id FK
+        int template_id FK
+        string database_name "the database in the agent's config, unique with host and template"
+        timestamp discovered_at "the time of the sample that last said what discovery found"
+    }
+    template_instance_values {
+        int id PK
+        int instance_id FK
+        string name "a column discovery found, unique with instance_id"
+        text value
+        string value_type "string, number or boolean, as facts have"
     }
     template_hosts {
         int id PK

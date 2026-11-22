@@ -57,7 +57,8 @@ fn to_alert_rule(
                 replaces_id: row.replaces_id,
                 template_enabled: on,
                 enabled_choice: row.enabled_choice,
-                waits_for_discovery: row.when_condition.is_some() || row.since.is_some(),
+                when: row.when_condition.clone(),
+                since: row.since.clone(),
                 original_changed_at: row.original_changed_at,
             })
         }

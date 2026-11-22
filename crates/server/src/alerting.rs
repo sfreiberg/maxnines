@@ -98,11 +98,11 @@ pub struct TemplateLink {
     pub enabled_choice: Option<bool>,
     /// Whether the template is on. Its alerts aren't checked while it's off.
     pub template_enabled: bool,
-    /// Whether the alert has a `when` or `since`, which pick the databases or hosts
-    /// it's for by what the template's discovery finds on each. Nothing keeps what
-    /// discovery finds yet, so there's no telling which those are, and the rule
-    /// isn't checked.
-    pub waits_for_discovery: bool,
+    /// CEL over what the template's discovery found, picking the databases the
+    /// alert is for.
+    pub when: Option<String>,
+    /// The version the alert is for from, as discovery found it.
+    pub since: Option<String>,
     /// When an upgrade last changed the built-in rule this is a copy of.
     pub original_changed_at: Option<Timestamp>,
 }
@@ -147,22 +147,22 @@ impl AlertRule {
         }
     }
 
-    /// Whether it's left alone for now, as it's only for some of what its template
-    /// runs for, and what discovery finds isn't kept to say which.
-    pub fn waits_for_discovery(&self) -> bool {
+    /// Whether it's only for the databases where what its template's discovery
+    /// found says so.
+    pub fn picks_by_discovery(&self) -> bool {
         self.template
             .as_ref()
-            .is_some_and(|template| template.waits_for_discovery)
+            .is_some_and(|template| template.when.is_some() || template.since.is_some())
     }
 
     /// Whether it's checked: it's on, and if it's a template's alert, so is the
-    /// template, and it isn't waiting for what discovery finds.
+    /// template.
     pub fn runs(&self) -> bool {
         self.rule.enabled
             && self
                 .template
                 .as_ref()
-                .is_none_or(|template| template.template_enabled && !template.waits_for_discovery)
+                .is_none_or(|template| template.template_enabled)
     }
 
     /// The template whose metrics the rule can use by their short names, if it's

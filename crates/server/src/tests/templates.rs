@@ -509,7 +509,7 @@ async fn peoples_own_templates_are_changed_directly_with_no_copies() {
 }
 
 #[tokio::test]
-async fn a_template_alert_on_its_own_metrics_is_checked_unless_it_needs_discovery() {
+async fn a_template_alert_on_its_own_metrics_is_checked_and_knows_what_discovery_picks() {
     let database = Database::for_test().await;
     let template =
         crate::templates::load(POSTGRES.as_str(), &json!({}), &Catalog::built_in()).unwrap();
@@ -524,20 +524,14 @@ async fn a_template_alert_on_its_own_metrics_is_checked_unless_it_needs_discover
         // names, as saving it read them.
         let conditions = alert.rule.conditions.as_ref();
         assert!(conditions.is_some(), "{}", alert.key);
-        // Only one for some of what discovery finds is left alone, as nothing
-        // keeps what discovery finds yet.
+        // One for some of what discovery finds says so, and runs as any other.
         let picks = written.when.is_some() || written.since.is_some();
-        assert_eq!(alert.rule.waits_for_discovery(), picks, "{}", alert.key);
-        assert_eq!(
-            alert.rule.runs(),
-            written.enabled && !picks,
-            "{}",
-            alert.key
-        );
+        assert_eq!(alert.rule.picks_by_discovery(), picks, "{}", alert.key);
+        assert_eq!(alert.rule.runs(), written.enabled, "{}", alert.key);
     }
     let waiting: Vec<&str> = alerts
         .iter()
-        .filter(|alert| alert.rule.waits_for_discovery())
+        .filter(|alert| alert.rule.picks_by_discovery())
         .map(|alert| alert.key.as_str())
         .collect();
     assert_eq!(
@@ -612,8 +606,8 @@ async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_n
     assert_eq!(status, 200, "{shown}");
     assert_eq!(shown["template"]["alert"], "replica_lagging");
     assert_eq!(shown["template"]["key"], "pg");
-    // It's only for replicas, and nothing keeps which those are yet.
-    assert_eq!(shown["template"]["waits_for_discovery"], true);
+    // It's only for replicas, which discovery says.
+    assert_eq!(shown["template"]["when"], "role == 'replica'");
 
     let mut changed = shown.clone();
     changed["warning"] = json!("lag > duration('1m')");
@@ -690,7 +684,7 @@ async fn the_templates_pages_show_each_templates_alerts_metrics_and_hcl() {
         "Replica lagging",
         "<code>lag &gt; duration(&#39;30s&#39;)</code>",
         "pg.slot_retained",
-        "Not checked yet",
+        "Only for the databases where what discovery found fits",
         "template &quot;pg&quot;",
     ] {
         assert!(page.body.contains(expected), "{expected}\n{}", page.body);
@@ -2105,4 +2099,130 @@ async fn an_agent_is_sent_what_its_database_templates_read_and_again_when_they_c
     .unwrap();
     let error = crate::rule_engine::check_rule(&rule).unwrap_err();
     assert!(format!("{error:#}").contains("templates"), "{error:#}");
+}
+
+/// A template whose alert is only for replicas, by what discovery finds.
+const STOCK: &str = r#"template "stock" {
+  name     = "Stock"
+  database = "postgres"
+  discover "role" {
+    interval = "10s"
+    sql      = "SELECT CASE WHEN pg_is_in_recovery() THEN 'replica' ELSE 'primary' END AS role"
+  }
+  query "replicas" {
+    when = "role == 'replica'"
+    sql  = "SELECT 1 AS behind"
+  }
+  query "orders" {
+    sql     = "SELECT count(*) AS waiting FROM orders"
+    metrics = { waiting = { description = "Orders waiting" } }
+  }
+  alert "backlog" {
+    name    = "Replica backlog"
+    when    = "role == 'replica'"
+    warning = "waiting > 10"
+  }
+}"#;
+
+#[tokio::test]
+async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "db-1").await;
+    TestServer::next_config(&mut client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "agent": { "databases": { "a": "postgres", "b": "postgres" } } }),
+    };
+    send(&mut client, &facts).await;
+    server.wait_for_facts(&host.id(), 1).await;
+    let database = &server.state.database;
+    let template = crate::templates::load(STOCK, &json!({}), &database.catalog()).unwrap();
+    database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    // Before discovery, each database reads only what needs nothing found.
+    let (_, config) = TestServer::next_config(&mut client).await;
+    let queries = |config: &AgentConfig, database: &str| -> Vec<String> {
+        config
+            .templates
+            .iter()
+            .find(|work| work.database == database)
+            .unwrap()
+            .queries
+            .iter()
+            .map(|query| query.key.clone())
+            .collect()
+    };
+    assert_eq!(queries(&config, "a"), ["orders"]);
+
+    // The agent sends what it found with a sample, with the rows it read.
+    let found = |role: &str, database: &str| json!({ "template": "stock", "database": database, "values": { "role": role } });
+    let rows = json!([
+        { "labels": { "instance": "a" }, "waiting": 40 },
+        { "labels": { "instance": "b" }, "waiting": 40 },
+    ]);
+    let time = crate::times::now() - TimeDelta::seconds(1);
+    let sample = AgentMessage::Sample(Sample {
+        time,
+        metrics: BTreeMap::from([
+            ("template.stock".to_string(), rows),
+            (
+                "discovered".to_string(),
+                json!([found("replica", "a"), found("primary", "b")]),
+            ),
+        ]),
+    });
+    send(&mut client, &sample).await;
+
+    // What's sent changes with it: a replica reads what only replicas do.
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(queries(&config, "a"), ["replicas", "orders"]);
+    assert_eq!(queries(&config, "b"), ["orders"]);
+    let kept = database.discoveries(&host.id()).await.unwrap();
+    assert_eq!(kept.len(), 2);
+    assert!(kept.values().any(|values| values["role"] == "replica"));
+
+    // The alert is only for the replica, though both are over the line.
+    let mut evaluator = crate::alert_evaluator::Evaluator::new(
+        &server.state,
+        crate::times::now() - TimeDelta::hours(1),
+    );
+    // The sample is stored apart from what discovery found, so it may come after.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let open = loop {
+        evaluator.evaluate(crate::times::now()).await.unwrap();
+        let open = database.open_alerts().await.unwrap();
+        if !open.is_empty() || std::time::Instant::now() > deadline {
+            break open;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].series.as_deref(), Some("a"));
+    // What was found isn't stored as metrics.
+    assert!(database.catalog().find("discovered").is_none());
+
+    // An older sample, sent late, doesn't undo what's newer.
+    let old: Vec<maxnines_protocol::templates::work::Discovered> =
+        serde_json::from_value(json!([found("primary", "a")])).unwrap();
+    let late = time - TimeDelta::minutes(5);
+    assert!(
+        !database
+            .save_discovered(&host.id(), &old, late)
+            .await
+            .unwrap()
+    );
+    let kept = database.discoveries(&host.id()).await.unwrap();
+    assert!(kept.values().any(|values| values["role"] == "replica"));
+    // A newer one does, and the alert goes.
+    let newer = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("discovered".to_string(), json!([found("primary", "a")]))]),
+    });
+    send(&mut client, &newer).await;
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(queries(&config, "a"), ["orders"]);
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert!(database.open_alerts().await.unwrap().is_empty());
 }

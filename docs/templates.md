@@ -258,9 +258,11 @@ labels' values, such as `main, slot_a`, what a database template runs for coming
 first. An alert on them with nothing sent yet doesn't fire, as missing data never
 does.
 
-An alert with `when` or `since` says **Not checked yet** on the template's page, and
-isn't worked out yet: which databases or hosts it's for depends on what discovery
-finds on each, which isn't kept yet.
+An alert with `when` or `since` is only for the databases where what discovery last
+found fits them, such as only replicas for `role == 'replica'`: it isn't checked on a
+host until discovery has found something there, and only the series of those databases
+are. Agents send what discovery finds with their samples, and the server keeps the
+newest for each database a template runs for on each host.
 
 ### Notices
 

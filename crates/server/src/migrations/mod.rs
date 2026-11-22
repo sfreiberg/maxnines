@@ -1152,6 +1152,94 @@ impl MigrationTrait for CreateTables {
             None,
         )
         .await?;
+        // What a template's discovery last found for each database it runs for on
+        // each host, a row to a column found, kept as facts are.
+        manager
+            .create_table(
+                Table::create()
+                    .table(TemplateInstances::Table)
+                    .col(id(TemplateInstances::Id))
+                    .col(
+                        ColumnDef::new(TemplateInstances::HostId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(TemplateInstances::TemplateId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(exact_text(backend, TemplateInstances::DatabaseName, 255).not_null())
+                    .col(moment(backend, TemplateInstances::DiscoveredAt).not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_instances_host_id")
+                            .from(TemplateInstances::Table, TemplateInstances::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_instances_template_id")
+                            .from(TemplateInstances::Table, TemplateInstances::TemplateId)
+                            .to(Templates::Table, Templates::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        index_of(
+            manager,
+            Unique,
+            "idx_template_instances_host_template_database",
+            "template_instances",
+            "host_id, template_id, database_name",
+            None,
+        )
+        .await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(TemplateInstanceValues::Table)
+                    .col(id(TemplateInstanceValues::Id))
+                    .col(
+                        ColumnDef::new(TemplateInstanceValues::InstanceId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(exact_text(backend, TemplateInstanceValues::Name, 255).not_null())
+                    .col(
+                        ColumnDef::new(TemplateInstanceValues::Value)
+                            .text()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(TemplateInstanceValues::ValueType)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_instance_values_instance_id")
+                            .from(
+                                TemplateInstanceValues::Table,
+                                TemplateInstanceValues::InstanceId,
+                            )
+                            .to(TemplateInstances::Table, TemplateInstances::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        index_of(
+            manager,
+            Unique,
+            "idx_template_instance_values_instance_name",
+            "template_instance_values",
+            "instance_id, name",
+            None,
+        )
+        .await?;
         // A rule is only ever marked deleted, as its alerts keep it, and its name is
         // used once among those that aren't. A template's alert is a rule, which for
         // a built-in template belongs to the server: someone changing it makes a copy
@@ -2246,6 +2334,26 @@ enum Templates {
     UpgradeSeen,
     UpgradeNote,
     DeletedAt,
+}
+
+#[derive(Iden)]
+enum TemplateInstances {
+    Table,
+    Id,
+    HostId,
+    TemplateId,
+    DatabaseName,
+    DiscoveredAt,
+}
+
+#[derive(Iden)]
+enum TemplateInstanceValues {
+    Table,
+    Id,
+    InstanceId,
+    Name,
+    Value,
+    ValueType,
 }
 
 #[derive(Iden)]

@@ -45,6 +45,7 @@ use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
 use crate::rule_engine::{Condition, Host};
 use crate::server_stats::ServerStatus;
 use crate::templates::hosts::RunningTemplates;
+use crate::templates::work::{self as template_work, Discoveries};
 use crate::times::{self, Timestamp};
 
 /// How often rules are checked. Matches the default sample interval.
@@ -279,6 +280,9 @@ struct Snapshot {
     /// For each template that says which hosts it's for, those hosts, by the
     /// template's ID.
     template_hosts: HashMap<i64, HashSet<String>>,
+    /// For each template's rule with a `when` or `since`, the hosts and databases
+    /// what discovery found there picks, by the rule's ID.
+    picked: HashMap<i64, HashSet<(String, String)>>,
     /// Each host's facts, ready for conditions, if any condition uses them.
     facts: HashMap<String, CelValue>,
     /// By metric and agent. A metric that couldn't be read is missing, which
@@ -299,7 +303,12 @@ impl Snapshot {
                 .get(&template.id)
                 .is_none_or(|hosts| hosts.contains(host_id))
         });
+        let discovery_picks = self
+            .picked
+            .get(&rule.id)
+            .is_none_or(|picked| picked.iter().any(|(host, _)| host == host_id));
         template_is_for
+            && discovery_picks
             && (rule.rule.applies_to.is_none()
                 || self
                     .applies
@@ -442,6 +451,35 @@ fn hosts_each_applies_to(
         }
     }
     applies
+}
+
+/// For each of these template rules, by ID, the hosts and databases where what
+/// discovery found fits its `when` and `since`.
+fn picked_by_discovery(
+    rules: &[&AlertRule],
+    found: &BTreeMap<String, Discoveries>,
+) -> HashMap<i64, HashSet<(String, String)>> {
+    let mut picked: HashMap<i64, HashSet<(String, String)>> = HashMap::new();
+    for rule in rules {
+        let Some(link) = &rule.template else {
+            continue;
+        };
+        let mine = picked.entry(rule.id).or_default();
+        for (host, discoveries) in found {
+            for ((template, database), values) in discoveries {
+                if *template == link.id
+                    && template_work::picked(
+                        link.when.as_deref(),
+                        link.since.as_deref(),
+                        Some(values),
+                    )
+                {
+                    mine.insert((host.clone(), database.clone()));
+                }
+            }
+        }
+    }
+    picked
 }
 
 /// For each of these templates, by ID, the hosts it's for. Without facts, only
@@ -658,6 +696,11 @@ impl Evaluator {
         let templates_use_facts = narrowed
             .iter()
             .any(|id| templates.get(*id).is_some_and(|t| t.uses_facts()));
+        let picking: Vec<&AlertRule> = active().filter(|rule| rule.picks_by_discovery()).collect();
+        let picked = match picking.is_empty() {
+            true => HashMap::new(),
+            false => picked_by_discovery(&picking, &self.database.all_discoveries().await?),
+        };
         let ids: Vec<String> = hosts.keys().cloned().collect();
         let (applies, facts, template_hosts) =
             if applies_to.is_empty() && !wants_facts && !templates_use_facts {
@@ -760,6 +803,7 @@ impl Evaluator {
             hosts,
             applies,
             template_hosts,
+            picked,
             facts,
             readings,
             trends: self.trends.clone(),
@@ -1107,6 +1151,19 @@ impl Evaluator {
         }
         if fanned.is_empty() {
             series.push(String::new());
+        }
+        // Only the databases discovery picks, for a rule that's for some of them.
+        if let Some(picked) = snapshot.picked.get(&rule.id)
+            && let Some(at) = conditions
+                .series_labels()
+                .iter()
+                .position(|label| label == INSTANCE_LABEL)
+        {
+            series.retain(|series| {
+                series_values(series)
+                    .get(at)
+                    .is_some_and(|database| picked.contains(&(host.id.clone(), database.clone())))
+            });
         }
         series.truncate(MAX_SERIES_PER_HOST);
 

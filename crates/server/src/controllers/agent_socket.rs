@@ -9,6 +9,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::actions::ActionResult;
+use maxnines_protocol::templates::work::{DISCOVERED, Discovered, MAX_WORK};
 use maxnines_protocol::{
     AgentMessage, COLLECTORS, ProtocolFit, Protocols, RegistrationStatus, ServerMessage, auth,
 };
@@ -324,6 +325,8 @@ enum Job {
     },
     /// When the host started, as a sample said.
     Boot(Timestamp),
+    /// What templates' discovery found, as a sample taken at this time said.
+    Discovered(Vec<Discovered>, Timestamp),
 }
 
 /// Reads from the agent and pings it until the connection ends, returning why.
@@ -488,6 +491,17 @@ async fn do_jobs(
                 Some(Job::ConfigResult { version, error, skipped_collectors }) => {
                     save_config_result(version, error, skipped_collectors, agent, state).await;
                 }
+                Some(Job::Discovered(found, at)) => {
+                    match state.database.save_discovered(&agent.id, &found, at).await {
+                        Ok(true) => send_config(&configs, agent, state, &mut sent_version).await,
+                        Ok(false) => {}
+                        Err(error) => warn!(
+                            id = agent.id,
+                            error = format!("{error:#}"),
+                            "saving what discovery found failed"
+                        ),
+                    }
+                }
                 Some(Job::Boot(booted_at)) => {
                     save_boot(booted_at, agent, state, &mut known_boot).await;
                 }
@@ -586,8 +600,9 @@ fn receive(
             acks.try_send(sample.time).ok();
             return None;
         }
-        Ok(AgentMessage::Sample(sample)) => {
+        Ok(AgentMessage::Sample(mut sample)) => {
             note_boot(&sample, agent, jobs, last_boot);
+            note_discovered(&mut sample, agent, jobs);
             let command = WriterCommand::SaveAndAck {
                 sample: NewSample {
                     host_id: agent.id.clone(),
@@ -713,6 +728,39 @@ fn note_boot(
         warn!(
             id = agent.id,
             "too much waiting on the database, skipping a boot time"
+        );
+    }
+}
+
+/// Takes what templates' discovery found out of a sample, as it's kept with the
+/// host rather than as metrics, and passes it on. It's sent again with the next
+/// discovery, so one there's no room for is let go.
+fn note_discovered(
+    sample: &mut maxnines_protocol::Sample,
+    agent: &Agent,
+    jobs: &mpsc::Sender<Job>,
+) {
+    let Some(found) = sample.metrics.remove(DISCOVERED) else {
+        return;
+    };
+    let found: Vec<Discovered> = match serde_json::from_value(found) {
+        Ok(found) => found,
+        Err(error) => {
+            warn!(id = agent.id, %error, "skipping what discovery found");
+            return;
+        }
+    };
+    if found.len() > MAX_WORK {
+        warn!(
+            id = agent.id,
+            "skipping what discovery found, as it's too much"
+        );
+        return;
+    }
+    if jobs.try_send(Job::Discovered(found, sample.time)).is_err() {
+        warn!(
+            id = agent.id,
+            "too much waiting on the database, skipping what discovery found"
         );
     }
 }

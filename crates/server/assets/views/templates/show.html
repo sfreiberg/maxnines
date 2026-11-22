@@ -67,7 +67,7 @@
           {% if alert.built_in %}
           <div class="hint">Your own copy. It comes as{% if alert.built_in.warning %} warning <code>{{ alert.built_in.warning }}</code>{% endif %}{% if alert.built_in.warning and alert.built_in.critical %},{% endif %}{% if alert.built_in.critical %} critical <code>{{ alert.built_in.critical }}</code>{% endif %}, for {{ alert.built_in.hold }}.{% if alert.built_in_changed %} A newer version changed that on {{ alert.built_in_changed }}.{% endif %}</div>
           {% endif %}
-          {% if alert.waits_for_discovery %}<div class="hint">Not checked yet: its <code>when</code> or <code>since</code> picks what it's for by what discovery finds, which isn't kept yet.</div>{% endif %}
+          {% if alert.picks_by_discovery %}<div class="hint">Only for the databases where what discovery found fits its <code>when</code> or <code>since</code>.</div>{% endif %}
         </td>
         <td class="nowrap">{{ alert.hold }}</td>
         <td>{% if not alert.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if alert.built_in %} <span class="badge hollow">Yours</span>{% endif %}{% if alert.enabled_chosen and not alert.built_in %}<span class="under">{% if alert.enabled %}On{% else %}Off{% endif %} by your choice</span>{% endif %}</td>
