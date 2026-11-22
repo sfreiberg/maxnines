@@ -691,7 +691,7 @@ impl Evaluator {
         let picking: Vec<&AlertRule> = active().filter(|rule| rule.picks_by_discovery()).collect();
         let picked = match picking.is_empty() {
             true => HashMap::new(),
-            false => picked_by_discovery(&picking, &self.database.all_discoveries().await?),
+            false => picked_by_discovery(&picking, self.database.all_discoveries().await?.as_ref()),
         };
         let ids: Vec<String> = hosts.keys().cloned().collect();
         let (applies, facts, template_hosts) =

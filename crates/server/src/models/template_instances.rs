@@ -4,6 +4,7 @@
 //! are for.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, PoisonError};
 
 use anyhow::{Context, Result};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
@@ -86,7 +87,7 @@ impl Database {
                     id
                 }
                 None => {
-                    template_instance::Entity::insert(template_instance::ActiveModel {
+                    let id = template_instance::Entity::insert(template_instance::ActiveModel {
                         host_id: Set(host_id.to_string()),
                         template_id: Set(*template_id),
                         database_name: Set(one.database.clone()),
@@ -96,7 +97,9 @@ impl Database {
                     .exec(&transaction)
                     .await
                     .context("saving what discovery found")?
-                    .last_insert_id
+                    .last_insert_id;
+                    changed = true;
+                    id
                 }
             };
             let kept = values_of(&transaction, instance_id).await?;
@@ -130,26 +133,86 @@ impl Database {
             .commit()
             .await
             .context("saving what discovery found")?;
+        if changed {
+            self.discoveries_changed();
+        }
         Ok(changed)
     }
 
     /// What discovery found on one host.
     pub async fn discoveries(&self, host_id: &str) -> Result<Discoveries> {
-        let instances = template_instance::Entity::find()
-            .filter(template_instance::Column::HostId.eq(host_id))
-            .all(&self.connection)
-            .await
-            .context("loading what discovery found")?;
-        let mut found = Discoveries::new();
-        for instance in instances {
-            let values = values_of(&self.connection, instance.id).await?;
-            found.insert((instance.template_id, instance.database_name), values);
+        let all = self.all_discoveries().await?;
+        Ok(all.get(host_id).cloned().unwrap_or_default())
+    }
+
+    /// What discovery found on every host, by host ID. It's kept in memory between
+    /// changes, as every check of alerts and every agent's config reads it.
+    pub async fn all_discoveries(&self) -> Result<Arc<BTreeMap<String, Discoveries>>> {
+        let generation = {
+            let kept = self
+                .discovered
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(found) = &kept.1 {
+                return Ok(found.clone());
+            }
+            kept.0
+        };
+        let found = Arc::new(self.load_discoveries().await?);
+        let mut kept = self
+            .discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // What changed while it was read is read again next time.
+        if kept.0 == generation {
+            kept.1 = Some(found.clone());
         }
         Ok(found)
     }
 
-    /// What discovery found on every host, by host ID.
-    pub async fn all_discoveries(&self) -> Result<BTreeMap<String, Discoveries>> {
+    /// Forgets what's kept in memory of what discovery found, once it's changed.
+    fn discoveries_changed(&self) {
+        let mut kept = self
+            .discovered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        kept.0 += 1;
+        kept.1 = None;
+    }
+
+    /// Forgets what discovery found on a host for any template and database it
+    /// isn't sent to read any more, by template key and database: one taken out
+    /// of the agent's config, or a template that's off or no longer for the host.
+    pub async fn forget_discovered(&self, host_id: &str, sent: &[(String, String)]) -> Result<()> {
+        let all = self.all_discoveries().await?;
+        let Some(found) = all.get(host_id) else {
+            return Ok(());
+        };
+        let templates = self.running_templates();
+        let key_of = |id: i64| templates.get(id).map(|t| t.template().key.clone());
+        let gone: Vec<&(i64, String)> = found
+            .keys()
+            .filter(|(template, database)| {
+                key_of(*template).is_none_or(|key| !sent.contains(&(key, database.clone())))
+            })
+            .collect();
+        if gone.is_empty() {
+            return Ok(());
+        }
+        for (template, database) in gone {
+            template_instance::Entity::delete_many()
+                .filter(template_instance::Column::HostId.eq(host_id))
+                .filter(template_instance::Column::TemplateId.eq(*template))
+                .filter(template_instance::Column::DatabaseName.eq(database))
+                .exec(&self.connection)
+                .await
+                .context("forgetting what discovery found")?;
+        }
+        self.discoveries_changed();
+        Ok(())
+    }
+
+    async fn load_discoveries(&self) -> Result<BTreeMap<String, Discoveries>> {
         let instances: HashMap<i64, template_instance::Model> = template_instance::Entity::find()
             .all(&self.connection)
             .await

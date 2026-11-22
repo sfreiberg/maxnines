@@ -2265,6 +2265,18 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
         .await
         .unwrap();
     TestServer::next_config(&mut client).await;
+    // Not for the host for a while, what discovery found there was forgotten, and
+    // the agent finds it again as it's sent the template again.
+    assert!(database.discoveries(&host.id()).await.unwrap().is_empty());
+    let found_again = AgentMessage::Sample(Sample {
+        time: time + TimeDelta::milliseconds(1),
+        metrics: BTreeMap::from([(
+            "discovered".to_string(),
+            json!([found("replica", "a"), found("primary", "b")]),
+        )]),
+    });
+    send(&mut client, &found_again).await;
+    TestServer::next_config(&mut client).await;
     TestServer::next_config(&mut client).await;
 
     // What was found isn't stored as metrics.
@@ -2302,4 +2314,15 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
     assert_eq!(queries(&config, "a"), ["orders"]);
     evaluator.evaluate(crate::times::now()).await.unwrap();
     assert!(database.open_alerts().await.unwrap().is_empty());
+
+    // A database the agent no longer has is forgotten, with what it found.
+    let fewer = AgentMessage::Facts {
+        facts: json!({ "agent": { "databases": { "a": "postgres" } } }),
+    };
+    send(&mut client, &fewer).await;
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(config.templates.len(), 1);
+    let kept = database.discoveries(&host.id()).await.unwrap();
+    let databases: Vec<&str> = kept.keys().map(|(_, database)| database.as_str()).collect();
+    assert_eq!(databases, ["a"]);
 }

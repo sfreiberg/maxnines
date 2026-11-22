@@ -197,7 +197,17 @@ pub struct Database {
     templates: SharedTemplates,
     /// Bumped each time they're made again.
     template_changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// What templates' discovery found, kept in memory once read until it changes,
+    /// with how many times it has, so a read that overlapped a change isn't kept.
+    discovered: DiscoveredCache,
 }
+
+type DiscoveredCache = Arc<
+    std::sync::Mutex<(
+        u64,
+        Option<Arc<BTreeMap<String, crate::templates::work::Discoveries>>>,
+    )>,
+>;
 
 /// A lock for each host whose facts are being saved, kept only while they are.
 #[derive(Clone, Default)]
@@ -283,6 +293,7 @@ impl Database {
             catalog: SharedCatalog::default(),
             templates: SharedTemplates::default(),
             template_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            discovered: DiscoveredCache::default(),
         };
         database.refresh_catalog().await?;
         Ok(database)

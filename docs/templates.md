@@ -283,7 +283,10 @@ An alert with `when` or `since` is only for the databases where what discovery l
 found fits them, such as only replicas for `role == 'replica'`: it isn't checked on a
 host until discovery has found something there, and only the series of those databases
 are. Agents send what discovery finds with their samples, and the server keeps the
-newest for each database a template runs for on each host.
+newest for each database a template runs for on each host. It's forgotten once the
+agent isn't sent that template for that database any more, as when the database
+leaves the agent's config or the template is turned off or no longer for the host,
+and found again when it is.
 
 ### Notices
 

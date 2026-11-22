@@ -503,7 +503,18 @@ async fn do_jobs(
                 Some(Job::ConfigResult { version, error, skipped_collectors }) => {
                     save_config_result(version, error, skipped_collectors, agent, state).await;
                 }
-                Some(Job::Discovered(found, at)) => {
+                Some(Job::Discovered(mut found, at)) => {
+                    // Only for what the agent's still sent to read, as a sample can
+                    // come after what it reads changed.
+                    {
+                        let work = sent.work.lock().unwrap_or_else(PoisonError::into_inner);
+                        found.retain(|one| {
+                            work.iter().any(|work| {
+                                work.template == one.template
+                                    && work.database.as_deref() == Some(one.database.as_str())
+                            })
+                        });
+                    }
                     match state.database.save_discovered(&agent.id, &found, at).await {
                         Ok(true) => send_config(&configs, agent, state, &mut sent).await,
                         Ok(false) => {}
@@ -550,6 +561,20 @@ async fn send_config(
         }
     };
 
+    // What discovery found for anything the agent isn't sent to read is forgotten.
+    let reads: Vec<(String, String)> = resolved
+        .config
+        .templates
+        .iter()
+        .filter_map(|work| Some((work.template.clone(), work.database.clone()?)))
+        .collect();
+    if let Err(error) = state.database.forget_discovered(&agent.id, &reads).await {
+        warn!(
+            id = agent.id,
+            error = format!("{error:#}"),
+            "forgetting what discovery found failed"
+        );
+    }
     if sent.version.as_ref() == Some(&resolved.version) {
         return;
     }

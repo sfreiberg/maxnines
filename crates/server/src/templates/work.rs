@@ -47,6 +47,16 @@ pub fn version_in(found: &Map<String, Value>) -> Option<Version> {
 /// discovery found `found`, or nothing yet. With neither, it always is. With
 /// either, it isn't until something's found.
 pub fn picked(when: Option<&str>, since: Option<&str>, found: Option<&Map<String, Value>>) -> bool {
+    let when = when.map(Condition::compile);
+    picked_by(when.as_ref(), since, found)
+}
+
+/// [`picked`], with `when` compiled, or not, as it may not compile.
+fn picked_by(
+    when: Option<&anyhow::Result<Condition>>,
+    since: Option<&str>,
+    found: Option<&Map<String, Value>>,
+) -> bool {
     if when.is_none() && since.is_none() {
         return true;
     }
@@ -62,7 +72,8 @@ pub fn picked(when: Option<&str>, since: Option<&str>, found: Option<&Map<String
         }
     }
     when.is_none_or(|when| {
-        Condition::compile(when).is_ok_and(|condition| condition.check_values(found))
+        when.as_ref()
+            .is_ok_and(|condition| condition.check_values(found))
     })
 }
 
@@ -74,10 +85,12 @@ pub fn picked_databases(
     since: Option<&str>,
     found: &BTreeMap<String, Discoveries>,
 ) -> HashSet<(String, String)> {
+    // Compiled once, however many databases it's tried on.
+    let when = when.map(Condition::compile);
     let mut picked = HashSet::new();
     for (host, discoveries) in found {
         for ((template, database), values) in discoveries {
-            if *template == template_id && self::picked(when, since, Some(values)) {
+            if *template == template_id && picked_by(when.as_ref(), since, Some(values)) {
                 picked.insert((host.clone(), database.clone()));
             }
         }
