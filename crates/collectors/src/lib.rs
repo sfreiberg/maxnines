@@ -28,4 +28,11 @@ pub const WARMUP: Duration = sysinfo::MINIMUM_CPU_UPDATE_INTERVAL;
 pub trait Collector {
     fn name(&self) -> &'static str;
     fn collect(&mut self) -> Result<Value>;
+
+    /// Whether what it collects is a map whose entries each go into the sample
+    /// under their own names, rather than all of it under its name, as templates'
+    /// rows go under each template's.
+    fn spreads(&self) -> bool {
+        false
+    }
 }

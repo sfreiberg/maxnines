@@ -30,6 +30,7 @@ mod services;
 mod spool;
 mod status_pages;
 mod system_collector;
+mod templates;
 mod websocket;
 
 use std::collections::BTreeMap;
@@ -513,6 +514,7 @@ fn collect(collectors: &mut [Box<dyn Collector + Send>]) -> Sample {
         match catch_unwind(AssertUnwindSafe(|| collector.collect())) {
             // Nothing yet, which isn't the same as finding nothing.
             Ok(Ok(Value::Null)) => {}
+            Ok(Ok(Value::Object(entries))) if collector.spreads() => metrics.extend(entries),
             Ok(Ok(value)) => {
                 metrics.insert(collector.name().to_string(), value);
             }

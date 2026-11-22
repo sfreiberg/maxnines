@@ -86,6 +86,17 @@ address.
 
 For example, `orders sizes`.
 
+## Templates
+
+A [template](templates.md) for a kind of database, such as `database = "postgres"`,
+runs for each `database` block of that kind in the agent's config, whether or not a
+config rule reads its stats, signing in the same way. The agent reads what the server
+sends it for each: the template's discover blocks first, and then its queries, each
+on its own schedule and over one connection, and sends their rows with its samples
+under the template's key, with whether the database answered as `<key>.up`. When the
+connection has to be opened again, as after the database restarts, discovery runs
+again. Templates can read PostgreSQL and MySQL so far.
+
 ## Hosts without an agent
 
 For a database on a [host without an agent](agentless-hosts.md), such as a managed

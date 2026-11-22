@@ -59,7 +59,7 @@ fn build_runtime() -> std::io::Result<Runtime> {
 
 /// The shared runtime, started on its own thread the first time it's needed. It
 /// runs for as long as the agent does.
-fn runtime() -> Result<Handle> {
+pub fn runtime() -> Result<Handle> {
     let mut shared = RUNTIME.lock().unwrap_or_else(PoisonError::into_inner);
     if let Some(handle) = &*shared {
         return Ok(handle.clone());

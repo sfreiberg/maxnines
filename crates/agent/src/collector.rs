@@ -27,6 +27,7 @@ use crate::openmetrics::{OpenMetricsCollector, PageDefinitions};
 use crate::services::ServiceCollector;
 use crate::status_pages::{Software, StatusPageCollector};
 use crate::system_collector::SystemCollector;
+use crate::templates::TemplateCollector;
 
 /// Only Linux runs containers for real, so that's the only agent that reads them.
 const LINUX_ONLY: [&str; 1] = ["containers"];
@@ -97,12 +98,20 @@ pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn C
         files: enabled("processes"),
     };
     let interval = config.interval;
-    config
+    let mut built: Vec<Box<dyn Collector + Send>> = config
         .collectors
         .iter()
         .filter(|(_, settings)| settings.enabled)
         .map(|(name, settings)| build(name, settings, local, interval, &mut processes))
-        .collect()
+        .collect::<Result<_>>()?;
+    if !config.templates.is_empty() {
+        built.push(Box::new(TemplateCollector::new(
+            &config.templates,
+            local.databases,
+            interval,
+        )?));
+    }
+    Ok(built)
 }
 
 /// The process list, read once a sample for both collectors that use it, once the
