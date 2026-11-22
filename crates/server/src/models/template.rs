@@ -12,7 +12,8 @@ pub struct Model {
     /// [`super::name_key`].
     pub name_key: String,
     pub description: Option<String>,
-    pub built_in: bool,
+    /// Where it came from: `built_in`, `imported` or `own`.
+    pub origin: String,
     /// What it runs for: `database`, `service` or `os`, or nothing for every host.
     pub target_kind: Option<String>,
     /// The kind of database, the service, or the operating systems, comma separated.

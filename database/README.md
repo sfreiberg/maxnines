@@ -170,17 +170,17 @@ erDiagram
         string name
         string name_key "unique among those not deleted"
         text description
-        boolean built_in
+        string origin "built_in, imported or own"
         string target_kind "database, service or os, or NULL for every host"
         string target "the kind of database, the service, or systems, comma separated"
         string min_version
         json renamed_from "keys it had before"
         json services "services the host's alerts should watch"
-        string fingerprint "a hash of what a built-in one says, or NULL"
+        string fingerprint "a hash of what a built-in or imported one says, or NULL"
         boolean enabled "starting never writes it"
         timestamp created_at
         timestamp updated_at
-        timestamp upgraded_at "when an upgrade last changed a built-in one"
+        timestamp upgraded_at "when a newer version last changed a built-in or imported one"
         boolean upgrade_seen "whether admins dismissed the notice of it"
         timestamp deleted_at "kept so its rules can name it"
     }
@@ -588,8 +588,8 @@ erDiagram
 | `host_config_status` | The config each host's agent last applied, why if it refused one, and the collectors in it the agent doesn't know |
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
-| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A template's alert is a rule too. A built-in template's rule is the server's, rewritten as it starts but for `enabled`; someone changing it makes a copy of their own, a second rule whose `replaces_id` points at it, which is used in its place until it's deleted |
-| `templates` | What MaxNines watches for in something it monitors: the built-in ones, which the server writes each time it starts, marked by `built_in`, and people's own. HCL is only how they come in and go out. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
+| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A template's alert is a rule too. A built-in or imported template's rule isn't people's to change, and is rewritten by a newer version but for `enabled`; someone changing it makes a copy of their own, a second rule whose `replaces_id` points at it, which is used in its place until it's deleted |
+| `templates` | What MaxNines watches for in something it monitors: by `origin`, the built-in ones, which the server writes each time it starts, imported ones, which importing a newer version rewrites the same way, and people's own. HCL is only how they come in and go out. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
 | `template_discoveries`, `template_registry_reads`, `template_notices`, `template_queries`, `template_fills`, `template_fill_versions`, `template_counters`, `template_metrics` | A template's parts, one row to a block or entry, each with its key as the HCL has it and its `position` among the others. They go with their template, query, counters or fill. Each has a `replaces_id` for someone's own copy of a built-in part, as alert rules have, which nothing makes yet |
 | `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |

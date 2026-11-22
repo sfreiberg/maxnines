@@ -47,7 +47,7 @@
       </header>
       <div class="page-notices">
         <div id="update-notice" role="status" hx-get="/update-notice?build={{ build_id }}" hx-trigger="every 60s, online from:window, visibilitychange from:document"></div>
-        {% if template_upgrades %}<form method="post" action="/templates/upgrades/dismiss" class="notice" role="status"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><span>An upgrade changed the built-in {% if template_upgrades | length == 1 %}template{% else %}templates{% endif %} {{ template_upgrades | join(sep=", ") }}, leaving your own copies of their alerts alone. <a href="/templates">See templates</a>.</span> <button type="submit" class="secondary">Dismiss</button></form>{% endif %}
+        {% if template_upgrades %}<form method="post" action="/templates/upgrades/dismiss" class="notice" role="status"><input type="hidden" name="authenticity_token" value="{{ csrf_token }}"><span>A new version changed the {% if template_upgrades | length == 1 %}template{% else %}templates{% endif %} {{ template_upgrades | join(sep=", ") }}, leaving your own copies of their alerts alone. <a href="/templates">See templates</a>.</span> <button type="submit" class="secondary">Dismiss</button></form>{% endif %}
         {% if proxy_notice %}<p class="notice" role="status">Requests seem to come through a proxy at <code>{{ proxy_notice.address }}</code>{% if proxy_notice.others > 0 %} and {{ proxy_notice.others }} more{% endif %}, so MaxNines can't be sure where people are. <a href="/settings/proxies">Say whether it's yours</a>.</p>{% endif %}
         <p id="stale-notice" class="error" role="status" hidden>This page couldn't update, so what it shows may be out of date.</p>
       </div>

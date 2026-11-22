@@ -42,12 +42,59 @@ use crate::templates::built_in::BuiltIn;
 use crate::templates::{Refused, alert_rule as template_values, local_metrics};
 use crate::times::Timestamp;
 
+/// Where a template came from, which says whose it is to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// It comes with MaxNines, which rewrites it as it starts.
+    BuiltIn,
+    /// Someone imported it, and importing a newer version rewrites it.
+    Imported,
+    /// Someone made it here, and changes it directly.
+    Own,
+}
+
+impl Origin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built_in",
+            Self::Imported => "imported",
+            Self::Own => "own",
+        }
+    }
+
+    fn parse(text: &str) -> Result<Self> {
+        match text {
+            "built_in" => Ok(Self::BuiltIn),
+            "imported" => Ok(Self::Imported),
+            "own" => Ok(Self::Own),
+            other => bail!("unknown template origin {other:?}"),
+        }
+    }
+
+    /// Whether its rows are an original that isn't people's to change: they make
+    /// copies of its parts instead, and a newer version rewrites it.
+    pub fn is_original(self) -> bool {
+        self != Self::Own
+    }
+}
+
+/// What importing a template did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Imported {
+    Added,
+    Updated,
+    /// It says what the one already imported says.
+    Unchanged,
+}
+
 /// A template as stored.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StoredTemplate {
     pub id: i64,
     pub template: Template,
-    pub built_in: bool,
+    pub origin: Origin,
     pub enabled: bool,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
@@ -343,7 +390,7 @@ async fn to_stored<C: ConnectionTrait>(
     Ok(StoredTemplate {
         template: read_template(connection, &row).await?,
         id: row.id,
-        built_in: row.built_in,
+        origin: Origin::parse(&row.origin)?,
         enabled: row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -523,7 +570,7 @@ async fn write_parts<C: ConnectionTrait>(
 fn template_snapshot(stored: &StoredTemplate) -> Result<Snapshot> {
     let mut fields = serde_json::to_value(&stored.template).context("recording a template")?;
     fields["enabled"] = json!(stored.enabled);
-    fields["built_in"] = json!(stored.built_in);
+    fields["origin"] = json!(stored.origin.as_str());
     Ok(Snapshot::new(stored.template.name.clone(), fields))
 }
 
@@ -634,16 +681,19 @@ async fn make_room<C: ConnectionTrait>(connection: &C, name: &str, own: Option<i
 
 /// Writes a template's alerts as its own alert rules. One that's there is written
 /// over with what the template says, keeping who it tells and what else people set
-/// on it; for a built-in template, whether it's on is kept too, and someone's copy
-/// of it is left alone, only noting that what it's a copy of changed. New alerts
-/// get rules, and the rules of alerts it no longer has are deleted, with any copies.
+/// on it; for a built-in or imported template, whether it's on is kept too, and
+/// someone's copy of it is left alone, only noting that what it's a copy of changed.
+/// New alerts get rules, and the rules of alerts it no longer has are deleted, with
+/// any copies. A rule in the way of a built-in template's is moved aside, as the
+/// server has to start; for any other template it's an error.
 async fn write_rules<C: ConnectionTrait>(
     connection: &C,
     id: i64,
     template: &Template,
-    built_in: bool,
+    origin: Origin,
     now: Timestamp,
 ) -> Result<()> {
+    let original = origin.is_original();
     let rows = own_rules(connection, id).await?;
     for (position, alert) in template.alerts.iter().enumerate() {
         let theirs = template_values(template, alert)?;
@@ -653,7 +703,7 @@ async fn write_rules<C: ConnectionTrait>(
             .iter()
             .find(|row| row.template_alert.as_deref() == Some(alert.key.as_str()));
 
-        if built_in {
+        if origin == Origin::BuiltIn {
             make_room(connection, &theirs.name, existing.map(|row| row.id)).await?;
         } else {
             let own: Vec<i64> = existing.iter().map(|row| row.id).collect();
@@ -683,11 +733,11 @@ async fn write_rules<C: ConnectionTrait>(
 
         let hold = theirs.hold.num_seconds();
         let window = theirs.window.map(|window| window.num_seconds());
-        let applies_to = match built_in {
+        let applies_to = match original {
             true => theirs.applies_to.clone(),
             false => row.applies_to.clone(),
         };
-        let enabled = match built_in {
+        let enabled = match original {
             true => row.enabled,
             false => alert.enabled,
         };
@@ -851,7 +901,8 @@ async fn move_aside<C: ConnectionTrait>(
     let mut keys: BTreeSet<String> = rows.iter().map(|row| row.key.clone()).collect();
     let mut names: BTreeSet<String> = rows.iter().map(|row| row.name_key.clone()).collect();
     let in_the_way = rows.into_iter().filter(|row| {
-        !row.built_in && (row.key == built_in.key || row.name_key == name_key(&built_in.name))
+        row.origin != Origin::BuiltIn.as_str()
+            && (row.key == built_in.key || row.name_key == name_key(&built_in.name))
     });
     for row in in_the_way {
         let stored = to_stored(connection, row.clone()).await?;
@@ -881,6 +932,67 @@ async fn move_aside<C: ConnectionTrait>(
         record_template(connection, stored.id, Some(&before)).await?;
     }
     Ok(())
+}
+
+/// Writes a newer version of a built-in or imported template over the one that's
+/// there, noting that it changed. Whether it and its alerts are on, and people's
+/// copies of its alerts, are left.
+async fn rewrite_original<C: ConnectionTrait>(
+    connection: &C,
+    row: &template::Model,
+    template: &Template,
+    fingerprint: &str,
+    now: Timestamp,
+) -> Result<()> {
+    let origin = Origin::parse(&row.origin)?;
+    let before = template_snapshot(&to_stored(connection, row.clone()).await?)?;
+    let mut active = template::ActiveModel {
+        id: Set(row.id),
+        fingerprint: Set(Some(fingerprint.to_string())),
+        updated_at: Set(now),
+        upgraded_at: Set(Some(now)),
+        upgrade_seen: Set(false),
+        ..Default::default()
+    };
+    described(&mut active, template);
+    active
+        .update(connection)
+        .await
+        .map_err(|error| taken(error, template))?;
+    write_parts(connection, row.id, template).await?;
+    write_rules(connection, row.id, template, origin, now).await?;
+    record_template(connection, row.id, Some(&before)).await
+}
+
+/// Adds a built-in or imported template, with a notice of it if `noticed`.
+async fn add_original<C: ConnectionTrait>(
+    connection: &C,
+    template: &Template,
+    origin: Origin,
+    fingerprint: &str,
+    noticed: bool,
+    now: Timestamp,
+) -> Result<i64> {
+    let mut active = template::ActiveModel {
+        origin: Set(origin.as_str().to_string()),
+        fingerprint: Set(Some(fingerprint.to_string())),
+        enabled: Set(template.enabled),
+        created_at: Set(now),
+        updated_at: Set(now),
+        upgraded_at: Set(noticed.then_some(now)),
+        upgrade_seen: Set(!noticed),
+        ..Default::default()
+    };
+    described(&mut active, template);
+    let id = template::Entity::insert(active)
+        .exec(connection)
+        .await
+        .map_err(|error| taken(error, template))?
+        .last_insert_id;
+    write_parts(connection, id, template).await?;
+    write_rules(connection, id, template, origin, now).await?;
+    record_template(connection, id, None).await?;
+    Ok(id)
 }
 
 /// What's known of the template a rule is one of the alerts of.
@@ -943,7 +1055,7 @@ impl Database {
             .context("updating built-in templates")?;
         let rows = template::Entity::find()
             .filter(template::Column::DeletedAt.is_null())
-            .filter(template::Column::BuiltIn.eq(true))
+            .filter(template::Column::Origin.eq(Origin::BuiltIn.as_str()))
             .all(&transaction)
             .await
             .context("loading templates")?;
@@ -971,46 +1083,21 @@ impl Database {
             move_aside(&transaction, template, now).await?;
             let id = match existing {
                 Some(row) => {
-                    let before = template_snapshot(&to_stored(&transaction, row.clone()).await?)?;
-                    let mut active = template::ActiveModel {
-                        id: Set(row.id),
-                        fingerprint: Set(Some(built_in.fingerprint.clone())),
-                        updated_at: Set(now),
-                        upgraded_at: Set(Some(now)),
-                        upgrade_seen: Set(false),
-                        ..Default::default()
-                    };
-                    described(&mut active, template);
-                    active
-                        .update(&transaction)
-                        .await
-                        .map_err(|error| taken(error, template))?;
-                    write_parts(&transaction, row.id, template).await?;
-                    write_rules(&transaction, row.id, template, true, now).await?;
-                    record_template(&transaction, row.id, Some(&before)).await?;
+                    rewrite_original(&transaction, row, template, &built_in.fingerprint, now)
+                        .await?;
                     changed.push(template.name.clone());
                     row.id
                 }
                 None => {
-                    let mut active = template::ActiveModel {
-                        built_in: Set(true),
-                        fingerprint: Set(Some(built_in.fingerprint.clone())),
-                        enabled: Set(template.enabled),
-                        created_at: Set(now),
-                        updated_at: Set(now),
-                        upgraded_at: Set(upgrading.then_some(now)),
-                        upgrade_seen: Set(!upgrading),
-                        ..Default::default()
-                    };
-                    described(&mut active, template);
-                    let id = template::Entity::insert(active)
-                        .exec(&transaction)
-                        .await
-                        .map_err(|error| taken(error, template))?
-                        .last_insert_id;
-                    write_parts(&transaction, id, template).await?;
-                    write_rules(&transaction, id, template, true, now).await?;
-                    record_template(&transaction, id, None).await?;
+                    let id = add_original(
+                        &transaction,
+                        template,
+                        Origin::BuiltIn,
+                        &built_in.fingerprint,
+                        upgrading,
+                        now,
+                    )
+                    .await?;
                     if upgrading {
                         changed.push(template.name.clone());
                     }
@@ -1040,7 +1127,52 @@ impl Database {
         Ok(changed)
     }
 
-    /// Built-in and people's own, sorted by name.
+    /// What importing `template` would do, or why it can't be imported: its key or
+    /// name is a built-in template's, or one of people's own.
+    pub async fn import_outcome(&self, template: &Template) -> Result<Imported> {
+        import_outcome_in(&self.connection, template)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Imports a template, checked already: adds it, or writes it over the one of
+    /// the same key imported before, as an upgrade does a built-in one, keeping
+    /// what's turned off and people's copies of its alerts.
+    pub async fn import_template(
+        &self,
+        template: &Template,
+        now: Timestamp,
+    ) -> Result<(i64, Imported)> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("importing template")?;
+        let (outcome, existing) = import_outcome_in(&transaction, template).await?;
+        let fingerprint = crate::templates::built_in::fingerprint(template);
+        let id = match (outcome, existing) {
+            (Imported::Unchanged, Some(row)) => return Ok((row.id, outcome)),
+            (_, Some(row)) => {
+                rewrite_original(&transaction, &row, template, &fingerprint, now).await?;
+                row.id
+            }
+            (_, None) => {
+                add_original(
+                    &transaction,
+                    template,
+                    Origin::Imported,
+                    &fingerprint,
+                    false,
+                    now,
+                )
+                .await?
+            }
+        };
+        transaction.commit().await.context("importing template")?;
+        Ok((id, outcome))
+    }
+
+    /// Built-in, imported and people's own, sorted by name.
     pub async fn list_templates(&self) -> Result<Vec<StoredTemplate>> {
         let rows = template::Entity::find()
             .filter(template::Column::DeletedAt.is_null())
@@ -1102,7 +1234,7 @@ impl Database {
         let transaction = self.connection.begin().await.context("saving template")?;
         refuse_taken(&transaction, template, None).await?;
         let mut active = template::ActiveModel {
-            built_in: Set(false),
+            origin: Set(Origin::Own.as_str().to_string()),
             enabled: Set(template.enabled),
             created_at: Set(now),
             updated_at: Set(now),
@@ -1116,7 +1248,7 @@ impl Database {
             .map_err(|error| taken(error, template))?
             .last_insert_id;
         write_parts(&transaction, id, template).await?;
-        write_rules(&transaction, id, template, false, now).await?;
+        write_rules(&transaction, id, template, Origin::Own, now).await?;
         record_template(&transaction, id, None).await?;
         transaction.commit().await.context("saving template")?;
         Ok(id)
@@ -1135,10 +1267,11 @@ impl Database {
         let Some(stored) = load_template(&transaction, id).await? else {
             return Ok(false);
         };
-        if stored.built_in {
-            bail!(Refused(
-                "a built-in template can't be changed, as upgrades replace it: disable it, or change its alerts".to_string()
-            ));
+        if stored.origin.is_original() {
+            bail!(Refused(match stored.origin {
+                Origin::Imported => "an imported template can't be changed, as importing a newer version replaces it: disable it, or change its alerts".to_string(),
+                _ => "a built-in template can't be changed, as upgrades replace it: disable it, or change its alerts".to_string(),
+            }));
         }
         refuse_taken(&transaction, template, Some(id)).await?;
         let before = template_snapshot(&stored)?;
@@ -1154,7 +1287,7 @@ impl Database {
             .await
             .map_err(|error| taken(error, template))?;
         write_parts(&transaction, id, template).await?;
-        write_rules(&transaction, id, template, false, now).await?;
+        write_rules(&transaction, id, template, Origin::Own, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
         Ok(true)
@@ -1167,7 +1300,7 @@ impl Database {
         let Some(stored) = load_template(&transaction, id).await? else {
             return Ok(false);
         };
-        if stored.built_in {
+        if stored.origin == Origin::BuiltIn {
             bail!(Refused(
                 "a built-in template can't be deleted, but it can be disabled".to_string()
             ));
@@ -1246,7 +1379,7 @@ impl Database {
         let own = [found.original, found.copy.unwrap_or(found.original)];
         refuse_taken_name(&transaction, &wanted.name, &own).await?;
 
-        let target = match (found.template.built_in, found.copy) {
+        let target = match (found.template.origin.is_original(), found.copy) {
             (false, _) => found.original,
             (true, Some(copy)) => copy,
             (true, None) => {
@@ -1319,7 +1452,7 @@ impl Database {
     /// changed under them.
     pub async fn template_upgrades(&self) -> Result<Vec<String>> {
         let rows = template::Entity::find()
-            .filter(template::Column::BuiltIn.eq(true))
+            .filter(template::Column::Origin.ne(Origin::Own.as_str()))
             .filter(template::Column::UpgradeSeen.eq(false))
             .order_by_asc(template::Column::Name)
             .all(&self.connection)
@@ -1365,6 +1498,48 @@ impl Database {
             .context("saving templates")?;
         Ok(())
     }
+}
+
+async fn import_outcome_in<C: ConnectionTrait>(
+    connection: &C,
+    template: &Template,
+) -> Result<(Imported, Option<template::Model>)> {
+    let live = template::Entity::find()
+        .filter(template::Column::DeletedAt.is_null())
+        .all(connection)
+        .await
+        .context("loading templates")?;
+    let key = name_key(&template.name);
+    for row in &live {
+        let same_key = row.key == template.key;
+        let same_name = row.name_key == key;
+        match Origin::parse(&row.origin)? {
+            Origin::BuiltIn if same_key => bail!(Refused(format!(
+                "{:?} is the key of the built-in template {}, so a template can't be imported under it",
+                template.key, row.name
+            ))),
+            Origin::BuiltIn if same_name => bail!(Refused(format!(
+                "{:?} is the name of a built-in template, so a template can't be imported under it",
+                template.name
+            ))),
+            Origin::Own if same_key => bail!(Refused(format!(
+                "{:?} is the key of your own template {}: delete or rename that first",
+                template.key, row.name
+            ))),
+            _ if same_name && !same_key => bail!(NameTaken::Template(template.name.clone())),
+            _ => {}
+        }
+    }
+    let existing = live.into_iter().find(|row| row.key == template.key);
+    let fingerprint = crate::templates::built_in::fingerprint(template);
+    let outcome = match &existing {
+        None => Imported::Added,
+        Some(row) if row.fingerprint.as_deref() == Some(fingerprint.as_str()) => {
+            Imported::Unchanged
+        }
+        Some(_) => Imported::Updated,
+    };
+    Ok((outcome, existing))
 }
 
 /// Someone's own template can't have a key another template has, built-in or not.

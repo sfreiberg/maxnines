@@ -4,9 +4,9 @@
 <p class="breadcrumb"><a href="/settings">Settings</a></p>
 <div class="title-row">
   <h1>Templates</h1>
-  {% if can_edit %}<div class="actions"><a class="button" href="/templates/new">Add template</a></div>{% endif %}
+  {% if can_edit %}<div class="actions"><a class="button secondary" href="/templates/import">Import</a><a class="button" href="/templates/new">Add template</a></div>{% endif %}
 </div>
-<p class="hint">What MaxNines watches for in what it monitors, with the alert rules each one has. Those that come with MaxNines are updated by upgrades, which leave your own copies of their alerts alone. <a href="/docs/templates">How templates work</a>.</p>
+<p class="hint">What MaxNines watches for in what it monitors, with the alert rules each one has. Those that come with MaxNines are updated by upgrades, and imported ones by importing a newer version, which both leave your own copies of their alerts alone. <a href="/docs/templates">How templates work</a>.</p>
 {% if templates %}
 <div class="tablebox" id="templates"><table>
   <thead>
@@ -15,7 +15,7 @@
   <tbody>
     {% for template in templates %}
     <tr{% if not template.enabled %} class="disabled"{% endif %}>
-      <td><a href="/templates/{{ template.id }}">{{ template.name }}</a>{% if template.built_in %}<span class="under">Comes with MaxNines{% if template.upgraded %} · updated {{ template.upgraded }}{% endif %}</span>{% else %}<span class="under">Yours</span>{% endif %}{% if template.description %}<span class="under">{{ template.description }}</span>{% endif %}</td>
+      <td><a href="/templates/{{ template.id }}">{{ template.name }}</a>{% if template.origin == "built_in" %}<span class="under">Comes with MaxNines{% if template.upgraded %} · updated {{ template.upgraded }}{% endif %}</span>{% elif template.origin == "imported" %}<span class="under">Imported{% if template.upgraded %} · updated {{ template.upgraded }}{% endif %}</span>{% else %}<span class="under">Yours</span>{% endif %}{% if template.description %}<span class="under">{{ template.description }}</span>{% endif %}</td>
       <td>{{ template.target }}</td>
       <td class="number">{{ template.alerts }}</td>
       <td>{% if not template.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if template.changed %} <span class="badge hollow" title="You have your own copy of some of its alerts">Changed</span>{% endif %}</td>

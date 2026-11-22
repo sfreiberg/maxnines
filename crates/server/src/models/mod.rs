@@ -88,7 +88,7 @@ use self::audit::record_change;
 pub use self::built_in_rules::same_rule;
 pub use self::events::{MAX_TIMELINE, NewEvent};
 pub use self::stats::DatabaseStats;
-pub use self::templates::{StoredTemplate, TemplateAlert};
+pub use self::templates::{Imported, Origin, StoredTemplate, TemplateAlert};
 pub use self::two_factor::CHALLENGE_LIFETIME;
 pub use self::users::{
     DEFAULT_THEME, SESSION_LIFETIME, THEMES, User, UserChange, check_new_password, check_new_user,

@@ -20,7 +20,7 @@ use super::{CsrfForm, Page, local_date, server_error};
 use crate::alert_conditions::LocalKind;
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
-use crate::models::{StoredTemplate, TemplateAlert};
+use crate::models::{Imported, Origin, StoredTemplate, TemplateAlert};
 use crate::templates::{Refused, local_metrics};
 
 pub fn routes() -> Router<AppState> {
@@ -29,6 +29,8 @@ pub fn routes() -> Router<AppState> {
         .route("/templates/new", get(new))
         .route("/templates/new/hcl", get(new_hcl))
         .route("/templates/hcl", post(create_hcl))
+        .route("/templates/import", get(import_page).post(import))
+        .route("/templates/{id}/export", get(export))
         .route("/templates/upgrades/dismiss", post(dismiss_upgrades))
         .route("/templates/{id}", get(show).post(update))
         .route("/templates/{id}/edit", get(edit))
@@ -48,6 +50,8 @@ pub fn api_routes() -> Router<AppState> {
         .route("/templates", get(api_list).post(api_create))
         .route("/templates/upgrades", get(api_upgrades))
         .route("/templates/upgrades/dismiss", post(api_dismiss_upgrades))
+        .route("/templates/import", post(api_import))
+        .route("/templates/{id}/export", get(api_export))
         .route(
             "/templates/{id}",
             get(api_show).put(api_update).delete(api_delete),
@@ -99,7 +103,9 @@ struct TemplateRow {
     key: String,
     description: String,
     target: String,
-    built_in: bool,
+    origin: &'static str,
+    /// Whether it's a built-in or imported one, which isn't edited.
+    original: bool,
     enabled: bool,
     alerts: usize,
     upgraded: Option<String>,
@@ -123,7 +129,8 @@ async fn rows(state: &AppState) -> Result<Vec<TemplateRow>> {
                 key: stored.template.key.clone(),
                 description: stored.template.description.clone().unwrap_or_default(),
                 target: target_words(&stored.template),
-                built_in: stored.built_in,
+                origin: stored.origin.as_str(),
+                original: stored.origin.is_original(),
                 enabled: stored.enabled,
                 alerts: mine.len(),
                 upgraded: stored.upgraded_at.map(local_date),
@@ -300,7 +307,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
     Page::new(&state, &token, "templates/show.html")
         .with("id", &stored.id)
         .with("template", &stored.template)
-        .with("built_in", &stored.built_in)
+        .with("origin", stored.origin.as_str())
+        .with("original", &stored.origin.is_original())
         .with("enabled", &stored.enabled)
         .with("target", &target_words(&stored.template))
         .with("upgraded", &stored.upgraded_at.map(local_date))
@@ -397,7 +405,7 @@ async fn own_template(state: &AppState, id: i64) -> Result<Option<StoredTemplate
         .database
         .get_template(id)
         .await?
-        .filter(|stored| !stored.built_in))
+        .filter(|stored| stored.origin == Origin::Own))
 }
 
 async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfToken) -> Response {
@@ -691,7 +699,8 @@ struct TemplateSummary {
     key: String,
     name: String,
     description: Option<String>,
-    built_in: bool,
+    /// `built_in`, `imported` or `own`.
+    origin: Origin,
     enabled: bool,
     target: Option<maxnines_protocol::templates::Target>,
     created_at: crate::times::Timestamp,
@@ -707,7 +716,7 @@ fn summary(stored: &StoredTemplate, rules: &[AlertRule]) -> TemplateSummary {
         key: stored.template.key.clone(),
         name: stored.template.name.clone(),
         description: stored.template.description.clone(),
-        built_in: stored.built_in,
+        origin: stored.origin,
         enabled: stored.enabled,
         target: stored.template.target.clone(),
         created_at: stored.created_at,
@@ -771,21 +780,7 @@ async fn api_show(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
                 key: alert.key,
             })
             .collect();
-        let local = local_metrics(&stored.template);
-        let metrics: Vec<MetricView> = local
-            .metrics
-            .iter()
-            .map(|(short, metric)| MetricView {
-                name: format!("{}.{short}", local.prefix),
-                kind: match metric.kind {
-                    LocalKind::Number => "number",
-                    LocalKind::Seconds => "seconds",
-                    LocalKind::Flag => "flag",
-                    LocalKind::Unknown => "unknown",
-                },
-                labels: metric.labels.clone(),
-            })
-            .collect();
+        let metrics = metric_views(&stored.template);
         let mut view = serde_json::to_value(summary(&stored, &rules))?;
         view["hcl"] = json!(stored.hcl());
         view["template"] = serde_json::to_value(&stored.template)?;
@@ -819,9 +814,9 @@ async fn api_save(state: &AppState, id: Option<i64>, hcl: &str) -> Response {
     };
     if let Some(id) = id {
         match state.database.get_template(id).await {
-            Ok(Some(stored)) if stored.built_in => {
+            Ok(Some(stored)) if stored.origin.is_original() => {
                 return refused(&anyhow::anyhow!(Refused(
-                    "a built-in template can't be changed, as upgrades replace it: disable it, or change its alerts".to_string()
+                    "a built-in or imported template can't be changed, as a newer version replaces it: disable it, or change its alerts".to_string()
                 )));
             }
             Ok(Some(_)) => {}
@@ -946,6 +941,377 @@ async fn api_upgrades(State(state): State<AppState>) -> Response {
 async fn api_dismiss_upgrades(State(state): State<AppState>) -> Response {
     match state.dismiss_template_upgrades().await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => super::api::server_error(&error),
+    }
+}
+
+// Importing and exporting.
+
+/// What importing a template would do, shown before it's done: what it is, what
+/// it would run, anything wrong with it, and what would change of one imported
+/// before.
+#[derive(Serialize)]
+struct ImportPreview {
+    /// `added`, `updated` or `unchanged`, when it can be imported.
+    outcome: Option<Imported>,
+    /// Why it can't be imported, each on its own.
+    problems: Vec<String>,
+    key: String,
+    name: String,
+    description: Option<String>,
+    /// What it runs for, in words.
+    target: String,
+    metrics: Vec<MetricView>,
+    alerts: Vec<PreviewAlert>,
+    /// Every SQL statement it would run, with each version's fills filled in.
+    sql: Vec<PreviewSql>,
+    /// Every performance counter it would read.
+    counters: Vec<PreviewCounters>,
+    /// For one imported before, what's different, part by part.
+    changes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PreviewAlert {
+    key: String,
+    name: String,
+    warning: Option<String>,
+    critical: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Serialize)]
+struct PreviewSql {
+    /// `discover`, or the query's key.
+    from: String,
+    statements: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PreviewCounters {
+    key: String,
+    object: String,
+    counters: Vec<String>,
+}
+
+fn metric_views(template: &Template) -> Vec<MetricView> {
+    let local = local_metrics(template);
+    local
+        .metrics
+        .iter()
+        .map(|(short, metric)| MetricView {
+            name: format!("{}.{short}", local.prefix),
+            kind: match metric.kind {
+                LocalKind::Number => "number",
+                LocalKind::Seconds => "seconds",
+                LocalKind::Flag => "flag",
+                LocalKind::Unknown => "unknown",
+            },
+            labels: metric.labels.clone(),
+        })
+        .collect()
+}
+
+/// What's different between two versions of a template, a part to a line.
+fn differences(old: &Template, new: &Template) -> Vec<String> {
+    fn parts<T: PartialEq>(
+        kind: &str,
+        old: &[T],
+        new: &[T],
+        key: impl Fn(&T) -> &str,
+        changes: &mut Vec<String>,
+    ) {
+        for part in new {
+            match old.iter().find(|other| key(other) == key(part)) {
+                None => changes.push(format!("Adds the {kind} {}", key(part))),
+                Some(other) if other != part => {
+                    changes.push(format!("Changes the {kind} {}", key(part)));
+                }
+                Some(_) => {}
+            }
+        }
+        for part in old {
+            if !new.iter().any(|other| key(other) == key(part)) {
+                changes.push(format!("Removes the {kind} {}", key(part)));
+            }
+        }
+    }
+    let mut changes = Vec::new();
+    let top = |template: &Template| {
+        (
+            template.name.clone(),
+            template.description.clone(),
+            template.target.clone(),
+            template.min_version.clone(),
+            template.services.clone(),
+        )
+    };
+    if top(old) != top(new) {
+        changes.push("Changes its name, description or what it runs for".to_string());
+    }
+    if old.discover != new.discover {
+        changes.push("Changes its discovery".to_string());
+    }
+    parts(
+        "notice",
+        &old.notices,
+        &new.notices,
+        |n| &n.key,
+        &mut changes,
+    );
+    parts(
+        "query",
+        &old.queries,
+        &new.queries,
+        |q| &q.key,
+        &mut changes,
+    );
+    parts(
+        "counters",
+        &old.counters,
+        &new.counters,
+        |c| &c.key,
+        &mut changes,
+    );
+    // Whether an alert is on is the server's own to keep, not the import's.
+    let alerts = |template: &Template| -> Vec<maxnines_protocol::templates::Alert> {
+        template
+            .alerts
+            .iter()
+            .cloned()
+            .map(|mut alert| {
+                alert.enabled = true;
+                alert
+            })
+            .collect()
+    };
+    parts(
+        "alert",
+        &alerts(old),
+        &alerts(new),
+        |a| &a.key,
+        &mut changes,
+    );
+    changes
+}
+
+async fn preview_of(
+    state: &AppState,
+    hcl: &str,
+) -> Result<Result<(Template, ImportPreview), String>> {
+    let template = match parse(hcl) {
+        Ok(template) => template,
+        Err(error) => return Ok(Err(format!("{error:#}"))),
+    };
+    let found = state.check_template(&template).await?;
+    let mut problems = Problems::new(&template, found).described;
+    let outcome = match state.database.import_outcome(&template).await {
+        Ok(outcome) => Some(outcome),
+        Err(error) if error.is::<Refused>() || error.is::<NameTaken>() => {
+            problems.push(format!("{error:#}"));
+            None
+        }
+        Err(error) => return Err(error),
+    };
+    let mut changes = Vec::new();
+    if outcome == Some(Imported::Updated) {
+        let before = state.database.list_templates().await?;
+        if let Some(stored) = before
+            .iter()
+            .find(|stored| stored.template.key == template.key)
+        {
+            changes = differences(&stored.template, &template);
+        }
+    }
+    let mut sql = Vec::new();
+    if let Some(statement) = template.discover.as_ref().and_then(|d| d.sql.clone()) {
+        sql.push(PreviewSql {
+            from: "discover".to_string(),
+            statements: vec![statement],
+        });
+    }
+    for query in &template.queries {
+        sql.push(PreviewSql {
+            from: query.key.clone(),
+            statements: maxnines_protocol::templates::filled_sql(query),
+        });
+    }
+    let preview = ImportPreview {
+        outcome: outcome.filter(|_| problems.is_empty()),
+        problems,
+        key: template.key.clone(),
+        name: template.name.clone(),
+        description: template.description.clone(),
+        target: target_words(&template),
+        metrics: metric_views(&template),
+        alerts: template
+            .alerts
+            .iter()
+            .map(|alert| PreviewAlert {
+                key: alert.key.clone(),
+                name: alert.name.clone(),
+                warning: alert.warning.clone(),
+                critical: alert.critical.clone(),
+                enabled: alert.enabled,
+            })
+            .collect(),
+        sql,
+        counters: template
+            .counters
+            .iter()
+            .map(|counters| PreviewCounters {
+                key: counters.key.clone(),
+                object: counters.object.clone(),
+                counters: counters
+                    .metrics
+                    .iter()
+                    .filter_map(|metric| metric.counter.clone())
+                    .collect(),
+            })
+            .collect(),
+        changes,
+    };
+    Ok(Ok((template, preview)))
+}
+
+fn import_view(
+    state: &AppState,
+    token: &CsrfToken,
+    hcl: &str,
+    preview: Option<&ImportPreview>,
+    error: Option<&str>,
+) -> Response {
+    let page = Page::new(state, token, "templates/import.html")
+        .with("hcl", hcl)
+        .with("preview", &preview)
+        .with("error", &error);
+    match error.is_some() || preview.is_some_and(|preview| !preview.problems.is_empty()) {
+        true => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
+        false => page.render(),
+    }
+}
+
+async fn import_page(State(state): State<AppState>, token: CsrfToken) -> Response {
+    import_view(&state, &token, "", None, None)
+}
+
+/// Shows what importing would do, and once that's been seen and confirmed, does it.
+async fn import(State(state): State<AppState>, form: CsrfForm) -> Response {
+    let hcl = form
+        .fields
+        .get("hcl")
+        .cloned()
+        .unwrap_or_default()
+        .replace("\r\n", "\n");
+    let (template, preview) = match preview_of(&state, &hcl).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(message)) => return import_view(&state, &form.token, &hcl, None, Some(&message)),
+        Err(error) => return server_error(&error),
+    };
+    if !form.fields.contains_key("confirm") || preview.outcome.is_none() {
+        return import_view(&state, &form.token, &hcl, Some(&preview), None);
+    }
+    match state
+        .database
+        .import_template(&template, crate::times::now())
+        .await
+    {
+        Ok((id, _)) => {
+            refresh_upgrades(&state).await;
+            (form.token, Redirect::to(&format!("/templates/{id}"))).into_response()
+        }
+        Err(error) if error.is::<Refused>() || error.is::<NameTaken>() => {
+            let message = format!("{error:#}");
+            import_view(&state, &form.token, &hcl, Some(&preview), Some(&message))
+        }
+        Err(error) => server_error(&error),
+    }
+}
+
+/// The notice admins see is kept in memory, so importing a newer version says so
+/// at once.
+async fn refresh_upgrades(state: &AppState) {
+    if let Ok(upgrades) = state.database.template_upgrades().await {
+        *state
+            .template_upgrades
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = upgrades;
+    }
+}
+
+fn hcl_file(stored: &StoredTemplate) -> Response {
+    use axum::http::header;
+    let name = format!("attachment; filename=\"{}.hcl\"", stored.template.key);
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (header::CONTENT_DISPOSITION, name),
+        ],
+        stored.hcl(),
+    )
+        .into_response()
+}
+
+async fn export(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfToken) -> Response {
+    match state.database.get_template(id).await {
+        Ok(Some(stored)) => hcl_file(&stored),
+        Ok(None) => not_found(&state, &token),
+        Err(error) => server_error(&error),
+    }
+}
+
+async fn api_export(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match state.database.get_template(id).await {
+        Ok(Some(stored)) => hcl_file(&stored),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => super::api::server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct ImportInput {
+    hcl: String,
+    /// Only say what importing would do.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+async fn api_import(State(state): State<AppState>, Json(input): Json<ImportInput>) -> Response {
+    let (template, preview) = match preview_of(&state, &input.hcl).await {
+        Ok(Ok(found)) => found,
+        Ok(Err(message)) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({ "error": message })),
+            )
+                .into_response();
+        }
+        Err(error) => return super::api::server_error(&error),
+    };
+    if input.dry_run {
+        return Json(preview).into_response();
+    }
+    if preview.outcome.is_none() {
+        let body = Json(json!({ "error": preview.problems.join("; ") }));
+        return (StatusCode::UNPROCESSABLE_ENTITY, body).into_response();
+    }
+    match state
+        .database
+        .import_template(&template, crate::times::now())
+        .await
+    {
+        Ok((id, outcome)) => {
+            refresh_upgrades(&state).await;
+            let status = match outcome {
+                Imported::Added => StatusCode::CREATED,
+                _ => StatusCode::OK,
+            };
+            (status, Json(json!({ "id": id, "outcome": outcome }))).into_response()
+        }
+        Err(error) if error.is::<Refused>() || error.is::<NameTaken>() => refused(&error),
         Err(error) => super::api::server_error(&error),
     }
 }

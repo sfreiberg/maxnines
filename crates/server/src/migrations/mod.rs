@@ -966,7 +966,8 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(Templates::Name).string_len(255).not_null())
             .col(name_key(backend))
             .col(ColumnDef::new(Templates::Description).text())
-            .col(ColumnDef::new(Templates::BuiltIn).boolean().not_null())
+            // Where it came from: built_in, imported or own.
+            .col(ColumnDef::new(Templates::Origin).string_len(16).not_null())
             // What it runs once for on each host: a kind of database, a service or
             // operating systems, comma separated. Neither for every host.
             .col(ColumnDef::new(Templates::TargetKind).string_len(16))
@@ -2101,7 +2102,7 @@ enum Templates {
     Key,
     Name,
     Description,
-    BuiltIn,
+    Origin,
     TargetKind,
     Target,
     MinVersion,

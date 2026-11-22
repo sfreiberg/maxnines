@@ -9,7 +9,7 @@
 {% if template %}
 <div class="notice" role="note">
   {% if template.original %}
-  <p>Your own copy of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alert <code>{{ template.alert }}</code>, used in place of the one that comes with MaxNines, which upgrades keep up to date.{% if template.original_changed %} An upgrade changed that one on {{ template.original_changed }}.{% endif %} It says:</p>
+  <p>Your own copy of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alert <code>{{ template.alert }}</code>, used in place of the template's own, which a newer version of the template keeps up to date.{% if template.original_changed %} A newer version changed that one on {{ template.original_changed }}.{% endif %} It says:</p>
   <ul class="changes">
     <li>Name: {{ template.original.name }}</li>
     {% if template.original.warning %}<li>Warning when: <code>{{ template.original.warning }}</code></li>{% endif %}
@@ -25,7 +25,7 @@
   </form>
   {% endif %}
   {% elif template.built_in %}
-  <p>One of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>, which comes with MaxNines. Saving a change makes a copy of your own, used in its place, which upgrades leave alone. Turning it on or off needs no copy. Its conditions can use the template's own metrics by their short names.</p>
+  <p>One of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>, which isn't yours to change. Saving a change makes a copy of your own, used in its place, which a newer version of the template leaves alone. Turning it on or off needs no copy. Its conditions can use the template's own metrics by their short names.</p>
   {% else %}
   <p>One of your <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>. Its conditions can use the template's own metrics by their short names.</p>
   {% endif %}

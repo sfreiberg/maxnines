@@ -331,6 +331,8 @@ struct TemplateOf {
     id: i64,
     name: String,
     alert: String,
+    /// Whether the template is a built-in or imported one, whose rules are copied
+    /// to change them.
     built_in: bool,
     /// The template's own rule.
     original_id: i64,
@@ -422,7 +424,7 @@ async fn form_page_with(
                     id: found.template.id,
                     name: found.template.template.name,
                     alert: found.alert,
-                    built_in: found.template.built_in,
+                    built_in: found.template.origin.is_original(),
                     original_id: found.original,
                     original: original
                         .as_ref()

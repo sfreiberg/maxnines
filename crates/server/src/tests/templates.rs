@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
-use crate::models::Database;
+use crate::models::{Database, Imported, Origin};
 use crate::templates::Refused;
 use crate::templates::built_in::{self, BuiltIn, from_source};
 use maxnines_protocol::templates::parse;
@@ -101,7 +101,7 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
 
     let templates = database.list_templates().await.unwrap();
     assert_eq!(templates.len(), 1);
-    assert!(templates[0].built_in && templates[0].enabled);
+    assert!(templates[0].origin == Origin::BuiltIn && templates[0].enabled);
     assert_eq!(templates[0].template.key, "host");
     let rules = database.list_alert_rules().await.unwrap();
     assert_eq!(rules.len(), 8);
@@ -364,7 +364,13 @@ async fn what_is_in_a_built_in_templates_way_is_moved_aside() {
         .await
         .unwrap()
         .into_iter()
-        .map(|stored| (stored.template.key, stored.template.name, stored.built_in))
+        .map(|stored| {
+            (
+                stored.template.key,
+                stored.template.name,
+                stored.origin == Origin::BuiltIn,
+            )
+        })
         .collect();
     assert_eq!(
         keys,
@@ -404,7 +410,7 @@ async fn peoples_own_templates_are_changed_directly_with_no_copies() {
         .await
         .unwrap();
     let stored = database.get_template(id).await.unwrap().unwrap();
-    assert!(!stored.built_in);
+    assert_eq!(stored.origin, Origin::Own);
     assert_eq!(stored.template, app);
     assert_eq!(database.template_alerts(id).await.unwrap().len(), 2);
 
@@ -808,8 +814,7 @@ async fn admins_hear_of_upgraded_templates_until_one_dismisses_it() {
     let mut browser = Browser::default();
     let page = browser.get(&server, "/").await;
     assert!(
-        page.body
-            .contains("An upgrade changed the built-in template App"),
+        page.body.contains("A new version changed the template App"),
         "{}",
         page.body
     );
@@ -824,7 +829,7 @@ async fn admins_hear_of_upgraded_templates_until_one_dismisses_it() {
     assert_eq!(page.status, 303);
     assert_eq!(page.header("location"), Some("/hosts"));
     let page = browser.get(&server, "/").await;
-    assert!(!page.body.contains("An upgrade changed"));
+    assert!(!page.body.contains("A new version changed"));
     assert!(database.template_upgrades().await.unwrap().is_empty());
 }
 
@@ -904,7 +909,7 @@ async fn the_api_covers_what_the_templates_pages_do() {
     let (status, list) = api(&server, "GET", "/api/v1/templates", &Value::Null).await;
     assert_eq!(status, 200, "{list}");
     assert_eq!(list[0]["key"], "host");
-    assert_eq!(list[0]["built_in"], true);
+    assert_eq!(list[0]["origin"], "built_in");
 
     let (status, body) = api(&server, "POST", "/api/v1/templates", &json!({ "hcl": APP })).await;
     assert_eq!(status, 201, "{body}");
@@ -1106,4 +1111,283 @@ async fn cel_fields_get_suggestions_from_the_real_catalog() {
         local["discovered"],
         json!(["version", "role", "archiving", "sees_all_sessions"])
     );
+}
+
+#[tokio::test]
+async fn an_imported_template_is_replaced_by_a_newer_one_keeping_copies_and_what_is_off() {
+    let database = Database::for_test().await;
+    database
+        .sync_templates(&built_in::all().unwrap(), crate::times::now())
+        .await
+        .unwrap();
+    let app = parse(APP).unwrap();
+    assert_eq!(
+        database.import_outcome(&app).await.unwrap(),
+        Imported::Added
+    );
+    let (id, outcome) = database
+        .import_template(&app, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!(outcome, Imported::Added);
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert_eq!(stored.origin, Origin::Imported);
+    assert!(database.template_upgrades().await.unwrap().is_empty());
+
+    // Like a built-in one: it isn't edited, its alert is copied to change it, and
+    // turning an alert off is a flag.
+    let error = database
+        .update_template(id, &app, crate::times::now())
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<Refused>().is_some());
+    let slow = rule(&database, "App slow").await;
+    let wanted = AlertRuleInput {
+        hold: chrono::TimeDelta::minutes(10),
+        ..slow.rule.clone()
+    };
+    database.update_alert_rule(slow.id, &wanted).await.unwrap();
+    let gone = rule(&database, "App host gone").await;
+    let off = AlertRuleInput {
+        enabled: false,
+        ..gone.rule.clone()
+    };
+    database.update_alert_rule(gone.id, &off).await.unwrap();
+    database
+        .set_template_enabled(id, false, crate::times::now())
+        .await
+        .unwrap();
+
+    // The same again changes nothing; a newer version replaces it.
+    let (_, outcome) = database
+        .import_template(&app, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!(outcome, Imported::Unchanged);
+    let newer = parse(&APP.replace("cpu.usage > 80", "cpu.usage > 70")).unwrap();
+    let (again, outcome) = database
+        .import_template(&newer, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!((again, outcome), (id, Imported::Updated));
+    let alert = alert_of(&database, id, "slow").await;
+    assert_eq!(alert.rule.rule.warning.as_deref(), Some("cpu.usage > 70"));
+    assert_eq!(alert.copy.unwrap().rule, wanted, "the copy is left");
+    assert!(!rule(&database, "App host gone").await.rule.enabled);
+    assert!(!database.get_template(id).await.unwrap().unwrap().enabled);
+    assert_eq!(
+        database.template_upgrades().await.unwrap(),
+        ["App (its version of App slow changed, which you have your own of)"]
+    );
+
+    // Unlike a built-in one, it can be deleted, with its rules and copies.
+    assert!(
+        database
+            .delete_template(id, crate::times::now())
+            .await
+            .unwrap()
+    );
+    assert_eq!(database.list_alert_rules().await.unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn an_import_in_the_way_of_a_built_in_or_own_template_is_refused() {
+    let database = Database::for_test().await;
+    database
+        .sync_templates(&built_in::all().unwrap(), crate::times::now())
+        .await
+        .unwrap();
+    let own = parse(APP).unwrap();
+    database
+        .create_template(&own, crate::times::now())
+        .await
+        .unwrap();
+
+    let host_key = parse(
+        &APP.replace("\"app\"", "\"host\"")
+            .replace("\"App\"", "\"Other\""),
+    )
+    .unwrap();
+    let host_name = parse(
+        &APP.replace("\"app\"", "\"other\"")
+            .replace("\"App\"", "\"host\""),
+    )
+    .unwrap();
+    for (template, expected) in [
+        (&host_key, "is the key of the built-in template Host"),
+        (&host_name, "is the name of a built-in template"),
+        (&own, "is the key of your own template App"),
+    ] {
+        let error = database
+            .import_template(template, crate::times::now())
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<Refused>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert!(database.import_outcome(template).await.is_err());
+    }
+    assert_eq!(database.list_templates().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back() {
+    let server = with_built_in_templates().await;
+    let mut browser = Browser::default();
+
+    // A look first, with everything it would run, and nothing saved.
+    let page = browser
+        .submit(
+            &server,
+            "/templates/import",
+            "/templates/import",
+            &[("hcl", POSTGRES)],
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    for expected in [
+        "This would add a template.",
+        "Replica lagging",
+        "postgres.slot_retained",
+        "FROM pg_stat_replication",
+        "invalidation_reason IS NOT NULL",
+        r#"name="confirm""#,
+    ] {
+        assert!(page.body.contains(expected), "{expected}\n{}", page.body);
+    }
+    assert!(page.has_only_our_scripts());
+    assert_eq!(
+        server.state.database.list_templates().await.unwrap().len(),
+        1
+    );
+
+    let broken = POSTGRES.replace("critical         = \"!up\"", "critical         = \"!upp\"");
+    let page = browser
+        .submit(
+            &server,
+            "/templates/import",
+            "/templates/import",
+            &[("hcl", &broken), ("confirm", "yes")],
+        )
+        .await;
+    assert_eq!(page.status, 422);
+    assert!(
+        page.body.contains("It can't be imported as it is"),
+        "{}",
+        page.body
+    );
+    assert!(!page.body.contains(r#"name="confirm""#));
+
+    let page = browser
+        .submit(
+            &server,
+            "/templates/import",
+            "/templates/import",
+            &[("hcl", POSTGRES), ("confirm", "yes")],
+        )
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let id = template_id(&server.state.database, "postgres").await;
+
+    // A newer version says what it would change.
+    let newer = POSTGRES.replace("connections_used > 80", "connections_used > 70");
+    let page = browser
+        .submit(
+            &server,
+            "/templates/import",
+            "/templates/import",
+            &[("hcl", &newer)],
+        )
+        .await;
+    assert!(
+        page.body
+            .contains("Changes the alert connections_running_out"),
+        "{}",
+        page.body
+    );
+
+    // The export is HCL that reads back as the same template, from the page and the API.
+    let page = browser
+        .get(&server, &format!("/templates/{id}/export"))
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(
+        page.header("content-disposition")
+            .unwrap()
+            .contains("postgres.hcl")
+    );
+    let stored = server
+        .state
+        .database
+        .get_template(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parse(&page.body).unwrap(), stored.template);
+    let response = server
+        .request("GET", &format!("/api/v1/templates/{id}/export"), "")
+        .await;
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(parse(body).unwrap(), stored.template);
+    let host = template_id(&server.state.database, "host").await;
+    let page = browser
+        .get(&server, &format!("/templates/{host}/export"))
+        .await;
+    assert!(page.body.contains("template \"host\""));
+
+    // The API does the same, with a dry run for the look first.
+    let (status, preview) = api(
+        &server,
+        "POST",
+        "/api/v1/templates/import",
+        &json!({ "hcl": newer, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, 200, "{preview}");
+    assert_eq!(preview["outcome"], "updated");
+    assert_eq!(
+        preview["changes"],
+        json!(["Changes the alert connections_running_out"])
+    );
+    assert!(preview["sql"].as_array().unwrap().len() > 10);
+    let (status, body) = api(
+        &server,
+        "POST",
+        "/api/v1/templates/import",
+        &json!({ "hcl": newer }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({ "id": id, "outcome": "updated" }));
+    let (status, body) = api(
+        &server,
+        "POST",
+        "/api/v1/templates/import",
+        &json!({ "hcl": APP }),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    let (status, body) = api(
+        &server,
+        "POST",
+        "/api/v1/templates/import",
+        &json!({ "hcl": APP.replace("\"app\"", "\"host\"").replace("\"App\"", "\"Other\"") }),
+    )
+    .await;
+    assert_eq!(status, 422);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("built-in template"),
+        "{body}"
+    );
+
+    // Imports and re-imports are in the audit log, as whoever did them.
+    let entries = server.state.database.audit_log(None, 200).await.unwrap();
+    let postgres: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.subject.kind == "template" && entry.subject.name == "PostgreSQL")
+        .map(|entry| entry.action.as_str())
+        .collect();
+    assert_eq!(postgres, ["changed", "created"]);
 }

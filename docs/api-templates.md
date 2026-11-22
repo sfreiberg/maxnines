@@ -11,11 +11,11 @@ themselves, which gives `422`.
 | `id` | Given back |
 | `key` | The template's key, which starts its metrics' names |
 | `name`, `description` | From the HCL |
-| `built_in` | Whether it comes with MaxNines |
+| `origin` | `built_in` for one that comes with MaxNines, `imported`, or `own` |
 | `enabled` | Whether it's on. Turning it off turns off its alerts |
 | `target` | What it runs for: `{"kind": "database", "value": "postgres"}`, `service`, or `os` with a list of systems, or `null` for every host |
 | `created_at`, `updated_at` | When it was added, and last changed |
-| `upgraded_at` | When an upgrade last changed a built-in one, or `null` |
+| `upgraded_at` | When a newer version last changed a built-in or imported one, or `null` |
 | `changed` | Whether you have your own copy of any of its alerts |
 
 ## List templates
@@ -33,7 +33,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/template
     "key": "host",
     "name": "Host",
     "description": "Whether each host is online and sending metrics, and its disks, clock, services and containers.",
-    "built_in": true,
+    "origin": "built_in",
     "enabled": true,
     "target": null,
     "created_at": "2026-11-21T09:00:00.000Z",
@@ -88,6 +88,48 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 { "id": 2 }
 ```
 
+## Import a template
+
+`POST /api/v1/templates/import`
+
+Imports the template in `hcl`, as **Import** on the Templates page does. One with a key
+that's new is added, with `201`; one with the key of a template imported before
+replaces it, leaving alone your copies of its alerts and what's turned off, with `200`.
+The answer has its `id` and the `outcome`: `added`, `updated`, or `unchanged` when it
+says what's there already. A key or name of a built-in template, or the key of one of
+your own, gives `422`, as anything wrong with the template does.
+
+With `"dry_run": true` nothing is saved, and the answer is what importing would do:
+the `outcome`, or `null` with the `problems` stopping it; its `key`, `name`,
+`description` and `target` in words; its `metrics` and `alerts`; every statement of
+`sql` it would run, by query, with each version's fills filled in; the `counters` it
+would read; and for an update, the `changes`, a part to a line.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data "$(jq -n --rawfile hcl myapp.hcl '{hcl: $hcl, dry_run: true}')" \
+  "$MAXNINES_URL/api/v1/templates/import"
+```
+
+```json
+{ "id": 3, "outcome": "added" }
+```
+
+An imported template is deleted as one of your own is.
+
+## Export a template
+
+`GET /api/v1/templates/{id}/export`
+
+Any template as HCL, written out from its parts, as text rather than JSON, ready to
+import somewhere else.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/templates/1/export" > host.hcl
+```
+
 ## Update a template
 
 `PUT /api/v1/templates/{id}`
@@ -100,7 +142,7 @@ deleted.
 
 `DELETE /api/v1/templates/{id}`
 
-Deletes a template of your own and its alert rules, as [deleting a
+Deletes a template of your own, or an imported one, and its alert rules, as [deleting a
 rule](api-alert-rules.md#delete-an-alert-rule) does.
 
 ## Turn a template on or off
@@ -117,7 +159,7 @@ The body is the whole rule, as for [updating an alert rule](api-alert-rules.md#u
 which does the same. Its conditions can use the template's own metrics by their short
 names, and it can't have a calculation.
 
-For a built-in template, the first change makes your own copy of the rule, with an `id`
+For a built-in or imported template, the first change makes your own copy of the rule, with an `id`
 of its own, which is checked in place of the built-in one from then on, and later
 changes update the copy. A body that differs from the built-in rule only in `enabled`
 sets that on the built-in rule and makes no copy. For a template of your own, the rule

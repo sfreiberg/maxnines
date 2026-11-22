@@ -13,6 +13,18 @@ or alert can be disabled, which stays that way through upgrades. Admins see a no
 every page when an upgrade has changed a template, saying which alerts you have your
 own copies of, until one of them dismisses it.
 
+You can also **import** a template someone else wrote, from **Import** on the Templates
+page: choose an `.hcl` file or paste it, and the page shows what it is before anything is
+saved: its alerts and metrics, every SQL statement and performance counter it would
+run, anything wrong with it, and for one imported before, what would change. An
+imported template behaves as a built-in one does: it isn't edited, changing one of its
+alerts makes your own copy, and it and its alerts can be disabled. Importing a newer
+version of the same key replaces it, leaving your copies and what's turned off alone,
+with the same notice to admins. Unlike a built-in one, it can be deleted. An import
+with the key or name of a built-in template, or the key of one of your own, is refused.
+
+Any template can be **exported** as HCL, from **Export** on its page.
+
 You can add templates of your own, for things MaxNines doesn't know, with the form on
 the Templates page, as HCL on its **HCL** tab, or through the
 [API](api-templates.md). MaxNines keeps a template as its parts, not as text: HCL is how
