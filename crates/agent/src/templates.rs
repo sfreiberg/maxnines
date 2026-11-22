@@ -8,12 +8,16 @@
 //! first, then on its own schedule, and again whenever the connection had to be
 //! opened, as the database may have restarted. A database that doesn't answer is
 //! tried once each time a growing wait runs out, and one that has nothing due is
-//! checked every sample, so `up` is always as recent as a sample. A sample takes what's been
-//! read since the last one: each template's rows under `template.<key>`, whether
-//! each database answered as `up`, and what discovery found under `discovered`,
-//! which the server uses to work out what to send next.
+//! checked every sample, so `up` is always as recent as a sample. A sample takes
+//! what's been read since the last one: each template's rows under
+//! `template.<key>`, whether each database answered as `up`, and what discovery
+//! found under `discovered`, which the server uses to work out what to send next.
+//!
+//! A new config changes each task only as much as its work changed: one whose work
+//! is the same carries on, and one whose work changed keeps its connection, what it
+//! found, and the running totals of each query whose SQL is the same.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -22,6 +26,7 @@ use maxnines_checks::databases::TIMEOUT;
 use maxnines_checks::templates::{INSTANCE_LABEL, Session, Totals, discovered, metric_rows};
 use maxnines_protocol::templates::work::{DISCOVERED, Discovered, TemplateWork, collector_of};
 use serde_json::{Map, Value, json};
+use tokio::sync::watch;
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::warn;
@@ -56,9 +61,19 @@ const ALIVE: &str = "SELECT 1";
 /// What errors reaching a database are noted under.
 const CONNECTING: &str = "connecting";
 
+/// What one database's task is told to do: its work, and how often a sample is.
+type Told = (TemplateWork, Duration);
+
+/// One database's task.
+struct Task {
+    told: watch::Sender<Told>,
+    running: AbortHandle,
+}
+
 pub struct TemplateCollector {
     read: Arc<Mutex<Read>>,
-    tasks: Vec<AbortHandle>,
+    /// By template and database.
+    tasks: HashMap<(String, String), Task>,
 }
 
 impl TemplateCollector {
@@ -69,48 +84,87 @@ impl TemplateCollector {
         definitions: &DatabaseDefinitions,
         interval: Duration,
     ) -> Result<Self> {
-        let read = Arc::new(Mutex::new(Read::default()));
-        let mut tasks = Vec::new();
+        let mut collector = Self {
+            read: Arc::new(Mutex::new(Read::default())),
+            tasks: HashMap::new(),
+        };
+        collector.update(work, definitions, interval)?;
+        Ok(collector)
+    }
+
+    /// Changes what's read to `work`: a database's task whose work is the same
+    /// carries on, one whose work changed is told, and the rest stop or start.
+    pub fn update(
+        &mut self,
+        work: &[TemplateWork],
+        definitions: &DatabaseDefinitions,
+        interval: Duration,
+    ) -> Result<()> {
+        let mut wanted: HashMap<(String, String), &TemplateWork> = HashMap::new();
         for one in work {
             // Only a database template has anything this agent can read so far.
-            let Some(name) = &one.database else {
+            if let Some(name) = &one.database {
+                wanted.insert((one.template.clone(), name.clone()), one);
+            }
+        }
+        // What isn't wanted any more stops, and says nothing more.
+        self.tasks.retain(|key, task| {
+            let keep = wanted.contains_key(key);
+            if !keep {
+                task.running.abort();
+            }
+            keep
+        });
+        lock(&self.read)
+            .up
+            .retain(|key, _| wanted.contains_key(key));
+
+        for (key, one) in wanted {
+            if let Some(task) = self.tasks.get(&key) {
+                let told = (one.clone(), interval);
+                task.told.send_if_modified(|current| {
+                    let changed = *current != told;
+                    *current = told;
+                    changed
+                });
                 continue;
-            };
-            let key = (one.template.clone(), name.clone());
+            }
+            let (template, name) = &key;
             let database = definitions
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("the agent's config has no database by that name"))
                 .and_then(|definition| definition.database(name));
             match database {
                 Ok(database) => {
-                    let task = runtime()?.spawn(run(
-                        one.clone(),
+                    let (told, listening) = watch::channel((one.clone(), interval));
+                    let running = runtime()?.spawn(run(
+                        listening,
                         name.clone(),
                         Session::new(database),
-                        interval,
-                        read.clone(),
+                        self.read.clone(),
                     ));
-                    tasks.push(task.abort_handle());
+                    let running = running.abort_handle();
+                    self.tasks.insert(key, Task { told, running });
                 }
                 Err(error) => {
                     warn!(
-                        template = one.template,
+                        template,
                         database = name,
                         error = format!("{error:#}"),
                         "a template can't read a database"
                     );
-                    lock(&read).up.insert(key, false);
+                    lock(&self.read).up.insert(key, false);
                 }
             }
         }
-        Ok(Self { read, tasks })
+        Ok(())
     }
 }
 
 impl Drop for TemplateCollector {
     fn drop(&mut self) {
-        for task in &self.tasks {
-            task.abort();
+        for task in self.tasks.values() {
+            task.running.abort();
         }
     }
 }
@@ -126,6 +180,10 @@ impl Collector for TemplateCollector {
 
     fn spreads(&self) -> bool {
         true
+    }
+
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 
     fn collect(&mut self) -> Result<Value> {
@@ -153,54 +211,147 @@ impl Collector for TemplateCollector {
     }
 }
 
-/// Reads one database for one template, for as long as the config lasts.
+/// When one discover block runs next, and how long it waits after failing.
+struct DiscoverAt {
+    at: Instant,
+    retry: Duration,
+}
+
+/// When one query runs next, and its running totals.
+struct QueryAt {
+    at: Instant,
+    totals: Totals,
+}
+
+/// Where a database's task is with what it was told, carried over when it's told
+/// something new as much as what it does is the same.
+struct Schedule {
+    work: TemplateWork,
+    every: Duration,
+    discover: Vec<DiscoverAt>,
+    queries: Vec<QueryAt>,
+}
+
+impl Schedule {
+    fn new((work, every): Told, now: Instant, before: Option<Self>) -> Self {
+        let mut before = before;
+        let discover = work
+            .discover
+            .iter()
+            .map(|discover| {
+                // The same block keeps its place; a new or changed one runs now.
+                let same = before.as_mut().and_then(|before| {
+                    let index = before
+                        .work
+                        .discover
+                        .iter()
+                        .position(|old| old == discover)?;
+                    Some(std::mem::replace(
+                        &mut before.discover[index],
+                        DiscoverAt {
+                            at: now,
+                            retry: FIRST_RETRY,
+                        },
+                    ))
+                });
+                same.unwrap_or(DiscoverAt {
+                    at: now,
+                    retry: FIRST_RETRY,
+                })
+            })
+            .collect();
+        let queries = work
+            .queries
+            .iter()
+            .map(|query| {
+                let interval = query.interval.unwrap_or(every);
+                let same = before.as_mut().and_then(|before| {
+                    let index = before
+                        .work
+                        .queries
+                        .iter()
+                        .position(|old| old.key == query.key && old.sql == query.sql)?;
+                    let kept = std::mem::replace(
+                        &mut before.queries[index],
+                        QueryAt {
+                            at: now,
+                            totals: Totals::default(),
+                        },
+                    );
+                    let old = before.work.queries[index].interval.unwrap_or(before.every);
+                    // Its totals carry on; it keeps its time unless that changed.
+                    let at = match old == interval {
+                        true => kept.at,
+                        false => now + jitter(interval.min(every)),
+                    };
+                    Some(QueryAt {
+                        at,
+                        totals: kept.totals,
+                    })
+                });
+                // A new one starts at a random point in its first interval, as
+                // samples do.
+                same.unwrap_or_else(|| QueryAt {
+                    at: now + jitter(interval.min(every)),
+                    totals: Totals::default(),
+                })
+            })
+            .collect();
+        Self {
+            work,
+            every,
+            discover,
+            queries,
+        }
+    }
+}
+
+/// Reads one database for whatever templates have it read, for as long as the
+/// config has it read, taking each change of what it's told as it comes.
 ///
 /// While the database doesn't answer, nothing is run: it's tried once each time a
 /// wait runs out, the waits growing to [`MAX_RETRY`], and `up` says so. Once it
 /// answers, and whenever it has to be connected to again, as after a restart,
 /// discovery runs at once. A discover block that fails is tried again sooner than
 /// its interval. With nothing due for a while, the connection is checked every
-/// `every`, so `up` is always as recent as a sample.
+/// sample, so `up` is always as recent as a sample.
 async fn run(
-    work: TemplateWork,
+    mut told: watch::Receiver<Told>,
     database: String,
     mut session: Session,
-    every: Duration,
     read: Arc<Mutex<Read>>,
 ) {
     let start = Instant::now();
-    let mut discover_at = vec![start; work.discover.len()];
-    let mut discover_retry = vec![FIRST_RETRY; work.discover.len()];
-    // Queries start at a random point in their first interval, as samples do.
-    let mut query_at: Vec<Instant> = work
-        .queries
-        .iter()
-        .map(|query| start + jitter(query.interval.unwrap_or(every).min(every)))
-        .collect();
-    let mut totals: Vec<Totals> = work.queries.iter().map(|_| Totals::default()).collect();
+    let mut schedule = Schedule::new(told.borrow_and_update().clone(), start, None);
     let mut found = Map::new();
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
     let mut connections = 0;
     let mut retry_at = start;
     let mut retry = FIRST_RETRY;
     let mut check_at = start;
-    let key = (work.template.clone(), database.clone());
 
     loop {
         let now = Instant::now();
+        let Schedule {
+            work,
+            every,
+            discover: discover_at,
+            queries: query_at,
+        } = &mut schedule;
+        let every = *every;
+        let key = (work.template.clone(), database.clone());
         let mut discovered_now = false;
         let mut rows = Vec::new();
         // One try at reaching it each time the wait runs out, whatever's due.
         let reachable = session.is_up() || {
-            let tried = now >= retry_at;
-            if tried {
+            if now >= retry_at {
                 match session.open(TIMEOUT).await {
                     Ok(()) => {
                         retry = FIRST_RETRY;
                         errors.remove(CONNECTING);
                     }
                     Err(error) => {
-                        note(&work, &database, CONNECTING, &error, &mut errors);
+                        note(work, &database, CONNECTING, &error, &mut errors);
                         retry_at = Instant::now() + retry;
                         retry = (retry * 2).min(MAX_RETRY);
                     }
@@ -213,10 +364,10 @@ async fn run(
             // Connected anew, so it may have restarted: discover again, now.
             if session.connections() != connections {
                 connections = session.connections();
-                discover_at.iter_mut().for_each(|at| *at = now);
+                discover_at.iter_mut().for_each(|block| block.at = now);
             }
-            for (index, discover) in work.discover.iter().enumerate() {
-                if discover_at[index] > now || !session.is_up() {
+            for (block, discover) in discover_at.iter_mut().zip(&work.discover) {
+                if block.at > now || !session.is_up() {
                     continue;
                 }
                 match session.run(&discover.sql, TIMEOUT).await {
@@ -224,36 +375,36 @@ async fn run(
                         found.extend(discovered(&rows));
                         discovered_now = true;
                         errors.remove(&discover.key);
-                        discover_at[index] = now + discover.interval;
-                        discover_retry[index] = FIRST_RETRY;
+                        block.at = now + discover.interval;
+                        block.retry = FIRST_RETRY;
                     }
                     Err(error) => {
-                        note(&work, &database, &discover.key, &error, &mut errors);
+                        note(work, &database, &discover.key, &error, &mut errors);
                         // Sooner than its interval, as what it finds is waited on.
-                        discover_at[index] = now + discover_retry[index].min(discover.interval);
-                        discover_retry[index] = (discover_retry[index] * 2).min(MAX_RETRY);
+                        block.at = now + block.retry.min(discover.interval);
+                        block.retry = (block.retry * 2).min(MAX_RETRY);
                     }
                 }
                 check_at = now + every;
             }
-            for (index, query) in work.queries.iter().enumerate() {
-                if query_at[index] > now || !session.is_up() {
+            for (at, query) in query_at.iter_mut().zip(&work.queries) {
+                if at.at > now || !session.is_up() {
                     continue;
                 }
-                query_at[index] = now + query.interval.unwrap_or(every);
+                at.at = now + query.interval.unwrap_or(every);
                 match session.run(&query.sql, TIMEOUT).await {
                     Ok(read) => {
-                        rows.extend(metric_rows(&read, query, &database, &mut totals[index]));
+                        rows.extend(metric_rows(&read, query, &database, &mut at.totals));
                         errors.remove(&query.key);
                     }
-                    Err(error) => note(&work, &database, &query.key, &error, &mut errors),
+                    Err(error) => note(work, &database, &query.key, &error, &mut errors),
                 }
                 check_at = now + every;
             }
             // Nothing ran for a while, so see that it still answers.
             if now >= check_at && session.is_up() {
                 if let Err(error) = session.run(ALIVE, TIMEOUT).await {
-                    note(&work, &database, CONNECTING, &error, &mut errors);
+                    note(work, &database, CONNECTING, &error, &mut errors);
                 }
                 check_at = now + every;
             }
@@ -283,15 +434,26 @@ async fn run(
         let next = match session.is_up() {
             true => discover_at
                 .iter()
-                .chain(&query_at)
-                .chain([&check_at])
+                .map(|block| block.at)
+                .chain(query_at.iter().map(|query| query.at))
+                .chain([check_at])
                 .min()
-                .copied()
                 .unwrap_or(check_at),
             // Nothing runs until it answers again.
             false => retry_at,
         };
-        sleep_until(next).await;
+        tokio::select! {
+            () = sleep_until(next) => {}
+            changed = told.changed() => {
+                if changed.is_err() {
+                    // The collector's gone.
+                    return;
+                }
+                let now = Instant::now();
+                let new = told.borrow_and_update().clone();
+                schedule = Schedule::new(new, now, Some(schedule));
+            }
+        }
     }
 }
 
@@ -500,6 +662,53 @@ mod tests {
                 .as_array()
                 .is_some_and(|rows| rows.iter().any(|row| row["up"] == 1))
         });
+    }
+
+    #[test]
+    fn new_work_keeps_the_connection_what_was_found_and_running_totals() {
+        let Some(definitions) = real() else {
+            return;
+        };
+        let every = Duration::from_millis(200);
+        let mut collector = TemplateCollector::new(&[work("main")], &definitions, every).unwrap();
+        collect_until(&mut collector, |output| {
+            output["template.pg"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row.get("commits").is_some()))
+        });
+
+        // Discovery found a version, say, and the server sends a query more.
+        let mut more = work("main");
+        more.queries.push(QueryWork {
+            key: "sessions".to_string(),
+            sql: "SELECT count(*) AS sessions FROM pg_stat_activity".to_string(),
+            interval: None,
+            labels: Vec::new(),
+            totals: Vec::new(),
+            omit: Vec::new(),
+        });
+        collector.update(&[more], &definitions, every).unwrap();
+        let after = collect_until(&mut collector, |output| {
+            output["template.pg"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row.get("sessions").is_some()))
+        });
+        let rows = after["template.pg"].as_array().unwrap();
+        // The same query's totals carried on, so it's never without its change,
+        // and nothing was discovered again, as the connection's the same.
+        assert!(
+            rows.iter()
+                .filter(|row| row.get("backends").is_some())
+                .all(|row| row.get("commits").is_some()),
+            "{rows:?}"
+        );
+        assert!(after.get(DISCOVERED).is_none(), "{after}");
+
+        // Work no longer sent stops, and says nothing more.
+        collector.update(&[], &definitions, every).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        collector.collect().unwrap();
+        assert_eq!(collector.collect().unwrap(), Value::Null);
     }
 
     #[test]

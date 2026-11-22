@@ -84,8 +84,33 @@ impl Local<'static> {
     }
 }
 
-/// Builds everything a config turns on.
-pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn Collector + Send>>> {
+/// What one collector was made from, so a new config that says the same keeps it,
+/// with whatever it holds, such as connections and running totals.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Made {
+    /// The config's settings for it.
+    Settings {
+        name: String,
+        settings: Box<CollectorSettings>,
+        interval: Duration,
+    },
+    /// What templates have it read, which a new config changes in place.
+    Templates,
+    /// The agent's report on itself, which never changes.
+    OwnUsage,
+}
+
+/// The collectors that share the process list, which are made again together.
+const SHARE_PROCESSES: [&str; 2] = ["processes", "top_processes"];
+
+/// Everything a config turns on, in order, each with what it's made from, and
+/// built only if `keeping`, what the collectors running now were made from, has
+/// nothing made the same: one that does is kept, so it's `None` here. Templates are
+/// kept whenever they're running, as they take new work in place.
+pub type Plan = Vec<(Made, Option<Box<dyn Collector + Send>>)>;
+
+/// Builds what a config turns on that isn't running already. See [`Plan`].
+pub fn build_all(config: &AgentConfig, local: Local<'_>, keeping: &[Made]) -> Result<Plan> {
     let enabled = |name: &str| {
         config
             .collectors
@@ -98,20 +123,46 @@ pub fn build_all(config: &AgentConfig, local: Local<'_>) -> Result<Vec<Box<dyn C
         files: enabled("processes"),
     };
     let interval = config.interval;
-    let mut built: Vec<Box<dyn Collector + Send>> = config
+    let made: Vec<Made> = config
         .collectors
         .iter()
         .filter(|(_, settings)| settings.enabled)
-        .map(|(name, settings)| build(name, settings, local, interval, &mut processes))
-        .collect::<Result<_>>()?;
-    if !config.templates.is_empty() {
-        built.push(Box::new(TemplateCollector::new(
-            &config.templates,
-            local.databases,
+        .map(|(name, settings)| Made::Settings {
+            name: name.clone(),
+            settings: Box::new(settings.clone()),
             interval,
-        )?));
+        })
+        .collect();
+    // Those sharing the process list share one, so they're kept only together.
+    let sharing = |made: &Made| matches!(made, Made::Settings { name, .. } if SHARE_PROCESSES.contains(&name.as_str()));
+    let shared_now: Vec<&Made> = made.iter().filter(|made| sharing(made)).collect();
+    let shared_before: Vec<&Made> = keeping.iter().filter(|made| sharing(made)).collect();
+    let keep_shared = shared_now == shared_before;
+
+    let mut plan: Plan = Vec::with_capacity(made.len() + 1);
+    for made in made {
+        let kept = keeping.contains(&made) && (!sharing(&made) || keep_shared);
+        let Made::Settings { name, settings, .. } = &made else {
+            continue;
+        };
+        let built = match kept {
+            true => None,
+            false => Some(build(name, settings, local, interval, &mut processes)?),
+        };
+        plan.push((made, built));
     }
-    Ok(built)
+    if !config.templates.is_empty() {
+        let built: Option<Box<dyn Collector + Send>> = match keeping.contains(&Made::Templates) {
+            true => None,
+            false => Some(Box::new(TemplateCollector::new(
+                &config.templates,
+                local.databases,
+                interval,
+            )?)),
+        };
+        plan.push((Made::Templates, built));
+    }
+    Ok(plan)
 }
 
 /// The process list, read once a sample for both collectors that use it, once the
@@ -505,7 +556,9 @@ mod tests {
         );
 
         assert_eq!(
-            build_all(&config(collectors), Local::none()).unwrap().len(),
+            build_all(&config(collectors), Local::none(), &[])
+                .unwrap()
+                .len(),
             supported().len()
         );
     }
@@ -513,10 +566,54 @@ mod tests {
     #[test]
     fn disabled_collectors_are_left_out() {
         let collectors = json!({ "cpu": {}, "memory": { "enabled": false } });
-        let built = build_all(&config(collectors), Local::none()).unwrap();
+        let built = build_all(&config(collectors), Local::none(), &[]).unwrap();
 
         assert_eq!(built.len(), 1);
-        assert_eq!(built[0].name(), "cpu");
+        assert_eq!(built[0].1.as_ref().unwrap().name(), "cpu");
+    }
+
+    #[test]
+    fn only_what_a_new_config_changes_is_built_again() {
+        let before =
+            config(json!({ "cpu": {}, "disk": { "mount_points": ["/"] }, "processes": {} }));
+        let keeping: Vec<Made> = build_all(&before, Local::none(), &[])
+            .unwrap()
+            .into_iter()
+            .map(|(made, _)| made)
+            .collect();
+        let built = |collectors: Value| {
+            let plan = build_all(&config(collectors), Local::none(), &keeping).unwrap();
+            plan.iter()
+                .filter(|(_, built)| built.is_some())
+                .map(|(made, _)| match made {
+                    Made::Settings { name, .. } => name.clone(),
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The same config builds nothing.
+        assert!(
+            built(json!({ "cpu": {}, "disk": { "mount_points": ["/"] }, "processes": {} }))
+                .is_empty()
+        );
+        // A changed setting builds that one again.
+        assert_eq!(
+            built(json!({ "cpu": {}, "disk": { "mount_points": ["/data"] }, "processes": {} })),
+            ["disk"]
+        );
+        // Those sharing the process list are built again together.
+        assert_eq!(
+            built(
+                json!({ "cpu": {}, "disk": { "mount_points": ["/"] }, "processes": {}, "top_processes": {} })
+            ),
+            ["processes", "top_processes"]
+        );
+        // A new interval builds everything again, as they run on it.
+        let mut slower = config(json!({ "cpu": {} }));
+        slower.interval = Duration::from_secs(60);
+        let plan = build_all(&slower, Local::none(), &keeping).unwrap();
+        assert!(plan[0].1.is_some());
     }
 
     fn process(name: &str, exe: Option<&str>) -> RunningProcess {
@@ -732,6 +829,6 @@ mod tests {
 
     #[test]
     fn an_unknown_collector_is_an_error() {
-        assert!(build_all(&config(json!({ "nope": {} })), Local::none()).is_err());
+        assert!(build_all(&config(json!({ "nope": {} })), Local::none(), &[]).is_err());
     }
 }

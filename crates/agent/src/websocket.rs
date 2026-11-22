@@ -55,7 +55,7 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const DEFAULT_FACTS_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// A config from the server, waiting to be applied.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ConfigUpdate {
     pub version: String,
     pub config: AgentConfig,

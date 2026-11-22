@@ -35,4 +35,10 @@ pub trait Collector {
     fn spreads(&self) -> bool {
         false
     }
+
+    /// It, as what it is, for a collector a new config changes in place rather than
+    /// building again.
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
 }

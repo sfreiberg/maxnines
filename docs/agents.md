@@ -73,6 +73,12 @@ Every rule that matches a host applies, lowest priority first, so a higher prior
 wins. A rule can be limited to some operating systems, by ticking them under
 **Applies to**, and to hosts whose facts match conditions.
 
+When what an agent's sent changes, it changes only what's different: a collector
+whose settings are the same carries on with what it holds, such as connections and
+running totals, and each database a template reads keeps its connection, what
+discovery found, and the totals of each query that's the same. A changed interval
+starts every collector again.
+
 ### Built-in rules
 
 Some rules come with MaxNines, and are marked **Comes with MaxNines**:
