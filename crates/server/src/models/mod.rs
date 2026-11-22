@@ -53,6 +53,7 @@ mod template_counters;
 mod template_discovery;
 mod template_fill;
 mod template_fill_version;
+mod template_items;
 mod template_metric;
 mod template_notice;
 mod template_query;

@@ -582,8 +582,10 @@ impl Template {
         if let Some(version) = &self.min_version {
             check_version(version, &mut |message| say(top, "min_version", message));
         }
-        for old in &self.renamed_from {
-            if !is_key(old) {
+        for (index, old) in self.renamed_from.iter().enumerate() {
+            if self.renamed_from[..index].contains(old) {
+                say(top, "renamed_from", format!("{old:?} is listed twice"));
+            } else if !is_key(old) {
                 say(top, "renamed_from", format!("{old:?} {KEY_RULE}"));
             } else if *old == self.key {
                 say(
@@ -593,9 +595,11 @@ impl Template {
                 );
             }
         }
-        for service in &self.services {
+        for (index, service) in self.services.iter().enumerate() {
             if service.trim().is_empty() {
                 say(top, "services", "can't have an empty name".to_string());
+            } else if self.services[..index].contains(service) {
+                say(top, "services", format!("{service:?} is listed twice"));
             }
         }
 
@@ -898,6 +902,11 @@ fn check_counters(index: usize, counters: &Counters, say: &mut dyn FnMut(Place, 
     }
     if let Some(since) = &counters.since {
         check_version(since, &mut |message| say(place, "since", message));
+    }
+    for (index, instance) in counters.exclude.iter().enumerate() {
+        if counters.exclude[..index].contains(instance) {
+            say(place, "exclude", format!("{instance:?} is listed twice"));
+        }
     }
     for name in counters.groups.keys() {
         if !is_key(name) {

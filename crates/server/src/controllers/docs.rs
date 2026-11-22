@@ -16,7 +16,37 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(BASE_PATH, get(first))
         .route(&format!("{BASE_PATH}/search"), get(search))
+        .route(&format!("{BASE_PATH}/examples/{{name}}"), get(example))
         .route(&format!("{BASE_PATH}/{{name}}"), get(show))
+}
+
+/// An example file the pages link to, as text to read or save.
+async fn example(
+    State(state): State<AppState>,
+    token: CsrfToken,
+    Path(name): Path<String>,
+) -> Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    match crate::docs::example(&name) {
+        Some(text) => (
+            [
+                (
+                    header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8".to_string(),
+                ),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("inline; filename=\"{name}\""),
+                ),
+            ],
+            text,
+        )
+            .into_response(),
+        None => Page::new(&state, &token, "errors/not_found.html")
+            .with_status(StatusCode::NOT_FOUND)
+            .render(),
+    }
 }
 
 async fn first(State(state): State<AppState>, token: CsrfToken) -> Response {

@@ -1,8 +1,8 @@
-# IIS template, written in HCL with CEL for anything dynamic.
+# An example template for IIS, written in HCL with CEL for anything dynamic.
 #
-# Windows performance counters plus one registry read. Nothing in Rust is
-# specific to IIS: this file is the whole integration, the same way a user
-# would add an app MaxNines doesn't know.
+# Windows performance counters plus one registry read: the whole of it is
+# this file, the way you'd write one for an app MaxNines doesn't know. It's
+# an example of the format, not a template that comes with MaxNines.
 #
 # How counters turn into metrics:
 #   - Each entry under `metrics` becomes a metric named iis.<entry>. A plain
@@ -21,10 +21,7 @@
 # Choosing: `since = "8.0"` means from IIS 8.0 onwards; `when` is CEL over
 # what discovery found.
 #
-# Everything here can be changed or turned off from the template's page.
-#
-# Counter names to check on WinTest before building:
-#   typeperf -qx "W3SVC_W3WP" | findstr /i "500 WebSocket"
+# To see which counters a host has: typeperf -qx "W3SVC_W3WP"
 
 template "iis" {
   name        = "IIS"
@@ -46,7 +43,7 @@ template "iis" {
     }
   }
 
-  # Watched by the OS template's own "Service stopped" alert.
+  # For the host's own "Service stopped" alert to watch.
   services = ["W3SVC", "WAS"]
 
   # ---------------------------------------------------------------------------

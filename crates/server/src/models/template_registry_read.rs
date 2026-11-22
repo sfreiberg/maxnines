@@ -9,7 +9,6 @@ pub struct Model {
     pub template_id: i64,
     pub key: String,
     pub position: i32,
-    pub value_names: Json,
     /// The built-in part this is someone's own copy of, if it's one.
     pub replaces_id: Option<i64>,
 }

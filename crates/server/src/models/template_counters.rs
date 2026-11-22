@@ -13,8 +13,6 @@ pub struct Model {
     pub label: Option<String>,
     pub pattern: Option<String>,
     pub instance: Option<String>,
-    pub exclude: Option<Json>,
-    pub groups: Option<Json>,
     pub join_object: Option<String>,
     pub join_pattern: Option<String>,
     pub when_condition: Option<String>,

@@ -16,7 +16,6 @@ pub struct Model {
     pub description: Option<String>,
     pub value: Option<String>,
     pub since: Option<String>,
-    pub states: Option<Json>,
     /// The built-in part this is someone's own copy of, if it's one.
     pub replaces_id: Option<i64>,
 }

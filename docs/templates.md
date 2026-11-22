@@ -228,6 +228,38 @@ notice "cannot_see_sessions" {
 }
 ```
 
+## Examples
+
+Two full templates, to read, copy from and import. They're examples of the format,
+not templates that come with MaxNines.
+
+**[postgres.hcl](examples/postgres.hcl)**, for PostgreSQL, is all SQL:
+
+- `database = "postgres"`, so it's for each PostgreSQL database in an agent's config;
+- `discover` finds the version, whether the server is a primary or a replica, and
+  whether it archives WAL, which the queries' `when` and `since` then pick by;
+- a query each for sessions, throughput, checkpoints, WAL, replication from both
+  ends, replication slots, archiving and subscriptions. `fill` covers the views that
+  moved between versions, such as checkpoints in 17, so each query is written once;
+- `labels` give a series to each standby, slot and subscription;
+- the slow queries, database and WAL sizes, ship with `enabled = false`;
+- its alerts use the short names, such as `lag > duration('30s')` and `!receiving`,
+  and `when` keeps the replica's alerts to replicas.
+
+**[iis.hcl](examples/iis.hcl)**, for IIS, is Windows performance counters and one
+registry read, with nothing about IIS anywhere else:
+
+- `service = "W3SVC"`, so it's for each Windows host with IIS's web service;
+- `discover` reads the version from the registry and notes which counter sets the
+  host has, so ASP.NET's counters are only read where ASP.NET is;
+- `label` gives each site and each application pool its own series, and `pattern`
+  takes the pool's name out of a worker process's, leaving out the process ID that
+  changes on every recycle;
+- `join` matches a pool's memory and CPU, which Windows only counts per process, to
+  the pool by process ID;
+- `value = "value == 3"` makes a yes or no of a pool's state for alerting, and
+  `states` gives each state its word.
+
 ## Changing a template's alerts
 
 Open the alert from the template's page, or from **Settings > Alert rules**, where it

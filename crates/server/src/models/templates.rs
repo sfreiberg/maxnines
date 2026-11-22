@@ -12,14 +12,13 @@
 use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Context, Result, bail};
-use indexmap::IndexMap;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
     TransactionTrait,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 use maxnines_protocol::templates::{
     Alert, Counters, Discover, Fill, Join, Metric, Notice, Query, RegistryRead, Target, Template,
@@ -33,8 +32,8 @@ use super::alerting::{
 use super::audit::record_change;
 use super::{
     Database, alert, alert_rule, maintenance_window, name_key, name_taken_or, silence, template,
-    template_counters, template_discovery, template_fill, template_fill_version, template_metric,
-    template_notice, template_query, template_registry_read,
+    template_counters, template_discovery, template_fill, template_fill_version, template_items,
+    template_metric, template_notice, template_query, template_registry_read,
 };
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::audit::{Kind, Snapshot};
@@ -131,28 +130,6 @@ impl TemplateAlert {
     }
 }
 
-fn text_list(value: &Option<Value>) -> Vec<String> {
-    value
-        .as_ref()
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-        .unwrap_or_default()
-}
-
-fn text_map(value: &Option<Value>) -> IndexMap<String, String> {
-    value
-        .as_ref()
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-        .unwrap_or_default()
-}
-
-fn list_json(values: &[String]) -> Option<Value> {
-    (!values.is_empty()).then(|| json!(values))
-}
-
-fn map_json(values: &IndexMap<String, String>) -> Option<Value> {
-    (!values.is_empty()).then(|| json!(values))
-}
-
 /// A length of time a template wrote, as rows keep it. Saving a template checks
 /// they can all be read.
 fn secs(text: &Option<String>) -> Result<Option<i64>> {
@@ -169,8 +146,12 @@ fn length(secs: Option<i64>) -> Option<String> {
         .map(format_duration)
 }
 
-fn to_metric(row: template_metric::Model) -> Metric {
-    Metric {
+async fn to_metric<C: ConnectionTrait>(
+    connection: &C,
+    row: template_metric::Model,
+) -> Result<Metric> {
+    Ok(Metric {
+        states: template_items::metric_states::read(connection, row.id).await?,
         key: row.key,
         counter: row.counter,
         unit: row.unit,
@@ -178,8 +159,18 @@ fn to_metric(row: template_metric::Model) -> Metric {
         description: row.description,
         value: row.value,
         since: row.since,
-        states: text_map(&row.states),
+    })
+}
+
+async fn to_metrics<C: ConnectionTrait>(
+    connection: &C,
+    rows: Vec<template_metric::Model>,
+) -> Result<Vec<Metric>> {
+    let mut metrics = Vec::with_capacity(rows.len());
+    for row in rows {
+        metrics.push(to_metric(connection, row).await?);
     }
+    Ok(metrics)
 }
 
 /// The template a row and its parts' rows say. Copies of parts are someone's own,
@@ -202,18 +193,24 @@ async fn read_template<C: ConnectionTrait>(
         .all(connection)
         .await
         .context("loading a template's registry reads")?;
-    let discover = discover.map(|found| Discover {
-        interval: length(found.interval_secs),
-        sql: found.sql,
-        registry: registry
-            .into_iter()
-            .map(|read| RegistryRead {
-                key: read.key,
-                values: text_map(&Some(read.value_names)),
+    let discover = match discover {
+        Some(found) => {
+            let mut reads = Vec::with_capacity(registry.len());
+            for read in registry {
+                reads.push(RegistryRead {
+                    values: template_items::registry_values::read(connection, read.id).await?,
+                    key: read.key,
+                });
+            }
+            Some(Discover {
+                interval: length(found.interval_secs),
+                sql: found.sql,
+                registry: reads,
+                counter_sets: template_items::counter_sets::read(connection, found.id).await?,
             })
-            .collect(),
-        counter_sets: text_map(&found.counter_sets),
-    });
+        }
+        None => None,
+    };
 
     let notices = template_notice::Entity::find()
         .filter(template_notice::Column::TemplateId.eq(id))
@@ -278,9 +275,9 @@ async fn read_template<C: ConnectionTrait>(
             since: query.since,
             when: query.when_condition,
             enabled: query.enabled,
-            labels: text_list(&query.labels),
+            labels: template_items::query_labels::read(connection, query.id).await?,
             fills,
-            metrics: metrics.into_iter().map(to_metric).collect(),
+            metrics: to_metrics(connection, metrics).await?,
         });
     }
 
@@ -306,8 +303,8 @@ async fn read_template<C: ConnectionTrait>(
             label: block.label,
             pattern: block.pattern,
             instance: block.instance,
-            exclude: text_list(&block.exclude),
-            groups: text_map(&block.groups),
+            exclude: template_items::counters_excludes::read(connection, block.id).await?,
+            groups: template_items::counters_groups::read(connection, block.id).await?,
             join: match (block.join_object, block.join_pattern) {
                 (None, None) => None,
                 (object, pattern) => Some(Join {
@@ -319,7 +316,7 @@ async fn read_template<C: ConnectionTrait>(
             since: block.since,
             interval: length(block.interval_secs),
             enabled: block.enabled,
-            metrics: metrics.into_iter().map(to_metric).collect(),
+            metrics: to_metrics(connection, metrics).await?,
         });
     }
 
@@ -351,9 +348,9 @@ async fn read_template<C: ConnectionTrait>(
         description: row.description.clone(),
         target,
         min_version: row.min_version.clone(),
-        renamed_from: text_list(&row.renamed_from),
+        renamed_from: template_items::renames::read(connection, row.id).await?,
         enabled: row.enabled,
-        services: text_list(&row.services),
+        services: template_items::services::read(connection, row.id).await?,
         discover,
         notices,
         queries,
@@ -482,10 +479,10 @@ async fn write_metrics<C: ConnectionTrait>(
             description: metric.description.clone(),
             value: metric.value.clone(),
             since: metric.since.clone(),
-            states: map_json(&metric.states),
             replaces_id: None,
         };
-        put_part!(template_metric, connection, expected, existing);
+        let metric_id = put_part!(template_metric, connection, expected, existing);
+        template_items::metric_states::write(connection, metric_id, &metric.states).await?;
     }
     drop_parts!(template_metric, connection, left);
     Ok(())
@@ -501,6 +498,8 @@ async fn write_parts<C: ConnectionTrait>(
     id: i64,
     template: &Template,
 ) -> Result<()> {
+    template_items::renames::write(connection, id, &template.renamed_from).await?;
+    template_items::services::write(connection, id, &template.services).await?;
     // Discovery, of which a template has one.
     let existing = template_discovery::Entity::find()
         .filter(template_discovery::Column::TemplateId.eq(id))
@@ -515,10 +514,11 @@ async fn write_parts<C: ConnectionTrait>(
                 template_id: id,
                 interval_secs: secs(&discover.interval)?,
                 sql: discover.sql.clone(),
-                counter_sets: map_json(&discover.counter_sets),
                 replaces_id: None,
             };
-            put_part!(template_discovery, connection, expected, existing);
+            let discovery = put_part!(template_discovery, connection, expected, existing);
+            template_items::counter_sets::write(connection, discovery, &discover.counter_sets)
+                .await?;
         }
         (None, Some(row)) => {
             template_discovery::Entity::delete_by_id(row.id)
@@ -550,10 +550,10 @@ async fn write_parts<C: ConnectionTrait>(
             template_id: id,
             key: read.key.clone(),
             position: i32::try_from(position)?,
-            value_names: json!(read.values),
             replaces_id: None,
         };
-        put_part!(template_registry_read, connection, expected, existing);
+        let read_id = put_part!(template_registry_read, connection, expected, existing);
+        template_items::registry_values::write(connection, read_id, &read.values).await?;
     }
     drop_parts!(template_registry_read, connection, left);
 
@@ -603,10 +603,10 @@ async fn write_parts<C: ConnectionTrait>(
             when_condition: query.when.clone(),
             enabled: query.enabled,
             enabled_choice: existing.as_ref().and_then(|row| row.enabled_choice),
-            labels: list_json(&query.labels),
             replaces_id: None,
         };
         let query_id = put_part!(template_query, connection, expected, existing);
+        template_items::query_labels::write(connection, query_id, &query.labels).await?;
 
         let mut fills_left: HashMap<String, template_fill::Model> = template_fill::Entity::find()
             .filter(template_fill::Column::QueryId.eq(query_id))
@@ -678,8 +678,6 @@ async fn write_parts<C: ConnectionTrait>(
             label: counters.label.clone(),
             pattern: counters.pattern.clone(),
             instance: counters.instance.clone(),
-            exclude: list_json(&counters.exclude),
-            groups: map_json(&counters.groups),
             join_object: counters.join.as_ref().map(|join| join.object.clone()),
             join_pattern: counters.join.as_ref().map(|join| join.pattern.clone()),
             when_condition: counters.when.clone(),
@@ -690,6 +688,9 @@ async fn write_parts<C: ConnectionTrait>(
             replaces_id: None,
         };
         let counters_id = put_part!(template_counters, connection, expected, existing);
+        template_items::counters_excludes::write(connection, counters_id, &counters.exclude)
+            .await?;
+        template_items::counters_groups::write(connection, counters_id, &counters.groups).await?;
         write_metrics(connection, &counters.metrics, None, Some(counters_id)).await?;
     }
     drop_parts!(template_counters, connection, left);
@@ -1129,8 +1130,6 @@ fn described(row: &mut template::ActiveModel, template: &Template) {
     row.target_kind = Set(template.target.as_ref().map(|t| t.kind().to_string()));
     row.target = Set(template.target.as_ref().map(Target::value));
     row.min_version = Set(template.min_version.clone());
-    row.renamed_from = Set(list_json(&template.renamed_from));
-    row.services = Set(list_json(&template.services));
 }
 
 /// A template's name in use by another template, which is the one unique index on

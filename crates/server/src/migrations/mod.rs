@@ -199,15 +199,11 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     let mut discoveries = table("template_discoveries", &template);
     discoveries
         .col(part("interval_secs").big_integer())
-        .col(part("sql").text())
-        .col(json(backend, Alias::new("counter_sets")));
+        .col(part("sql").text());
     manager.create_table(discoveries).await?;
 
     let mut registry = table("template_registry_reads", &template);
-    registry
-        .col(key())
-        .col(position())
-        .col(json(backend, Alias::new("value_names")).not_null());
+    registry.col(key()).col(position());
     manager.create_table(registry).await?;
 
     let mut notices = table("template_notices", &template);
@@ -227,8 +223,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("since").string_len(64))
         .col(part("when_condition").text())
         .col(part("enabled").boolean().not_null())
-        .col(part("enabled_choice").boolean())
-        .col(json(backend, Alias::new("labels")));
+        .col(part("enabled_choice").boolean());
     manager.create_table(queries).await?;
 
     let mut fills = table("template_fills", &[("query_id", "template_queries", true)]);
@@ -253,8 +248,6 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("label").string_len(64))
         .col(part("pattern").text())
         .col(part("instance").string_len(255))
-        .col(json(backend, Alias::new("exclude")))
-        .col(json(backend, Alias::new("groups")))
         .col(part("join_object").string_len(255))
         .col(part("join_pattern").text())
         .col(part("when_condition").text())
@@ -280,9 +273,81 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("total").boolean().not_null())
         .col(part("description").text())
         .col(part("value").text())
-        .col(part("since").string_len(64))
-        .col(json(backend, Alias::new("states")));
+        .col(part("since").string_len(64));
     manager.create_table(metrics).await?;
+
+    // The short lists and maps of a template and its parts, a row to an item: what
+    // it belongs to, its name, where it comes, and for a map what the name stands for.
+    for (name, parent, of, item, value) in [
+        (
+            "template_renames",
+            "template_id",
+            "templates",
+            "old_key",
+            None,
+        ),
+        (
+            "template_services",
+            "template_id",
+            "templates",
+            "service",
+            None,
+        ),
+        (
+            "template_counter_sets",
+            "discovery_id",
+            "template_discoveries",
+            "key",
+            Some("counter_set"),
+        ),
+        (
+            "template_registry_values",
+            "registry_read_id",
+            "template_registry_reads",
+            "key",
+            Some("value_name"),
+        ),
+        (
+            "template_query_labels",
+            "query_id",
+            "template_queries",
+            "label",
+            None,
+        ),
+        (
+            "template_counters_excludes",
+            "counters_id",
+            "template_counters",
+            "instance",
+            None,
+        ),
+        (
+            "template_counters_groups",
+            "counters_id",
+            "template_counters",
+            "key",
+            Some("counter"),
+        ),
+        (
+            "template_metric_states",
+            "metric_id",
+            "template_metrics",
+            "number",
+            Some("word"),
+        ),
+    ] {
+        let mut items = table(name, &[(parent, of, true)]);
+        items
+            .col(exact_text(backend, Alias::new(item), 255).not_null())
+            .col(position());
+        if let Some(value) = value {
+            items.col(part(value).text().not_null());
+        }
+        manager.create_table(items).await?;
+        let index = format!("idx_{name}_parent");
+        let columns = format!("{parent}, position");
+        index_of(manager, Plain, &index, name, &columns, None).await?;
+    }
 
     for (name, table, columns) in [
         (
@@ -975,8 +1040,6 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(Templates::TargetKind).string_len(16))
             .col(ColumnDef::new(Templates::Target).string_len(255))
             .col(ColumnDef::new(Templates::MinVersion).string_len(64))
-            .col(json(backend, Templates::RenamedFrom))
-            .col(json(backend, Templates::Services))
             // What a built-in one says, hashed, so an upgrade can tell it changed.
             .col(ColumnDef::new(Templates::Fingerprint).string_len(64))
             // Whether it ships on, and what someone chose instead, if they have: until
@@ -2117,8 +2180,6 @@ enum Templates {
     TargetKind,
     Target,
     MinVersion,
-    RenamedFrom,
-    Services,
     Fingerprint,
     Enabled,
     EnabledChoice,

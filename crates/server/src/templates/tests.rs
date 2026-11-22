@@ -3,8 +3,8 @@ use serde_json::json;
 use super::*;
 use maxnines_protocol::templates::parse;
 
-const POSTGRES: &str = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
-const IIS: &str = include_str!("../../../protocol/src/templates/examples/iis.hcl");
+const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 fn no_facts() -> Value {
     json!({})

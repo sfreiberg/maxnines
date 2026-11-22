@@ -19,10 +19,6 @@ pub struct Model {
     /// The kind of database, the service, or the operating systems, comma separated.
     pub target: Option<String>,
     pub min_version: Option<String>,
-    /// Keys it had before, as a list.
-    pub renamed_from: Option<Json>,
-    /// Services the host's own alerts should watch, as a list.
-    pub services: Option<Json>,
     /// For a built-in one, a hash of what it says.
     pub fingerprint: Option<String>,
     /// Whether it ships on.

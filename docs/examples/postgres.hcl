@@ -1,7 +1,6 @@
-# PostgreSQL template, written in HCL with CEL for anything dynamic.
-#
-# A port of the agent's Rust PostgreSQL reader
-# (crates/checks/src/databases/postgres.rs), plus the alerts it needs.
+# An example template for PostgreSQL, written in HCL with CEL for anything
+# dynamic: health, load, replication and archiving, with the alerts on them.
+# It's an example of the format, not a template that comes with MaxNines.
 #
 # How a query turns into metrics:
 #   - Each numeric column becomes a metric named postgres.<column>.
@@ -17,8 +16,7 @@
 #   - `fill` picks a piece of SQL by version, so a query is written only once.
 #   - `when` is CEL over what discovery found: role, archiving and so on.
 #
-# Everything here can be changed or turned off from the template's page,
-# without editing this file. `enabled = false` ships something turned off.
+# `enabled = false` ships something turned off.
 
 template "postgres" {
   name        = "PostgreSQL"
@@ -307,7 +305,7 @@ template "postgres" {
   # `summary` is the text channels send. {{ lag }} and the like are written in
   # the metric's unit ("3m 12s", "4.2 GiB").
 
-  # postgres.up comes from the agent: false when it can't sign in.
+  # `up` is every database template's: false when the agent can't sign in.
   alert "down" {
     name             = "PostgreSQL down"
     critical         = "!up"

@@ -27,6 +27,17 @@ use syntect::util::LinesWithEndings;
 #[include = "*.md"]
 struct DocFiles;
 
+/// The example files the pages link to, served as they are.
+#[derive(RustEmbed)]
+#[folder = "../../docs/examples/"]
+struct ExampleFiles;
+
+/// An example file by its name, such as `postgres.hcl`.
+pub fn example(name: &str) -> Option<String> {
+    let file = ExampleFiles::get(name)?;
+    String::from_utf8(file.data.into_owned()).ok()
+}
+
 /// Where the pages are served, which chapter links are rewritten to.
 pub const BASE_PATH: &str = "/docs";
 
@@ -375,6 +386,14 @@ fn render(name: &str, title: &str, markdown: &str, syntaxes: &SyntaxSet) -> Resu
                             anchor => format!("{BASE_PATH}/{target}#{anchor}"),
                         })
                     }
+                    // An example file there is, which is served as it is.
+                    Some(Err(()))
+                        if dest_url
+                            .strip_prefix("examples/")
+                            .is_some_and(|file| example(file).is_some()) =>
+                    {
+                        Some(format!("{BASE_PATH}/{dest_url}"))
+                    }
                     Some(Err(())) => {
                         unusable_links.push(dest_url.to_string());
                         None
@@ -649,6 +668,10 @@ mod tests {
             chapter("[config](../crates/agent/config/agent.hcl) and [site](https://example.com)");
         assert_eq!(page.unusable_links, ["../crates/agent/config/agent.hcl"]);
         assert!(page.html.contains(r#"href="https://example.com""#));
+        // An example file under docs/examples is served, and one that isn't there isn't.
+        let page = chapter("[one](examples/postgres.hcl) and [none](examples/nope.hcl)");
+        assert_eq!(page.unusable_links, ["examples/nope.hcl"]);
+        assert!(page.html.contains(r#"href="/docs/examples/postgres.hcl""#));
     }
 
     #[test]

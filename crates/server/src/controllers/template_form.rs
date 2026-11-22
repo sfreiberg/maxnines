@@ -899,8 +899,8 @@ mod tests {
     use super::*;
     use maxnines_protocol::templates::{parse, to_hcl};
 
-    const POSTGRES: &str = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
-    const IIS: &str = include_str!("../../../protocol/src/templates/examples/iis.hcl");
+    const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+    const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
     #[test]
     fn a_template_goes_through_its_form_to_hcl_and_back_unchanged() {

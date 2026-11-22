@@ -75,8 +75,8 @@ async fn template_id(database: &Database, key: &str) -> i64 {
         .id
 }
 
-const POSTGRES: &str = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
-const IIS: &str = include_str!("../../../protocol/src/templates/examples/iis.hcl");
+const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 /// The rule in use for a template's alert, and the template's own beside it if
 /// that's a copy.
@@ -555,7 +555,7 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
 #[tokio::test]
 async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_names() {
     let server = start().await;
-    let postgres = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
+    let postgres = include_str!("../../../../docs/examples/postgres.hcl");
     let template = crate::templates::load(postgres, &json!({})).unwrap();
     server
         .state
@@ -619,7 +619,7 @@ async fn with_built_in_templates() -> TestServer {
 #[tokio::test]
 async fn the_templates_pages_show_each_templates_alerts_metrics_and_hcl() {
     let server = with_built_in_templates().await;
-    let postgres = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
+    let postgres = include_str!("../../../../docs/examples/postgres.hcl");
     let template = crate::templates::load(postgres, &json!({})).unwrap();
     let id = server
         .state
@@ -1086,7 +1086,7 @@ async fn cel_fields_get_suggestions_from_the_real_catalog() {
             .contains(r#"<script src="/assets/js/cel_complete.js""#)
     );
 
-    let postgres = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
+    let postgres = include_str!("../../../../docs/examples/postgres.hcl");
     let template = crate::templates::load(postgres, &json!({})).unwrap();
     let id = server
         .state
@@ -1715,5 +1715,29 @@ async fn a_copy_of_an_alert_a_newer_version_drops_becomes_a_rule_of_ones_own() {
             .delete_alert_rule(kept.id, crate::times::now())
             .await
             .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_documented_examples_are_served_to_read_and_import() {
+    let server = with_built_in_templates().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/docs/templates").await;
+    assert_eq!(page.status, 200);
+    for (file, text) in [("postgres.hcl", POSTGRES), ("iis.hcl", IIS)] {
+        assert!(
+            page.body
+                .contains(&format!(r#"href="/docs/examples/{file}""#)),
+            "{file}"
+        );
+        let example = browser
+            .get(&server, &format!("/docs/examples/{file}"))
+            .await;
+        assert_eq!(example.status, 200, "{file}");
+        assert_eq!(example.body, text);
+    }
+    assert_eq!(
+        browser.get(&server, "/docs/examples/nope.hcl").await.status,
+        404
     );
 }

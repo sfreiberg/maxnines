@@ -1,7 +1,7 @@
 use super::*;
 
-const POSTGRES: &str = include_str!("examples/postgres.hcl");
-const IIS: &str = include_str!("examples/iis.hcl");
+const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 fn problems(text: &str) -> Vec<String> {
     let template = parse(text).unwrap();
