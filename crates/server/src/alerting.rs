@@ -87,11 +87,16 @@ pub struct TemplateLink {
     pub id: i64,
     /// The alert's key in the template.
     pub alert: String,
-    /// The fields people changed from the template's values, which upgrades leave.
-    pub overridden: Vec<String>,
+    /// For someone's own copy of a built-in template's rule, the rule it's used in
+    /// place of.
+    pub replaces_id: Option<i64>,
+    /// Whether the template is on. Its alerts aren't checked while it's off.
+    pub template_enabled: bool,
     /// Whether it needs what only agents running the template would send, its own
     /// metrics or what its discovery finds, so it isn't checked yet.
     pub waits_for_agents: bool,
+    /// When an upgrade last changed the built-in rule this is a copy of.
+    pub original_changed_at: Option<Timestamp>,
 }
 
 impl AlertRule {
@@ -111,6 +116,16 @@ impl AlertRule {
         self.template
             .as_ref()
             .is_some_and(|template| template.waits_for_agents)
+    }
+
+    /// Whether it's checked: it's on, and if it's a template's alert, so is the
+    /// template, and it isn't waiting for agents.
+    pub fn runs(&self) -> bool {
+        self.rule.enabled
+            && self
+                .template
+                .as_ref()
+                .is_none_or(|template| template.template_enabled && !template.waits_for_agents)
     }
 
     /// See [`AlertRuleInput::watched`].

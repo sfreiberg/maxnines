@@ -1,31 +1,41 @@
-//! Templates, and the alert rules their alerts become.
+//! Templates, kept as rows: one for the template, one for each of its parts in the
+//! table for its kind, and an alert rule for each of its alerts. HCL is how
+//! templates come in and go out, and is written from the rows.
 //!
-//! A template's alert is an ordinary alert rule, which holds what's in effect: the
-//! template's values with what people changed. What they changed is kept on its own,
-//! in the rule's `overrides`, by field. A template changing, by an upgrade or by
-//! whoever owns it, only ever rewrites the template's values, and works the rule out
-//! again from them and the same overrides.
+//! A built-in template's rows belong to the server, which rewrites them as it
+//! starts. Someone changing one of its alerts makes a copy of their own: a second
+//! rule, pointing at the built-in one with `replaces_id`, which is used in its
+//! place while it's there. Putting the alert back deletes the copy. Whether a
+//! built-in template or one of its alerts is on is a flag on its own row, which
+//! starting never writes. People's own templates are the same rows, changed directly.
 
 use std::collections::BTreeSet;
 
 use anyhow::{Context, Result, bail};
+use indexmap::IndexMap;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set,
     TransactionTrait,
 };
 use serde::Serialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
-use maxnines_protocol::templates::{Alert, Template};
+use maxnines_protocol::templates::{
+    Alert, Counters, Discover, Fill, Join, Metric, Notice, Query, RegistryRead, Target, Template,
+    format_duration, parse_duration, to_hcl,
+};
 
 use super::alerting::{
     alert_rule_row, alert_rule_snapshot, delete_rule_in, load_alert_rule, record_alert_rule,
-    save_actions, save_links,
+    refuse_taken_name, save_actions, save_links, write_rule_in,
 };
 use super::audit::record_change;
-use super::{Database, alert_rule, alert_rule_channel, name_key, name_taken_or, template};
-use crate::alert_conditions::LocalMetrics;
+use super::{
+    Database, alert_rule, name_key, name_taken_or, template, template_counters, template_discovery,
+    template_fill, template_fill_version, template_metric, template_notice, template_query,
+    template_registry_read,
+};
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::audit::{Kind, Snapshot};
 use crate::templates::built_in::BuiltIn;
@@ -37,8 +47,6 @@ use crate::times::Timestamp;
 pub struct StoredTemplate {
     pub id: i64,
     pub template: Template,
-    /// Its HCL.
-    pub source: String,
     pub built_in: bool,
     pub enabled: bool,
     pub created_at: Timestamp,
@@ -47,19 +55,467 @@ pub struct StoredTemplate {
     pub upgraded_at: Option<Timestamp>,
 }
 
-fn to_stored(row: template::Model) -> Result<StoredTemplate> {
-    let template = maxnines_protocol::templates::parse(&row.source)
-        .with_context(|| format!("reading the template {:?}", row.key))?;
+impl StoredTemplate {
+    /// The template as HCL, written from its rows.
+    pub fn hcl(&self) -> String {
+        to_hcl(&self.template)
+    }
+}
+
+/// One of a template's alerts: its rule, and for a built-in template, someone's
+/// copy of it if they've made one, which is the one in use.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TemplateAlert {
+    pub key: String,
+    /// The template's own rule.
+    pub rule: AlertRule,
+    /// Someone's own copy of it.
+    pub copy: Option<AlertRule>,
+}
+
+impl TemplateAlert {
+    /// The rule in use.
+    pub fn in_use(&self) -> &AlertRule {
+        self.copy.as_ref().unwrap_or(&self.rule)
+    }
+}
+
+fn text_list(value: &Option<Value>) -> Vec<String> {
+    value
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn text_map(value: &Option<Value>) -> IndexMap<String, String> {
+    value
+        .as_ref()
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn list_json(values: &[String]) -> Option<Value> {
+    (!values.is_empty()).then(|| json!(values))
+}
+
+fn map_json(values: &IndexMap<String, String>) -> Option<Value> {
+    (!values.is_empty()).then(|| json!(values))
+}
+
+/// A length of time a template wrote, as rows keep it. Saving a template checks
+/// they can all be read.
+fn secs(text: &Option<String>) -> Result<Option<i64>> {
+    text.as_deref()
+        .map(|text| {
+            let secs = parse_duration(text).map_err(anyhow::Error::msg)?;
+            Ok(i64::try_from(secs)?)
+        })
+        .transpose()
+}
+
+fn length(secs: Option<i64>) -> Option<String> {
+    secs.and_then(|secs| u64::try_from(secs).ok())
+        .map(format_duration)
+}
+
+fn to_metric(row: template_metric::Model) -> Metric {
+    Metric {
+        key: row.key,
+        counter: row.counter,
+        unit: row.unit,
+        total: row.total,
+        description: row.description,
+        value: row.value,
+        since: row.since,
+        states: text_map(&row.states),
+    }
+}
+
+/// The template a row and its parts' rows say. Copies of parts are someone's own,
+/// and aren't the template's.
+async fn read_template<C: ConnectionTrait>(
+    connection: &C,
+    row: &template::Model,
+) -> Result<Template> {
+    let id = row.id;
+    let discover = template_discovery::Entity::find()
+        .filter(template_discovery::Column::TemplateId.eq(id))
+        .filter(template_discovery::Column::ReplacesId.is_null())
+        .one(connection)
+        .await
+        .context("loading a template's discovery")?;
+    let registry = template_registry_read::Entity::find()
+        .filter(template_registry_read::Column::TemplateId.eq(id))
+        .filter(template_registry_read::Column::ReplacesId.is_null())
+        .order_by_asc(template_registry_read::Column::Position)
+        .all(connection)
+        .await
+        .context("loading a template's registry reads")?;
+    let discover = discover.map(|found| Discover {
+        interval: length(found.interval_secs),
+        sql: found.sql,
+        registry: registry
+            .into_iter()
+            .map(|read| RegistryRead {
+                key: read.key,
+                values: text_map(&Some(read.value_names)),
+            })
+            .collect(),
+        counter_sets: text_map(&found.counter_sets),
+    });
+
+    let notices = template_notice::Entity::find()
+        .filter(template_notice::Column::TemplateId.eq(id))
+        .filter(template_notice::Column::ReplacesId.is_null())
+        .order_by_asc(template_notice::Column::Position)
+        .all(connection)
+        .await
+        .context("loading a template's notices")?
+        .into_iter()
+        .map(|notice| Notice {
+            key: notice.key,
+            when: notice.when_condition,
+            text: notice.text,
+        })
+        .collect();
+
+    let mut queries = Vec::new();
+    for query in template_query::Entity::find()
+        .filter(template_query::Column::TemplateId.eq(id))
+        .filter(template_query::Column::ReplacesId.is_null())
+        .order_by_asc(template_query::Column::Position)
+        .all(connection)
+        .await
+        .context("loading a template's queries")?
+    {
+        let mut fills = Vec::new();
+        for fill in template_fill::Entity::find()
+            .filter(template_fill::Column::QueryId.eq(query.id))
+            .filter(template_fill::Column::ReplacesId.is_null())
+            .order_by_asc(template_fill::Column::Position)
+            .all(connection)
+            .await
+            .context("loading a query's fills")?
+        {
+            let versions = template_fill_version::Entity::find()
+                .filter(template_fill_version::Column::FillId.eq(fill.id))
+                .filter(template_fill_version::Column::ReplacesId.is_null())
+                .order_by_asc(template_fill_version::Column::Position)
+                .all(connection)
+                .await
+                .context("loading a fill's versions")?;
+            fills.push(Fill {
+                key: fill.key,
+                versions: versions
+                    .into_iter()
+                    .map(|version| (version.version, version.sql))
+                    .collect(),
+                older: fill.older,
+            });
+        }
+        let metrics = template_metric::Entity::find()
+            .filter(template_metric::Column::QueryId.eq(query.id))
+            .filter(template_metric::Column::ReplacesId.is_null())
+            .order_by_asc(template_metric::Column::Position)
+            .all(connection)
+            .await
+            .context("loading a query's metrics")?;
+        queries.push(Query {
+            key: query.key,
+            sql: query.sql,
+            interval: length(query.interval_secs),
+            since: query.since,
+            when: query.when_condition,
+            enabled: query.enabled,
+            labels: text_list(&query.labels),
+            fills,
+            metrics: metrics.into_iter().map(to_metric).collect(),
+        });
+    }
+
+    let mut counters = Vec::new();
+    for block in template_counters::Entity::find()
+        .filter(template_counters::Column::TemplateId.eq(id))
+        .filter(template_counters::Column::ReplacesId.is_null())
+        .order_by_asc(template_counters::Column::Position)
+        .all(connection)
+        .await
+        .context("loading a template's counters")?
+    {
+        let metrics = template_metric::Entity::find()
+            .filter(template_metric::Column::CountersId.eq(block.id))
+            .filter(template_metric::Column::ReplacesId.is_null())
+            .order_by_asc(template_metric::Column::Position)
+            .all(connection)
+            .await
+            .context("loading counters' metrics")?;
+        counters.push(Counters {
+            key: block.key,
+            object: block.object,
+            label: block.label,
+            pattern: block.pattern,
+            instance: block.instance,
+            exclude: text_list(&block.exclude),
+            groups: text_map(&block.groups),
+            join: match (block.join_object, block.join_pattern) {
+                (None, None) => None,
+                (object, pattern) => Some(Join {
+                    object: object.unwrap_or_default(),
+                    pattern: pattern.unwrap_or_default(),
+                }),
+            },
+            when: block.when_condition,
+            since: block.since,
+            interval: length(block.interval_secs),
+            enabled: block.enabled,
+            metrics: metrics.into_iter().map(to_metric).collect(),
+        });
+    }
+
+    let alerts = own_rules(connection, id)
+        .await?
+        .into_iter()
+        .map(|rule| Alert {
+            key: rule.template_alert.unwrap_or_default(),
+            name: rule.name,
+            warning: rule.warning,
+            critical: rule.critical,
+            hold: length((rule.for_secs > 0).then_some(rule.for_secs)),
+            window: length(rule.window_secs),
+            summary: rule.summary,
+            resolved_summary: rule.resolved_summary,
+            when: rule.when_condition,
+            since: rule.since,
+            enabled: rule.enabled,
+        })
+        .collect();
+
+    let target = match (&row.target_kind, &row.target) {
+        (Some(kind), Some(value)) => Target::from_parts(kind, value),
+        _ => None,
+    };
+    Ok(Template {
+        key: row.key.clone(),
+        name: row.name.clone(),
+        description: row.description.clone(),
+        target,
+        min_version: row.min_version.clone(),
+        renamed_from: text_list(&row.renamed_from),
+        enabled: row.enabled,
+        services: text_list(&row.services),
+        discover,
+        notices,
+        queries,
+        counters,
+        alerts,
+    })
+}
+
+/// A template's own alert rules, in its order: not anyone's copies of them.
+async fn own_rules<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Vec<alert_rule::Model>> {
+    alert_rule::Entity::find()
+        .filter(alert_rule::Column::DeletedAt.is_null())
+        .filter(alert_rule::Column::TemplateId.eq(id))
+        .filter(alert_rule::Column::ReplacesId.is_null())
+        .order_by_asc(alert_rule::Column::TemplatePosition)
+        .all(connection)
+        .await
+        .context("loading a template's alert rules")
+}
+
+/// Someone's copy of a built-in template's rule, if there is one.
+async fn copy_of<C: ConnectionTrait>(
+    connection: &C,
+    original: i64,
+) -> Result<Option<alert_rule::Model>> {
+    alert_rule::Entity::find()
+        .filter(alert_rule::Column::DeletedAt.is_null())
+        .filter(alert_rule::Column::ReplacesId.eq(original))
+        .one(connection)
+        .await
+        .context("loading a rule's copy")
+}
+
+async fn to_stored<C: ConnectionTrait>(
+    connection: &C,
+    row: template::Model,
+) -> Result<StoredTemplate> {
     Ok(StoredTemplate {
+        template: read_template(connection, &row).await?,
         id: row.id,
-        template,
-        source: row.source,
         built_in: row.built_in,
         enabled: row.enabled,
         created_at: row.created_at,
         updated_at: row.updated_at,
         upgraded_at: row.upgraded_at,
     })
+}
+
+async fn metric_rows<C: ConnectionTrait>(
+    connection: &C,
+    metrics: &[Metric],
+    query: Option<i64>,
+    counters: Option<i64>,
+) -> Result<()> {
+    for (position, metric) in metrics.iter().enumerate() {
+        template_metric::ActiveModel {
+            query_id: Set(query),
+            counters_id: Set(counters),
+            key: Set(metric.key.clone()),
+            position: Set(i32::try_from(position)?),
+            counter: Set(metric.counter.clone()),
+            unit: Set(metric.unit.clone()),
+            total: Set(metric.total),
+            description: Set(metric.description.clone()),
+            value: Set(metric.value.clone()),
+            since: Set(metric.since.clone()),
+            states: Set(map_json(&metric.states)),
+            ..Default::default()
+        }
+        .insert(connection)
+        .await
+        .context("saving a template's metric")?;
+    }
+    Ok(())
+}
+
+/// Writes a template's parts, but for its alerts, in place of the ones it had: the
+/// fills, versions and metrics of a query or counters block go with it.
+async fn write_parts<C: ConnectionTrait>(
+    connection: &C,
+    id: i64,
+    template: &Template,
+) -> Result<()> {
+    template_discovery::Entity::delete_many()
+        .filter(template_discovery::Column::TemplateId.eq(id))
+        .exec(connection)
+        .await
+        .context("replacing a template's discovery")?;
+    template_registry_read::Entity::delete_many()
+        .filter(template_registry_read::Column::TemplateId.eq(id))
+        .exec(connection)
+        .await
+        .context("replacing a template's registry reads")?;
+    template_notice::Entity::delete_many()
+        .filter(template_notice::Column::TemplateId.eq(id))
+        .exec(connection)
+        .await
+        .context("replacing a template's notices")?;
+    template_query::Entity::delete_many()
+        .filter(template_query::Column::TemplateId.eq(id))
+        .exec(connection)
+        .await
+        .context("replacing a template's queries")?;
+    template_counters::Entity::delete_many()
+        .filter(template_counters::Column::TemplateId.eq(id))
+        .exec(connection)
+        .await
+        .context("replacing a template's counters")?;
+
+    if let Some(discover) = &template.discover {
+        template_discovery::ActiveModel {
+            template_id: Set(id),
+            interval_secs: Set(secs(&discover.interval)?),
+            sql: Set(discover.sql.clone()),
+            counter_sets: Set(map_json(&discover.counter_sets)),
+            ..Default::default()
+        }
+        .insert(connection)
+        .await
+        .context("saving a template's discovery")?;
+        for (position, read) in discover.registry.iter().enumerate() {
+            template_registry_read::ActiveModel {
+                template_id: Set(id),
+                key: Set(read.key.clone()),
+                position: Set(i32::try_from(position)?),
+                value_names: Set(json!(read.values)),
+                ..Default::default()
+            }
+            .insert(connection)
+            .await
+            .context("saving a template's registry read")?;
+        }
+    }
+    for (position, notice) in template.notices.iter().enumerate() {
+        template_notice::ActiveModel {
+            template_id: Set(id),
+            key: Set(notice.key.clone()),
+            position: Set(i32::try_from(position)?),
+            when_condition: Set(notice.when.clone()),
+            text: Set(notice.text.clone()),
+            ..Default::default()
+        }
+        .insert(connection)
+        .await
+        .context("saving a template's notice")?;
+    }
+    for (position, query) in template.queries.iter().enumerate() {
+        let saved = template_query::ActiveModel {
+            template_id: Set(id),
+            key: Set(query.key.clone()),
+            position: Set(i32::try_from(position)?),
+            sql: Set(query.sql.clone()),
+            interval_secs: Set(secs(&query.interval)?),
+            since: Set(query.since.clone()),
+            when_condition: Set(query.when.clone()),
+            enabled: Set(query.enabled),
+            labels: Set(list_json(&query.labels)),
+            ..Default::default()
+        }
+        .insert(connection)
+        .await
+        .context("saving a template's query")?;
+        for (position, fill) in query.fills.iter().enumerate() {
+            let saved_fill = template_fill::ActiveModel {
+                query_id: Set(saved.id),
+                key: Set(fill.key.clone()),
+                position: Set(i32::try_from(position)?),
+                older: Set(fill.older.clone()),
+                ..Default::default()
+            }
+            .insert(connection)
+            .await
+            .context("saving a query's fill")?;
+            for (position, (version, sql)) in fill.versions.iter().enumerate() {
+                template_fill_version::ActiveModel {
+                    fill_id: Set(saved_fill.id),
+                    version: Set(version.clone()),
+                    position: Set(i32::try_from(position)?),
+                    sql: Set(sql.clone()),
+                    ..Default::default()
+                }
+                .insert(connection)
+                .await
+                .context("saving a fill's version")?;
+            }
+        }
+        metric_rows(connection, &query.metrics, Some(saved.id), None).await?;
+    }
+    for (position, counters) in template.counters.iter().enumerate() {
+        let saved = template_counters::ActiveModel {
+            template_id: Set(id),
+            key: Set(counters.key.clone()),
+            position: Set(i32::try_from(position)?),
+            object: Set(counters.object.clone()),
+            label: Set(counters.label.clone()),
+            pattern: Set(counters.pattern.clone()),
+            instance: Set(counters.instance.clone()),
+            exclude: Set(list_json(&counters.exclude)),
+            groups: Set(map_json(&counters.groups)),
+            join_object: Set(counters.join.as_ref().map(|join| join.object.clone())),
+            join_pattern: Set(counters.join.as_ref().map(|join| join.pattern.clone())),
+            when_condition: Set(counters.when.clone()),
+            since: Set(counters.since.clone()),
+            interval_secs: Set(secs(&counters.interval)?),
+            enabled: Set(counters.enabled),
+            ..Default::default()
+        }
+        .insert(connection)
+        .await
+        .context("saving a template's counters")?;
+        metric_rows(connection, &counters.metrics, None, Some(saved.id)).await?;
+    }
+    Ok(())
 }
 
 /// A template as the audit log compares them: what it says, field by field, and
@@ -75,13 +531,15 @@ async fn load_template<C: ConnectionTrait>(
     connection: &C,
     id: i64,
 ) -> Result<Option<StoredTemplate>> {
-    template::Entity::find_by_id(id)
+    let row = template::Entity::find_by_id(id)
         .filter(template::Column::DeletedAt.is_null())
         .one(connection)
         .await
-        .context("loading template")?
-        .map(to_stored)
-        .transpose()
+        .context("loading template")?;
+    match row {
+        Some(row) => to_stored(connection, row).await.map(Some),
+        None => Ok(None),
+    }
 }
 
 async fn record_template<C: ConnectionTrait>(
@@ -96,63 +554,34 @@ async fn record_template<C: ConnectionTrait>(
     record_change(connection, Kind::Template, id, before, after.as_ref(), None).await
 }
 
-/// The rule a template's alert is with what people changed of it: the template's
-/// values, with each field in `overrides` in place of the template's.
-pub fn effective_rule(
-    template: &Template,
-    alert: &Alert,
-    overrides: &Map<String, Value>,
-) -> Result<AlertRuleInput> {
-    let mut fields = serde_json::to_value(template_values(template, alert)?)?;
-    for (field, value) in overrides {
-        fields[field] = value.clone();
-    }
-    serde_json::from_value(fields).context("applying what was changed of a template's alert")
-}
-
-/// The fields of `wanted` that aren't the template's values, as the API names them.
-pub fn overrides_of(
-    theirs: &AlertRuleInput,
-    wanted: &AlertRuleInput,
-) -> Result<Map<String, Value>> {
-    let ordered = |rule: &AlertRuleInput| {
-        let mut rule = rule.clone();
-        rule.channels.sort_unstable();
-        rule.channels.dedup();
-        serde_json::to_value(rule)
-    };
-    let Value::Object(theirs) = ordered(theirs)? else {
-        bail!("a rule is a map of fields");
-    };
-    let Value::Object(wanted) = ordered(wanted)? else {
-        bail!("a rule is a map of fields");
-    };
-    Ok(wanted
-        .into_iter()
-        .filter(|(field, value)| theirs.get(field) != Some(value))
-        .collect())
-}
-
 /// Whether a template's alert needs what only agents running the template would
 /// send: what its discovery finds, or the template's own metrics.
-fn waits_for_agents(alert: &Alert, rule: &AlertRuleInput, local: &LocalMetrics) -> bool {
-    alert.when.is_some()
-        || alert.since.is_some()
+fn waits_for_agents(
+    template: &Template,
+    when: &Option<String>,
+    since: &Option<String>,
+    rule: &AlertRuleInput,
+) -> bool {
+    let local = local_metrics(template);
+    when.is_some()
+        || since.is_some()
         || rule
-            .conditions_in(Some(local))
+            .conditions_in(Some(&local))
             .is_ok_and(|conditions| conditions.uses_local())
 }
 
-/// What a rule's overrides are, as stored.
-fn overrides_in(row: &alert_rule::Model) -> Map<String, Value> {
-    match &row.overrides {
-        Some(Value::Object(fields)) => fields.clone(),
-        _ => Map::new(),
-    }
+async fn set_waits<C: ConnectionTrait>(connection: &C, rule_id: i64, waits: bool) -> Result<()> {
+    alert_rule::Entity::update_many()
+        .col_expr(alert_rule::Column::WaitsForAgents, Expr::value(waits))
+        .filter(alert_rule::Column::Id.eq(rule_id))
+        .exec(connection)
+        .await
+        .context("saving alert rule")?;
+    Ok(())
 }
 
-/// A name for a rule moved aside for a template's, as names are compared: `Disk
-/// (yours)`, then `Disk (yours 2)` and so on.
+/// A name for a rule moved aside for a built-in template's: `Disk (yours)`, then
+/// `Disk (yours 2)` and so on.
 async fn free_name<C: ConnectionTrait>(connection: &C, name: &str) -> Result<String> {
     let taken: BTreeSet<String> = alert_rule::Entity::find()
         .filter(alert_rule::Column::DeletedAt.is_null())
@@ -171,129 +600,157 @@ async fn free_name<C: ConnectionTrait>(connection: &C, name: &str) -> Result<Str
     Ok(candidate)
 }
 
-/// Moves another rule that has `name`, as names are compared, out of the way of a
-/// built-in template's alert, under a name of its own. One that's a template's alert
-/// keeps its new name as something changed of it.
-async fn make_room<C: ConnectionTrait>(
-    connection: &C,
-    name: &str,
-    except: Option<i64>,
-) -> Result<()> {
-    let mut clashing = alert_rule::Entity::find()
+/// Moves any other rule that has `name`, as names are compared, out of the way of a
+/// built-in template's alert, under a name of its own. The alert's own rule and
+/// someone's copy of it are left.
+async fn make_room<C: ConnectionTrait>(connection: &C, name: &str, own: Option<i64>) -> Result<()> {
+    let clashing = alert_rule::Entity::find()
         .filter(alert_rule::Column::DeletedAt.is_null())
-        .filter(alert_rule::Column::NameKey.eq(name_key(name)));
-    if let Some(except) = except {
-        clashing = clashing.filter(alert_rule::Column::Id.ne(except));
-    }
-    let Some(row) = clashing
-        .one(connection)
+        .filter(alert_rule::Column::NameKey.eq(name_key(name)))
+        .all(connection)
         .await
-        .context("loading alert rules")?
-    else {
-        return Ok(());
-    };
-    let before = match load_alert_rule(connection, row.id).await? {
-        Some(rule) => Some(alert_rule_snapshot(connection, &rule).await?),
-        None => None,
-    };
-    let new_name = free_name(connection, &row.name).await?;
-    let mut overrides = overrides_in(&row);
-    let has_template = row.template_id.is_some();
-    let id = row.id;
-    let mut active: alert_rule::ActiveModel = row.into();
-    if has_template {
-        overrides.insert("name".to_string(), json!(new_name));
-        active.overrides = Set(Some(Value::Object(overrides)));
+        .context("loading alert rules")?;
+    for row in clashing {
+        if Some(row.id) == own || (own.is_some() && row.replaces_id == own) {
+            continue;
+        }
+        let before = match load_alert_rule(connection, row.id).await? {
+            Some(rule) => Some(alert_rule_snapshot(connection, &rule).await?),
+            None => None,
+        };
+        let new_name = free_name(connection, &row.name).await?;
+        let id = row.id;
+        let mut active: alert_rule::ActiveModel = row.into();
+        active.name_key = Set(name_key(&new_name));
+        active.name = Set(new_name);
+        active
+            .update(connection)
+            .await
+            .context("renaming an alert rule")?;
+        record_alert_rule(connection, id, before.as_ref()).await?;
     }
-    active.name_key = Set(name_key(&new_name));
-    active.name = Set(new_name);
-    active
-        .update(connection)
-        .await
-        .context("renaming an alert rule")?;
-    record_alert_rule(connection, id, before.as_ref()).await
+    Ok(())
 }
 
-/// Writes a template's alerts as its alert rules: each worked out from the template
-/// and what people changed of it, which is kept. Alerts that are new get rules, and
-/// the rules of those it no longer has are deleted. A rule in the way is moved aside
-/// when `moving_aside`, as for a built-in template as the server starts; otherwise
-/// it's an error.
+/// Writes a template's alerts as its own alert rules. One that's there is written
+/// over with what the template says, keeping who it tells and what else people set
+/// on it; for a built-in template, whether it's on is kept too, and someone's copy
+/// of it is left alone, only noting that what it's a copy of changed. New alerts
+/// get rules, and the rules of alerts it no longer has are deleted, with any copies.
 async fn write_rules<C: ConnectionTrait>(
     connection: &C,
     id: i64,
     template: &Template,
-    enabled: bool,
-    moving_aside: bool,
+    built_in: bool,
     now: Timestamp,
 ) -> Result<()> {
-    let rows = alert_rule::Entity::find()
-        .filter(alert_rule::Column::DeletedAt.is_null())
-        .filter(alert_rule::Column::TemplateId.eq(id))
-        .all(connection)
-        .await
-        .context("loading a template's alert rules")?;
-    let local = local_metrics(template);
-    for alert in &template.alerts {
+    let rows = own_rules(connection, id).await?;
+    for (position, alert) in template.alerts.iter().enumerate() {
+        let theirs = template_values(template, alert)?;
+        let waits = waits_for_agents(template, &alert.when, &alert.since, &theirs);
+        let position = i32::try_from(position)?;
         let existing = rows
             .iter()
             .find(|row| row.template_alert.as_deref() == Some(alert.key.as_str()));
-        let overrides = existing.map(overrides_in).unwrap_or_default();
-        let own = effective_rule(template, alert, &overrides)?;
-        let waits = waits_for_agents(alert, &own, &local);
-        let mut in_effect = own;
-        in_effect.enabled &= enabled;
 
-        if let Some(row) = existing {
-            let current = load_alert_rule(connection, row.id)
-                .await?
-                .context("a template's rule went missing")?;
-            if current.rule == in_effect && row.waits_for_agents == waits {
-                continue;
-            }
-            if moving_aside {
-                make_room(connection, &in_effect.name, Some(row.id)).await?;
-            }
-            let before = alert_rule_snapshot(connection, &current).await?;
-            let mut active = alert_rule_row(&in_effect)?;
-            active.id = Set(row.id);
+        if built_in {
+            make_room(connection, &theirs.name, existing.map(|row| row.id)).await?;
+        } else {
+            let own: Vec<i64> = existing.iter().map(|row| row.id).collect();
+            refuse_taken_name(connection, &theirs.name, &own).await?;
+        }
+        let Some(row) = existing else {
+            let mut active = alert_rule_row(&theirs)?;
+            active.template_id = Set(Some(id));
+            active.template_alert = Set(Some(alert.key.clone()));
+            active.template_position = Set(Some(position));
+            active.when_condition = Set(alert.when.clone());
+            active.since = Set(alert.since.clone());
             active.waits_for_agents = Set(waits);
-            alert_rule::Entity::update(active)
+            let rule_id = alert_rule::Entity::insert(active)
                 .exec(connection)
                 .await
                 .map_err(|error| {
-                    let taken = NameTaken::AlertRule(in_effect.name.clone());
+                    let taken = NameTaken::AlertRule(theirs.name.clone());
                     name_taken_or(error, taken, "saving a template's alert rule")
-                })?;
-            alert_rule_channel::Entity::delete_many()
-                .filter(alert_rule_channel::Column::RuleId.eq(row.id))
-                .exec(connection)
-                .await
-                .context("saving alert rule channels")?;
-            save_links(connection, row.id, &in_effect.channels).await?;
-            save_actions(connection, row.id, &in_effect.actions).await?;
-            record_alert_rule(connection, row.id, Some(&before)).await?;
+                })?
+                .last_insert_id;
+            save_links(connection, rule_id, &theirs.channels).await?;
+            save_actions(connection, rule_id, &theirs.actions).await?;
+            record_alert_rule(connection, rule_id, None).await?;
+            continue;
+        };
+
+        let hold = theirs.hold.num_seconds();
+        let window = theirs.window.map(|window| window.num_seconds());
+        let applies_to = match built_in {
+            true => theirs.applies_to.clone(),
+            false => row.applies_to.clone(),
+        };
+        let enabled = match built_in {
+            true => row.enabled,
+            false => alert.enabled,
+        };
+        let says_the_same = row.name == theirs.name
+            && row.warning == theirs.warning
+            && row.critical == theirs.critical
+            && row.summary == theirs.summary
+            && row.resolved_summary == theirs.resolved_summary
+            && row.for_secs == hold
+            && row.window_secs == window
+            && row.when_condition == alert.when
+            && row.since == alert.since
+            && row.applies_to == applies_to;
+        let same = says_the_same
+            && row.enabled == enabled
+            && row.template_position == Some(position)
+            && row.waits_for_agents == waits;
+        if same {
             continue;
         }
-
-        if moving_aside {
-            make_room(connection, &in_effect.name, None).await?;
+        let before = match load_alert_rule(connection, row.id).await? {
+            Some(rule) => Some(alert_rule_snapshot(connection, &rule).await?),
+            None => None,
+        };
+        alert_rule::ActiveModel {
+            id: Set(row.id),
+            name: Set(theirs.name.clone()),
+            name_key: Set(name_key(&theirs.name)),
+            warning: Set(theirs.warning.clone()),
+            critical: Set(theirs.critical.clone()),
+            summary: Set(theirs.summary.clone()),
+            resolved_summary: Set(theirs.resolved_summary.clone()),
+            for_secs: Set(hold),
+            window_secs: Set(window),
+            applies_to: Set(applies_to),
+            enabled: Set(enabled),
+            template_position: Set(Some(position)),
+            when_condition: Set(alert.when.clone()),
+            since: Set(alert.since.clone()),
+            waits_for_agents: Set(waits),
+            ..Default::default()
         }
-        let mut active = alert_rule_row(&in_effect)?;
-        active.template_id = Set(Some(id));
-        active.template_alert = Set(Some(alert.key.clone()));
-        active.waits_for_agents = Set(waits);
-        let rule_id = alert_rule::Entity::insert(active)
-            .exec(connection)
-            .await
-            .map_err(|error| {
-                let taken = NameTaken::AlertRule(in_effect.name.clone());
-                name_taken_or(error, taken, "saving a template's alert rule")
-            })?
-            .last_insert_id;
-        save_links(connection, rule_id, &in_effect.channels).await?;
-        save_actions(connection, rule_id, &in_effect.actions).await?;
-        record_alert_rule(connection, rule_id, None).await?;
+        .update(connection)
+        .await
+        .map_err(|error| {
+            let taken = NameTaken::AlertRule(theirs.name.clone());
+            name_taken_or(error, taken, "saving a template's alert rule")
+        })?;
+        record_alert_rule(connection, row.id, before.as_ref()).await?;
+        // Someone's copy stays as they made it, and says what it's a copy of changed.
+        if !says_the_same && let Some(copy) = copy_of(connection, row.id).await? {
+            alert_rule::Entity::update_many()
+                .col_expr(alert_rule::Column::OriginalChangedAt, Expr::value(now))
+                .col_expr(
+                    alert_rule::Column::WhenCondition,
+                    Expr::value(alert.when.clone()),
+                )
+                .col_expr(alert_rule::Column::Since, Expr::value(alert.since.clone()))
+                .filter(alert_rule::Column::Id.eq(copy.id))
+                .exec(connection)
+                .await
+                .context("noting a rule's copy")?;
+        }
     }
     let gone = rows.iter().filter(|row| {
         !template
@@ -302,33 +759,37 @@ async fn write_rules<C: ConnectionTrait>(
             .any(|alert| row.template_alert.as_deref() == Some(alert.key.as_str()))
     });
     for row in gone {
+        if let Some(copy) = copy_of(connection, row.id).await? {
+            delete_rule_in(connection, copy.id, now).await?;
+        }
         delete_rule_in(connection, row.id, now).await?;
     }
     Ok(())
 }
 
-/// Deletes a template, marking it deleted, and its rules with it.
+/// Deletes a template, marking it deleted, and its rules and their copies with it.
 async fn delete_in<C: ConnectionTrait>(
     connection: &C,
     stored: &StoredTemplate,
     now: Timestamp,
 ) -> Result<()> {
     let before = template_snapshot(stored)?;
-    template::Entity::update_many()
-        .col_expr(template::Column::DeletedAt, Expr::value(now))
-        .filter(template::Column::Id.eq(stored.id))
-        .exec(connection)
-        .await
-        .context("deleting a template")?;
     let rules: Vec<alert_rule::Model> = alert_rule::Entity::find()
         .filter(alert_rule::Column::DeletedAt.is_null())
         .filter(alert_rule::Column::TemplateId.eq(stored.id))
+        .order_by_desc(alert_rule::Column::ReplacesId)
         .all(connection)
         .await
         .context("loading a template's alert rules")?;
     for rule in rules {
         delete_rule_in(connection, rule.id, now).await?;
     }
+    template::Entity::update_many()
+        .col_expr(template::Column::DeletedAt, Expr::value(now))
+        .filter(template::Column::Id.eq(stored.id))
+        .exec(connection)
+        .await
+        .context("deleting a template")?;
     record_change(
         connection,
         Kind::Template,
@@ -340,12 +801,17 @@ async fn delete_in<C: ConnectionTrait>(
     .await
 }
 
-/// A template's key and name, as a row that's new or rewritten gets them.
-fn named(row: &mut template::ActiveModel, template: &Template) {
+/// What a template's own row says of it.
+fn described(row: &mut template::ActiveModel, template: &Template) {
     row.key = Set(template.key.clone());
     row.name = Set(template.name.clone());
     row.name_key = Set(name_key(&template.name));
     row.description = Set(template.description.clone());
+    row.target_kind = Set(template.target.as_ref().map(|t| t.kind().to_string()));
+    row.target = Set(template.target.as_ref().map(Target::value));
+    row.min_version = Set(template.min_version.clone());
+    row.renamed_from = Set(list_json(&template.renamed_from));
+    row.services = Set(list_json(&template.services));
 }
 
 /// A template's name in use by another template, which is the one unique index on
@@ -371,8 +837,7 @@ fn free_key(key: &str, taken: &BTreeSet<String>) -> String {
 }
 
 /// Moves someone's own template out of the way of a built-in one with the same key
-/// or name, keeping everything it has under a key and name of its own. Its HCL is
-/// written out again, with the new key.
+/// or name, keeping everything it has under a key and name of its own.
 async fn move_aside<C: ConnectionTrait>(
     connection: &C,
     built_in: &Template,
@@ -389,26 +854,25 @@ async fn move_aside<C: ConnectionTrait>(
         !row.built_in && (row.key == built_in.key || row.name_key == name_key(&built_in.name))
     });
     for row in in_the_way {
-        let stored = to_stored(row.clone())?;
+        let stored = to_stored(connection, row.clone()).await?;
         let before = template_snapshot(&stored)?;
-        let mut template = stored.template.clone();
-        if template.key == built_in.key {
-            template.key = free_key(&template.key, &keys);
-            keys.insert(template.key.clone());
+        let mut active: template::ActiveModel = row.clone().into();
+        if row.key == built_in.key {
+            let key = free_key(&row.key, &keys);
+            keys.insert(key.clone());
+            active.key = Set(key);
         }
-        if name_key(&template.name) == name_key(&built_in.name) {
-            let mut name = format!("{} (yours)", template.name);
+        if row.name_key == name_key(&built_in.name) {
+            let mut name = format!("{} (yours)", row.name);
             let mut number = 2;
             while names.contains(&name_key(&name)) {
-                name = format!("{} (yours {number})", template.name);
+                name = format!("{} (yours {number})", row.name);
                 number += 1;
             }
             names.insert(name_key(&name));
-            template.name = name;
+            active.name_key = Set(name_key(&name));
+            active.name = Set(name);
         }
-        let mut active: template::ActiveModel = row.into();
-        named(&mut active, &template);
-        active.source = Set(maxnines_protocol::templates::to_hcl(&template));
         active.updated_at = Set(now);
         active
             .update(connection)
@@ -419,13 +883,58 @@ async fn move_aside<C: ConnectionTrait>(
     Ok(())
 }
 
+/// What's known of the template a rule is one of the alerts of.
+#[derive(Debug, Clone)]
+pub struct TemplateRule {
+    pub template: StoredTemplate,
+    /// The alert's key.
+    pub alert: String,
+    /// The template's own rule.
+    pub original: i64,
+    /// Someone's copy of it, for a built-in template, if they've made one.
+    pub copy: Option<i64>,
+}
+
+async fn template_rule_in<C: ConnectionTrait>(
+    connection: &C,
+    rule_id: i64,
+) -> Result<Option<TemplateRule>> {
+    let Some(row) = alert_rule::Entity::find_by_id(rule_id)
+        .filter(alert_rule::Column::DeletedAt.is_null())
+        .one(connection)
+        .await
+        .context("loading alert rule")?
+    else {
+        return Ok(None);
+    };
+    let (Some(template_id), Some(alert)) = (row.template_id, row.template_alert.clone()) else {
+        return Ok(None);
+    };
+    let template = load_template(connection, template_id)
+        .await?
+        .context("a rule's template went missing")?;
+    let (original, copy) = match row.replaces_id {
+        Some(original) => (original, Some(row.id)),
+        None => (
+            row.id,
+            copy_of(connection, row.id).await?.map(|copy| copy.id),
+        ),
+    };
+    Ok(Some(TemplateRule {
+        template,
+        alert,
+        original,
+        copy,
+    }))
+}
+
 impl Database {
     /// Writes the templates this version ships over the built-in ones: adding new
     /// ones, rewriting changed ones, following renames, and deleting those no longer
-    /// shipped. Whether each is on, and what people changed of their alerts, stays.
-    /// Someone's own template with a built-in one's key or name is moved aside, as
-    /// is any rule in the way of a built-in one's. Gives the names of the templates
-    /// this changed, which on a new server is none.
+    /// shipped. Whether each template and alert is on, and people's copies of their
+    /// alerts, stay. Someone's own template with a built-in one's key or name is
+    /// moved aside, as is any rule in the way of a built-in one's. Gives the names of
+    /// the templates this changed, which on a new server is none.
     pub async fn sync_templates(&self, shipped: &[BuiltIn], now: Timestamp) -> Result<Vec<String>> {
         let transaction = self
             .connection
@@ -449,48 +958,42 @@ impl Database {
                 rows.iter()
                     .find(|row| template.renamed_from.contains(&row.key))
             });
+            if let Some(row) = existing {
+                kept.insert(row.id);
+            }
             let same = existing.is_some_and(|row| {
                 row.key == template.key
                     && row.fingerprint.as_deref() == Some(built_in.fingerprint.as_str())
             });
-            if !same {
-                move_aside(&transaction, template, now).await?;
+            if same {
+                continue;
             }
+            move_aside(&transaction, template, now).await?;
             let id = match existing {
                 Some(row) => {
-                    kept.insert(row.id);
-                    if same {
-                        // Only its comments or layout, if anything, changed.
-                        if row.source != built_in.source {
-                            let mut active: template::ActiveModel = row.clone().into();
-                            active.source = Set(built_in.source.clone());
-                            active
-                                .update(&transaction)
-                                .await
-                                .context("updating a template")?;
-                        }
-                    } else {
-                        let before = template_snapshot(&to_stored(row.clone())?)?;
-                        let mut active: template::ActiveModel = row.clone().into();
-                        named(&mut active, template);
-                        active.source = Set(built_in.source.clone());
-                        active.fingerprint = Set(Some(built_in.fingerprint.clone()));
-                        active.updated_at = Set(now);
-                        active.upgraded_at = Set(Some(now));
-                        active.upgrade_seen = Set(false);
-                        active
-                            .update(&transaction)
-                            .await
-                            .map_err(|error| taken(error, template))?;
-                        record_template(&transaction, row.id, Some(&before)).await?;
-                        changed.push(template.name.clone());
-                    }
+                    let before = template_snapshot(&to_stored(&transaction, row.clone()).await?)?;
+                    let mut active = template::ActiveModel {
+                        id: Set(row.id),
+                        fingerprint: Set(Some(built_in.fingerprint.clone())),
+                        updated_at: Set(now),
+                        upgraded_at: Set(Some(now)),
+                        upgrade_seen: Set(false),
+                        ..Default::default()
+                    };
+                    described(&mut active, template);
+                    active
+                        .update(&transaction)
+                        .await
+                        .map_err(|error| taken(error, template))?;
+                    write_parts(&transaction, row.id, template).await?;
+                    write_rules(&transaction, row.id, template, true, now).await?;
+                    record_template(&transaction, row.id, Some(&before)).await?;
+                    changed.push(template.name.clone());
                     row.id
                 }
                 None => {
                     let mut active = template::ActiveModel {
                         built_in: Set(true),
-                        source: Set(built_in.source.clone()),
                         fingerprint: Set(Some(built_in.fingerprint.clone())),
                         enabled: Set(template.enabled),
                         created_at: Set(now),
@@ -499,12 +1002,14 @@ impl Database {
                         upgrade_seen: Set(!upgrading),
                         ..Default::default()
                     };
-                    named(&mut active, template);
+                    described(&mut active, template);
                     let id = template::Entity::insert(active)
                         .exec(&transaction)
                         .await
                         .map_err(|error| taken(error, template))?
                         .last_insert_id;
+                    write_parts(&transaction, id, template).await?;
+                    write_rules(&transaction, id, template, true, now).await?;
                     record_template(&transaction, id, None).await?;
                     if upgrading {
                         changed.push(template.name.clone());
@@ -512,15 +1017,18 @@ impl Database {
                     id
                 }
             };
-            let enabled = load_template(&transaction, id)
-                .await?
-                .context("a template went missing")?
-                .enabled;
-            write_rules(&transaction, id, template, enabled, true, now).await?;
+            kept.insert(id);
         }
 
         for row in rows.iter().filter(|row| !kept.contains(&row.id)) {
-            let stored = to_stored(row.clone())?;
+            let stored = to_stored(&transaction, row.clone()).await?;
+            // Kept unseen, so the notice says it went.
+            template::Entity::update_many()
+                .col_expr(template::Column::UpgradeSeen, Expr::value(false))
+                .filter(template::Column::Id.eq(row.id))
+                .exec(&transaction)
+                .await
+                .context("updating a template")?;
             delete_in(&transaction, &stored, now).await?;
             changed.push(stored.template.name);
         }
@@ -534,77 +1042,93 @@ impl Database {
 
     /// Built-in and people's own, sorted by name.
     pub async fn list_templates(&self) -> Result<Vec<StoredTemplate>> {
-        template::Entity::find()
+        let rows = template::Entity::find()
             .filter(template::Column::DeletedAt.is_null())
             .order_by_asc(template::Column::Name)
             .all(&self.connection)
             .await
-            .context("loading templates")?
-            .into_iter()
-            .map(to_stored)
-            .collect()
+            .context("loading templates")?;
+        let mut all = Vec::with_capacity(rows.len());
+        for row in rows {
+            all.push(to_stored(&self.connection, row).await?);
+        }
+        Ok(all)
+    }
+
+    /// Each template's name by its ID.
+    pub async fn template_names(&self) -> Result<std::collections::BTreeMap<i64, String>> {
+        let rows: Vec<(i64, String)> = {
+            use sea_orm::QuerySelect;
+            template::Entity::find()
+                .select_only()
+                .column(template::Column::Id)
+                .column(template::Column::Name)
+                .filter(template::Column::DeletedAt.is_null())
+                .into_tuple()
+                .all(&self.connection)
+                .await
+                .context("loading templates")?
+        };
+        Ok(rows.into_iter().collect())
     }
 
     pub async fn get_template(&self, id: i64) -> Result<Option<StoredTemplate>> {
         load_template(&self.connection, id).await
     }
 
-    /// The rules a template's alerts are, in the template's order.
-    pub async fn template_rules(&self, stored: &StoredTemplate) -> Result<Vec<AlertRule>> {
-        let rules = self.list_alert_rules().await?;
-        let mut mine: Vec<AlertRule> = rules
-            .into_iter()
-            .filter(|rule| rule.template.as_ref().is_some_and(|t| t.id == stored.id))
-            .collect();
-        let position = |rule: &AlertRule| {
-            let key = rule.template.as_ref().map(|t| t.alert.as_str());
-            stored
-                .template
-                .alerts
-                .iter()
-                .position(|alert| Some(alert.key.as_str()) == key)
-        };
-        mine.sort_by_key(position);
-        Ok(mine)
+    /// A template's alerts, in its order, each with its own rule and someone's copy
+    /// of it if there is one.
+    pub async fn template_alerts(&self, id: i64) -> Result<Vec<TemplateAlert>> {
+        let mut alerts = Vec::new();
+        for row in own_rules(&self.connection, id).await? {
+            let rule = load_alert_rule(&self.connection, row.id)
+                .await?
+                .context("a template's rule went missing")?;
+            let copy = match copy_of(&self.connection, row.id).await? {
+                Some(copy) => load_alert_rule(&self.connection, copy.id).await?,
+                None => None,
+            };
+            alerts.push(TemplateAlert {
+                key: row.template_alert.unwrap_or_default(),
+                rule,
+                copy,
+            });
+        }
+        Ok(alerts)
     }
 
     /// Adds someone's own template, checked already, with its alerts as rules.
-    pub async fn create_template(
-        &self,
-        template: &Template,
-        source: &str,
-        now: Timestamp,
-    ) -> Result<i64> {
+    pub async fn create_template(&self, template: &Template, now: Timestamp) -> Result<i64> {
         let transaction = self.connection.begin().await.context("saving template")?;
         refuse_taken(&transaction, template, None).await?;
         let mut active = template::ActiveModel {
             built_in: Set(false),
-            source: Set(source.to_string()),
             enabled: Set(template.enabled),
             created_at: Set(now),
             updated_at: Set(now),
             upgrade_seen: Set(true),
             ..Default::default()
         };
-        named(&mut active, template);
+        described(&mut active, template);
         let id = template::Entity::insert(active)
             .exec(&transaction)
             .await
             .map_err(|error| taken(error, template))?
             .last_insert_id;
+        write_parts(&transaction, id, template).await?;
+        write_rules(&transaction, id, template, false, now).await?;
         record_template(&transaction, id, None).await?;
-        write_rules(&transaction, id, template, template.enabled, false, now).await?;
         transaction.commit().await.context("saving template")?;
         Ok(id)
     }
 
-    /// Replaces someone's own template, checked already, keeping what people changed
-    /// of the alerts it still has. Returns false if there's no such template.
+    /// Replaces someone's own template, checked already. The alerts it still has
+    /// keep their rules, with who each tells. Returns false if there's no such
+    /// template.
     pub async fn update_template(
         &self,
         id: i64,
         template: &Template,
-        source: &str,
         now: Timestamp,
     ) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving template")?;
@@ -620,17 +1144,18 @@ impl Database {
         let before = template_snapshot(&stored)?;
         let mut active = template::ActiveModel {
             id: Set(id),
-            source: Set(source.to_string()),
+            enabled: Set(template.enabled),
             updated_at: Set(now),
             ..Default::default()
         };
-        named(&mut active, template);
+        described(&mut active, template);
         active
             .update(&transaction)
             .await
             .map_err(|error| taken(error, template))?;
+        write_parts(&transaction, id, template).await?;
+        write_rules(&transaction, id, template, false, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
-        write_rules(&transaction, id, template, stored.enabled, false, now).await?;
         transaction.commit().await.context("saving template")?;
         Ok(true)
     }
@@ -652,8 +1177,8 @@ impl Database {
         Ok(true)
     }
 
-    /// Turns a template, and so its alert rules, on or off. Returns false if there's
-    /// no such template.
+    /// Turns a template, and so its alerts, on or off, which starting never undoes.
+    /// Returns false if there's no such template.
     pub async fn set_template_enabled(
         &self,
         id: i64,
@@ -678,32 +1203,28 @@ impl Database {
         .await
         .context("saving template")?;
         record_template(&transaction, id, Some(&before)).await?;
-        write_rules(&transaction, id, &stored.template, enabled, false, now).await?;
         transaction.commit().await.context("saving template")?;
         Ok(true)
     }
 
-    /// The template a rule is one of the alerts of, that alert, and the rule as the
-    /// template and what people changed make it, before the template being off
-    /// turns it off. None for a rule that isn't a template's.
-    pub async fn template_rule(
-        &self,
-        rule_id: i64,
-    ) -> Result<Option<(StoredTemplate, Alert, Map<String, Value>, AlertRuleInput)>> {
+    /// The template a rule is one of the alerts of, whether it's the template's own
+    /// rule or someone's copy. None for a rule that isn't a template's.
+    pub async fn template_rule(&self, rule_id: i64) -> Result<Option<TemplateRule>> {
         template_rule_in(&self.connection, rule_id).await
     }
 
-    /// Saves what's different in `wanted` from a template's values for one of its
-    /// alerts as what people changed of it, and the rule as that makes it. Returns
-    /// false if there's no such rule.
-    pub async fn override_template_rule(
+    /// Saves one of a template's alerts as `wanted`. For someone's own template, or
+    /// a copy that's there, it's written over. For a built-in template's own rule,
+    /// which isn't theirs to change, the first change makes a copy of their own,
+    /// used in its place from then on; turning it on or off and nothing else is
+    /// only the flag on the built-in rule. Returns false if there's no such rule.
+    pub async fn update_template_rule(
         &self,
         rule_id: i64,
         wanted: &AlertRuleInput,
-        now: Timestamp,
     ) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert rule")?;
-        let Some((stored, alert, _, _)) = template_rule_in(&transaction, rule_id).await? else {
+        let Some(found) = template_rule_in(&transaction, rule_id).await? else {
             return Ok(false);
         };
         if wanted.is_calculation() {
@@ -711,45 +1232,91 @@ impl Database {
                 "a template's alert is about each host, so it can't have a calculation".to_string()
             ));
         }
-        let theirs = template_values(&stored.template, &alert)?;
-        let overrides = overrides_of(&theirs, wanted)?;
-        save_overrides(&transaction, rule_id, overrides).await?;
-        write_rules(
-            &transaction,
-            stored.id,
-            &stored.template,
-            stored.enabled,
-            false,
-            now,
-        )
-        .await?;
+        let original = alert_rule::Entity::find_by_id(found.original)
+            .one(&transaction)
+            .await
+            .context("loading alert rule")?
+            .context("a template's rule went missing")?;
+        let waits = waits_for_agents(
+            &found.template.template,
+            &original.when_condition,
+            &original.since,
+            wanted,
+        );
+        let own = [found.original, found.copy.unwrap_or(found.original)];
+        refuse_taken_name(&transaction, &wanted.name, &own).await?;
+
+        let target = match (found.template.built_in, found.copy) {
+            (false, _) => found.original,
+            (true, Some(copy)) => copy,
+            (true, None) => {
+                let theirs = load_alert_rule(&transaction, found.original)
+                    .await?
+                    .context("a template's rule went missing")?;
+                let mut same_but_on = wanted.clone();
+                same_but_on.enabled = theirs.rule.enabled;
+                same_but_on.channels.sort_unstable();
+                let mut theirs_sorted = theirs.rule.clone();
+                theirs_sorted.channels.sort_unstable();
+                if same_but_on == theirs_sorted {
+                    if wanted.enabled != theirs.rule.enabled {
+                        let before = alert_rule_snapshot(&transaction, &theirs).await?;
+                        alert_rule::Entity::update_many()
+                            .col_expr(alert_rule::Column::Enabled, Expr::value(wanted.enabled))
+                            .filter(alert_rule::Column::Id.eq(found.original))
+                            .exec(&transaction)
+                            .await
+                            .context("saving alert rule")?;
+                        record_alert_rule(&transaction, found.original, Some(&before)).await?;
+                    }
+                    transaction.commit().await.context("saving alert rule")?;
+                    return Ok(true);
+                }
+                let mut active = alert_rule_row(wanted)?;
+                active.template_id = Set(original.template_id);
+                active.template_alert = Set(original.template_alert.clone());
+                active.template_position = Set(original.template_position);
+                active.when_condition = Set(original.when_condition.clone());
+                active.since = Set(original.since.clone());
+                active.replaces_id = Set(Some(found.original));
+                active.waits_for_agents = Set(waits);
+                let copy = alert_rule::Entity::insert(active)
+                    .exec(&transaction)
+                    .await
+                    .context("saving a copy of a template's alert rule")?
+                    .last_insert_id;
+                save_links(&transaction, copy, &wanted.channels).await?;
+                save_actions(&transaction, copy, &wanted.actions).await?;
+                record_alert_rule(&transaction, copy, None).await?;
+                transaction.commit().await.context("saving alert rule")?;
+                return Ok(true);
+            }
+        };
+        write_rule_in(&transaction, target, wanted).await?;
+        set_waits(&transaction, target, waits).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
     }
 
-    /// Puts one of a template's alerts back to the template's values. Returns false if
-    /// there's no such rule.
+    /// Puts one of a built-in template's alerts back to the template's own rule, by
+    /// deleting someone's copy of it. Returns false if there's no such rule, or no
+    /// copy of it.
     pub async fn reset_template_rule(&self, rule_id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert rule")?;
-        let Some((stored, ..)) = template_rule_in(&transaction, rule_id).await? else {
+        let Some(found) = template_rule_in(&transaction, rule_id).await? else {
             return Ok(false);
         };
-        save_overrides(&transaction, rule_id, Map::new()).await?;
-        write_rules(
-            &transaction,
-            stored.id,
-            &stored.template,
-            stored.enabled,
-            false,
-            now,
-        )
-        .await?;
+        let Some(copy) = found.copy else {
+            return Ok(false);
+        };
+        delete_rule_in(&transaction, copy, now).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
     }
 
-    /// The names of built-in templates an upgrade changed that admins haven't
-    /// dismissed the notice of.
+    /// What admins haven't dismissed of what an upgrade changed in the built-in
+    /// templates: each one's name, with the alerts people have copies of that it
+    /// changed under them.
     pub async fn template_upgrades(&self) -> Result<Vec<String>> {
         let rows = template::Entity::find()
             .filter(template::Column::BuiltIn.eq(true))
@@ -758,13 +1325,34 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading templates")?;
-        Ok(rows
-            .into_iter()
-            .map(|row| match row.deleted_at {
-                Some(_) => format!("{} (removed)", row.name),
-                None => row.name,
-            })
-            .collect())
+        let mut notices = Vec::new();
+        for row in rows {
+            if row.deleted_at.is_some() {
+                notices.push(format!("{} (removed)", row.name));
+                continue;
+            }
+            let copies: Vec<String> = alert_rule::Entity::find()
+                .filter(alert_rule::Column::DeletedAt.is_null())
+                .filter(alert_rule::Column::TemplateId.eq(row.id))
+                .filter(alert_rule::Column::ReplacesId.is_not_null())
+                .filter(alert_rule::Column::OriginalChangedAt.gte(row.upgraded_at))
+                .order_by_asc(alert_rule::Column::Name)
+                .all(&self.connection)
+                .await
+                .context("loading alert rules")?
+                .into_iter()
+                .map(|copy| copy.name)
+                .collect();
+            notices.push(match copies.is_empty() {
+                true => row.name,
+                false => format!(
+                    "{} (its version of {} changed, which you have your own of)",
+                    row.name,
+                    copies.join(", ")
+                ),
+            });
+        }
+        Ok(notices)
     }
 
     /// Dismisses the notice of what an upgrade changed in the built-in templates.
@@ -800,49 +1388,4 @@ async fn refuse_taken<C: ConnectionTrait>(
         bail!(NameTaken::TemplateKey(template.key.clone()));
     }
     Ok(())
-}
-
-async fn save_overrides<C: ConnectionTrait>(
-    connection: &C,
-    rule_id: i64,
-    overrides: Map<String, Value>,
-) -> Result<()> {
-    let overrides = (!overrides.is_empty()).then_some(Value::Object(overrides));
-    alert_rule::Entity::update_many()
-        .col_expr(alert_rule::Column::Overrides, Expr::value(overrides))
-        .filter(alert_rule::Column::Id.eq(rule_id))
-        .exec(connection)
-        .await
-        .context("saving what was changed of a template's alert")?;
-    Ok(())
-}
-
-async fn template_rule_in<C: ConnectionTrait>(
-    connection: &C,
-    rule_id: i64,
-) -> Result<Option<(StoredTemplate, Alert, Map<String, Value>, AlertRuleInput)>> {
-    let Some(row) = alert_rule::Entity::find_by_id(rule_id)
-        .filter(alert_rule::Column::DeletedAt.is_null())
-        .one(connection)
-        .await
-        .context("loading alert rule")?
-    else {
-        return Ok(None);
-    };
-    let (Some(template_id), Some(key)) = (row.template_id, &row.template_alert) else {
-        return Ok(None);
-    };
-    let stored = load_template(connection, template_id)
-        .await?
-        .context("a rule's template went missing")?;
-    let alert = stored
-        .template
-        .alerts
-        .iter()
-        .find(|alert| &alert.key == key)
-        .cloned()
-        .context("a rule's alert went missing from its template")?;
-    let overrides = overrides_in(&row);
-    let own = effective_rule(&stored.template, &alert, &overrides)?;
-    Ok(Some((stored, alert, overrides, own)))
 }

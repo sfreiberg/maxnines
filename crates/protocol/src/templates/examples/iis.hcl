@@ -130,7 +130,7 @@ template "iis" {
     }
     metrics = {
       pool_memory = { counter = "Working Set - Private", unit = "bytes" }
-      pool_cpu    = { counter = "% Processor Time", value = "value / host.cpu_count" } # 100% per core otherwise
+      pool_cpu    = { counter = "% Processor Time", value = "value / facts.cpu.logical_cores" } # 100% per core otherwise
     }
   }
 
@@ -147,7 +147,7 @@ template "iis" {
     }
     metrics = {
       pool_memory = { counter = "Working Set - Private", unit = "bytes" }
-      pool_cpu    = { counter = "% Processor Time", value = "value / host.cpu_count" }
+      pool_cpu    = { counter = "% Processor Time", value = "value / facts.cpu.logical_cores" }
     }
   }
 

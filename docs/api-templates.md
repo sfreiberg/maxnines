@@ -1,10 +1,10 @@
 # Templates API
 
-[Templates](templates.md) are sent and given back as HCL. A template you save is kept
-as you wrote it, and comments and layout in it are kept too; one saved from the form
-on its page is written out again, without them. The built-in ones can be turned on and
-off, and their alerts changed, but not changed or deleted themselves, which gives
-`422`.
+[Templates](templates.md) are sent and given back as HCL. The server keeps a template as
+its parts, not as text, so comments and layout in HCL you send aren't kept, and the HCL
+given back is written out from the parts. The built-in ones can be turned on and off,
+and their alerts changed by making your own copy of one, but not changed or deleted
+themselves, which gives `422`.
 
 | Field | Description |
 | --- | --- |
@@ -16,7 +16,7 @@ off, and their alerts changed, but not changed or deleted themselves, which give
 | `target` | What it runs for: `{"kind": "database", "value": "postgres"}`, `service`, or `os` with a list of systems, or `null` for every host |
 | `created_at`, `updated_at` | When it was added, and last changed |
 | `upgraded_at` | When an upgrade last changed a built-in one, or `null` |
-| `changed` | Whether any of its alerts has been changed from the template's values |
+| `changed` | Whether you have your own copy of any of its alerts |
 
 ## List templates
 
@@ -52,15 +52,16 @@ Everything listed, with:
 
 | Field | Description |
 | --- | --- |
-| `hcl` | The template |
+| `hcl` | The template, written out from its parts |
 | `template` | The template read, field by field, as the HCL has it |
 | `metrics` | Its own metrics, each with its full `name`, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
-| `alerts` | Each of its alerts, by `key`, with the `rule` that's in effect, as [alert rules](api-alert-rules.md) are given, and the template's own values as `template_values` |
+| `alerts` | Each of its alerts, by `key`, with the `rule` in use, as [alert rules](api-alert-rules.md) are given, and where that's your own copy of a built-in template's, the built-in one as `built_in_rule`, `null` otherwise |
 
 A template's rule has a `template` field saying so: the template's `id`, the `alert`'s
-key, the fields `overridden`, by their names in the API, and `waits_for_agents`, true
-while it needs what only agents running the template would send, which leaves it
-unchecked.
+key, `replaces_id`, which for your own copy is the built-in rule it's used in place of,
+`template_enabled`, `waits_for_agents`, true while it needs what only agents running
+the template would send, which leaves it unchecked, and `original_changed_at`, when an
+upgrade last changed the built-in rule under a copy.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/templates/1"
@@ -91,8 +92,9 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `PUT /api/v1/templates/{id}`
 
-Replaces a template of your own with the HCL in `hcl`. What was changed of the alerts
-it still has, by their keys, is kept. The rules of alerts it no longer has are deleted.
+Replaces a template of your own with the HCL in `hcl`. The alerts it still has, by their
+keys, keep their rules, with who each tells. The rules of alerts it no longer has are
+deleted.
 
 ## Delete a template
 
@@ -112,9 +114,14 @@ Turning a built-in template off lasts through upgrades.
 `PUT /api/v1/templates/{id}/alerts/{key}`
 
 The body is the whole rule, as for [updating an alert rule](api-alert-rules.md#update-an-alert-rule),
-which does the same. What's different from the template's values is kept as what's
-changed, so the API and the page show it, and an upgrade keeps it. Its conditions can use
-the template's own metrics by their short names, and it can't have a calculation.
+which does the same. Its conditions can use the template's own metrics by their short
+names, and it can't have a calculation.
+
+For a built-in template, the first change makes your own copy of the rule, with an `id`
+of its own, which is checked in place of the built-in one from then on, and later
+changes update the copy. A body that differs from the built-in rule only in `enabled`
+sets that on the built-in rule and makes no copy. For a template of your own, the rule
+itself, and so the template, is changed.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -132,14 +139,17 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 ## Put one of a template's alerts back
 
-`POST /api/v1/templates/{id}/alerts/{key}/reset`
+`DELETE /api/v1/templates/{id}/alerts/{key}`, or `POST /api/v1/templates/{id}/alerts/{key}/reset`
 
-Back to the template's values, forgetting what was changed.
+Deletes your copy of a built-in template's alert, as deleting the copy as an
+[alert rule](api-alert-rules.md#delete-an-alert-rule) does, so the built-in rule is
+checked again. `404` if there's no copy.
 
 ## What an upgrade changed
 
 `GET /api/v1/templates/upgrades` gives the names of the built-in templates an upgrade
-changed whose notice admins haven't dismissed, and
+changed whose notice admins haven't dismissed, each saying which alerts you have copies
+of that it changed, and
 `POST /api/v1/templates/upgrades/dismiss` dismisses it. Both need an admin.
 
 ```json

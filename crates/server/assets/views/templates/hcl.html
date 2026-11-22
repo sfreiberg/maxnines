@@ -13,7 +13,7 @@
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
   <label>HCL
     <textarea name="hcl" rows="24" spellcheck="false" class="mono">{{ hcl }}</textarea>
-    <small>One <code>template "key" {{ '{' }} … }</code> block, as <a href="/docs/templates">the docs</a> describe. Saving from the form writes it out again, without comments.</small>
+    <small>One <code>template "key" {{ '{' }} … }</code> block, as <a href="/docs/templates">the docs</a> describe. It's kept as its parts, not as text, so comments and layout aren't kept: what's shown afterwards is written out from them.</small>
   </label>
   <div class="actions">
     {% if can_edit %}<button type="submit">Save template</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}

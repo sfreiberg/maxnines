@@ -125,11 +125,20 @@ async fn index_of(
 /// Makes `table`, whose names are each used once among the rows that aren't deleted.
 async fn live_names(
     manager: &SchemaManager<'_>,
-    mut table: TableCreateStatement,
+    table: TableCreateStatement,
     name: &str,
 ) -> Result<(), DbErr> {
+    live_names_while(manager, table, name, "deleted_at IS NULL").await
+}
+
+/// Makes `table`, whose names are each used once among the rows `live` picks.
+async fn live_names_while(
+    manager: &SchemaManager<'_>,
+    mut table: TableCreateStatement,
+    name: &str,
+    live: &str,
+) -> Result<(), DbErr> {
     let index = format!("idx_{name}_live_name");
-    let live = "deleted_at IS NULL";
     if manager.get_database_backend() == DatabaseBackend::MySql {
         table.col(only_while("live_name", NAME_KEY_LEN, live, "name_key"));
         manager.create_table(table).await?;
@@ -138,6 +147,191 @@ async fn live_names(
         manager.create_table(table).await?;
         index_of(manager, Unique, &index, name, "name_key", Some(live)).await
     }
+}
+
+/// A column of one of the tables holding a template's parts, which are named as
+/// the HCL names them.
+fn part(name: &str) -> ColumnDef {
+    ColumnDef::new(Alias::new(name))
+}
+
+/// The tables holding the parts of a template, one row to a block or entry, each
+/// with its key and where it comes among the others. Every one has a `replaces_id`,
+/// for someone's own copy of a built-in template's part, as alert rules have.
+async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
+    let backend = manager.get_database_backend();
+    let key = || {
+        exact_text(backend, Alias::new("key"), 255)
+            .not_null()
+            .to_owned()
+    };
+    let position = || part("position").integer().not_null().to_owned();
+    // What every part has, and the template, query, counters or fill it's part of.
+    let table = |name: &str, parents: &[(&str, &str, bool)]| {
+        let mut table = Table::create()
+            .table(Alias::new(name))
+            .col(id(Alias::new("id")))
+            .to_owned();
+        for (column, parent, required) in parents {
+            let mut owner = part(column).big_integer().to_owned();
+            if *required {
+                owner.not_null();
+            }
+            table.col(owner).foreign_key(
+                ForeignKey::create()
+                    .name(format!("fk_{name}_{column}"))
+                    .from(Alias::new(name), Alias::new(*column))
+                    .to(Alias::new(*parent), Alias::new("id"))
+                    .on_delete(ForeignKeyAction::Cascade),
+            );
+        }
+        table.col(part("replaces_id").big_integer()).foreign_key(
+            ForeignKey::create()
+                .name(format!("fk_{name}_replaces_id"))
+                .from(Alias::new(name), Alias::new("replaces_id"))
+                .to(Alias::new(name), Alias::new("id"))
+                .on_delete(ForeignKeyAction::Cascade),
+        );
+        table
+    };
+    let template = [("template_id", "templates", true)];
+
+    let mut discoveries = table("template_discoveries", &template);
+    discoveries
+        .col(part("interval_secs").big_integer())
+        .col(part("sql").text())
+        .col(json(backend, Alias::new("counter_sets")));
+    manager.create_table(discoveries).await?;
+
+    let mut registry = table("template_registry_reads", &template);
+    registry
+        .col(key())
+        .col(position())
+        .col(json(backend, Alias::new("value_names")).not_null());
+    manager.create_table(registry).await?;
+
+    let mut notices = table("template_notices", &template);
+    notices
+        .col(key())
+        .col(position())
+        .col(part("when_condition").text())
+        .col(part("text").text().not_null());
+    manager.create_table(notices).await?;
+
+    let mut queries = table("template_queries", &template);
+    queries
+        .col(key())
+        .col(position())
+        .col(part("sql").text().not_null())
+        .col(part("interval_secs").big_integer())
+        .col(part("since").string_len(64))
+        .col(part("when_condition").text())
+        .col(part("enabled").boolean().not_null())
+        .col(json(backend, Alias::new("labels")));
+    manager.create_table(queries).await?;
+
+    let mut fills = table("template_fills", &[("query_id", "template_queries", true)]);
+    fills.col(key()).col(position()).col(part("older").text());
+    manager.create_table(fills).await?;
+
+    let mut versions = table(
+        "template_fill_versions",
+        &[("fill_id", "template_fills", true)],
+    );
+    versions
+        .col(part("version").string_len(64).not_null())
+        .col(position())
+        .col(part("sql").text().not_null());
+    manager.create_table(versions).await?;
+
+    let mut counters = table("template_counters", &template);
+    counters
+        .col(key())
+        .col(position())
+        .col(part("object").string_len(255).not_null())
+        .col(part("label").string_len(64))
+        .col(part("pattern").text())
+        .col(part("instance").string_len(255))
+        .col(json(backend, Alias::new("exclude")))
+        .col(json(backend, Alias::new("groups")))
+        .col(part("join_object").string_len(255))
+        .col(part("join_pattern").text())
+        .col(part("when_condition").text())
+        .col(part("since").string_len(64))
+        .col(part("interval_secs").big_integer())
+        .col(part("enabled").boolean().not_null());
+    manager.create_table(counters).await?;
+
+    // A metric is a query's or a counters block's.
+    let mut metrics = table(
+        "template_metrics",
+        &[
+            ("query_id", "template_queries", false),
+            ("counters_id", "template_counters", false),
+        ],
+    );
+    metrics
+        .col(key())
+        .col(position())
+        .col(part("counter").string_len(255))
+        .col(part("unit").string_len(16))
+        .col(part("total").boolean().not_null())
+        .col(part("description").text())
+        .col(part("value").text())
+        .col(part("since").string_len(64))
+        .col(json(backend, Alias::new("states")));
+    manager.create_table(metrics).await?;
+
+    for (name, table, columns) in [
+        (
+            "idx_template_discoveries_template",
+            "template_discoveries",
+            "template_id",
+        ),
+        (
+            "idx_template_registry_reads_template",
+            "template_registry_reads",
+            "template_id, position",
+        ),
+        (
+            "idx_template_notices_template",
+            "template_notices",
+            "template_id, position",
+        ),
+        (
+            "idx_template_queries_template",
+            "template_queries",
+            "template_id, position",
+        ),
+        (
+            "idx_template_fills_query",
+            "template_fills",
+            "query_id, position",
+        ),
+        (
+            "idx_template_fill_versions_fill",
+            "template_fill_versions",
+            "fill_id, position",
+        ),
+        (
+            "idx_template_counters_template",
+            "template_counters",
+            "template_id, position",
+        ),
+        (
+            "idx_template_metrics_query",
+            "template_metrics",
+            "query_id, position",
+        ),
+        (
+            "idx_template_metrics_counters",
+            "template_metrics",
+            "counters_id, position",
+        ),
+    ] {
+        index_of(manager, Plain, name, table, columns, None).await?;
+    }
+    Ok(())
 }
 
 struct CreateTables;
@@ -773,8 +967,13 @@ impl MigrationTrait for CreateTables {
             .col(name_key(backend))
             .col(ColumnDef::new(Templates::Description).text())
             .col(ColumnDef::new(Templates::BuiltIn).boolean().not_null())
-            // The HCL, as the built-in file or whoever saved it wrote it.
-            .col(ColumnDef::new(Templates::Source).text().not_null())
+            // What it runs once for on each host: a kind of database, a service or
+            // operating systems, comma separated. Neither for every host.
+            .col(ColumnDef::new(Templates::TargetKind).string_len(16))
+            .col(ColumnDef::new(Templates::Target).string_len(255))
+            .col(ColumnDef::new(Templates::MinVersion).string_len(64))
+            .col(json(backend, Templates::RenamedFrom))
+            .col(json(backend, Templates::Services))
             // What a built-in one says, hashed, so an upgrade can tell it changed.
             .col(ColumnDef::new(Templates::Fingerprint).string_len(64))
             .col(ColumnDef::new(Templates::Enabled).boolean().not_null())
@@ -818,10 +1017,13 @@ impl MigrationTrait for CreateTables {
             )
             .await?;
         }
+        template_parts(manager).await?;
         // A rule is only ever marked deleted, as its alerts keep it, and its name is
-        // used once among those that aren't. One a template's alert became holds
-        // what's in effect, the template's values with what people changed in
-        // `overrides`, which is all that's kept of their changes.
+        // used once among those that aren't. A template's alert is a rule, which for
+        // a built-in template belongs to the server: someone changing it makes a copy
+        // of their own, a second rule that `replaces_id` points from, and that one
+        // is used while it's there. Copies' names aren't in the index, as each has
+        // its original's until it's renamed.
         let rules = Table::create()
             .table(AlertRules::Table)
             .col(id(AlertRules::Id))
@@ -848,7 +1050,14 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
             .col(ColumnDef::new(AlertRules::TemplateId).big_integer())
             .col(exact_text(backend, AlertRules::TemplateAlert, 64))
-            .col(json(backend, AlertRules::Overrides))
+            .col(ColumnDef::new(AlertRules::ReplacesId).big_integer())
+            // Where a template's alert comes among its alerts, and what only a
+            // template's alert has: which of what discovery found it's for.
+            .col(ColumnDef::new(AlertRules::TemplatePosition).integer())
+            .col(ColumnDef::new(AlertRules::WhenCondition).text())
+            .col(ColumnDef::new(AlertRules::Since).string_len(64))
+            // When an upgrade last changed the built-in rule under someone's copy.
+            .col(moment(backend, AlertRules::OriginalChangedAt))
             // Until agents run templates, one whose alert needs what only they'd send,
             // the template's own metrics or what its discovery finds, isn't checked.
             .col(
@@ -864,18 +1073,30 @@ impl MigrationTrait for CreateTables {
                     .from(AlertRules::Table, AlertRules::TemplateId)
                     .to(Templates::Table, Templates::Id),
             )
+            .foreign_key(
+                ForeignKey::create()
+                    .name("fk_alert_rules_replaces_id")
+                    .from(AlertRules::Table, AlertRules::ReplacesId)
+                    .to(AlertRules::Table, AlertRules::Id),
+            )
             .to_owned();
+        let own = "deleted_at IS NULL AND replaces_id IS NULL";
         let mut rules = rules;
         if mysql {
-            rules.col(only_while(
-                "live_template_alert",
-                64,
-                live,
-                "template_alert",
-            ));
+            rules.col(only_while("live_template_alert", 64, own, "template_alert"));
+            rules.col(
+                ColumnDef::new(Alias::new("live_replaces_id"))
+                    .big_integer()
+                    .generated(
+                        Expr::cust(format!("CASE WHEN {live} THEN replaces_id END")),
+                        true,
+                    )
+                    .to_owned(),
+            );
         }
-        live_names(manager, rules, "alert_rules").await?;
-        // Each of a template's alerts is one rule, among those that aren't deleted.
+        live_names_while(manager, rules, "alert_rules", own).await?;
+        // Each of a template's alerts is one rule, and has at most one copy, among
+        // those that aren't deleted.
         if mysql {
             index_of(
                 manager,
@@ -886,6 +1107,15 @@ impl MigrationTrait for CreateTables {
                 None,
             )
             .await?;
+            index_of(
+                manager,
+                Unique,
+                "idx_alert_rules_replaces",
+                "alert_rules",
+                "live_replaces_id",
+                None,
+            )
+            .await?;
         } else {
             index_of(
                 manager,
@@ -893,7 +1123,16 @@ impl MigrationTrait for CreateTables {
                 "idx_alert_rules_template_alert",
                 "alert_rules",
                 "template_id, template_alert",
-                Some("deleted_at IS NULL AND template_id IS NOT NULL"),
+                Some("deleted_at IS NULL AND replaces_id IS NULL AND template_id IS NOT NULL"),
+            )
+            .await?;
+            index_of(
+                manager,
+                Unique,
+                "idx_alert_rules_replaces",
+                "alert_rules",
+                "replaces_id",
+                Some("deleted_at IS NULL AND replaces_id IS NOT NULL"),
             )
             .await?;
         }
@@ -1846,7 +2085,11 @@ enum AlertRules {
     RemindEverySecs,
     TemplateId,
     TemplateAlert,
-    Overrides,
+    ReplacesId,
+    TemplatePosition,
+    WhenCondition,
+    Since,
+    OriginalChangedAt,
     WaitsForAgents,
     DeletedAt,
 }
@@ -1859,7 +2102,11 @@ enum Templates {
     Name,
     Description,
     BuiltIn,
-    Source,
+    TargetKind,
+    Target,
+    MinVersion,
+    RenamedFrom,
+    Services,
     Fingerprint,
     Enabled,
     CreatedAt,

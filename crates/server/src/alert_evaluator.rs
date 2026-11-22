@@ -370,11 +370,7 @@ impl Snapshot {
     /// Missing data is never a reason: the agent may just be offline, and that's
     /// exactly when a disk alert shouldn't quietly close itself.
     fn reason_to_close(&self, alert: &Alert) -> Option<&'static str> {
-        let Some(rule) = self
-            .rules
-            .get(&alert.rule_id)
-            .filter(|rule| rule.rule.enabled)
-        else {
+        let Some(rule) = self.rules.get(&alert.rule_id).filter(|rule| rule.runs()) else {
             return Some(RULE_GONE_REASON);
         };
         // Checking a calculation deals with its own alerts. Getting here means it
@@ -577,10 +573,7 @@ impl Evaluator {
         // Saving a rule checks its conditions can be read, so one that can't was
         // saved some other way, and is left alone rather than stopping every rule.
         let mut conditions: HashMap<i64, Arc<Conditions>> = HashMap::new();
-        for rule in rules
-            .values()
-            .filter(|rule| rule.rule.enabled && !rule.waits_for_agents())
-        {
+        for rule in rules.values().filter(|rule| rule.runs()) {
             match &rule.conditions {
                 Some(read) => {
                     conditions.insert(rule.id, read.clone());

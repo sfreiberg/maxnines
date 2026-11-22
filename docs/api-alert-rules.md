@@ -25,12 +25,12 @@ or something that can't work, such as a length of time compared with a number, g
 `422` with what's wrong.
 
 A rule that's one of a [template's](api-templates.md) alerts has a `template` field,
-`null` for any other rule, with the template's `id`, the `alert`'s key, the fields
-`overridden` from the template's values, and whether it `waits_for_agents`. Updating it
-keeps what's different from the template's values apart from them, so an upgrade of the
-template keeps it; its conditions can use the template's own metrics by their short
-names, and it can't have a calculation. It can't be deleted, which gives `422`: turn it
-off, or the template.
+`null` for any other rule, with the template's `id`, the `alert`'s key, and `replaces_id`
+when it's your own copy of a built-in template's rule. Updating a built-in template's
+rule makes that copy, or updates it, as [changing a template's
+alert](api-templates.md#change-one-of-a-templates-alerts) does, and the list has the
+copy in place of the rule it replaces. A template's rule can't have a calculation, and
+can't be deleted, which gives `422`; deleting a copy puts the built-in rule back.
 
 A rule for a host that's connected but whose samples have stopped, as in
 [connected but sending no metrics](alerts.md#connected-but-sending-no-metrics):
@@ -216,7 +216,7 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `DELETE /api/v1/alert-rules/{id}`
 
-A template's rule can't be deleted, which gives `422`. Any other rule stops watching, its
+A template's own rule can't be deleted, which gives `422`; a copy of one can. The rule stops watching, its
 open alerts end, and its silences that haven't ended and its
 maintenance windows go. It's kept, marked deleted, so its alerts still say which rule
 raised them as `rule_id`, but it's no longer listed or found, and its name is free for a

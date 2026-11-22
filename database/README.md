@@ -60,6 +60,16 @@ erDiagram
     hosts ||--o{ remote_checks : "is checked by"
     hosts ||--o{ alerts : "has"
     templates |o--o{ alert_rules : "alerts as"
+    alert_rules |o--o| alert_rules : "copied as"
+    templates ||--o| template_discoveries : "discovers with"
+    templates ||--o{ template_registry_reads : "reads"
+    templates ||--o{ template_notices : "notes"
+    templates ||--o{ template_queries : "queries"
+    template_queries ||--o{ template_fills : "fills"
+    template_fills ||--o{ template_fill_versions : "by version"
+    templates ||--o{ template_counters : "counts"
+    template_queries |o--o{ template_metrics : "gives"
+    template_counters |o--o{ template_metrics : "gives"
     alert_rules ||--o{ alerts : "raised"
     alert_rules ||--o{ alert_rule_channels : "tells"
     notification_channels ||--o{ alert_rule_channels : "told by"
@@ -146,7 +156,11 @@ erDiagram
         int remind_every_secs
         int template_id FK "the template whose alert it is, or NULL"
         string template_alert "which of its alerts, by key"
-        json overrides "what people changed of the template's values, by field"
+        int replaces_id FK "for someone's copy, the built-in template's rule it's used in place of"
+        int template_position "where it comes among the template's alerts"
+        text when_condition "a template's alert: CEL over what discovery found"
+        string since "a template's alert: the version it's from"
+        timestamp original_changed_at "when an upgrade last changed the rule a copy replaces"
         boolean waits_for_agents "needs what only agents running the template send"
         timestamp deleted_at "kept so alerts can name it"
     }
@@ -157,14 +171,106 @@ erDiagram
         string name_key "unique among those not deleted"
         text description
         boolean built_in
-        text source "the template in HCL"
+        string target_kind "database, service or os, or NULL for every host"
+        string target "the kind of database, the service, or systems, comma separated"
+        string min_version
+        json renamed_from "keys it had before"
+        json services "services the host's alerts should watch"
         string fingerprint "a hash of what a built-in one says, or NULL"
-        boolean enabled
+        boolean enabled "starting never writes it"
         timestamp created_at
         timestamp updated_at
         timestamp upgraded_at "when an upgrade last changed a built-in one"
         boolean upgrade_seen "whether admins dismissed the notice of it"
         timestamp deleted_at "kept so its rules can name it"
+    }
+    template_discoveries {
+        int id PK
+        int template_id FK
+        int replaces_id FK
+        int interval_secs
+        text sql
+        json counter_sets "name to counter set"
+    }
+    template_registry_reads {
+        int id PK
+        int template_id FK
+        int replaces_id FK
+        string key "the registry key"
+        int position
+        json value_names "name to registry value"
+    }
+    template_notices {
+        int id PK
+        int template_id FK
+        int replaces_id FK
+        string key
+        int position
+        text when_condition
+        text text
+    }
+    template_queries {
+        int id PK
+        int template_id FK
+        int replaces_id FK
+        string key
+        int position
+        text sql
+        int interval_secs
+        string since
+        text when_condition
+        boolean enabled
+        json labels "the columns that tell rows apart"
+    }
+    template_fills {
+        int id PK
+        int query_id FK
+        int replaces_id FK
+        string key
+        int position
+        text older "the SQL below every version"
+    }
+    template_fill_versions {
+        int id PK
+        int fill_id FK
+        int replaces_id FK
+        string version
+        int position
+        text sql
+    }
+    template_counters {
+        int id PK
+        int template_id FK
+        int replaces_id FK
+        string key
+        int position
+        string object "the counter set"
+        string label
+        text pattern
+        string instance
+        json exclude "instances left out"
+        json groups "group to counter"
+        string join_object
+        text join_pattern
+        text when_condition
+        string since
+        int interval_secs
+        boolean enabled
+    }
+    template_metrics {
+        int id PK
+        int query_id FK "its query, or"
+        int counters_id FK "its counters"
+        int replaces_id FK
+        string key
+        int position
+        string counter
+        string unit
+        boolean total
+        text description
+        text value "CEL working it out"
+        string since
+        json states "number to word"
     }
     alerts {
         int id PK
@@ -482,8 +588,9 @@ erDiagram
 | `host_config_status` | The config each host's agent last applied, why if it refused one, and the collectors in it the agent doesn't know |
 | `host_boots` | When each host last started, to notice restarts |
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
-| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A rule that's a template's alert holds what's in effect, the template's values with what people changed, which `overrides` keeps on its own, so a new version of the template never touches it |
-| `templates` | What MaxNines watches for in something it monitors, in HCL: the built-in ones, which the server writes each time it starts, marked by `built_in`, and people's own. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
+| `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A template's alert is a rule too. A built-in template's rule is the server's, rewritten as it starts but for `enabled`; someone changing it makes a copy of their own, a second rule whose `replaces_id` points at it, which is used in its place until it's deleted |
+| `templates` | What MaxNines watches for in something it monitors: the built-in ones, which the server writes each time it starts, marked by `built_in`, and people's own. HCL is only how they come in and go out. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
+| `template_discoveries`, `template_registry_reads`, `template_notices`, `template_queries`, `template_fills`, `template_fill_versions`, `template_counters`, `template_metrics` | A template's parts, one row to a block or entry, each with its key as the HCL has it and its `position` among the others. They go with their template, query, counters or fill. Each has a `replaces_id` for someone's own copy of a built-in part, as alert rules have, which nothing makes yet |
 | `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |
 | `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |
@@ -509,7 +616,8 @@ such as rules that aren't deleted, index those rows alone on PostgreSQL and SQLi
 MySQL and MariaDB can't, so those tables also have a column the database works out,
 holding what's kept unique for those rows and NULL for the rest, with a unique index
 that lets NULL repeat: `live_name` on `alert_rules`, `notification_channels` and
-`templates`, `live_key` on `templates`, `live_template_alert` on `alert_rules`,
+`templates`, `live_key` on `templates`, `live_template_alert` and `live_replaces_id` on
+`alert_rules`,
 `current_name` on `host_facts` and `open_series` on `alerts`. Each compares exactly,
 by the `utf8mb4_bin` collation, as the other databases do, rather than as the table's
 collation would. MySQL and MariaDB also make an index for each foreign key that no
@@ -533,11 +641,13 @@ index here starts with.
 | `idx_recovery_codes_user_id` | `recovery_codes (user_id)` | A user's recovery codes |
 | `idx_sign_in_challenges_user_id` | `sign_in_challenges (user_id)` | A user's challenges |
 | `idx_sign_in_challenges_expires` | `sign_in_challenges (expires_at)` | Clearing challenges that ran out, on every sign in |
-| `idx_alert_rules_live_name` | `alert_rules (name_key)` where `deleted_at` is NULL, unique | One rule to a name |
+| `idx_alert_rules_live_name` | `alert_rules (name_key)` where `deleted_at` and `replaces_id` are NULL, unique | One rule to a name. A copy has its original's name until it's renamed, so the server checks copies' names itself |
 | `idx_notification_channels_live_name` | `notification_channels (name_key)` where `deleted_at` is NULL, unique | One channel to a name |
 | `idx_templates_live_name` | `templates (name_key)` where `deleted_at` is NULL, unique | One template to a name |
 | `idx_templates_live_key` | `templates (key)` where `deleted_at` is NULL, unique | One template to a key |
-| `idx_alert_rules_template_alert` | `alert_rules (template_id, template_alert)` where `deleted_at` is NULL and `template_id` isn't, unique | One rule to each of a template's alerts |
+| `idx_alert_rules_template_alert` | `alert_rules (template_id, template_alert)` where `deleted_at` and `replaces_id` are NULL and `template_id` isn't, unique | One rule to each of a template's alerts |
+| `idx_alert_rules_replaces` | `alert_rules (replaces_id)` where `deleted_at` is NULL and `replaces_id` isn't, unique | One copy of a built-in template's rule |
+| `idx_template_*` | Each part table by its template, query, counters or fill, and `position` | A template's parts in order |
 | `idx_alert_rule_channels_channel` | `alert_rule_channels (channel_id)` | The rules telling a channel |
 | `idx_alert_rule_actions_rule` | `alert_rule_actions (rule_id)` | A rule's actions |
 | `idx_alerts_resolved` | `alerts (resolved_at, id)` | Open alerts, and those that ended most recently |

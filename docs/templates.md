@@ -6,15 +6,18 @@ of its alerts is an [alert rule](alerts.md), which you can change, turn off and 
 back as it was.
 
 Templates are under **Settings > Templates**. The ones that come with MaxNines are
-written as the server starts, and an upgrade can bring new versions of them. What you
-change of their alerts is kept apart from the template, so an upgrade never undoes it.
-Admins see a notice on every page when an upgrade has changed one, until one of them
-dismisses it. A built-in template can't be edited or deleted, but it can be disabled,
-which turns off all its alerts and stays that way through upgrades.
+written as the server starts, and an upgrade can bring new versions of them. A built-in
+template can't be edited or deleted. Changing one of its alerts makes a copy of your
+own, used in place of the built-in one, which upgrades never touch. A built-in template
+or alert can be disabled, which stays that way through upgrades. Admins see a notice on
+every page when an upgrade has changed a template, saying which alerts you have your
+own copies of, until one of them dismisses it.
 
 You can add templates of your own, for things MaxNines doesn't know, with the form on
 the Templates page, as HCL on its **HCL** tab, or through the
-[API](api-templates.md).
+[API](api-templates.md). MaxNines keeps a template as its parts, not as text: HCL is how
+one comes in and goes out, so comments and layout in HCL you save aren't kept, and what's
+shown afterwards is written out from the parts.
 
 ## What comes with MaxNines
 
@@ -216,15 +219,25 @@ notice "cannot_see_sessions" {
 ## Changing a template's alerts
 
 Open the alert from the template's page, or from **Settings > Alert rules**, where it
-says which template it's from, and change it with the usual form. Only what you change
-is kept, apart from the template, and the template's page marks each changed field with
-the template's own value beside it. **Reset to template** puts an alert back to the
-template's values. A template's alerts can be turned off but not deleted.
+says which template it's from, and change it with the usual form.
+
+For a **built-in** template, saving a change makes a copy of your own. From then on your
+copy is the rule that's checked, and the built-in one isn't: any alerts it had open
+end, and your copy raises its own. The template's page and the copy's form show what
+the built-in one says beside yours, and when an upgrade last changed it, so you can
+compare. **Reset to template** deletes your copy, ending its open alerts, and the
+built-in rule is checked again. Turning a built-in alert on or off, and nothing else,
+only sets a flag on it, with no copy.
+
+For a template of **your own**, there are no copies: changing an alert with its form
+changes the template itself, as editing the template does.
+
+A template's alerts can be turned off but not deleted.
 
 ## Names, keys and upgrades
 
 A built-in template is known by its key, so an upgrade can rename it or change
-anything else about it and still keep what you changed. One whose key changes says so
+anything else about it and still keep your copies of its alerts and what's turned off. One whose key changes says so
 with `renamed_from = ["old_key"]`. If an upgrade brings a built-in template with the
 key or name of one of yours, yours keeps everything it has under a key and name of its
 own, such as `myapp_yours` and `My app (yours)`, and a rule of yours with the name of

@@ -13,8 +13,15 @@ pub struct Model {
     pub name_key: String,
     pub description: Option<String>,
     pub built_in: bool,
-    /// The template in HCL.
-    pub source: String,
+    /// What it runs for: `database`, `service` or `os`, or nothing for every host.
+    pub target_kind: Option<String>,
+    /// The kind of database, the service, or the operating systems, comma separated.
+    pub target: Option<String>,
+    pub min_version: Option<String>,
+    /// Keys it had before, as a list.
+    pub renamed_from: Option<Json>,
+    /// Services the host's own alerts should watch, as a list.
+    pub services: Option<Json>,
     /// For a built-in one, a hash of what it says.
     pub fingerprint: Option<String>,
     pub enabled: bool,

@@ -6,7 +6,7 @@
   <h1>Templates</h1>
   {% if can_edit %}<div class="actions"><a class="button" href="/templates/new">Add template</a></div>{% endif %}
 </div>
-<p class="hint">What MaxNines watches for in what it monitors, with the alert rules each one has. Those that come with MaxNines are updated by upgrades, which keep what you change of their alerts. <a href="/docs/templates">How templates work</a>.</p>
+<p class="hint">What MaxNines watches for in what it monitors, with the alert rules each one has. Those that come with MaxNines are updated by upgrades, which leave your own copies of their alerts alone. <a href="/docs/templates">How templates work</a>.</p>
 {% if templates %}
 <div class="tablebox" id="templates"><table>
   <thead>
@@ -18,7 +18,7 @@
       <td><a href="/templates/{{ template.id }}">{{ template.name }}</a>{% if template.built_in %}<span class="under">Comes with MaxNines{% if template.upgraded %} · updated {{ template.upgraded }}{% endif %}</span>{% else %}<span class="under">Yours</span>{% endif %}{% if template.description %}<span class="under">{{ template.description }}</span>{% endif %}</td>
       <td>{{ template.target }}</td>
       <td class="number">{{ template.alerts }}</td>
-      <td>{% if not template.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if template.changed %} <span class="badge hollow" title="Some of its alerts have been changed from the template's values">Changed</span>{% endif %}</td>
+      <td>{% if not template.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if template.changed %} <span class="badge hollow" title="You have your own copy of some of its alerts">Changed</span>{% endif %}</td>
       <td>
         {% if can_edit %}
         <div class="actions row-actions">

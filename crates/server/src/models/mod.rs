@@ -49,6 +49,14 @@ mod silence;
 mod silences;
 mod stats;
 mod template;
+mod template_counters;
+mod template_discovery;
+mod template_fill;
+mod template_fill_version;
+mod template_metric;
+mod template_notice;
+mod template_query;
+mod template_registry_read;
 mod templates;
 mod two_factor;
 mod user;
@@ -80,7 +88,7 @@ use self::audit::record_change;
 pub use self::built_in_rules::same_rule;
 pub use self::events::{MAX_TIMELINE, NewEvent};
 pub use self::stats::DatabaseStats;
-pub use self::templates::StoredTemplate;
+pub use self::templates::{StoredTemplate, TemplateAlert};
 pub use self::two_factor::CHALLENGE_LIFETIME;
 pub use self::users::{
     DEFAULT_THEME, SESSION_LIFETIME, THEMES, User, UserChange, check_new_password, check_new_user,

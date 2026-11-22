@@ -239,7 +239,8 @@ impl AppState {
         input: &AlertRuleInput,
     ) -> Result<Conditions> {
         match self.database.template_rule(id).await? {
-            Some((stored, ..)) => {
+            Some(found) => {
+                let stored = found.template;
                 ensure!(
                     !input.is_calculation(),
                     "a template's alert is about each host, so it can't have a calculation"

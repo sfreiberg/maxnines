@@ -331,8 +331,13 @@ struct TemplateOf {
     id: i64,
     name: String,
     alert: String,
-    /// The fields changed from the template's values, as the form labels them.
-    changed: Vec<&'static str>,
+    built_in: bool,
+    /// The template's own rule.
+    original_id: i64,
+    /// What the built-in template's own rule says, when this is someone's copy of it.
+    original: Option<super::templates::BuiltInValues>,
+    /// When an upgrade last changed it under the copy.
+    original_changed: Option<String>,
     /// Its own metrics, for suggesting as conditions are typed.
     local_metrics: String,
 }
@@ -397,15 +402,36 @@ async fn form_page_with(
     // One of a template's alerts says so, and what's been changed of it.
     let template = match id {
         Some(id) => match state.database.template_rule(id).await {
-            Ok(Some((stored, alert, overrides, _))) => Some(TemplateOf {
-                local_metrics: super::templates::local_suggestions(&stored.template),
-                id: stored.id,
-                name: stored.template.name,
-                alert: alert.key,
-                changed: super::templates::changed_labels(
-                    &overrides.keys().cloned().collect::<Vec<_>>(),
-                ),
-            }),
+            Ok(Some(found)) => {
+                let original = match found.copy {
+                    Some(_) => match state.database.get_alert_rule(found.original).await {
+                        Ok(rule) => rule,
+                        Err(error) => return server_error(&error),
+                    },
+                    None => None,
+                };
+                let copy = match found.copy {
+                    Some(copy) => match state.database.get_alert_rule(copy).await {
+                        Ok(rule) => rule,
+                        Err(error) => return server_error(&error),
+                    },
+                    None => None,
+                };
+                Some(TemplateOf {
+                    local_metrics: super::templates::local_suggestions(&found.template.template),
+                    id: found.template.id,
+                    name: found.template.template.name,
+                    alert: found.alert,
+                    built_in: found.template.built_in,
+                    original_id: found.original,
+                    original: original
+                        .as_ref()
+                        .map(|rule| super::templates::BuiltInValues::of(&rule.rule)),
+                    original_changed: copy
+                        .and_then(|copy| copy.template?.original_changed_at)
+                        .map(super::local_date),
+                })
+            }
             Ok(None) => None,
             Err(error) => return server_error(&error),
         },
@@ -455,13 +481,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     let rows = async {
         let rules = state.database.list_alert_rules().await?;
         let channels = state.database.list_channels().await?;
-        let templates: BTreeMap<i64, String> = state
-            .database
-            .list_templates()
-            .await?
-            .into_iter()
-            .map(|stored| (stored.id, stored.template.name))
-            .collect();
+        let templates = state.database.template_names().await?;
         anyhow::Ok((rules, channels, templates))
     };
     let (rules, channels, templates) = match rows.await {
@@ -534,15 +554,17 @@ fn not_found(state: &AppState, token: &CsrfToken) -> Response {
 }
 
 async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfToken) -> Response {
-    // A template's alert shows its own values, which its template being off doesn't
-    // change.
-    let own = match state.database.template_rule(id).await {
-        Ok(found) => found.map(|(.., own)| own),
+    // A built-in template's rule that someone has a copy of is changed as the copy.
+    let copy = match state.database.template_rule(id).await {
+        Ok(found) => found.and_then(|found| found.copy),
         Err(error) => return server_error(&error),
     };
+    if let Some(copy) = copy.filter(|copy| *copy != id) {
+        return Redirect::to(&format!("/alerts/rules/{copy}/edit")).into_response();
+    }
     match state.database.get_alert_rule(id).await {
         Ok(Some(rule)) => {
-            let form = AlertRuleForm::from_rule(own.as_ref().unwrap_or(&rule.rule));
+            let form = AlertRuleForm::from_rule(&rule.rule);
             form_page(&state, &token, Some(id), &form, None).await
         }
         Ok(None) => not_found(&state, &token),

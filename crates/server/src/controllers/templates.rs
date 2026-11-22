@@ -2,8 +2,6 @@
 //! with its alerts, metrics and HCL, and the form for adding and changing one's own.
 //! The API's `/templates` routes are here too, as they do what the pages do.
 
-use std::collections::BTreeMap;
-
 use anyhow::Result;
 use axum::Json;
 use axum::Router;
@@ -22,8 +20,8 @@ use super::{CsrfForm, Page, local_date, server_error};
 use crate::alert_conditions::LocalKind;
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
-use crate::models::StoredTemplate;
-use crate::templates::{Refused, alert_rule as template_values, local_metrics};
+use crate::models::{StoredTemplate, TemplateAlert};
+use crate::templates::{Refused, local_metrics};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -56,7 +54,10 @@ pub fn api_routes() -> Router<AppState> {
         )
         .route("/templates/{id}/enable", post(api_enable))
         .route("/templates/{id}/disable", post(api_disable))
-        .route("/templates/{id}/alerts/{key}", put(api_override_alert))
+        .route(
+            "/templates/{id}/alerts/{key}",
+            put(api_override_alert).delete(api_reset_alert),
+        )
         .route("/templates/{id}/alerts/{key}/reset", post(api_reset_alert))
 }
 
@@ -129,7 +130,7 @@ async fn rows(state: &AppState) -> Result<Vec<TemplateRow>> {
                 changed: mine.iter().any(|rule| {
                     rule.template
                         .as_ref()
-                        .is_some_and(|t| !t.overridden.is_empty())
+                        .is_some_and(|t| t.replaces_id.is_some())
                 }),
             }
         })
@@ -145,25 +146,48 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
     }
 }
 
-/// One of a template's alerts as its page shows it: what's in effect, with what
-/// people changed marked and the template's value beside it.
+/// One of a template's alerts as its page shows it: the rule in use, and where
+/// that's someone's own copy, the built-in template's rule beside it.
 #[derive(Serialize)]
 struct AlertRow {
+    /// The rule in use.
     rule_id: i64,
     key: String,
     name: String,
     warning: String,
     critical: String,
     hold: String,
-    summary: String,
     enabled: bool,
     waits_for_agents: bool,
-    /// The fields people changed, as the form names them.
-    changed: Vec<String>,
-    /// The template's own value of each field that was changed.
-    template_values: BTreeMap<String, String>,
-    /// What else was changed, by label, with the template's value.
-    other_changes: Vec<(&'static str, String)>,
+    /// The built-in template's own rule, when the one in use is someone's copy.
+    built_in: Option<BuiltInValues>,
+    /// When an upgrade last changed the built-in rule under someone's copy.
+    built_in_changed: Option<String>,
+}
+
+/// What a built-in template's own rule says, for comparing with someone's copy.
+#[derive(Serialize)]
+pub(super) struct BuiltInValues {
+    name: String,
+    warning: String,
+    critical: String,
+    hold: String,
+    summary: String,
+    resolved_summary: String,
+}
+
+impl BuiltInValues {
+    pub(super) fn of(rule: &AlertRuleInput) -> Self {
+        let text = |value: &Option<String>| value.clone().unwrap_or_default();
+        Self {
+            name: rule.name.clone(),
+            warning: text(&rule.warning),
+            critical: text(&rule.critical),
+            hold: crate::alerting::format_duration(rule.hold),
+            summary: text(&rule.summary),
+            resolved_summary: text(&rule.resolved_summary),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -177,109 +201,30 @@ struct MetricRow {
     from: String,
 }
 
-/// What the alert rule form calls a field the API names, for saying what was changed.
-pub fn field_label(field: &str) -> &'static str {
-    match field {
-        "name" => "Name",
-        "warning" => "Warning when",
-        "critical" => "Critical when",
-        "summary" => "Summary",
-        "resolved_summary" => "Summary when it clears",
-        "for_secs" => "For at least",
-        "applies_to" => "Applies to",
-        "enabled" => "Enabled",
-        "channels" | "all_channels" => "Notify",
-        "window_secs" => "Looking back",
-        "remind_every_secs" => "Remind every",
-        "actions" => "Actions",
-        _ => "Other",
-    }
-}
-
-/// The labels of the fields changed, each once.
-pub fn changed_labels(fields: &[String]) -> Vec<&'static str> {
-    let mut labels: Vec<&'static str> = Vec::new();
-    for field in fields {
-        let label = field_label(field);
-        if !labels.contains(&label) {
-            labels.push(label);
-        }
-    }
-    labels
-}
-
-fn field_words(rule: &AlertRuleInput, field: &str) -> String {
-    let text = |value: &Option<String>| value.clone().unwrap_or_default();
-    match field {
-        "name" => rule.name.clone(),
-        "warning" => text(&rule.warning),
-        "critical" => text(&rule.critical),
-        "summary" => text(&rule.summary),
-        "resolved_summary" => text(&rule.resolved_summary),
-        "for_secs" => crate::alerting::format_duration(rule.hold),
-        "enabled" => if rule.enabled { "on" } else { "off" }.to_string(),
-        "window_secs" => rule
-            .window
-            .map(crate::alerting::format_duration)
-            .unwrap_or_default(),
-        "all_channels" | "channels" => match rule.all_channels {
-            true => "every channel".to_string(),
-            false => "the channels chosen".to_string(),
-        },
-        "applies_to" => text(&rule.applies_to),
-        _ => String::new(),
-    }
-}
-
-fn alert_rows(stored: &StoredTemplate, rules: &[AlertRule]) -> Vec<AlertRow> {
-    rules
+fn alert_rows(alerts: &[TemplateAlert]) -> Vec<AlertRow> {
+    alerts
         .iter()
-        .filter_map(|rule| {
-            let link = rule.template.as_ref()?;
-            let alert = stored
-                .template
-                .alerts
-                .iter()
-                .find(|a| a.key == link.alert)?;
-            let theirs = template_values(&stored.template, alert).ok()?;
-            let own_enabled = !link.overridden.contains(&"enabled".to_string()) && alert.enabled
-                || link.overridden.contains(&"enabled".to_string()) && !alert.enabled;
-            Some(AlertRow {
+        .map(|alert| {
+            let rule = alert.in_use();
+            AlertRow {
                 rule_id: rule.id,
-                key: link.alert.clone(),
+                key: alert.key.clone(),
                 name: rule.rule.name.clone(),
                 warning: rule.rule.warning.clone().unwrap_or_default(),
                 critical: rule.rule.critical.clone().unwrap_or_default(),
                 hold: crate::alerting::format_duration(rule.rule.hold),
-                summary: rule.rule.summary.clone().unwrap_or_default(),
-                enabled: own_enabled,
-                waits_for_agents: link.waits_for_agents,
-                changed: link.overridden.clone(),
-                template_values: link
-                    .overridden
-                    .iter()
-                    .map(|field| (field.clone(), field_words(&theirs, field)))
-                    .collect(),
-                other_changes: {
-                    let shown = ["warning", "critical", "name", "for_secs", "enabled"];
-                    let others: Vec<String> = link
-                        .overridden
-                        .iter()
-                        .filter(|field| !shown.contains(&field.as_str()))
-                        .cloned()
-                        .collect();
-                    changed_labels(&others)
-                        .into_iter()
-                        .map(|label| {
-                            let field = others
-                                .iter()
-                                .find(|field| field_label(field) == label)
-                                .map_or("", String::as_str);
-                            (label, field_words(&theirs, field))
-                        })
-                        .collect()
-                },
-            })
+                enabled: rule.rule.enabled,
+                waits_for_agents: rule.waits_for_agents(),
+                built_in: alert
+                    .copy
+                    .as_ref()
+                    .map(|_| BuiltInValues::of(&alert.rule.rule)),
+                built_in_changed: alert
+                    .copy
+                    .as_ref()
+                    .and_then(|copy| copy.template.as_ref()?.original_changed_at)
+                    .map(local_date),
+            }
         })
         .collect()
 }
@@ -344,10 +289,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         let Some(stored) = state.database.get_template(id).await? else {
             return Ok(None);
         };
-        let rules = state.database.template_rules(&stored).await?;
-        anyhow::Ok(Some((stored, rules)))
+        let alerts = state.database.template_alerts(stored.id).await?;
+        anyhow::Ok(Some((stored, alerts)))
     };
-    let (stored, rules) = match loaded.await {
+    let (stored, alerts) = match loaded.await {
         Ok(Some(found)) => found,
         Ok(None) => return not_found(&state, &token),
         Err(error) => return server_error(&error),
@@ -359,8 +304,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         .with("enabled", &stored.enabled)
         .with("target", &target_words(&stored.template))
         .with("upgraded", &stored.upgraded_at.map(local_date))
-        .with("source", &stored.source)
-        .with("alerts", &alert_rows(&stored, &rules))
+        .with("source", &stored.hcl())
+        .with("alerts", &alert_rows(&alerts))
         .with("metrics", &metric_rows(&stored.template))
         .render()
 }
@@ -472,7 +417,7 @@ async fn edit_hcl(
     token: CsrfToken,
 ) -> Response {
     match own_template(&state, id).await {
-        Ok(Some(stored)) => hcl_page(&state, &token, Some(id), &stored.source, None).await,
+        Ok(Some(stored)) => hcl_page(&state, &token, Some(id), &stored.hcl(), None).await,
         Ok(None) => not_found(&state, &token),
         Err(error) => server_error(&error),
     }
@@ -495,22 +440,17 @@ fn saving_problem(error: &anyhow::Error) -> Option<Problem> {
 }
 
 /// Saves a template that's been checked, as new or over `id`.
-async fn save(
-    state: &AppState,
-    id: Option<i64>,
-    template: &Template,
-    source: &str,
-) -> Result<Option<i64>> {
+async fn save(state: &AppState, id: Option<i64>, template: &Template) -> Result<Option<i64>> {
     let now = crate::times::now();
     match id {
         None => state
             .database
-            .create_template(template, source, now)
+            .create_template(template, now)
             .await
             .map(Some),
         Some(id) => Ok(state
             .database
-            .update_template(id, template, source, now)
+            .update_template(id, template, now)
             .await?
             .then_some(id)),
     }
@@ -530,8 +470,7 @@ async fn save_form(state: AppState, id: Option<i64>, form: CsrfForm) -> Response
     if !problems.is_empty() {
         return form_page(&state, &form.token, id, &fields, &problems).await;
     }
-    let source = to_hcl(&template);
-    match save(&state, id, &template, &source).await {
+    match save(&state, id, &template).await {
         Ok(Some(id)) => (form.token, Redirect::to(&format!("/templates/{id}"))).into_response(),
         Ok(None) => not_found(&state, &form.token),
         Err(error) => match saving_problem(&error) {
@@ -578,7 +517,7 @@ async fn save_hcl(state: AppState, id: Option<i64>, form: CsrfForm) -> Response 
         Ok(Err(message)) => return hcl_page(&state, &form.token, id, &hcl, Some(&message)).await,
         Err(error) => return server_error(&error),
     };
-    match save(&state, id, &template, &hcl).await {
+    match save(&state, id, &template).await {
         Ok(Some(id)) => (form.token, Redirect::to(&format!("/templates/{id}"))).into_response(),
         Ok(None) => not_found(&state, &form.token),
         Err(error) => match saving_problem(&error) {
@@ -650,19 +589,24 @@ async fn disable(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfF
     turn(&state, id, false, form).await
 }
 
-/// Turns one of a template's alerts on or off, as something changed of it.
+/// Turns one of a template's alerts on or off: the rule in use, which for a
+/// built-in template's own rule is only its flag.
 async fn turn_alert(state: &AppState, id: i64, rule_id: i64, enabled: bool) -> Result<bool> {
-    let Some((stored, _, _, own)) = state.database.template_rule(rule_id).await? else {
+    let Some(found) = state.database.template_rule(rule_id).await? else {
         return Ok(false);
     };
-    if stored.id != id {
+    if found.template.id != id {
         return Ok(false);
     }
-    let wanted = AlertRuleInput { enabled, ..own };
-    state
-        .database
-        .override_template_rule(rule_id, &wanted, crate::times::now())
-        .await
+    let in_use = found.copy.unwrap_or(found.original);
+    let Some(rule) = state.database.get_alert_rule(in_use).await? else {
+        return Ok(false);
+    };
+    let wanted = AlertRuleInput {
+        enabled,
+        ..rule.rule
+    };
+    state.database.update_template_rule(in_use, &wanted).await
 }
 
 async fn enable_alert(
@@ -696,7 +640,7 @@ async fn reset_alert(
 ) -> Response {
     let reset = async {
         match state.database.template_rule(rule).await? {
-            Some((stored, ..)) if stored.id == id => {
+            Some(found) if found.template.id == id => {
                 state
                     .database
                     .reset_template_rule(rule, crate::times::now())
@@ -705,10 +649,7 @@ async fn reset_alert(
             _ => Ok(false),
         }
     };
-    let to = match form.fields.get("back").map(String::as_str) {
-        Some("rule") => format!("/alerts/rules/{rule}/edit"),
-        _ => format!("/templates/{id}"),
-    };
+    let to = format!("/templates/{id}");
     match reset.await {
         Ok(true) => (form.token, Redirect::to(&to)).into_response(),
         Ok(false) => not_found(&state, &form.token),
@@ -775,7 +716,7 @@ fn summary(stored: &StoredTemplate, rules: &[AlertRule]) -> TemplateSummary {
         changed: rules.iter().any(|rule| {
             rule.template
                 .as_ref()
-                .is_some_and(|t| t.id == stored.id && !t.overridden.is_empty())
+                .is_some_and(|t| t.id == stored.id && t.replaces_id.is_some())
         }),
     }
 }
@@ -797,13 +738,13 @@ async fn api_list(State(state): State<AppState>) -> Response {
     }
 }
 
-/// One of a template's alerts as the API shows it: the rule in effect, with the
-/// template's values beside it.
+/// One of a template's alerts as the API shows it: the rule in use, and where
+/// that's someone's own copy, the built-in template's rule beside it.
 #[derive(Serialize)]
 struct AlertView {
     key: String,
     rule: AlertRule,
-    template_values: AlertRuleInput,
+    built_in_rule: Option<AlertRule>,
 }
 
 #[derive(Serialize)]
@@ -818,17 +759,16 @@ async fn api_show(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
         let Some(stored) = state.database.get_template(id).await? else {
             return Ok(None);
         };
-        let rules = state.database.template_rules(&stored).await?;
-        let alerts: Vec<AlertView> = rules
-            .iter()
-            .filter_map(|rule| {
-                let key = rule.template.as_ref()?.alert.clone();
-                let alert = stored.template.alerts.iter().find(|a| a.key == key)?;
-                Some(AlertView {
-                    template_values: template_values(&stored.template, alert).ok()?,
-                    key,
-                    rule: rule.clone(),
-                })
+        let rules = state.database.list_alert_rules().await?;
+        let alerts: Vec<AlertView> = state
+            .database
+            .template_alerts(stored.id)
+            .await?
+            .into_iter()
+            .map(|alert| AlertView {
+                rule: alert.in_use().clone(),
+                built_in_rule: alert.copy.is_some().then_some(alert.rule),
+                key: alert.key,
             })
             .collect();
         let local = local_metrics(&stored.template);
@@ -847,7 +787,7 @@ async fn api_show(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
             })
             .collect();
         let mut view = serde_json::to_value(summary(&stored, &rules))?;
-        view["hcl"] = json!(stored.source);
+        view["hcl"] = json!(stored.hcl());
         view["template"] = serde_json::to_value(&stored.template)?;
         view["metrics"] = serde_json::to_value(metrics)?;
         view["alerts"] = serde_json::to_value(alerts)?;
@@ -889,7 +829,7 @@ async fn api_save(state: &AppState, id: Option<i64>, hcl: &str) -> Response {
             Err(error) => return super::api::server_error(&error),
         }
     }
-    match save(state, id, &template, hcl).await {
+    match save(state, id, &template).await {
         Ok(Some(saved)) if id.is_none() => {
             (StatusCode::CREATED, Json(json!({ "id": saved }))).into_response()
         }
@@ -945,16 +885,13 @@ async fn api_disable(State(state): State<AppState>, Path(id): Path<i64>) -> Resp
     api_turn(&state, id, false).await
 }
 
-/// The rule one of a template's alerts is, by the alert's key.
+/// The template's own rule for one of its alerts, by the alert's key.
 async fn rule_of(state: &AppState, id: i64, key: &str) -> Result<Option<i64>> {
-    let Some(stored) = state.database.get_template(id).await? else {
-        return Ok(None);
-    };
-    let rules = state.database.template_rules(&stored).await?;
-    Ok(rules
+    let alerts = state.database.template_alerts(id).await?;
+    Ok(alerts
         .iter()
-        .find(|rule| rule.template.as_ref().is_some_and(|t| t.alert == key))
-        .map(|rule| rule.id))
+        .find(|alert| alert.key == key)
+        .map(|alert| alert.rule.id))
 }
 
 async fn api_override_alert(
@@ -970,11 +907,7 @@ async fn api_override_alert(
     if let Err(error) = state.check_saved_alert_rule(rule, &input).await {
         return refused(&error);
     }
-    match state
-        .database
-        .override_template_rule(rule, &input, crate::times::now())
-        .await
-    {
+    match state.database.update_template_rule(rule, &input).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) if error.is::<NameTaken>() || error.is::<Refused>() => refused(&error),

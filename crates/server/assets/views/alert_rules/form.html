@@ -8,13 +8,26 @@
 {% if error %}<p class="error">{{ error }}</p>{% endif %}
 {% if template %}
 <div class="notice" role="note">
-  <p>One of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>. What you change is kept apart from the template, so a new version of it never undoes it. Its conditions can use the template's own metrics by their short names.{% if template.changed %} Changed from the template: {{ template.changed | join(sep=", ") }}.{% endif %}</p>
-  {% if template.changed and can_edit %}
+  {% if template.original %}
+  <p>Your own copy of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alert <code>{{ template.alert }}</code>, used in place of the one that comes with MaxNines, which upgrades keep up to date.{% if template.original_changed %} An upgrade changed that one on {{ template.original_changed }}.{% endif %} It says:</p>
+  <ul class="changes">
+    <li>Name: {{ template.original.name }}</li>
+    {% if template.original.warning %}<li>Warning when: <code>{{ template.original.warning }}</code></li>{% endif %}
+    {% if template.original.critical %}<li>Critical when: <code>{{ template.original.critical }}</code></li>{% endif %}
+    <li>For at least: {{ template.original.hold }}</li>
+    {% if template.original.summary %}<li>Summary: <code>{{ template.original.summary }}</code></li>{% endif %}
+    {% if template.original.resolved_summary %}<li>Summary when it clears: <code>{{ template.original.resolved_summary }}</code></li>{% endif %}
+  </ul>
+  {% if can_edit %}
   <form method="post" action="/templates/{{ template.id }}/alerts/{{ id }}/reset">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
-    <input type="hidden" name="back" value="rule">
     <button type="submit" class="secondary">Reset to template</button>
   </form>
+  {% endif %}
+  {% elif template.built_in %}
+  <p>One of the <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>, which comes with MaxNines. Saving a change makes a copy of your own, used in its place, which upgrades leave alone. Turning it on or off needs no copy. Its conditions can use the template's own metrics by their short names.</p>
+  {% else %}
+  <p>One of your <a href="/templates/{{ template.id }}">{{ template.name }}</a> template's alerts, <code>{{ template.alert }}</code>. Its conditions can use the template's own metrics by their short names.</p>
   {% endif %}
 </div>
 {% endif %}

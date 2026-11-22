@@ -27,9 +27,17 @@ pub struct Model {
     pub template_id: Option<i64>,
     /// Which of the template's alerts.
     pub template_alert: Option<String>,
-    /// What people changed of the template's values, by field, as the API names
-    /// them. The rest of the row is what's in effect.
-    pub overrides: Option<Json>,
+    /// The built-in template's rule this is someone's own copy of, which is used
+    /// in its place.
+    pub replaces_id: Option<i64>,
+    /// Where it comes among its template's alerts.
+    pub template_position: Option<i32>,
+    /// Which of what its template's discovery found it's for, as CEL.
+    pub when_condition: Option<String>,
+    /// The version it's from.
+    pub since: Option<String>,
+    /// When an upgrade last changed the built-in rule this is a copy of.
+    pub original_changed_at: Option<DateTimeUtc>,
     /// Whether it needs what only agents running its template would send.
     pub waits_for_agents: bool,
     /// When it was deleted. Its alerts keep pointing at it.

@@ -75,6 +75,19 @@ async fn template_id(database: &Database, key: &str) -> i64 {
         .id
 }
 
+const POSTGRES: &str = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
+const IIS: &str = include_str!("../../../protocol/src/templates/examples/iis.hcl");
+
+/// The rule in use for a template's alert, and the template's own beside it if
+/// that's a copy.
+async fn alert_of(database: &Database, template: i64, key: &str) -> crate::models::TemplateAlert {
+    let alerts = database.template_alerts(template).await.unwrap();
+    alerts
+        .into_iter()
+        .find(|alert| alert.key == key)
+        .unwrap_or_else(|| panic!("no alert {key}"))
+}
+
 #[tokio::test]
 async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
     let database = Database::for_test().await;
@@ -95,8 +108,8 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
     for rule in &rules {
         let link = rule.template.as_ref().unwrap();
         assert_eq!(link.id, templates[0].id);
-        assert!(link.overridden.is_empty());
-        assert!(!link.waits_for_agents, "{}", rule.rule.name);
+        assert!(link.replaces_id.is_none() && link.template_enabled);
+        assert!(rule.runs(), "{}", rule.rule.name);
         assert!(rule.conditions.is_some(), "{}", rule.rule.name);
     }
 
@@ -109,52 +122,90 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
     assert_eq!(database.list_alert_rules().await.unwrap(), rules);
 }
 
+/// A template is kept as rows, and HCL written from them reads back as the same
+/// rows, whatever comments and layout it came with.
 #[tokio::test]
-async fn an_upgrade_keeps_what_people_changed_and_says_so_to_admins() {
+async fn a_template_goes_from_hcl_to_rows_to_hcl_and_back_to_the_same_rows() {
+    let host = built_in::all().unwrap().remove(0).source;
+    for source in [POSTGRES, IIS, host.as_str()] {
+        let database = Database::for_test().await;
+        let template = crate::templates::load(source, &json!({})).unwrap();
+        let id = database
+            .create_template(&template, crate::times::now())
+            .await
+            .unwrap();
+        let stored = database.get_template(id).await.unwrap().unwrap();
+        assert_eq!(stored.template, template, "{}", template.key);
+
+        // Written out, read and saved over itself, and nothing has changed.
+        let written = stored.hcl();
+        assert!(
+            !written
+                .lines()
+                .any(|line| line.trim_start().starts_with('#')),
+            "comments aren't kept"
+        );
+        let again = crate::templates::load(&written, &json!({})).unwrap();
+        assert!(
+            database
+                .update_template(id, &again, crate::times::now())
+                .await
+                .unwrap()
+        );
+        let after = database.get_template(id).await.unwrap().unwrap();
+        assert_eq!(after.template, stored.template);
+        assert_eq!(after.hcl(), written);
+    }
+}
+
+#[tokio::test]
+async fn changing_a_built_in_alert_makes_a_copy_that_upgrades_leave_alone() {
     let database = Database::for_test().await;
     database
         .sync_templates(&shipped(&[APP]), crate::times::now())
         .await
         .unwrap();
-
-    // Someone tells it a channel of their own and waits longer.
-    let channel = database
-        .create_channel(&crate::alerting::ChannelInput {
-            name: "Ops".to_string(),
-            kind: crate::alerting::ChannelKind::Webhook,
-            target: "http://127.0.0.1:9/ops".to_string(),
-            credential: None,
-            app_token: None,
-            severities: crate::alerting::every_severity(),
-            mail: None,
-            request: None,
-        })
-        .await
-        .unwrap();
+    let id = template_id(&database, "app").await;
     let slow = rule(&database, "App slow").await;
     let wanted = AlertRuleInput {
         hold: chrono::TimeDelta::minutes(10),
-        all_channels: false,
-        channels: vec![channel],
         ..slow.rule.clone()
     };
     assert!(database.update_alert_rule(slow.id, &wanted).await.unwrap());
-    let changed = rule(&database, "App slow").await;
-    assert_eq!(changed.rule, wanted);
-    let mut overridden = changed.template.as_ref().unwrap().overridden.clone();
-    overridden.sort();
-    assert_eq!(overridden, ["all_channels", "channels", "for_secs"]);
+
+    // The copy is the one in use, and the built-in rule is as it was.
+    let alert = alert_of(&database, id, "slow").await;
+    assert_eq!(alert.rule.id, slow.id);
+    assert_eq!(alert.rule.rule, slow.rule);
+    let copy = alert.copy.clone().unwrap();
+    assert_eq!(copy.rule, wanted);
+    assert_eq!(copy.template.as_ref().unwrap().replaces_id, Some(slow.id));
+    let in_use = rule(&database, "App slow").await;
+    assert_eq!(in_use.id, copy.id, "only the copy is listed and checked");
+    assert_eq!(database.list_alert_rules().await.unwrap().len(), 2);
+    assert!(database.get_template(id).await.unwrap().unwrap().template == parse(APP).unwrap());
+
+    // Saving it again, by either rule, changes the copy.
+    let again = AlertRuleInput {
+        hold: chrono::TimeDelta::minutes(20),
+        ..wanted.clone()
+    };
+    assert!(database.update_alert_rule(slow.id, &again).await.unwrap());
+    assert_eq!(
+        alert_of(&database, id, "slow").await.copy.unwrap().id,
+        copy.id
+    );
 
     let changed = database
         .sync_templates(&shipped(&[APP_UPGRADED]), crate::times::now())
         .await
         .unwrap();
     assert_eq!(changed, ["App"]);
-    let upgraded = rule(&database, "App slow").await;
-    assert_eq!(upgraded.id, slow.id, "the same rule");
-    assert_eq!(upgraded.rule.warning.as_deref(), Some("cpu.usage > 70"));
-    assert_eq!(upgraded.rule.hold, chrono::TimeDelta::minutes(10));
-    assert_eq!(upgraded.rule.channels, [channel]);
+    let alert = alert_of(&database, id, "slow").await;
+    assert_eq!(alert.rule.rule.warning.as_deref(), Some("cpu.usage > 70"));
+    let kept = alert.copy.unwrap();
+    assert_eq!(kept.rule, again, "the copy is as it was left");
+    assert!(kept.template.unwrap().original_changed_at.is_some());
     let names: Vec<String> = rules_named(&database)
         .await
         .into_iter()
@@ -162,66 +213,80 @@ async fn an_upgrade_keeps_what_people_changed_and_says_so_to_admins() {
         .collect();
     assert_eq!(names, ["App busy", "App slow"], "gone is gone");
 
-    assert_eq!(database.template_upgrades().await.unwrap(), ["App"]);
-    let stored = database.list_templates().await.unwrap().remove(0);
-    assert!(stored.upgraded_at.is_some());
+    assert_eq!(
+        database.template_upgrades().await.unwrap(),
+        ["App (its version of App slow changed, which you have your own of)"]
+    );
     database.dismiss_template_upgrades().await.unwrap();
     assert!(database.template_upgrades().await.unwrap().is_empty());
 
-    // Back to the template's values.
+    // Resetting deletes the copy, and the built-in rule is in use again.
     assert!(
         database
-            .reset_template_rule(slow.id, crate::times::now())
+            .reset_template_rule(copy.id, crate::times::now())
             .await
             .unwrap()
     );
     let reset = rule(&database, "App slow").await;
-    assert_eq!(reset.rule.hold, chrono::TimeDelta::minutes(5));
-    assert!(reset.rule.all_channels && reset.rule.channels.is_empty());
-    assert!(reset.template.unwrap().overridden.is_empty());
+    assert_eq!(reset.id, slow.id);
+    assert_eq!(reset.rule.warning.as_deref(), Some("cpu.usage > 70"));
+    assert!(alert_of(&database, id, "slow").await.copy.is_none());
+    assert!(
+        !database
+            .reset_template_rule(slow.id, crate::times::now())
+            .await
+            .unwrap(),
+        "there's no copy to delete"
+    );
 }
 
 #[tokio::test]
-async fn a_disabled_template_stays_disabled_through_an_upgrade() {
+async fn what_is_turned_off_stays_off_through_an_upgrade() {
     let database = Database::for_test().await;
     database
         .sync_templates(&shipped(&[APP]), crate::times::now())
         .await
         .unwrap();
     let id = template_id(&database, "app").await;
+
+    // Turning a built-in alert off is its own flag, with no copy.
+    let slow = rule(&database, "App slow").await;
+    let off = AlertRuleInput {
+        enabled: false,
+        ..slow.rule.clone()
+    };
+    database.update_alert_rule(slow.id, &off).await.unwrap();
+    let alert = alert_of(&database, id, "slow").await;
+    assert!(alert.copy.is_none() && !alert.rule.rule.enabled);
+
+    database
+        .sync_templates(&shipped(&[APP_UPGRADED]), crate::times::now())
+        .await
+        .unwrap();
+    let slow = rule(&database, "App slow").await;
+    assert!(!slow.rule.enabled, "still off");
+    assert_eq!(slow.rule.warning.as_deref(), Some("cpu.usage > 70"));
+
+    // A template turned off stops its alerts without changing them, and stays off.
     assert!(
         database
             .set_template_enabled(id, false, crate::times::now())
             .await
             .unwrap()
     );
-    assert!(rules_named(&database).await.iter().all(|(_, on)| !on));
-
+    let busy = rule(&database, "App busy").await;
+    assert!(busy.rule.enabled && !busy.runs());
     database
-        .sync_templates(&shipped(&[APP_UPGRADED]), crate::times::now())
+        .sync_templates(&shipped(&[APP]), crate::times::now())
         .await
         .unwrap();
     assert!(!database.get_template(id).await.unwrap().unwrap().enabled);
-    assert!(rules_named(&database).await.iter().all(|(_, on)| !on));
-
-    // An alert turned off stays off when the template is turned back on.
-    let busy = rule(&database, "App busy").await;
-    let off = AlertRuleInput {
-        enabled: false,
-        ..busy.rule.clone()
-    };
-    database.update_alert_rule(busy.id, &off).await.unwrap();
     database
         .set_template_enabled(id, true, crate::times::now())
         .await
         .unwrap();
-    assert_eq!(
-        rules_named(&database).await,
-        [
-            ("App busy".to_string(), false),
-            ("App slow".to_string(), true)
-        ]
-    );
+    assert!(rule(&database, "App host gone").await.runs());
+    assert!(!rule(&database, "App slow").await.runs());
 }
 
 #[tokio::test]
@@ -248,9 +313,12 @@ async fn a_renamed_template_keeps_its_rules_and_one_no_longer_shipped_goes() {
         .await
         .unwrap();
     assert_eq!(template_id(&database, "application").await, id);
-    let kept = rule(&database, "App slow").await;
-    assert_eq!(kept.id, slow.id);
-    assert_eq!(kept.rule.hold, chrono::TimeDelta::minutes(15));
+    let alert = alert_of(&database, id, "slow").await;
+    assert_eq!(alert.rule.id, slow.id);
+    assert_eq!(
+        alert.copy.unwrap().rule.hold,
+        chrono::TimeDelta::minutes(15)
+    );
 
     let changed = database
         .sync_templates(&[], crate::times::now())
@@ -275,7 +343,7 @@ async fn what_is_in_a_built_in_templates_way_is_moved_aside() {
     )
     .unwrap();
     database
-        .create_template(&theirs, APP, crate::times::now())
+        .create_template(&theirs, crate::times::now())
         .await
         .unwrap();
     database
@@ -323,7 +391,7 @@ async fn what_is_in_a_built_in_templates_way_is_moved_aside() {
 }
 
 #[tokio::test]
-async fn peoples_own_templates_are_added_changed_and_deleted() {
+async fn peoples_own_templates_are_changed_directly_with_no_copies() {
     let database = Database::for_test().await;
     database
         .sync_templates(&built_in::all().unwrap(), crate::times::now())
@@ -332,18 +400,16 @@ async fn peoples_own_templates_are_added_changed_and_deleted() {
 
     let app = parse(APP).unwrap();
     let id = database
-        .create_template(&app, APP, crate::times::now())
+        .create_template(&app, crate::times::now())
         .await
         .unwrap();
     let stored = database.get_template(id).await.unwrap().unwrap();
     assert!(!stored.built_in);
-    assert_eq!(stored.source, APP);
-    assert_eq!(database.template_rules(&stored).await.unwrap().len(), 2);
+    assert_eq!(stored.template, app);
+    assert_eq!(database.template_alerts(id).await.unwrap().len(), 2);
 
     // Its own key and name only.
-    let again = database
-        .create_template(&app, APP, crate::times::now())
-        .await;
+    let again = database.create_template(&app, crate::times::now()).await;
     let error = again.unwrap_err();
     assert!(
         matches!(error.downcast_ref(), Some(NameTaken::TemplateKey(_))),
@@ -355,7 +421,7 @@ async fn peoples_own_templates_are_added_changed_and_deleted() {
     )
     .unwrap();
     let error = database
-        .create_template(&host, APP, crate::times::now())
+        .create_template(&host, crate::times::now())
         .await
         .unwrap_err();
     assert!(matches!(
@@ -363,30 +429,39 @@ async fn peoples_own_templates_are_added_changed_and_deleted() {
         Some(NameTaken::TemplateKey(_))
     ));
 
-    // A changed alert keeps what was changed of it; one that's gone takes its rule.
+    // Changing its alert with the rule's form changes the template itself.
     let slow = rule(&database, "App slow").await;
     let renamed = AlertRuleInput {
         name: "Slow app".to_string(),
+        all_channels: false,
         ..slow.rule.clone()
     };
     database.update_alert_rule(slow.id, &renamed).await.unwrap();
-    let upgraded = parse(APP_UPGRADED).unwrap();
+    let alert = alert_of(&database, id, "slow").await;
+    assert!(alert.copy.is_none());
+    assert_eq!(alert.rule.rule, renamed);
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert_eq!(stored.template.alerts[0].name, "Slow app");
+
+    // Saving the template keeps who its alerts tell; one that's gone takes its rule.
+    let mut upgraded = parse(APP_UPGRADED).unwrap();
+    upgraded.alerts[0].name = "Slow app".to_string();
     assert!(
         database
-            .update_template(id, &upgraded, APP_UPGRADED, crate::times::now())
+            .update_template(id, &upgraded, crate::times::now())
             .await
             .unwrap()
     );
     let kept = rule(&database, "Slow app").await;
     assert_eq!(kept.id, slow.id);
     assert_eq!(kept.rule.warning.as_deref(), Some("cpu.usage > 70"));
-    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert!(!kept.rule.all_channels);
     let mine: Vec<String> = database
-        .template_rules(&stored)
+        .template_alerts(id)
         .await
         .unwrap()
         .into_iter()
-        .map(|rule| rule.rule.name)
+        .map(|alert| alert.rule.rule.name)
         .collect();
     assert_eq!(mine, ["Slow app", "App busy"]);
 
@@ -407,7 +482,7 @@ async fn peoples_own_templates_are_added_changed_and_deleted() {
     // The built-in one stays as it ships.
     let host_id = template_id(&database, "host").await;
     let error = database
-        .update_template(host_id, &upgraded, APP_UPGRADED, crate::times::now())
+        .update_template(host_id, &upgraded, crate::times::now())
         .await
         .unwrap_err();
     assert!(error.downcast_ref::<Refused>().is_some());
@@ -421,21 +496,19 @@ async fn peoples_own_templates_are_added_changed_and_deleted() {
 #[tokio::test]
 async fn a_template_alert_on_its_own_metrics_waits_for_agents() {
     let database = Database::for_test().await;
-    let postgres = include_str!("../../../protocol/src/templates/examples/postgres.hcl");
-    let template = crate::templates::load(postgres, &json!({})).unwrap();
+    let template = crate::templates::load(POSTGRES, &json!({})).unwrap();
     let id = database
-        .create_template(&template, postgres, crate::times::now())
+        .create_template(&template, crate::times::now())
         .await
         .unwrap();
-    let stored = database.get_template(id).await.unwrap().unwrap();
-    let rules = database.template_rules(&stored).await.unwrap();
-    assert_eq!(rules.len(), template.alerts.len());
-    assert!(rules.iter().all(AlertRule::waits_for_agents));
-    let off = rules
+    let alerts = database.template_alerts(id).await.unwrap();
+    assert_eq!(alerts.len(), template.alerts.len());
+    assert!(alerts.iter().all(|alert| alert.rule.waits_for_agents()));
+    let off = alerts
         .iter()
-        .find(|rule| rule.rule.name == "Too few standbys")
+        .find(|alert| alert.rule.rule.name == "Too few standbys")
         .unwrap();
-    assert!(!off.rule.enabled, "it ships off");
+    assert!(!off.rule.rule.enabled, "it ships off");
 }
 
 #[tokio::test]
@@ -481,7 +554,7 @@ async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_n
     server
         .state
         .database
-        .create_template(&template, postgres, crate::times::now())
+        .create_template(&template, crate::times::now())
         .await
         .unwrap();
     let lagging = rule(&server.state.database, "Replica lagging").await;
@@ -498,7 +571,11 @@ async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_n
     assert_eq!(status, 204, "{body}");
     let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(shown["warning"], "lag > duration('1m')");
-    assert_eq!(shown["template"]["overridden"], json!(["warning"]));
+    assert_eq!(
+        shown["template"]["replaces_id"],
+        Value::Null,
+        "theirs, so changed directly"
+    );
 
     changed["warning"] = json!("lagg > duration('1m')");
     let (status, body) = api(&server, "PUT", &path, &changed).await;
@@ -541,7 +618,7 @@ async fn the_templates_pages_show_each_templates_alerts_metrics_and_hcl() {
     let id = server
         .state
         .database
-        .create_template(&template, postgres, crate::times::now())
+        .create_template(&template, crate::times::now())
         .await
         .unwrap();
     let mut browser = Browser::default();
@@ -656,11 +733,7 @@ async fn a_template_is_added_with_the_form_a_row_at_a_time() {
         .await
         .unwrap()
         .unwrap();
-    assert!(
-        stored.source.contains("alert \"slow\""),
-        "{}",
-        stored.source
-    );
+    assert!(stored.hcl().contains("alert \"slow\""), "{}", stored.hcl());
 }
 
 #[tokio::test]
@@ -700,7 +773,7 @@ async fn a_template_is_added_as_hcl_and_its_mistakes_named() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored.source, APP, "kept as written");
+    assert_eq!(stored.template, parse(APP).unwrap());
 
     // A built-in template's key is taken.
     let host = APP
@@ -788,28 +861,40 @@ async fn a_templates_alert_is_changed_with_the_alert_rule_form_and_reset() {
         )
         .await;
     assert_eq!(page.status, 303, "{}", page.body);
-    let changed = rule(&server.state.database, "Host offline").await;
-    assert_eq!(changed.rule.hold, chrono::TimeDelta::minutes(2));
-    assert_eq!(changed.template.as_ref().unwrap().overridden, ["for_secs"]);
+    // A copy of their own is in use now, and the built-in rule's form leads to it.
+    let copy = rule(&server.state.database, "Host offline").await;
+    assert_ne!(copy.id, offline.id);
+    assert_eq!(copy.rule.hold, chrono::TimeDelta::minutes(2));
+    assert_eq!(
+        copy.template.as_ref().unwrap().replaces_id,
+        Some(offline.id)
+    );
     let page = browser.get(&server, &edit).await;
+    assert_eq!(page.status, 303);
+    let copy_edit = format!("/alerts/rules/{}/edit", copy.id);
+    assert_eq!(page.header("location"), Some(copy_edit.as_str()));
+    let page = browser.get(&server, &copy_edit).await;
+    assert!(page.body.contains("Your own copy"), "{}", page.body);
     assert!(
-        page.body
-            .contains("Changed from the template: For at least"),
+        page.body.contains("For at least: 1 minute"),
         "{}",
         page.body
     );
 
     let host = template_id(&server.state.database, "host").await;
+    let template_page = browser.get(&server, &format!("/templates/{host}")).await;
+    assert!(template_page.body.contains("Your own copy. It comes as"));
     let page = browser
         .submit(
             &server,
-            &edit,
-            &format!("/templates/{host}/alerts/{}/reset", offline.id),
-            &[("back", "rule")],
+            &copy_edit,
+            &format!("/templates/{host}/alerts/{}/reset", copy.id),
+            &[],
         )
         .await;
     assert_eq!(page.status, 303);
     let reset = rule(&server.state.database, "Host offline").await;
+    assert_eq!(reset.id, offline.id);
     assert_eq!(reset.rule.hold, chrono::TimeDelta::minutes(1));
 }
 
@@ -827,13 +912,14 @@ async fn the_api_covers_what_the_templates_pages_do() {
     let path = format!("/api/v1/templates/{id}");
     let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(status, 200, "{shown}");
-    assert_eq!(shown["hcl"], APP);
+    assert!(
+        shown["hcl"].as_str().unwrap().contains("alert \"slow\""),
+        "{shown}"
+    );
     assert_eq!(shown["template"]["alerts"][0]["key"], "slow");
     assert_eq!(shown["alerts"][0]["key"], "slow");
-    assert_eq!(
-        shown["alerts"][0]["template_values"]["warning"],
-        "cpu.usage > 80"
-    );
+    assert_eq!(shown["alerts"][0]["rule"]["warning"], "cpu.usage > 80");
+    assert_eq!(shown["alerts"][0]["built_in_rule"], Value::Null);
 
     let broken = json!({ "hcl": APP.replace("\"5m\"", "\"soon\"") });
     let (status, body) = api(&server, "PUT", &path, &broken).await;
@@ -848,13 +934,21 @@ async fn the_api_covers_what_the_templates_pages_do() {
     let (status, body) = api(&server, "PUT", &path, &json!({ "hcl": APP_UPGRADED })).await;
     assert_eq!(status, 204, "{body}");
 
-    // Changing one of its alerts, and putting it back.
-    let slow = rule(&server.state.database, "App slow").await;
+    // Changing a built-in template's alert makes a copy, and deleting it puts the
+    // template's own back.
+    let host = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["key"] == "host")
+        .unwrap();
+    let host = format!("/api/v1/templates/{}", host["id"]);
+    let offline = rule(&server.state.database, "Host offline").await;
     let changed = AlertRuleInput {
-        warning: Some("cpu.usage > 60".to_string()),
-        ..slow.rule.clone()
+        hold: chrono::TimeDelta::minutes(2),
+        ..offline.rule.clone()
     };
-    let alert = format!("{path}/alerts/slow");
+    let alert = format!("{host}/alerts/offline");
     let (status, body) = api(
         &server,
         "PUT",
@@ -863,22 +957,29 @@ async fn the_api_covers_what_the_templates_pages_do() {
     )
     .await;
     assert_eq!(status, 204, "{body}");
-    let (_, list) = api(&server, "GET", "/api/v1/templates", &Value::Null).await;
-    let app = list
+    let (_, shown) = api(&server, "GET", &host, &Value::Null).await;
+    assert_eq!(shown["changed"], true);
+    let offline_shown = shown["alerts"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|t| t["key"] == "app")
+        .find(|alert| alert["key"] == "offline")
         .unwrap();
-    assert_eq!(app["changed"], true);
-    let (status, _) = api(&server, "POST", &format!("{alert}/reset"), &Value::Null).await;
+    assert_eq!(offline_shown["rule"]["for_secs"], 120);
+    assert_eq!(offline_shown["built_in_rule"]["for_secs"], 60);
+    assert_eq!(offline_shown["built_in_rule"]["id"], offline.id);
+    let (status, _) = api(&server, "DELETE", &alert, &Value::Null).await;
     assert_eq!(status, 204);
-    let reset = rule(&server.state.database, "App slow").await;
-    assert_eq!(reset.rule.warning.as_deref(), Some("cpu.usage > 70"));
+    let (status, _) = api(&server, "POST", &format!("{alert}/reset"), &Value::Null).await;
+    assert_eq!(status, 404, "there's no copy left");
+    assert_eq!(
+        rule(&server.state.database, "Host offline").await.id,
+        offline.id
+    );
 
     let (status, _) = api(&server, "POST", &format!("{path}/disable"), &Value::Null).await;
     assert_eq!(status, 204);
-    assert!(!rule(&server.state.database, "App slow").await.rule.enabled);
+    assert!(!rule(&server.state.database, "App slow").await.runs());
     let (status, _) = api(&server, "POST", &format!("{path}/enable"), &Value::Null).await;
     assert_eq!(status, 204);
 
@@ -985,7 +1086,7 @@ async fn cel_fields_get_suggestions_from_the_real_catalog() {
     let id = server
         .state
         .database
-        .create_template(&template, postgres, crate::times::now())
+        .create_template(&template, crate::times::now())
         .await
         .unwrap();
     let form = browser.get(&server, &format!("/templates/{id}/edit")).await;

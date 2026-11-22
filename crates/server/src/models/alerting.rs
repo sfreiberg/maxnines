@@ -19,6 +19,7 @@ use super::audit::{record, record_change};
 use super::{
     Database, action_run, alert, alert_rule, alert_rule_action, alert_rule_channel, host,
     maintenance_window, name_key, name_taken_or, notification, notification_channel, silence,
+    template,
 };
 use crate::actions::{ActionRun, RuleAction, RunOn};
 use crate::alerting::{
@@ -41,16 +42,16 @@ fn to_alert_rule(
     row: alert_rule::Model,
     channels: Vec<i64>,
     actions: Vec<RuleAction>,
+    templates_off: &BTreeSet<i64>,
 ) -> Result<AlertRule> {
     let template = match (row.template_id, &row.template_alert) {
         (Some(id), Some(alert)) => Some(TemplateLink {
             id,
             alert: alert.clone(),
-            overridden: match &row.overrides {
-                Some(serde_json::Value::Object(fields)) => fields.keys().cloned().collect(),
-                _ => Vec::new(),
-            },
+            replaces_id: row.replaces_id,
+            template_enabled: !templates_off.contains(&id),
             waits_for_agents: row.waits_for_agents,
+            original_changed_at: row.original_changed_at,
         }),
         _ => None,
     };
@@ -548,6 +549,13 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading alert rules")?;
+        // A built-in template's rule that someone has a copy of gives way to it.
+        let replaced: BTreeSet<i64> = rows.iter().filter_map(|row| row.replaces_id).collect();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|row| !replaced.contains(&row.id))
+            .collect();
+        let off = templates_off(&self.connection).await?;
 
         // Only the links and actions of rules that aren't deleted.
         let live = || {
@@ -589,7 +597,7 @@ impl Database {
             .map(|row| {
                 let mine = channels.remove(&row.id).unwrap_or_default();
                 let run = actions.remove(&row.id).unwrap_or_default();
-                to_alert_rule(row, mine, run)
+                to_alert_rule(row, mine, run, &off)
             })
             .collect()
     }
@@ -600,6 +608,7 @@ impl Database {
 
     pub async fn create_alert_rule(&self, input: &AlertRuleInput) -> Result<i64> {
         let transaction = self.connection.begin().await.context("saving alert rule")?;
+        refuse_taken_name(&transaction, &input.name, &[]).await?;
         let id = alert_rule::Entity::insert(alert_rule_row(input)?)
             .exec(&transaction)
             .await
@@ -617,38 +626,18 @@ impl Database {
     }
 
     /// Returns false if there's no such rule.
-    /// One of a template's alerts keeps what's different from the template's values,
-    /// as [`Database::override_template_rule`] does.
+    /// Returns false if there's no such rule. A template's alert is saved as
+    /// [`Database::update_template_rule`] saves it: for a built-in template, as
+    /// someone's own copy of it.
     pub async fn update_alert_rule(&self, id: i64, input: &AlertRuleInput) -> Result<bool> {
         if self.template_rule(id).await?.is_some() {
-            return self
-                .override_template_rule(id, input, crate::times::now())
-                .await;
+            return self.update_template_rule(id, input).await;
         }
         let transaction = self.connection.begin().await.context("saving alert rule")?;
-        let Some(before) = load_alert_rule(&transaction, id).await? else {
+        refuse_taken_name(&transaction, &input.name, &[id]).await?;
+        if !write_rule_in(&transaction, id, input).await? {
             return Ok(false);
-        };
-        let before = alert_rule_snapshot(&transaction, &before).await?;
-
-        let mut row = alert_rule_row(input)?;
-        row.id = Set(id);
-        alert_rule::Entity::update(row)
-            .exec(&transaction)
-            .await
-            .map_err(|error| {
-                let taken = NameTaken::AlertRule(input.name.clone());
-                name_taken_or(error, taken, "saving alert rule")
-            })?;
-
-        alert_rule_channel::Entity::delete_many()
-            .filter(alert_rule_channel::Column::RuleId.eq(id))
-            .exec(&transaction)
-            .await
-            .context("saving alert rule channels")?;
-        save_links(&transaction, id, &input.channels).await?;
-        save_actions(&transaction, id, &input.actions).await?;
-        record_alert_rule(&transaction, id, Some(&before)).await?;
+        }
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
     }
@@ -688,16 +677,13 @@ impl Database {
             .begin()
             .await
             .context("deleting alert rule")?;
-        let template = alert_rule::Entity::find_by_id(id)
-            .select_only()
-            .column(alert_rule::Column::TemplateId)
+        let row = alert_rule::Entity::find_by_id(id)
             .filter(alert_rule::Column::DeletedAt.is_null())
-            .into_tuple::<Option<i64>>()
             .one(&transaction)
             .await
-            .context("loading alert rule")?
-            .flatten();
-        if template.is_some() {
+            .context("loading alert rule")?;
+        // Someone's copy of a template's alert can go, which puts the template's back.
+        if row.is_some_and(|row| row.template_id.is_some() && row.replaces_id.is_none()) {
             bail!(crate::templates::Refused(
                 "this rule is one of a template's alerts, so it can be disabled but not deleted"
                     .to_string()
@@ -902,7 +888,80 @@ pub(super) async fn load_alert_rule<C: ConnectionTrait>(
         .into_iter()
         .map(to_rule_action)
         .collect::<Result<_>>()?;
-    to_alert_rule(row, channels, actions).map(Some)
+    let off = templates_off(connection).await?;
+    to_alert_rule(row, channels, actions, &off).map(Some)
+}
+
+/// The templates that are turned off, whose alerts don't run.
+async fn templates_off<C: ConnectionTrait>(connection: &C) -> Result<BTreeSet<i64>> {
+    let ids: Vec<i64> = template::Entity::find()
+        .select_only()
+        .column(template::Column::Id)
+        .filter(template::Column::Enabled.eq(false))
+        .into_tuple()
+        .all(connection)
+        .await
+        .context("loading templates")?;
+    Ok(ids.into_iter().collect())
+}
+
+/// Writes `input` over a rule that's there, with its channels and actions, and
+/// records the change. What links it to a template is left as it is.
+pub(super) async fn write_rule_in<C: ConnectionTrait>(
+    transaction: &C,
+    id: i64,
+    input: &AlertRuleInput,
+) -> Result<bool> {
+    let Some(before) = load_alert_rule(transaction, id).await? else {
+        return Ok(false);
+    };
+    let before = alert_rule_snapshot(transaction, &before).await?;
+
+    let mut row = alert_rule_row(input)?;
+    row.id = Set(id);
+    alert_rule::Entity::update(row)
+        .exec(transaction)
+        .await
+        .map_err(|error| {
+            let taken = NameTaken::AlertRule(input.name.clone());
+            name_taken_or(error, taken, "saving alert rule")
+        })?;
+
+    alert_rule_channel::Entity::delete_many()
+        .filter(alert_rule_channel::Column::RuleId.eq(id))
+        .exec(transaction)
+        .await
+        .context("saving alert rule channels")?;
+    save_links(transaction, id, &input.channels).await?;
+    save_actions(transaction, id, &input.actions).await?;
+    record_alert_rule(transaction, id, Some(&before)).await?;
+    Ok(true)
+}
+
+/// Someone's own copy of a built-in template's rule keeps its original's name until
+/// it's renamed, so copies' names are checked here and not by the database: a name
+/// is taken if any rule but `own` and what it's a copy of has it.
+pub(super) async fn refuse_taken_name<C: ConnectionTrait>(
+    connection: &C,
+    name: &str,
+    own: &[i64],
+) -> Result<()> {
+    let same = alert_rule::Entity::find()
+        .filter(alert_rule::Column::DeletedAt.is_null())
+        .filter(alert_rule::Column::NameKey.eq(name_key(name)))
+        .all(connection)
+        .await
+        .context("loading alert rules")?;
+    let taken = same.iter().any(|row| {
+        !own.contains(&row.id)
+            && !row
+                .replaces_id
+                .is_some_and(|original| own.contains(&original))
+    });
+    if taken {
+        bail!(NameTaken::AlertRule(name.to_string()));
+    }
+    Ok(())
 }
 
 /// A rule as the audit log compares them, with its channels by name.
