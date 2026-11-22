@@ -20,8 +20,10 @@ pub struct Model {
     pub target: Option<String>,
     /// CEL over a host's facts saying which hosts it's for, as it ships.
     pub applies_to: Option<String>,
-    /// What someone chose instead, for a built-in or imported one, if they have.
+    /// What someone chose instead, for a built-in or imported one, while
+    /// `applies_to_chosen` says they have: nothing for no condition.
     pub applies_to_choice: Option<String>,
+    pub applies_to_chosen: bool,
     pub min_version: Option<String>,
     /// For a built-in one, a hash of what it says.
     pub fingerprint: Option<String>,

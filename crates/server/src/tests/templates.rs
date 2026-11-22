@@ -2004,10 +2004,18 @@ async fn a_template_is_for_the_hosts_given_it_and_those_it_picks_and_its_alerts_
         .unwrap();
     let stored = database.get_template(id).await.unwrap().unwrap();
     assert!(stored.applies_to_chosen);
+    assert_eq!(stored.applies_to, None);
     evaluator.evaluate(crate::times::now()).await.unwrap();
     let mut both = vec![a.id(), b.id()];
     both.sort();
     assert_eq!(firing_on(database.open_alerts().await.unwrap()), both);
+
+    // With no condition, hosts given it by hand are the only ones, as with a
+    // template of one's own.
+    let only_a = json!({ "applies_to": null, "host_ids": [a.id()] });
+    assert_eq!(api(&server, "PUT", &path, &only_a).await.0, 204);
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert_eq!(firing_on(database.open_alerts().await.unwrap()), [a.id()]);
 
     // A condition has to be CEL, and a host has to be there.
     let broken = json!({ "applies_to": "facts.custom.role ==" });
@@ -2026,6 +2034,21 @@ async fn a_template_is_for_the_hosts_given_it_and_those_it_picks_and_its_alerts_
     assert!(page.body.contains("Save hosts"), "{}", page.body);
     assert!(page.body.contains("db-1"), "{}", page.body);
     let token = page.token();
+    // A mistake is shown on the page, with what was typed.
+    let wrong = [
+        ("authenticity_token", token.as_str()),
+        ("applies_to", "facts.custom.role =="),
+    ];
+    let refused = browser
+        .post(&server, &format!("/templates/{id}/hosts"), &wrong)
+        .await;
+    assert_eq!(refused.status, 422);
+    assert!(refused.body.contains("isn&#39;t CEL"), "{}", refused.body);
+    assert!(
+        refused.body.contains("facts.custom.role =="),
+        "{}",
+        refused.body
+    );
     let host_field = format!("host.{}", a.id());
     let form = [
         ("authenticity_token", token.as_str()),

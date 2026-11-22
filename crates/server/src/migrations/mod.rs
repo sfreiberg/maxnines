@@ -1056,10 +1056,17 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(Templates::TargetKind).string_len(16))
             .col(ColumnDef::new(Templates::Target).string_len(255))
             // CEL over a host's facts saying which hosts it's for, as it ships, and
-            // what someone chose instead for a built-in or imported one, if they have.
-            // With neither, it's for every host, unless hosts are given it by hand.
+            // for a built-in or imported one, whether someone chose otherwise and
+            // what, which can be no condition. Without one, it's for every host,
+            // unless hosts are given it by hand.
             .col(ColumnDef::new(Templates::AppliesTo).text())
             .col(ColumnDef::new(Templates::AppliesToChoice).text())
+            .col(
+                ColumnDef::new(Templates::AppliesToChosen)
+                    .boolean()
+                    .not_null()
+                    .default(false),
+            )
             .col(ColumnDef::new(Templates::MinVersion).string_len(64))
             // What a built-in one says, hashed, so an upgrade can tell it changed.
             .col(ColumnDef::new(Templates::Fingerprint).string_len(64))
@@ -2324,6 +2331,7 @@ enum Templates {
     Target,
     AppliesTo,
     AppliesToChoice,
+    AppliesToChosen,
     MinVersion,
     Fingerprint,
     Enabled,

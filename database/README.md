@@ -187,7 +187,8 @@ erDiagram
         string target_kind "database, service or os, or NULL for every host"
         string target "the kind of database, the service, or systems, comma separated"
         text applies_to "CEL over facts saying which hosts it's for, as it ships, or NULL for all"
-        text applies_to_choice "what someone chose instead, for a built-in or imported one"
+        text applies_to_choice "what someone chose instead, for a built-in or imported one, NULL for no condition"
+        boolean applies_to_chosen "whether they chose, so applies_to_choice is used"
         string min_version
         string fingerprint "a hash of what a built-in or imported one says, or NULL"
         boolean enabled "whether it ships on, for a built-in or imported one"

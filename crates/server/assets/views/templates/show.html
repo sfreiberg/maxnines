@@ -34,6 +34,7 @@
   {% if can_edit %}
   <form method="post" action="/templates/{{ id }}/hosts" class="stacked" hx-post="/templates/{{ id }}/hosts" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    {% if hosts_error %}<p class="field-error">{{ hosts_error }}</p>{% endif %}
     <label>Hosts matching
       <input type="text" name="applies_to" value="{{ applies_to | default(value='') }}" spellcheck="false" autocomplete="off" data-cel="applies_to" placeholder="facts.custom.role == 'db'">
       <small>CEL over a host's facts. Leave empty for every host, or only those given it below.{% if original %} {% if applies_to_chosen %}Your choice, whatever a newer version says{% if ships_applies_to %}: it comes as <code>{{ ships_applies_to }}</code>{% else %}: it comes for every host{% endif %}.{% else %}As the template comes, which a newer version can change.{% endif %}{% endif %}</small>

@@ -396,7 +396,7 @@ async fn read_template<C: ConnectionTrait>(
         target,
         applies_to: match reading {
             Reading::AsWritten => row.applies_to.clone(),
-            Reading::AsRun => row.applies_to_choice.clone().or(row.applies_to.clone()),
+            Reading::AsRun => applies_to_of(row),
         },
         min_version: row.min_version.clone(),
         renamed_from: template_items::renames::read(connection, row.id).await?,
@@ -445,8 +445,8 @@ async fn to_stored<C: ConnectionTrait>(
         origin: Origin::parse(&row.origin)?,
         enabled: row.enabled_choice.unwrap_or(row.enabled),
         enabled_choice: row.enabled_choice,
-        applies_to: row.applies_to_choice.clone().or(row.applies_to.clone()),
-        applies_to_chosen: row.applies_to_choice.is_some(),
+        applies_to: applies_to_of(&row),
+        applies_to_chosen: row.applies_to_chosen,
         host_ids: hosts_given(connection, row.id).await?,
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -868,6 +868,15 @@ fn template_snapshot(stored: &StoredTemplate) -> Result<Snapshot> {
     fields["applies_to"] = json!(stored.applies_to);
     fields["host_ids"] = json!(stored.host_ids);
     Ok(Snapshot::new(stored.template.name.clone(), fields))
+}
+
+/// Which hosts a template is for by their facts: what someone chose, or what the
+/// template says.
+fn applies_to_of(row: &template::Model) -> Option<String> {
+    match row.applies_to_chosen {
+        true => row.applies_to_choice.clone(),
+        false => row.applies_to.clone(),
+    }
 }
 
 /// The hosts given a template by hand.
@@ -1806,13 +1815,10 @@ impl Database {
         };
         match stored.origin.is_original() {
             true => {
-                let ships = &stored.template.applies_to;
-                active.applies_to_choice = Set(match (&applies_to, ships) {
-                    (wanted, ships) if wanted == ships => None,
-                    // Every host, in place of the hosts the template picks.
-                    (None, Some(_)) => Some("true".to_string()),
-                    (wanted, _) => wanted.clone(),
-                });
+                // Choosing what it ships goes back to following it.
+                let chosen = applies_to != stored.template.applies_to;
+                active.applies_to_chosen = Set(chosen);
+                active.applies_to_choice = Set(applies_to.filter(|_| chosen));
             }
             false => active.applies_to = Set(applies_to),
         }

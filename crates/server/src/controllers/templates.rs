@@ -335,6 +335,22 @@ fn metric_rows(template: &Template) -> Vec<MetricRow> {
 }
 
 async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfToken) -> Response {
+    show_page(&state, &token, id, None).await
+}
+
+/// What was typed into the Hosts form, shown again with what's wrong with it.
+struct HostsTyped {
+    applies_to: String,
+    host_ids: Vec<String>,
+    error: String,
+}
+
+async fn show_page(
+    state: &AppState,
+    token: &CsrfToken,
+    id: i64,
+    typed: Option<HostsTyped>,
+) -> Response {
     let loaded = async {
         let Some(stored) = state.database.get_template(id).await? else {
             return Ok(None);
@@ -344,11 +360,17 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
     };
     let (stored, alerts) = match loaded.await {
         Ok(Some(found)) => found,
-        Ok(None) => return not_found(&state, &token),
+        Ok(None) => return not_found(state, token),
         Err(error) => return server_error(&error),
     };
-    let hosts = host_choices(&state, &stored.host_ids).await;
-    Page::new(&state, &token, "templates/show.html")
+    let given = typed
+        .as_ref()
+        .map_or(&stored.host_ids, |typed| &typed.host_ids);
+    let hosts = host_choices(state, given).await;
+    let applies_to = typed.as_ref().map_or(stored.applies_to.clone(), |typed| {
+        Some(typed.applies_to.clone())
+    });
+    let page = Page::new(state, token, "templates/show.html")
         .with("id", &stored.id)
         .with("template", &stored.template)
         .with("origin", stored.origin.as_str())
@@ -356,9 +378,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         .with("enabled", &stored.enabled)
         .with("enabled_choice", &stored.enabled_choice.is_some())
         .with("target", &target_words(&stored.template))
+        .with("applies_to", &applies_to)
         .with(
-            "applies_to",
-            &stored.applies_to.clone().filter(|text| text != "true"),
+            "hosts_error",
+            &typed.as_ref().map(|typed| typed.error.as_str()),
         )
         .with("applies_to_chosen", &stored.applies_to_chosen)
         .with("ships_applies_to", &stored.template.applies_to)
@@ -374,8 +397,11 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         .with("upgraded", &stored.upgraded_at.map(local_date))
         .with("source", &stored.hcl())
         .with("alerts", &alert_rows(&alerts))
-        .with("metrics", &metric_rows(&stored.template))
-        .render()
+        .with("metrics", &metric_rows(&stored.template));
+    match typed {
+        Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
+        None => page.render(),
+    }
 }
 
 /// A host the template's page can give it by hand.
@@ -441,14 +467,21 @@ async fn set_hosts(State(state): State<AppState>, Path(id): Path<i64>, form: Csr
             (value == "on").then(|| name.strip_prefix("host.").map(str::to_string))?
         })
         .collect();
-    match save_hosts(&state, id, applies_to, host_ids).await {
+    match save_hosts(&state, id, applies_to.clone(), host_ids.clone()).await {
         Ok(Ok(true)) => (
             form.token.clone(),
             Redirect::to(&format!("/templates/{id}")),
         )
             .into_response(),
         Ok(Ok(false)) => not_found(&state, &form.token),
-        Ok(Err(message)) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+        Ok(Err(error)) => {
+            let typed = HostsTyped {
+                applies_to: applies_to.unwrap_or_default(),
+                host_ids,
+                error,
+            };
+            show_page(&state, &form.token, id, Some(typed)).await
+        }
         Err(error) => server_error(&error),
     }
 }

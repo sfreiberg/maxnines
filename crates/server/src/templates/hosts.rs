@@ -25,22 +25,30 @@ pub struct Running {
     pub host_ids: BTreeSet<String>,
 }
 
+/// Which hosts a template's condition picks.
+enum Picks {
+    /// It has none, so it's for every host, or only those given it by hand.
+    Unsaid,
+    /// Those it's true of.
+    Matching(Condition),
+    /// None, as it doesn't compile, as a config rule's doesn't. Saving one is
+    /// refused, so only one saved before that could be.
+    Broken,
+}
+
 /// A template ready to say which hosts it's for.
 pub struct Assigned {
     pub running: Running,
-    /// Its condition, compiled. One that doesn't compile picks no hosts, as a config
-    /// rule's doesn't, and saving one is refused, so only an old one could.
-    condition: Option<Option<Condition>>,
+    picks: Picks,
 }
 
 impl Assigned {
     pub fn new(running: Running) -> Self {
-        let condition = running
-            .template
-            .applies_to
-            .as_deref()
-            .map(|text| Condition::compile(text).ok());
-        Self { running, condition }
+        let picks = match running.template.applies_to.as_deref() {
+            None => Picks::Unsaid,
+            Some(text) => Condition::compile(text).map_or(Picks::Broken, Picks::Matching),
+        };
+        Self { running, picks }
     }
 
     pub fn id(&self) -> i64 {
@@ -54,26 +62,23 @@ impl Assigned {
     /// Whether it says which hosts it's for, rather than being for them all, so
     /// working it out needs hosts' facts or IDs.
     pub fn is_narrowed(&self) -> bool {
-        self.condition.is_some() || !self.running.host_ids.is_empty()
+        !matches!(self.picks, Picks::Unsaid) || !self.running.host_ids.is_empty()
     }
 
     /// Whether it needs hosts' facts to say which it's for.
     pub fn uses_facts(&self) -> bool {
-        self.condition.is_some()
+        matches!(self.picks, Picks::Matching(_))
     }
 
     /// Whether it's for this host, whether it's on or not.
     pub fn is_for(&self, host: &Host) -> bool {
         let by_hand = self.running.host_ids.contains(host.id);
-        match &self.condition {
-            None => by_hand || self.running.host_ids.is_empty(),
-            Some(condition) => {
-                by_hand
-                    || condition
-                        .as_ref()
-                        .is_some_and(|condition| condition.check(host).unwrap_or(false))
+        by_hand
+            || match &self.picks {
+                Picks::Unsaid => self.running.host_ids.is_empty(),
+                Picks::Matching(condition) => condition.check(host).unwrap_or(false),
+                Picks::Broken => false,
             }
-        }
     }
 
     /// What it runs for on a host it's for, from the host's facts: the names of
