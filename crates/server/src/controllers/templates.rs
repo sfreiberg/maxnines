@@ -1311,11 +1311,13 @@ async fn preview_of(
         }
     }
     let mut sql = Vec::new();
-    if let Some(statement) = template.discover.as_ref().and_then(|d| d.sql.clone()) {
-        sql.push(PreviewSql {
-            from: "discover".to_string(),
-            statements: vec![statement],
-        });
+    for discover in &template.discover {
+        if let Some(statement) = &discover.sql {
+            sql.push(PreviewSql {
+                from: format!("discover {}", discover.key),
+                statements: vec![statement.clone()],
+            });
+        }
     }
     for query in &template.queries {
         sql.push(PreviewSql {

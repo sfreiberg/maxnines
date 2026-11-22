@@ -75,6 +75,10 @@ pub fn check_rule(rule: &RuleInput) -> Result<()> {
         unknown.join(", ")
     );
     config.validate().context("invalid settings")?;
+    ensure!(
+        config.templates.is_empty(),
+        "invalid settings: no such setting as templates, which the server works out from templates"
+    );
 
     // Settings are stored flat, and an empty list has no rows to store.
     let flat = flatten(&rule.settings).context("invalid settings")?;
@@ -110,6 +114,23 @@ impl Condition {
             .execute(host.context()?)
             .map_err(|error| anyhow!("{error}"))?;
         Ok(result == CelValue::Bool(true))
+    }
+}
+
+impl Condition {
+    /// Whether it's true with these as its variables, such as what a template's
+    /// discovery found. Anything but `true` isn't, and nor is one naming something
+    /// that isn't there.
+    pub fn check_values(&self, values: &serde_json::Map<String, Value>) -> bool {
+        let mut context = CelContext::with_env(FUNCTIONS.clone());
+        for (name, value) in values {
+            if context.add_variable(name.as_str(), value).is_err() {
+                return false;
+            }
+        }
+        self.0
+            .execute(&context)
+            .is_ok_and(|result| result == CelValue::Bool(true))
     }
 }
 

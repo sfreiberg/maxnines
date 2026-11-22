@@ -1,12 +1,12 @@
 use sea_orm::entity::prelude::*;
 
-/// Registry values a template's discovery reads from one key.
+/// Registry values one of a template's discover blocks reads from one key.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "template_registry_reads")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
-    pub template_id: i64,
+    pub discovery_id: i64,
     pub key: String,
     pub position: i32,
     /// The built-in part this is someone's own copy of, if it's one.

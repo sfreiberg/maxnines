@@ -224,37 +224,37 @@ async fn read_template<C: ConnectionTrait>(
         Reading::AsWritten => enabled,
         Reading::AsRun => choice.unwrap_or(enabled),
     };
-    let discover = template_discovery::Entity::find()
+    let discoveries = template_discovery::Entity::find()
         .filter(template_discovery::Column::TemplateId.eq(id))
         .filter(template_discovery::Column::ReplacesId.is_null())
-        .one(connection)
-        .await
-        .context("loading a template's discovery")?;
-    let registry = template_registry_read::Entity::find()
-        .filter(template_registry_read::Column::TemplateId.eq(id))
-        .filter(template_registry_read::Column::ReplacesId.is_null())
-        .order_by_asc(template_registry_read::Column::Position)
+        .order_by_asc(template_discovery::Column::Position)
         .all(connection)
         .await
-        .context("loading a template's registry reads")?;
-    let discover = match discover {
-        Some(found) => {
-            let mut reads = Vec::with_capacity(registry.len());
-            for read in registry {
-                reads.push(RegistryRead {
-                    values: template_items::registry_values::read(connection, read.id).await?,
-                    key: read.key,
-                });
-            }
-            Some(Discover {
-                interval: length(found.interval_secs),
-                sql: found.sql,
-                registry: reads,
-                counter_sets: template_items::counter_sets::read(connection, found.id).await?,
-            })
+        .context("loading a template's discovery")?;
+    let mut discover = Vec::with_capacity(discoveries.len());
+    for found in discoveries {
+        let registry = template_registry_read::Entity::find()
+            .filter(template_registry_read::Column::DiscoveryId.eq(found.id))
+            .filter(template_registry_read::Column::ReplacesId.is_null())
+            .order_by_asc(template_registry_read::Column::Position)
+            .all(connection)
+            .await
+            .context("loading a template's registry reads")?;
+        let mut reads = Vec::with_capacity(registry.len());
+        for read in registry {
+            reads.push(RegistryRead {
+                values: template_items::registry_values::read(connection, read.id).await?,
+                key: read.key,
+            });
         }
-        None => None,
-    };
+        discover.push(Discover {
+            interval: length(found.interval_secs),
+            sql: found.sql,
+            registry: reads,
+            counter_sets: template_items::counter_sets::read(connection, found.id).await?,
+            key: found.key,
+        });
+    }
 
     let notices = template_notice::Entity::find()
         .filter(template_notice::Column::TemplateId.eq(id))
@@ -554,62 +554,54 @@ async fn write_parts<C: ConnectionTrait>(
 ) -> Result<()> {
     template_items::renames::write(connection, id, &template.renamed_from).await?;
     template_items::services::write(connection, id, &template.services).await?;
-    // Discovery, of which a template has one.
-    let existing = template_discovery::Entity::find()
+    let mut left: HashMap<String, template_discovery::Model> = template_discovery::Entity::find()
         .filter(template_discovery::Column::TemplateId.eq(id))
         .filter(template_discovery::Column::ReplacesId.is_null())
-        .one(connection)
+        .all(connection)
         .await
-        .context("loading a template's discovery")?;
-    match (&template.discover, existing) {
-        (Some(discover), existing) => {
-            let expected = template_discovery::Model {
-                id: existing.as_ref().map_or(0, |row| row.id),
-                template_id: id,
-                interval_secs: secs(&discover.interval)?,
-                sql: discover.sql.clone(),
-                replaces_id: None,
-            };
-            let discovery = put_part!(template_discovery, connection, expected, existing);
-            template_items::counter_sets::write(connection, discovery, &discover.counter_sets)
-                .await?;
-        }
-        (None, Some(row)) => {
-            template_discovery::Entity::delete_by_id(row.id)
-                .exec(connection)
-                .await
-                .context("deleting a template's discovery")?;
-        }
-        (None, None) => {}
-    }
-
-    let mut left: HashMap<String, template_registry_read::Model> =
-        template_registry_read::Entity::find()
-            .filter(template_registry_read::Column::TemplateId.eq(id))
-            .filter(template_registry_read::Column::ReplacesId.is_null())
-            .all(connection)
-            .await
-            .context("loading a template's registry reads")?
-            .into_iter()
-            .map(|row| (row.key.clone(), row))
-            .collect();
-    let registry = template
-        .discover
-        .iter()
-        .flat_map(|discover| &discover.registry);
-    for (position, read) in registry.enumerate() {
-        let existing = left.remove(&read.key);
-        let expected = template_registry_read::Model {
+        .context("loading a template's discovery")?
+        .into_iter()
+        .map(|row| (row.key.clone(), row))
+        .collect();
+    for (position, discover) in template.discover.iter().enumerate() {
+        let existing = left.remove(&discover.key);
+        let expected = template_discovery::Model {
             id: existing.as_ref().map_or(0, |row| row.id),
             template_id: id,
-            key: read.key.clone(),
+            key: discover.key.clone(),
             position: i32::try_from(position)?,
+            interval_secs: secs(&discover.interval)?,
+            sql: discover.sql.clone(),
             replaces_id: None,
         };
-        let read_id = put_part!(template_registry_read, connection, expected, existing);
-        template_items::registry_values::write(connection, read_id, &read.values).await?;
+        let discovery = put_part!(template_discovery, connection, expected, existing);
+        template_items::counter_sets::write(connection, discovery, &discover.counter_sets).await?;
+
+        let mut reads: HashMap<String, template_registry_read::Model> =
+            template_registry_read::Entity::find()
+                .filter(template_registry_read::Column::DiscoveryId.eq(discovery))
+                .filter(template_registry_read::Column::ReplacesId.is_null())
+                .all(connection)
+                .await
+                .context("loading a template's registry reads")?
+                .into_iter()
+                .map(|row| (row.key.clone(), row))
+                .collect();
+        for (position, read) in discover.registry.iter().enumerate() {
+            let existing = reads.remove(&read.key);
+            let expected = template_registry_read::Model {
+                id: existing.as_ref().map_or(0, |row| row.id),
+                discovery_id: discovery,
+                key: read.key.clone(),
+                position: i32::try_from(position)?,
+                replaces_id: None,
+            };
+            let read_id = put_part!(template_registry_read, connection, expected, existing);
+            template_items::registry_values::write(connection, read_id, &read.values).await?;
+        }
+        drop_parts!(template_registry_read, connection, reads);
     }
-    drop_parts!(template_registry_read, connection, left);
+    drop_parts!(template_discovery, connection, left);
 
     let mut left: HashMap<String, template_notice::Model> = template_notice::Entity::find()
         .filter(template_notice::Column::TemplateId.eq(id))
@@ -790,19 +782,22 @@ async fn part_ids<C: ConnectionTrait>(
     id: i64,
 ) -> Result<std::collections::BTreeMap<String, i64>> {
     let mut ids = std::collections::BTreeMap::new();
-    for row in template_discovery::Entity::find()
+    for discovery in template_discovery::Entity::find()
         .filter(template_discovery::Column::TemplateId.eq(id))
         .all(connection)
         .await?
     {
-        ids.insert("discovery".to_string(), row.id);
-    }
-    for row in template_registry_read::Entity::find()
-        .filter(template_registry_read::Column::TemplateId.eq(id))
-        .all(connection)
-        .await?
-    {
-        ids.insert(format!("registry {}", row.key), row.id);
+        for row in template_registry_read::Entity::find()
+            .filter(template_registry_read::Column::DiscoveryId.eq(discovery.id))
+            .all(connection)
+            .await?
+        {
+            ids.insert(
+                format!("discover {} registry {}", discovery.key, row.key),
+                row.id,
+            );
+        }
+        ids.insert(format!("discover {}", discovery.key), discovery.id);
     }
     for row in template_notice::Entity::find()
         .filter(template_notice::Column::TemplateId.eq(id))

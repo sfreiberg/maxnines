@@ -461,6 +461,7 @@ async fn do_jobs(
     let (agent, state) = (agent.as_ref(), &state);
     let mut changes = state.registry.subscribe();
     let mut config_changes = state.configs.subscribe();
+    let mut template_changes = state.database.template_changes();
     let mut sent_version = None;
     let mut known_boot = None;
 
@@ -473,6 +474,9 @@ async fn do_jobs(
                 }
             }
             Ok(()) = config_changes.changed() => {
+                send_config(&configs, agent, state, &mut sent_version).await;
+            }
+            Ok(()) = template_changes.changed() => {
                 send_config(&configs, agent, state, &mut sent_version).await;
             }
             job = jobs.recv() => match job {

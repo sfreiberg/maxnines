@@ -31,7 +31,7 @@ template "iis" {
   # What's installed matters more than the version on Windows: every supported
   # Windows Server ships IIS 10, but ASP.NET and some counter sets may or may
   # not be there. Each counter set below becomes true or false.
-  discover {
+  discover "iis" {
     interval = "1h"
     registry "HKLM\\SOFTWARE\\Microsoft\\InetStp" {
       version = "VersionString" # "Version 10.0", read as version 10.0

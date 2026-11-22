@@ -31,7 +31,7 @@ pub struct TemplateForm {
     /// Comma separated.
     pub services: String,
     pub enabled: bool,
-    pub discover: DiscoverForm,
+    pub discover: Vec<DiscoverForm>,
     pub notices: Vec<NoticeForm>,
     pub queries: Vec<QueryForm>,
     pub counters: Vec<CountersForm>,
@@ -40,6 +40,7 @@ pub struct TemplateForm {
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct DiscoverForm {
+    pub key: String,
     pub interval: String,
     pub sql: String,
     /// `name = Counter set` on each line.
@@ -258,8 +259,9 @@ impl TemplateForm {
         };
         let discover = template
             .discover
-            .as_ref()
-            .map_or_else(DiscoverForm::default, |d| DiscoverForm {
+            .iter()
+            .map(|d| DiscoverForm {
+                key: d.key.clone(),
                 interval: text(&d.interval),
                 sql: text(&d.sql),
                 counter_sets: pairs(&d.counter_sets),
@@ -271,7 +273,8 @@ impl TemplateForm {
                         values: pairs(&read.values),
                     })
                     .collect(),
-            });
+            })
+            .collect();
         Self {
             key: template.key.clone(),
             name: template.name.clone(),
@@ -381,34 +384,36 @@ impl TemplateForm {
             "os" => Some(Target::Os(self.os.clone())),
             _ => None,
         };
-        let has_discover = !self.discover.interval.trim().is_empty()
-            || !self.discover.sql.trim().is_empty()
-            || !self.discover.counter_sets.trim().is_empty()
-            || !self.discover.registry.is_empty();
-        let discover = has_discover.then(|| {
-            let counter_sets = from_pairs(&self.discover.counter_sets).unwrap_or_else(|message| {
-                problems.push(Problem::new(Place::Discover, "counter_sets", message));
-                IndexMap::new()
-            });
-            let registry = self
-                .discover
-                .registry
-                .iter()
-                .map(|read| RegistryRead {
-                    key: read.key.trim().to_string(),
-                    values: from_pairs(&read.values).unwrap_or_else(|message| {
-                        problems.push(Problem::new(Place::Discover, "registry", message));
-                        IndexMap::new()
-                    }),
-                })
-                .collect();
-            Discover {
-                interval: optional(&self.discover.interval),
-                sql: long_text(&self.discover.sql),
-                registry,
-                counter_sets,
-            }
-        });
+        let discover = self
+            .discover
+            .iter()
+            .enumerate()
+            .map(|(index, form)| {
+                let place = Place::Discover(index);
+                let counter_sets = from_pairs(&form.counter_sets).unwrap_or_else(|message| {
+                    problems.push(Problem::new(place, "counter_sets", message));
+                    IndexMap::new()
+                });
+                let registry = form
+                    .registry
+                    .iter()
+                    .map(|read| RegistryRead {
+                        key: read.key.trim().to_string(),
+                        values: from_pairs(&read.values).unwrap_or_else(|message| {
+                            problems.push(Problem::new(place, "registry", message));
+                            IndexMap::new()
+                        }),
+                    })
+                    .collect();
+                Discover {
+                    key: form.key.trim().to_string(),
+                    interval: optional(&form.interval),
+                    sql: long_text(&form.sql),
+                    registry,
+                    counter_sets,
+                }
+            })
+            .collect();
         let notices = self
             .notices
             .iter()
@@ -575,17 +580,23 @@ impl TemplateForm {
             renamed_from: get("renamed_from"),
             services: get("services"),
             enabled: on("enabled"),
-            discover: DiscoverForm {
-                interval: get("discover.interval"),
-                sql: get("discover.sql"),
-                counter_sets: get("discover.counter_sets"),
-                registry: (0..rows("discover.registry."))
-                    .map(|index| RegistryForm {
-                        key: get(&format!("discover.registry.{index}.key")),
-                        values: get(&format!("discover.registry.{index}.values")),
-                    })
-                    .collect(),
-            },
+            discover: (0..rows("discover."))
+                .map(|index| {
+                    let prefix = format!("discover.{index}.");
+                    DiscoverForm {
+                        key: get(&format!("{prefix}key")),
+                        interval: get(&format!("{prefix}interval")),
+                        sql: get(&format!("{prefix}sql")),
+                        counter_sets: get(&format!("{prefix}counter_sets")),
+                        registry: (0..rows(&format!("{prefix}registry.")))
+                            .map(|number| RegistryForm {
+                                key: get(&format!("{prefix}registry.{number}.key")),
+                                values: get(&format!("{prefix}registry.{number}.values")),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect(),
             notices: (0..rows("notice."))
                 .map(|index| NoticeForm {
                     key: get(&format!("notice.{index}.key")),
@@ -694,11 +705,21 @@ impl TemplateForm {
             }
         }
         match parts.as_slice() {
-            ["registry"] | ["registry", _] => change(
-                &mut self.discover.registry,
+            ["discover"] | ["discover", _] => change(
+                &mut self.discover,
                 verb,
                 parts.get(1).and_then(|p| number(p)),
             ),
+            ["discover", at, "registry", rest @ ..] => {
+                let Some(discover) = number(at).and_then(|at| self.discover.get_mut(at)) else {
+                    return false;
+                };
+                change(
+                    &mut discover.registry,
+                    verb,
+                    rest.first().and_then(|p| number(p)),
+                )
+            }
             ["notice"] | ["notice", _] => change(
                 &mut self.notices,
                 verb,
@@ -795,12 +816,16 @@ impl TemplateForm {
         if let Some(on) = tick(self.enabled) {
             put("enabled".into(), on);
         }
-        put("discover.interval".into(), &self.discover.interval);
-        put("discover.sql".into(), &self.discover.sql);
-        put("discover.counter_sets".into(), &self.discover.counter_sets);
-        for (index, read) in self.discover.registry.iter().enumerate() {
-            put(format!("discover.registry.{index}.key"), &read.key);
-            put(format!("discover.registry.{index}.values"), &read.values);
+        for (index, discover) in self.discover.iter().enumerate() {
+            let prefix = format!("discover.{index}.");
+            put(format!("{prefix}key"), &discover.key);
+            put(format!("{prefix}interval"), &discover.interval);
+            put(format!("{prefix}sql"), &discover.sql);
+            put(format!("{prefix}counter_sets"), &discover.counter_sets);
+            for (number, read) in discover.registry.iter().enumerate() {
+                put(format!("{prefix}registry.{number}.key"), &read.key);
+                put(format!("{prefix}registry.{number}.values"), &read.values);
+            }
         }
         for (index, notice) in self.notices.iter().enumerate() {
             put(format!("notice.{index}.key"), &notice.key);
@@ -939,7 +964,10 @@ mod tests {
         assert!(form.apply_action("add:query.0.metric"));
         assert!(form.apply_action("add:alert"));
         assert!(form.apply_action("remove:alert.0"));
-        assert!(form.apply_action("add:registry"));
+        assert!(form.apply_action("add:discover.0.registry"));
+        assert_eq!(form.discover[0].registry.len(), 1);
+        assert!(form.apply_action("add:discover"));
+        assert!(form.apply_action("remove:discover.2"));
         assert!(form.apply_action("add:notice"));
         assert!(
             !form.apply_action("add:counters.0.metric"),
@@ -962,7 +990,11 @@ mod tests {
         let mut form = TemplateForm::blank();
         form.key = "app".to_string();
         form.name = "App".to_string();
-        form.discover.counter_sets = "asp_net ASP.NET".to_string();
+        form.discover.push(DiscoverForm {
+            key: "iis".to_string(),
+            counter_sets: "asp_net ASP.NET".to_string(),
+            ..DiscoverForm::default()
+        });
         form.counters.push(CountersForm {
             key: "c".to_string(),
             object: "Process".to_string(),
@@ -978,7 +1010,7 @@ mod tests {
         let (_, problems) = form.to_template();
         let errors = field_errors(&problems);
         assert_eq!(
-            errors["discover.counter_sets"],
+            errors["discover.0.counter_sets"],
             "line 1 needs a name, = and a value"
         );
         assert_eq!(errors["counters.0.groups"], "\"pid\" is given twice");

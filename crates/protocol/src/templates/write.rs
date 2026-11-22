@@ -120,7 +120,7 @@ fn template_block(template: &Template) -> Block {
     attributes.list("services", &template.services);
 
     let mut block = attributes.block("template", Some(&template.key));
-    if let Some(discover) = &template.discover {
+    for discover in &template.discover {
         block = block.add_block(discover_block(discover));
     }
     for notice in &template.notices {
@@ -143,7 +143,7 @@ fn discover_block(discover: &Discover) -> Block {
     attributes.text("interval", discover.interval.as_ref());
     attributes.text("sql", discover.sql.as_ref());
     attributes.map("counter_sets", &discover.counter_sets);
-    let mut block = attributes.block("discover", None);
+    let mut block = attributes.block("discover", Some(&discover.key));
     for read in &discover.registry {
         let mut values = Attributes::new();
         for (name, value) in &read.values {

@@ -273,6 +273,10 @@ pub struct AgentConfig {
     pub facts_interval: Duration,
     #[serde(default)]
     pub collectors: BTreeMap<String, CollectorSettings>,
+    /// What templates have the agent read, worked out by the server for this host.
+    /// Config rules can't set it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub templates: Vec<templates::work::TemplateWork>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -981,7 +985,7 @@ impl AgentConfig {
             );
             settings.validate(name, checking)?;
         }
-        Ok(())
+        templates::work::check_work(&self.templates)
     }
 
     /// Identifies this exact config, so an agent can report which one it runs.

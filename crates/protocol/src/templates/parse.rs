@@ -133,7 +133,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
         renamed_from: fields.renamed_from,
         enabled: fields.enabled,
         services: fields.services,
-        discover: None,
+        discover: Vec::new(),
         notices: Vec::new(),
         queries: Vec::new(),
         counters: Vec::new(),
@@ -142,12 +142,10 @@ fn read_template(key: String, body: Body) -> Result<Template> {
     for block in blocks {
         match block.identifier.as_str() {
             "discover" => {
-                no_label(&block)?;
-                ensure!(
-                    template.discover.is_none(),
-                    "a template has one discover block"
-                );
-                template.discover = Some(read_discover(block.body).context("discover")?);
+                let key = label_of(&block, "discover")?;
+                let discover = read_discover(key.clone(), block.body)
+                    .with_context(|| format!("discover {key:?}"))?;
+                template.discover.push(discover);
             }
             "notice" => {
                 let key = label_of(&block, "notice")?;
@@ -190,7 +188,7 @@ struct DiscoverFields {
     counter_sets: IndexMap<String, String>,
 }
 
-fn read_discover(body: Body) -> Result<Discover> {
+fn read_discover(key: String, body: Body) -> Result<Discover> {
     let (attributes, blocks) = split(body);
     let fields: DiscoverFields = read_fields(attributes)?;
     let mut registry = Vec::new();
@@ -208,6 +206,7 @@ fn read_discover(body: Body) -> Result<Discover> {
         registry.push(RegistryRead { key, values });
     }
     Ok(Discover {
+        key,
         interval: fields.interval,
         sql: fields.sql,
         registry,

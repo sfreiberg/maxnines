@@ -1153,7 +1153,7 @@ async fn cel_fields_get_suggestions_from_the_real_catalog() {
     );
     assert_eq!(
         local["discovered"],
-        json!(["version", "role", "archiving", "sees_all_sessions"])
+        json!(["version", "archiving", "sees_all_sessions", "role"])
     );
 }
 
@@ -1556,7 +1556,7 @@ async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
         .await
         .unwrap();
     let ids = database.template_part_ids(id).await;
-    assert!(ids.contains_key("discovery"));
+    assert!(ids.contains_key("discover server") && ids.contains_key("discover role"));
     assert!(ids.contains_key("notice cannot_see_sessions"));
     assert!(ids.contains_key("query slots fill lost version 17"));
     assert!(ids.contains_key("query throughput metric cache_hit"));
@@ -1573,7 +1573,7 @@ async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
     database.set_query_choice(sessions, Some(false)).await;
     template.queries[0].sql = template.queries[0].sql.replace("AS uptime", "AS up_for");
     template.queries[0].interval = Some("2m".to_string());
-    template.discover.as_mut().unwrap().interval = Some("5m".to_string());
+    template.discover[0].interval = Some("5m".to_string());
     let slots = template
         .queries
         .iter_mut()
@@ -1648,7 +1648,7 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
         .await
         .unwrap();
     let ids = database.template_part_ids(id).await;
-    assert!(ids.contains_key("registry HKLM\\SOFTWARE\\Microsoft\\InetStp"));
+    assert!(ids.contains_key("discover iis registry HKLM\\SOFTWARE\\Microsoft\\InetStp"));
     assert!(ids.contains_key("counters app_pools metric pool_running"));
     let mut newer = iis.clone();
     newer.counters[0].metrics[0].counter = Some("Total Method Requests".to_string());
@@ -2048,4 +2048,61 @@ async fn a_template_is_for_the_hosts_given_it_and_those_it_picks_and_its_alerts_
         stored.applies_to.as_deref(),
         Some("trusted.host_id == 'nowhere'")
     );
+}
+
+#[tokio::test]
+async fn an_agent_is_sent_what_its_database_templates_read_and_again_when_they_change() {
+    let server = start().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "db-1").await;
+    TestServer::next_config(&mut client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "agent": { "databases": { "orders": "postgres", "cache": "mysql" } } }),
+    };
+    send(&mut client, &facts).await;
+    server.wait_for_facts(&host.id(), 1).await;
+
+    // A template for PostgreSQL, whose discovery runs for orders straight away.
+    let database = &server.state.database;
+    let template = crate::templates::load(&POSTGRES, &json!({}), &database.catalog()).unwrap();
+    let id = database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(config.templates.len(), 1, "{config:?}");
+    let work = &config.templates[0];
+    assert_eq!(
+        (work.template.as_str(), work.database.as_str()),
+        ("pg", "orders")
+    );
+    let discover: Vec<&str> = work.discover.iter().map(|d| d.key.as_str()).collect();
+    assert_eq!(discover, ["server", "role"]);
+    // Its queries wait for what discovery finds, as it's for version 10 on.
+    assert!(work.queries.is_empty(), "{work:?}");
+
+    // Given to another host only, this one is sent nothing.
+    let other = identity();
+    let _other = server.connect_approved(&other, "db-2").await;
+    database
+        .set_template_hosts(
+            id,
+            None,
+            &std::collections::BTreeSet::from([other.id()]),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert!(config.templates.is_empty(), "{config:?}");
+
+    // Config rules can't set it.
+    let rule: crate::models::RuleInput = serde_json::from_value(json!({
+        "name": "Sneaky",
+        "priority": 1,
+        "settings": { "templates": [{ "template": "pg", "database": "orders" }] },
+    }))
+    .unwrap();
+    let error = crate::rule_engine::check_rule(&rule).unwrap_err();
+    assert!(format!("{error:#}").contains("templates"), "{error:#}");
 }

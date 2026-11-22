@@ -61,8 +61,8 @@ erDiagram
     hosts ||--o{ alerts : "has"
     templates |o--o{ alert_rules : "alerts as"
     alert_rules |o--o| alert_rules : "copied as"
-    templates ||--o| template_discoveries : "discovers with"
-    templates ||--o{ template_registry_reads : "reads"
+    templates ||--o{ template_discoveries : "discovers with"
+    template_discoveries ||--o{ template_registry_reads : "reads"
     templates ||--o{ template_notices : "notes"
     templates ||--o{ template_queries : "queries"
     template_queries ||--o{ template_fills : "fills"
@@ -204,13 +204,15 @@ erDiagram
     template_discoveries {
         int id PK
         int template_id FK
+        string key
+        int position
         int replaces_id FK
         int interval_secs
         text sql
     }
     template_registry_reads {
         int id PK
-        int template_id FK
+        int discovery_id FK
         int replaces_id FK
         string key "the registry key"
         int position

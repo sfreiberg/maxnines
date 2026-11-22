@@ -35,8 +35,13 @@ fn the_postgres_example_is_read_as_written() {
         Some(Target::Database("postgres".to_string()))
     );
     assert_eq!(template.min_version.as_deref(), Some("10"));
-    let discover = template.discover.as_ref().unwrap();
-    assert_eq!(discover.interval.as_deref(), Some("1m"));
+    let [server, role] = template.discover.as_slice() else {
+        panic!("{:?}", template.discover);
+    };
+    assert_eq!(role.key, "role");
+    assert_eq!(role.interval.as_deref(), Some("10s"));
+    let discover = server;
+    assert_eq!(discover.interval.as_deref(), Some("1h"));
     assert!(
         discover
             .sql
@@ -93,7 +98,7 @@ fn the_iis_example_is_read_as_written() {
     let template = parse(IIS).unwrap();
     assert_eq!(template.target, Some(Target::Service("W3SVC".to_string())));
     assert_eq!(template.services, ["W3SVC", "WAS"]);
-    let discover = template.discover.as_ref().unwrap();
+    let discover = &template.discover[0];
     assert_eq!(discover.registry[0].key, r"HKLM\SOFTWARE\Microsoft\InetStp");
     assert_eq!(
         discover.registry[0]
@@ -226,7 +231,8 @@ fn checks_name_the_template_block_and_field() {
              name = "App"
              os   = ["linux", "plan9", "linux"]
              min_version = "ten"
-             discover { interval = "soon" }
+             discover "d" { interval = "soon" }
+             discover "d" { sql = "SELECT 1" }
              query "q" {
                interval = "0s"
                sql      = "SELECT {{ missing }}, {{ v }}"
@@ -262,8 +268,9 @@ fn checks_name_the_template_block_and_field() {
         r#"template "app", os: "plan9" isn't an operating system"#,
         r#"template "app", os: "linux" is listed twice"#,
         r#"template "app", min_version: "ten" isn't a version"#,
-        r#"template "app", discover, interval: "soon" isn't a length of time"#,
-        r#"template "app", discover: needs sql, a registry block or counter_sets"#,
+        r#"template "app", discover "d", interval: "soon" isn't a length of time"#,
+        r#"template "app", discover "d": needs sql, a registry block or counter_sets"#,
+        r#"template "app", discover "d", key: "d" is used twice"#,
         r#"template "app", query "q", key: "q" is used twice"#,
         r#"template "app", query "q", interval: has to be longer than nothing"#,
         r#"template "app", query "q", sql: {{ missing }} has no fill block"#,

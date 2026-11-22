@@ -105,20 +105,35 @@ checked on the hosts it's for, and what it runs for is only looked for on them.
 
 ### Discovery
 
-`discover` runs first, then every `interval`, and again when what's monitored
-restarts. What it finds is what `when` and `since` look at:
+`discover` blocks run first, each then every `interval`, an hour unless it says, and
+again when what's monitored restarts. What they find is what `when` and `since` look
+at, together, so no two can find the same name. A template can have several, so what
+changes quickly can be looked at often and what hardly changes rarely:
 
-- `sql`: each column, by its name. A column called `version` is read as a version;
+- `sql`: each column of the first row, by its name. A column called `version` is
+  read as a version, from the first number in it, so `16.4 (Debian 16.4-1)` is 16.4;
 - `registry "<key>" { name = "Value" }`: Windows registry values, each by its name;
 - `counter_sets = { name = "Counter set" }`: whether the host has each performance
   counter set, true or false.
 
 ```hcl
-discover {
-  interval = "1m"
-  sql      = "SELECT current_setting('server_version') AS version, pg_is_in_recovery() AS replica"
+discover "server" {
+  sql = "SELECT current_setting('server_version') AS version"
+}
+
+discover "role" {
+  interval = "10s" # so a failover switches queries quickly
+  sql      = "SELECT pg_is_in_recovery() AS replica"
 }
 ```
+
+The server works out what each agent reads: for each database a template runs for,
+its discover blocks, and the queries whose `since` and `when` hold of what discovery
+last found there, their SQL filled in for that version. A query with a `when`,
+`since` or `fill`, or in a template with a `min_version`, waits until discovery has
+found something, and below `min_version` only discovery runs. When what discovery
+finds changes, the agent is sent what to read again. The agent itself only runs the
+SQL it's sent. Performance counters and registry values aren't read yet.
 
 ### Queries
 

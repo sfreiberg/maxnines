@@ -8,6 +8,7 @@
 //! expression compiles and whether alerts name metrics that exist.
 
 mod parse;
+pub mod work;
 mod write;
 
 use std::collections::BTreeSet;
@@ -30,6 +31,9 @@ pub const MAX_DESCRIPTION_LEN: usize = 1000;
 
 /// The operating systems a template can be for, by the `os.family` agents report.
 pub const OPERATING_SYSTEMS: [&str; 4] = ["freebsd", "linux", "macos", "windows"];
+
+/// How often a discover block runs when it doesn't say.
+pub const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// The units a metric can be given, when its name or its column's type doesn't say.
 pub const UNITS: [&str; 6] = ["%", "s", "bytes", "bytes/s", "/s", "°C"];
@@ -58,7 +62,9 @@ pub struct Template {
     /// Services that the host's own service alerts should watch.
     #[serde(default)]
     pub services: Vec<String>,
-    pub discover: Option<Discover>,
+    /// What's found first, each on its own schedule.
+    #[serde(default)]
+    pub discover: Vec<Discover>,
     #[serde(default)]
     pub notices: Vec<Notice>,
     #[serde(default)]
@@ -121,9 +127,13 @@ impl Target {
 }
 
 /// What runs first, then every `interval` and whenever what's monitored restarts.
-/// What it finds is what `when` and `since` look at.
+/// What it finds is what `when` and `since` look at. A template can have several, so
+/// what changes quickly, such as which server is the primary, can be looked at more
+/// often than what hardly does.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Discover {
+    pub key: String,
+    /// How often it runs, or [`DEFAULT_DISCOVERY_INTERVAL`].
     pub interval: Option<String>,
     /// Its columns each become something to look at, by their names.
     pub sql: Option<String>,
@@ -272,7 +282,7 @@ pub struct Alert {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Place {
     Template,
-    Discover,
+    Discover(usize),
     Notice(usize),
     Query(usize),
     Fill(usize, usize),
@@ -288,7 +298,7 @@ impl Place {
     pub fn form_prefix(self) -> String {
         match self {
             Self::Template => String::new(),
-            Self::Discover => "discover.".to_string(),
+            Self::Discover(index) => format!("discover.{index}."),
             Self::Notice(index) => format!("notice.{index}."),
             Self::Query(index) => format!("query.{index}."),
             Self::Fill(query, index) => format!("query.{query}.fill.{index}."),
@@ -317,7 +327,10 @@ impl Place {
         };
         match self {
             Self::Template => String::new(),
-            Self::Discover => "discover".to_string(),
+            Self::Discover(index) => {
+                let keys: Vec<&String> = template.discover.iter().map(|d| &d.key).collect();
+                format!("discover {}", key(&keys, index))
+            }
             Self::Notice(index) => {
                 let keys: Vec<&String> = template.notices.iter().map(|n| &n.key).collect();
                 format!("notice {}", key(&keys, index))
@@ -429,6 +442,17 @@ impl Version {
         }
         Some(Self(parts))
     }
+
+    /// The first version in some text, as a server describes itself: `16.4` in
+    /// `16.4 (Debian 16.4-1)`, or `10.0` in `Version 10.0`.
+    pub fn find(text: &str) -> Option<Self> {
+        let start = text.find(|c: char| c.is_ascii_digit())?;
+        let rest = &text[start..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        Self::parse(rest[..end].trim_end_matches('.'))
+    }
 }
 
 impl fmt::Display for Version {
@@ -467,14 +491,10 @@ pub fn fill_names(sql: &str) -> Vec<String> {
     names
 }
 
-/// The SQL each version range would run, with every fill filled: once with each
-/// fill's `older` and once from each version any fill names.
-pub fn filled_sql(query: &Query) -> Vec<String> {
-    let mut versions: BTreeSet<Version> = BTreeSet::new();
-    for fill in &query.fills {
-        versions.extend(fill.versions.keys().filter_map(|v| Version::parse(v)));
-    }
-    let pick = |fill: &Fill, at: Option<&Version>| -> String {
+/// A query's SQL with each fill filled for a version: the SQL given from the highest
+/// version at or below it, or the fill's `older` below them all or with no version.
+pub fn fill(query: &Query, at: Option<&Version>) -> String {
+    let pick = |fill: &Fill| -> String {
         let chosen = at.and_then(|at| {
             fill.versions
                 .iter()
@@ -485,24 +505,31 @@ pub fn filled_sql(query: &Query) -> Vec<String> {
         });
         chosen.or_else(|| fill.older.clone()).unwrap_or_default()
     };
-    let fill_at = |at: Option<&Version>| {
-        let mut sql = query.sql.clone();
-        for fill in &query.fills {
-            let filled = pick(fill, at);
-            let re = Regex::new(&format!(
-                r"\{{\{{\s*{}\s*\}}\}}",
-                regex_lite::escape(&fill.key)
-            ))
-            .expect("a key is a name");
-            sql = re
-                .replace_all(&sql, regex_lite::NoExpand(&filled))
-                .into_owned();
-        }
-        sql
-    };
-    let mut all = vec![fill_at(None)];
+    let mut sql = query.sql.clone();
+    for fill in &query.fills {
+        let filled = pick(fill);
+        let re = Regex::new(&format!(
+            r"\{{\{{\s*{}\s*\}}\}}",
+            regex_lite::escape(&fill.key)
+        ))
+        .expect("a key is a name");
+        sql = re
+            .replace_all(&sql, regex_lite::NoExpand(&filled))
+            .into_owned();
+    }
+    sql
+}
+
+/// The SQL each version range would run, with every fill filled: once with each
+/// fill's `older` and once from each version any fill names.
+pub fn filled_sql(query: &Query) -> Vec<String> {
+    let mut versions: BTreeSet<Version> = BTreeSet::new();
+    for fill in &query.fills {
+        versions.extend(fill.versions.keys().filter_map(|v| Version::parse(v)));
+    }
+    let mut all = vec![fill(query, None)];
     for version in &versions {
-        let sql = fill_at(Some(version));
+        let sql = fill(query, Some(version));
         if !all.contains(&sql) {
             all.push(sql);
         }
@@ -606,8 +633,15 @@ impl Template {
             }
         }
 
-        if let Some(discover) = &self.discover {
-            let place = Place::Discover;
+        check_keys(
+            self.discover.iter().map(|d| &d.key),
+            Place::Discover,
+            &mut say,
+        );
+        // What every discover block finds is looked at together, by name.
+        let mut found = BTreeSet::new();
+        for (index, discover) in self.discover.iter().enumerate() {
+            let place = Place::Discover(index);
             if let Some(interval) = &discover.interval {
                 check_interval(interval, &mut |message| say(place, "interval", message));
             }
@@ -628,7 +662,6 @@ impl Template {
             {
                 say(place, "sql", "can't be empty".to_string());
             }
-            let mut found = BTreeSet::new();
             let mut keys = BTreeSet::new();
             for read in &discover.registry {
                 if !keys.insert(&read.key) {

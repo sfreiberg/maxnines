@@ -202,11 +202,17 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
 
     let mut discoveries = table("template_discoveries", &template, true);
     discoveries
+        .col(key())
+        .col(position())
         .col(part("interval_secs").big_integer())
         .col(part("sql").text());
     manager.create_table(discoveries).await?;
 
-    let mut registry = table("template_registry_reads", &template, true);
+    let mut registry = table(
+        "template_registry_reads",
+        &[("discovery_id", "template_discoveries", true)],
+        true,
+    );
     registry.col(key()).col(position());
     manager.create_table(registry).await?;
 
@@ -363,12 +369,12 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         (
             "idx_template_discoveries_template",
             "template_discoveries",
-            "template_id",
+            "template_id, position",
         ),
         (
-            "idx_template_registry_reads_template",
+            "idx_template_registry_reads_discovery",
             "template_registry_reads",
-            "template_id, position",
+            "discovery_id, position",
         ),
         (
             "idx_template_notices_template",

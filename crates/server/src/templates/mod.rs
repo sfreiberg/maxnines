@@ -9,6 +9,7 @@
 
 pub mod built_in;
 pub mod hosts;
+pub mod work;
 
 use anyhow::{Result, bail};
 use cel::{Context as CelContext, Program, Value as CelValue};
@@ -90,10 +91,35 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
     }
 
     let dialect = dialect_for(template.target.as_ref());
-    if let Some(sql) = template.discover.as_ref().and_then(|d| d.sql.as_ref())
-        && let Err(message) = columns(dialect.as_ref(), sql)
-    {
-        problems.push(Problem::new(Place::Discover, "sql", message));
+    // What each discover block finds is looked at together, so no two find the same.
+    let mut found: Vec<String> = Vec::new();
+    for (index, discover) in template.discover.iter().enumerate() {
+        let names: Vec<String> = discover
+            .registry
+            .iter()
+            .flat_map(|read| read.values.keys().cloned())
+            .chain(discover.counter_sets.keys().cloned())
+            .collect();
+        found.extend(names);
+        let Some(sql) = &discover.sql else {
+            continue;
+        };
+        match columns(dialect.as_ref(), sql) {
+            Ok(columns) => {
+                for column in columns {
+                    if found.contains(&column) {
+                        problems.push(Problem::new(
+                            Place::Discover(index),
+                            "sql",
+                            format!("{column:?} is found by another discover block too"),
+                        ));
+                    } else {
+                        found.push(column);
+                    }
+                }
+            }
+            Err(message) => problems.push(Problem::new(Place::Discover(index), "sql", message)),
+        }
     }
     for (index, query) in template.queries.iter().enumerate() {
         let place = Place::Query(index);
@@ -245,21 +271,23 @@ fn dialect_for(target: Option<&Target>) -> Box<dyn Dialect> {
 /// What a template's discovery finds, by the names `when` uses: its SQL's columns,
 /// its registry values and its counter sets.
 pub fn discovered_names(template: &Template) -> Vec<String> {
-    let Some(discover) = &template.discover else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = discover
-        .sql
-        .as_deref()
-        .and_then(|sql| columns(dialect_for(template.target.as_ref()).as_ref(), sql).ok())
-        .unwrap_or_default();
-    names.extend(
-        discover
-            .registry
-            .iter()
-            .flat_map(|read| read.values.keys().cloned()),
-    );
-    names.extend(discover.counter_sets.keys().cloned());
+    let mut names: Vec<String> = Vec::new();
+    for discover in &template.discover {
+        names.extend(
+            discover
+                .sql
+                .as_deref()
+                .and_then(|sql| columns(dialect_for(template.target.as_ref()).as_ref(), sql).ok())
+                .unwrap_or_default(),
+        );
+        names.extend(
+            discover
+                .registry
+                .iter()
+                .flat_map(|read| read.values.keys().cloned()),
+        );
+        names.extend(discover.counter_sets.keys().cloned());
+    }
     names
 }
 
@@ -415,7 +443,7 @@ fn unit_of(metric: Option<&maxnines_protocol::templates::Metric>) -> Unit {
 /// The collector a template's samples are stored under, which no collector an
 /// agent has built in can be called, as a key has no dot.
 pub fn collector_of(key: &str) -> String {
-    format!("template.{key}")
+    maxnines_protocol::templates::work::collector_of(key)
 }
 
 /// The template's metrics, as they're read, each with whether it's on: each query's

@@ -24,17 +24,21 @@ template "postgres" {
   database    = "postgres" # once for each PostgreSQL database in the agent's config
   min_version = "10"
 
-  # Runs first, then every minute, so a failover switches queries quickly.
-  # Its columns are what `when` and `since` look at. `version` is read as a
-  # version, so 9.6 < 13 < 16.2.
-  discover {
-    interval = "1m"
+  # Discovery runs first, each block on its own schedule. Its columns are what
+  # `when` and `since` look at. `version` is read as a version, so 9.6 < 13 < 16.2.
+  discover "server" {
+    interval = "1h"
     sql      = <<-SQL
-      SELECT current_setting('server_version')                                AS version,
-             CASE WHEN pg_is_in_recovery() THEN 'replica' ELSE 'primary' END AS role,
-             current_setting('archive_mode') IN ('on', 'always')              AS archiving,
-             pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER')         AS sees_all_sessions
+      SELECT current_setting('server_version')                        AS version,
+             current_setting('archive_mode') IN ('on', 'always')      AS archiving,
+             pg_has_role(current_user, 'pg_read_all_stats', 'MEMBER') AS sees_all_sessions
     SQL
+  }
+
+  # Every ten seconds, so a failover switches queries quickly.
+  discover "role" {
+    interval = "10s"
+    sql      = "SELECT CASE WHEN pg_is_in_recovery() THEN 'replica' ELSE 'primary' END AS role"
   }
 
   notice "cannot_see_sessions" {

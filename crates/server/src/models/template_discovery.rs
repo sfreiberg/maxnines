@@ -1,12 +1,14 @@
 use sea_orm::entity::prelude::*;
 
-/// What a template's discovery runs.
+/// One of a template's discover blocks.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "template_discoveries")]
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i64,
     pub template_id: i64,
+    pub key: String,
+    pub position: i32,
     pub interval_secs: Option<i64>,
     pub sql: Option<String>,
     /// The built-in part this is someone's own copy of, if it's one.
