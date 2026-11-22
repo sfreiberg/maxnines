@@ -9,8 +9,6 @@
 
 pub mod built_in;
 
-use std::collections::BTreeMap;
-
 use anyhow::{Result, bail};
 use cel::{Context as CelContext, Program, Value as CelValue};
 use chrono::TimeDelta;
@@ -23,8 +21,10 @@ use maxnines_protocol::templates::{
     Alert, Place, Problem, Problems, Target, Template, filled_sql, is_key, parse_duration,
 };
 
-use crate::alert_conditions::{LocalKind, LocalMetric, LocalMetrics, Variable};
+use crate::alert_conditions::{Names, Variable};
 use crate::alerting::{AlertRuleInput, check_rule_in};
+use crate::catalog::Catalog;
+use crate::metrics::{INSTANCE_LABEL, Kind, Labelled, Metric, ShowChart, Source, Unit};
 
 /// Something that can't be done to a template or one of its alert rules, such as
 /// changing a built-in template's HCL, which says why to whoever asked.
@@ -43,9 +43,9 @@ impl std::error::Error for Refused {}
 pub const UP: &str = "up";
 
 /// Reads a template from HCL and checks it, saying everything that's wrong with it.
-pub fn load(text: &str, facts: &Value) -> Result<Template> {
+pub fn load(text: &str, facts: &Value, catalog: &Catalog) -> Result<Template> {
     let template = maxnines_protocol::templates::parse(text)?;
-    let problems = check(&template, facts);
+    let problems = check(&template, facts, catalog);
     if !problems.is_empty() {
         bail!(Problems::new(&template, problems));
     }
@@ -53,8 +53,9 @@ pub fn load(text: &str, facts: &Value) -> Result<Template> {
 }
 
 /// Everything wrong with a template, with conditions tried on `facts`, a real host's
-/// if there is one.
-pub fn check(template: &Template, facts: &Value) -> Vec<Problem> {
+/// if there is one, and names looked up in `catalog`, the metrics there are besides
+/// the template's own.
+pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Problem> {
     let mut problems = template.check();
     let mut say = |place: Place, field: &str, message: String| {
         problems.push(Problem::new(place, field, message));
@@ -101,12 +102,21 @@ pub fn check(template: &Template, facts: &Value) -> Vec<Problem> {
                 continue;
             }
         };
+        let runs_for_each = matches!(template.target, Some(Target::Database(_)));
         for label in &query.labels {
             if !columns.contains(label) {
                 problems.push(Problem::new(
                     place,
                     "labels",
                     format!("{label:?} isn't one of the query's columns"),
+                ));
+            } else if runs_for_each && label == INSTANCE_LABEL {
+                problems.push(Problem::new(
+                    place,
+                    "labels",
+                    format!(
+                        "a label can't be called {INSTANCE_LABEL}, which every series already has for the database it's from"
+                    ),
                 ));
             }
         }
@@ -124,8 +134,13 @@ pub fn check(template: &Template, facts: &Value) -> Vec<Problem> {
         }
     }
 
-    let local = local_metrics(template);
-    for short in local.metrics.keys() {
+    let own = metrics_of(template);
+    let short = |metric: &Metric| metric.name[template.key.len() + 1..].to_string();
+    // Two metrics can't share a name, and the ones MaxNines reads itself are there
+    // first. Said once for each query or counters block, however many it has.
+    let mut taken: Vec<(Place, &'static str, Vec<String>)> = Vec::new();
+    for (metric, _) in &own {
+        let short = short(metric);
         if let Some(variable) = Variable::ALL.iter().find(|v| v.name() == short) {
             problems.push(Problem::new(
                 Place::Template,
@@ -136,8 +151,36 @@ pub fn check(template: &Template, facts: &Value) -> Vec<Problem> {
                 ),
             ));
         }
+        if crate::metrics::find(&metric.name).is_some() {
+            let (place, how) = taken_place(template, &short);
+            match taken.iter_mut().find(|(seen, ..)| *seen == place) {
+                Some((.., names)) => names.push(metric.name.clone()),
+                None => taken.push((place, how, vec![metric.name.clone()])),
+            }
+        }
     }
-    for (index, alert) in template.alerts.iter().enumerate() {
+    // An alert about a name that's taken would be read as being about the built-in
+    // metric, so there's nothing to learn from checking the alerts until it isn't.
+    let names_taken = !taken.is_empty();
+    for (place, how, names) in taken {
+        let message = match names.as_slice() {
+            [name] => {
+                format!("its metric {name} would have the name of one MaxNines has built in: {how}")
+            }
+            names => format!(
+                "its metrics {} would have the names of ones MaxNines has built in: {how}",
+                names.join(", ")
+            ),
+        };
+        problems.push(Problem::new(place, "", message));
+    }
+    let catalog = catalog.with_template(template);
+    let names = Names {
+        catalog: &catalog,
+        template: Some(&template.key),
+    };
+    let alerts = template.alerts.iter().enumerate();
+    for (index, alert) in alerts.filter(|_| !names_taken) {
         // Lengths of time that are wrong, which the format's checks have said, are
         // left out, so the rest is still checked.
         let without_lengths = Alert {
@@ -150,7 +193,7 @@ pub fn check(template: &Template, facts: &Value) -> Vec<Problem> {
         else {
             continue;
         };
-        if let Err(error) = check_rule_in(&rule, facts, Some(&local)) {
+        if let Err(error) = check_rule_in(&rule, facts, &names) {
             let message = format!("{error:#}");
             let (field, message) = field_of(&message);
             problems.push(Problem::new(Place::Alert(index), field, message));
@@ -296,80 +339,228 @@ pub fn columns(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, String> 
 }
 
 /// What a metric's `value` gives, tried on a sample: true or false, or a number.
-fn kind_of_value(value: &str) -> LocalKind {
+fn kind_of_value(value: &str) -> Kind {
     let Ok(program) = Program::compile(value) else {
-        return LocalKind::Number;
+        return Kind::Number;
     };
     let mut context = CelContext::default();
     context.add_variable_from_value("value", CelValue::Float(50.0));
     match program.execute(&context) {
-        Ok(CelValue::Bool(_)) => LocalKind::Flag,
-        _ => LocalKind::Number,
+        Ok(CelValue::Bool(_)) => Kind::Flag,
+        _ => Kind::Number,
     }
 }
 
-fn kind_of(metric: &maxnines_protocol::templates::Metric, column: bool) -> LocalKind {
+fn kind_of(metric: &maxnines_protocol::templates::Metric, column: bool) -> Kind {
     if metric.unit.as_deref() == Some("s") {
-        return LocalKind::Seconds;
+        return Kind::Seconds;
     }
     if let Some(value) = &metric.value {
         return kind_of_value(value);
     }
     if !metric.states.is_empty() || metric.total || metric.unit.is_some() || !column {
-        return LocalKind::Number;
+        return Kind::Number;
     }
     // A column whose type only the database knows.
-    LocalKind::Unknown
+    Kind::Unknown
 }
 
-/// The template's own metrics, as its conditions see them: each query's columns
-/// that aren't labels, the metrics worked out from them, each counter, and whether a
-/// database template's database is answering.
-pub fn local_metrics(template: &Template) -> LocalMetrics {
-    let mut metrics: BTreeMap<String, LocalMetric> = BTreeMap::new();
-    if let Some(Target::Database(_)) = template.target {
-        metrics.insert(
-            UP.to_string(),
-            LocalMetric {
-                kind: LocalKind::Flag,
-                labels: Vec::new(),
-            },
-        );
+/// The unit a template gives a metric, by how templates write units.
+fn unit_named(unit: &str) -> Option<Unit> {
+    Some(match unit {
+        "%" => Unit::Percent,
+        "s" => Unit::Seconds,
+        "bytes" => Unit::Bytes,
+        "bytes/s" => Unit::BytesPerSecond,
+        "/s" => Unit::PerSecond,
+        "°C" => Unit::Celsius,
+        _ => return None,
+    })
+}
+
+/// The unit Windows' own name for a performance counter says it's in.
+fn counter_unit(counter: &str) -> Unit {
+    let counter = counter.trim();
+    let bytes = counter.starts_with("Bytes");
+    match counter.to_lowercase().ends_with("/sec") {
+        true if bytes => Unit::BytesPerSecond,
+        true => Unit::PerSecond,
+        false if bytes => Unit::Bytes,
+        false if counter.starts_with('%') => Unit::Percent,
+        false => Unit::Number,
+    }
+}
+
+/// What a metric is measured in: what the template says, or what a counter's name
+/// does, with a running total read as a rate each second.
+fn unit_of(metric: Option<&maxnines_protocol::templates::Metric>) -> Unit {
+    let Some(metric) = metric else {
+        return Unit::Number;
+    };
+    let said = metric.unit.as_deref().and_then(unit_named);
+    let unit = match (said, &metric.counter) {
+        (Some(unit), _) => unit,
+        (None, Some(counter)) if metric.value.is_none() => counter_unit(counter),
+        _ => Unit::Number,
+    };
+    match (metric.total, unit) {
+        (true, Unit::Bytes) => Unit::BytesPerSecond,
+        (true, Unit::Number) => Unit::PerSecond,
+        (_, unit) => unit,
+    }
+}
+
+/// The collector a template's samples are stored under, which no collector an
+/// agent has built in can be called, as a key has no dot.
+pub fn collector_of(key: &str) -> String {
+    format!("template.{key}")
+}
+
+/// The template's metrics, as they're read, each with whether it's on: each query's
+/// columns that aren't labels, the metrics worked out from them, each counter, and
+/// whether a database template's database is answering. One is on if the template
+/// and a query or counters block that gives it are.
+///
+/// A database template runs once for each database, so each of its series is
+/// labelled with which, before the query's own labels. A metric that several
+/// queries give has the labels of them all.
+pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
+    struct Found {
+        key: String,
+        kind: Kind,
+        unit: Unit,
+        description: Option<String>,
+        total: bool,
+        labels: Vec<String>,
+        on: bool,
+    }
+    let mut found: Vec<Found> = Vec::new();
+    let mut add = |new: Found| match found.iter_mut().find(|seen| seen.key == new.key) {
+        Some(seen) => {
+            for label in new.labels {
+                if !seen.labels.contains(&label) {
+                    seen.labels.push(label);
+                }
+            }
+            seen.on |= new.on;
+        }
+        None => found.push(new),
+    };
+
+    let instance = matches!(template.target, Some(Target::Database(_)));
+    let labelled = |own: &[String]| -> Vec<String> {
+        let instance = instance.then(|| INSTANCE_LABEL.to_string());
+        let own = own.iter().filter(|label| *label != INSTANCE_LABEL).cloned();
+        instance.into_iter().chain(own).collect()
+    };
+    if instance {
+        add(Found {
+            key: UP.to_string(),
+            kind: Kind::Flag,
+            unit: Unit::Number,
+            description: Some("Whether the database is answering".to_string()),
+            total: false,
+            labels: labelled(&[]),
+            on: template.enabled,
+        });
     }
     let dialect = dialect_for(template.target.as_ref());
     for query in &template.queries {
+        let on = template.enabled && query.enabled;
         let columns = query_columns(dialect.as_ref(), query).unwrap_or_default();
-        for column in columns
+        let metrics = columns
             .iter()
             .filter(|column| !query.labels.contains(column))
-        {
-            let detail = query.metrics.iter().find(|metric| &metric.key == column);
-            let kind = detail.map_or(LocalKind::Unknown, |metric| kind_of(metric, true));
-            metrics.entry(column.clone()).or_insert(LocalMetric {
-                kind,
-                labels: query.labels.clone(),
-            });
-        }
-        for metric in query.metrics.iter().filter(|m| !columns.contains(&m.key)) {
-            metrics.entry(metric.key.clone()).or_insert(LocalMetric {
-                kind: kind_of(metric, false),
-                labels: query.labels.clone(),
+            .map(|column| (column, true))
+            .chain(
+                query
+                    .metrics
+                    .iter()
+                    .filter(|metric| !columns.contains(&metric.key))
+                    .map(|metric| (&metric.key, false)),
+            );
+        for (key, column) in metrics {
+            let detail = query.metrics.iter().find(|metric| &metric.key == key);
+            add(Found {
+                key: key.clone(),
+                kind: detail.map_or(Kind::Unknown, |metric| kind_of(metric, column)),
+                unit: unit_of(detail),
+                description: detail.and_then(|metric| metric.description.clone()),
+                total: detail.is_some_and(|metric| metric.total),
+                labels: labelled(&query.labels),
+                on,
             });
         }
     }
     for counters in &template.counters {
-        let labels = counters.labels();
+        let labels = labelled(&counters.labels());
         for metric in &counters.metrics {
-            metrics.entry(metric.key.clone()).or_insert(LocalMetric {
+            add(Found {
+                key: metric.key.clone(),
                 kind: kind_of(metric, false),
+                unit: unit_of(Some(metric)),
+                description: metric.description.clone(),
+                total: metric.total,
                 labels: labels.clone(),
+                on: template.enabled && counters.enabled,
             });
         }
     }
-    LocalMetrics {
-        prefix: template.key.clone(),
-        metrics,
+
+    found
+        .into_iter()
+        // What's read is written into the stores' queries by name, so only names
+        // a template's checks allow are read.
+        .filter(|metric| {
+            is_key(&template.key)
+                && is_key(&metric.key)
+                && metric.labels.iter().all(|label| is_key(label))
+        })
+        .map(|metric| {
+            let read = Metric {
+                name: format!("{}.{}", template.key, metric.key),
+                title: format!("{} {}", template.name, metric.key.replace('_', " ")),
+                unit: metric.unit,
+                collector: collector_of(&template.key),
+                description: metric.description,
+                template: Some(template.key.clone()),
+                kind: metric.kind,
+                source: Source::Labelled(Labelled {
+                    field: metric.key,
+                    labels: metric.labels,
+                    total: metric.total,
+                }),
+                chart: ShowChart::WithData,
+            };
+            (read, metric.on)
+        })
+        .collect()
+}
+
+/// Where a template gives a metric whose name is taken, and what to do about it.
+fn taken_place(template: &Template, short: &str) -> (Place, &'static str) {
+    let dialect = dialect_for(template.target.as_ref());
+    for (index, query) in template.queries.iter().enumerate() {
+        let columns = query_columns(dialect.as_ref(), query).unwrap_or_default();
+        if columns.iter().any(|column| column == short)
+            || query.metrics.iter().any(|metric| metric.key == short)
+        {
+            return (
+                Place::Query(index),
+                "give the columns other names, or the template another key",
+            );
+        }
     }
+    for (index, counters) in template.counters.iter().enumerate() {
+        if counters.metrics.iter().any(|metric| metric.key == short) {
+            return (
+                Place::Counters(index),
+                "give the metrics other names, or the template another key",
+            );
+        }
+    }
+    // Whether its database is answering, which every database template has.
+    (Place::Template, "give the template another key")
 }
 
 /// A length of time a template wrote, which its checks have made sure is one.
@@ -416,6 +607,19 @@ pub fn alert_rule(template: &Template, alert: &Alert) -> Result<AlertRuleInput> 
         remind_every: None,
         actions: Vec::new(),
     })
+}
+
+/// The PostgreSQL example from the docs, under the key `pg`. As written its key is
+/// `postgres`, which would give its metrics the names of the ones MaxNines reads
+/// from PostgreSQL itself, so it's refused: tests that need a template like it use
+/// this.
+#[cfg(test)]
+pub fn postgres_example() -> String {
+    include_str!("../../../../docs/examples/postgres.hcl").replacen(
+        "template \"postgres\"",
+        "template \"pg\"",
+        1,
+    )
 }
 
 #[cfg(test)]

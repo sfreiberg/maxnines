@@ -82,7 +82,10 @@ impl MetricsReader for Script {
     ) -> anyhow::Result<crate::metrics::SeriesResult> {
         let stored = self.stored.lock().unwrap();
         Ok(crate::metrics::SeriesResult {
-            series: stored.get(query.metric.name).cloned().unwrap_or_default(),
+            series: stored
+                .get(query.metric.name.as_str())
+                .cloned()
+                .unwrap_or_default(),
             hidden: 0,
         })
     }
@@ -117,7 +120,7 @@ impl MetricsReader for Script {
         if *self.broken.lock().unwrap() {
             anyhow::bail!("deliberate test failure");
         }
-        if let Some(readings) = self.by_metric.lock().unwrap().get(metric.name) {
+        if let Some(readings) = self.by_metric.lock().unwrap().get(metric.name.as_str()) {
             return Ok(readings.clone());
         }
         Ok(self.readings.lock().unwrap().clone())
@@ -1240,7 +1243,12 @@ async fn every_server_starts_with_a_rule_for_failing_containers() {
     let rule = built_in("Container down").await;
     assert_eq!(rule.warning, None);
     assert_eq!(rule.critical.as_deref(), Some("container.up < 1"));
-    let stored = crate::alerting::AlertRule::new(1, rule.clone());
+    let stored = crate::alerting::AlertRule::new(
+        1,
+        rule.clone(),
+        None,
+        &crate::catalog::Catalog::built_in(),
+    );
     assert_eq!(stored.thresholds(), [(Severity::Critical, 1.0)]);
     assert_eq!(rule.hold, TimeDelta::seconds(60));
     assert!(rule.all_channels);
@@ -1386,7 +1394,13 @@ async fn every_server_starts_with_a_warning_at_80_percent_full_and_critical_at_9
     assert_eq!(rule.warning.as_deref(), Some("disk.usage > 80"));
     assert_eq!(rule.critical.as_deref(), Some("disk.usage > 90"));
     assert_eq!(
-        crate::alerting::AlertRule::new(1, rule.clone()).thresholds(),
+        crate::alerting::AlertRule::new(
+            1,
+            rule.clone(),
+            None,
+            &crate::catalog::Catalog::built_in()
+        )
+        .thresholds(),
         [(Severity::Warning, 80.0), (Severity::Critical, 90.0)]
     );
     assert_eq!(rule.hold, TimeDelta::seconds(300));
@@ -1936,7 +1950,7 @@ async fn a_stopped_process_alerts_from_what_an_agent_really_sends() {
             let metric = crate::metrics::find("process.count").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                let rows = metrics.newest(metric, crate::times::now()).await.unwrap();
+                let rows = metrics.newest(&metric, crate::times::now()).await.unwrap();
                 if rows
                     .iter()
                     .any(|r| r.series == "nginx" && r.value == count && r.time >= after)
@@ -1996,7 +2010,7 @@ async fn process_charts_only_appear_for_agents_that_report_processes() {
     while server
         .state
         .metrics
-        .newest(metric, crate::times::now())
+        .newest(&metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -2040,7 +2054,7 @@ async fn a_metric_for_alerts_only_gets_no_chart_but_can_still_be_read() {
     while server
         .state
         .metrics
-        .newest(metric, crate::times::now())
+        .newest(&metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -2087,7 +2101,7 @@ async fn an_hosts_page_shows_how_its_checks_last_went() {
     while server
         .state
         .metrics
-        .newest(metric, crate::times::now())
+        .newest(&metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -2134,7 +2148,7 @@ async fn an_hosts_page_shows_its_custom_metrics_without_trusting_them() {
     while server
         .state
         .metrics
-        .newest(metric, crate::times::now())
+        .newest(&metric, crate::times::now())
         .await
         .unwrap()
         .is_empty()
@@ -2180,7 +2194,7 @@ async fn a_windows_hosts_page_shows_its_performance_counters() {
         let newest = server
             .state
             .metrics
-            .newest(metric, crate::times::now())
+            .newest(&metric, crate::times::now())
             .await
             .unwrap();
         if !newest.is_empty() {
@@ -2652,7 +2666,7 @@ async fn wait_for_clock_reading(server: &TestServer, at: Timestamp) {
     while server
         .state
         .metrics
-        .newest(clock, at)
+        .newest(&clock, at)
         .await
         .unwrap()
         .is_empty()
@@ -6535,7 +6549,7 @@ mod remote {
         while server
             .state
             .metrics
-            .newest(metric, crate::times::now())
+            .newest(&metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -8264,7 +8278,7 @@ mod pages {
         while server
             .state
             .metrics
-            .newest(metric, crate::times::now())
+            .newest(&metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -8317,7 +8331,7 @@ mod pages {
         while server
             .state
             .metrics
-            .newest(metric, crate::times::now())
+            .newest(&metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -8362,7 +8376,7 @@ mod pages {
         while server
             .state
             .metrics
-            .newest(metric, crate::times::now())
+            .newest(&metric, crate::times::now())
             .await
             .unwrap()
             .is_empty()
@@ -8515,7 +8529,7 @@ mod server_page {
         let hosts = server
             .state
             .metrics
-            .series("server", metric, range, 8)
+            .series("server", &metric, range, 8)
             .await;
         let online = hosts
             .unwrap()
@@ -8700,7 +8714,7 @@ mod server_page {
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let page = loop {
-            let found = server.state.metrics.series("server", metric, range, 8);
+            let found = server.state.metrics.series("server", &metric, range, 8);
             if !found.await.unwrap().series.is_empty() {
                 break Browser::default().get(&server, "/server").await;
             }
@@ -8740,7 +8754,7 @@ mod server_page {
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let found = server.state.metrics.series("server", metric, range, 8);
+            let found = server.state.metrics.series("server", &metric, range, 8);
             if !found.await.unwrap().series.is_empty() {
                 break;
             }

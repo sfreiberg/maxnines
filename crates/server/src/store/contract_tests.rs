@@ -49,7 +49,7 @@ fn query(store: &TestStore, host_id: &str, metric: &str, max_series: usize) -> S
         .unwrap()
         .series(&SeriesQuery {
             host_id,
-            metric: find(metric).unwrap(),
+            metric: &find(metric).unwrap(),
             range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
             max_series,
         })
@@ -69,7 +69,7 @@ fn newest(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<Newest
     store
         .reader()
         .unwrap()
-        .newest(find(metric).unwrap(), at(since), at(until))
+        .newest(&find(metric).unwrap(), at(since), at(until))
         .unwrap()
 }
 
@@ -1279,7 +1279,7 @@ fn trends(store: &TestStore, metric: &str, since: i64, until: i64) -> Vec<Trend>
     store
         .reader()
         .unwrap()
-        .trends(find(metric).unwrap(), at(since), at(until))
+        .trends(&find(metric).unwrap(), at(since), at(until))
         .unwrap()
 }
 
@@ -1389,7 +1389,7 @@ fn chart_of(
         .unwrap()
         .series(&SeriesQuery {
             host_id,
-            metric: find(metric).unwrap(),
+            metric: &find(metric).unwrap(),
             range: TimeRange { from, to, step },
             max_series: 8,
         })
@@ -1439,7 +1439,7 @@ fn a_spike_outlasts_its_samples_in_the_rollups() {
     // The samples themselves are gone, as they're older than two days.
     let reader = store.reader().unwrap();
     let cpu = find("cpu.usage").unwrap();
-    assert!(reader.newest(cpu, start, start + HOUR * 2).unwrap().is_empty());
+    assert!(reader.newest(&cpu, start, start + HOUR * 2).unwrap().is_empty());
     let hours = chart_of(&store, "a", "cpu.usage", (start, start + HOUR * 2), HOUR);
     let points = &hours.series[0].points;
     assert_eq!(points.len(), 2);
@@ -1571,4 +1571,237 @@ fn hosts_are_combined_from_their_rollups() {
     };
     let result = store.reader().unwrap().calculate(&query).unwrap();
     assert_eq!(averages(&result.series[0]), [20.0]);
+}
+
+// ---- A template's metrics
+
+/// A template whose metrics are stored for each database it runs for, some with a
+/// series for each region, and one a running total.
+const SHOP: &str = r#"template "shop" {
+  name     = "Shop"
+  database = "postgres"
+  query "orders" {
+    sql     = "SELECT region, count(*) AS waiting, sum(items) AS taken FROM orders GROUP BY region"
+    labels  = ["region"]
+    metrics = { taken = { total = true } }
+  }
+  query "tills" {
+    sql = "SELECT count(*) AS tills FROM tills"
+  }
+}"#;
+
+/// Gives a store a catalog with the shop's metrics, as a server's has once the
+/// template is saved.
+fn with_shop(store: &mut TestStore) -> crate::catalog::Catalog {
+    let template = maxnines_protocol::templates::parse(SHOP).unwrap();
+    let catalog = crate::catalog::Catalog::with_templates([&template]);
+    let shared = SharedCatalog::default();
+    shared.set(catalog.clone());
+    store.use_catalog(shared);
+    catalog
+}
+
+/// What an agent running the shop's template sends: each row's labels, by name,
+/// and its numbers.
+fn shop_rows(rows: &[(&[(&str, &str)], Value)]) -> Value {
+    let rows = rows.iter().map(|(labels, numbers)| {
+        let mut row = numbers.clone();
+        let labels: serde_json::Map<String, Value> = labels
+            .iter()
+            .map(|(name, value)| (name.to_string(), json!(value)))
+            .collect();
+        row["labels"] = Value::Object(labels);
+        row
+    });
+    Value::Array(rows.collect())
+}
+
+fn chart_in(
+    store: &TestStore,
+    catalog: &crate::catalog::Catalog,
+    metric: &str,
+    (from, to): (Timestamp, Timestamp),
+    step: TimeDelta,
+) -> SeriesResult {
+    store
+        .reader()
+        .unwrap()
+        .series(&SeriesQuery {
+            host_id: "a",
+            metric: catalog.find(metric).unwrap(),
+            range: TimeRange { from, to, step },
+            max_series: 8,
+        })
+        .unwrap()
+}
+
+#[test]
+fn a_templates_metric_has_a_series_for_each_set_of_labels() {
+    let mut store = in_memory();
+    let catalog = with_shop(&mut store);
+    let rows = shop_rows(&[
+        (&[("instance", "main"), ("region", "north")], json!({ "waiting": 4 })),
+        // A comma in a value doesn't make it two.
+        (&[("instance", "main"), ("region", "south, coast")], json!({ "waiting": 9 })),
+        (&[("instance", "spare"), ("region", "north")], json!({ "waiting": 1 })),
+        (&[("instance", "main")], json!({ "tills": 3 })),
+    ]);
+    write_metric(&mut store, "a", 1000, "template.shop", rows);
+    // What another host sends is its own.
+    let other = shop_rows(&[(&[("instance", "main"), ("region", "north")], json!({ "waiting": 70 }))]);
+    write_metric(&mut store, "b", 1000, "template.shop", other);
+
+    let range = (at(0), at(HOUR_MS));
+    let waiting = chart_in(&store, &catalog, "shop.waiting", range, TimeDelta::minutes(1));
+    assert_eq!(names(&waiting), ["main, north", r"main, south\, coast", "spare, north"]);
+    assert_eq!(averages(&waiting.series[1]), [9.0]);
+    // The name says each label's value again.
+    assert_eq!(
+        crate::metrics::series_values(&waiting.series[1].name),
+        ["main", "south, coast"]
+    );
+    // One for each database, for a metric with no labels of its own.
+    let tills = chart_in(&store, &catalog, "shop.tills", range, TimeDelta::minutes(1));
+    assert_eq!(names(&tills), ["main"]);
+
+    let reader = store.reader().unwrap();
+    let newest = reader
+        .newest(catalog.find("shop.waiting").unwrap(), at(0), at(9000))
+        .unwrap();
+    assert_eq!(
+        values(&newest),
+        [
+            ("a", "main, north", 1000, 4.0),
+            ("a", r"main, south\, coast", 1000, 9.0),
+            ("a", "spare, north", 1000, 1.0),
+            ("b", "main, north", 1000, 70.0),
+        ]
+    );
+    // Nothing's been sent of one yet, which is nothing to read rather than a failure.
+    let taken = chart_in(&store, &catalog, "shop.taken", range, TimeDelta::minutes(1));
+    assert!(taken.series.is_empty());
+}
+
+#[test]
+fn a_templates_running_total_is_read_as_a_rate() {
+    let mut store = in_memory();
+    let catalog = with_shop(&mut store);
+    // Agents send a running total as how much it grew since they last read it, as
+    // they do the built-in ones: see `maxnines_protocol::totals`.
+    for (ms, taken) in [(0, 0), (10_000, 500), (20_000, 200)] {
+        let rows = shop_rows(&[(
+            &[("instance", "main"), ("region", "north")],
+            json!({ "taken": taken }),
+        )]);
+        write_metric(&mut store, "a", ms, "template.shop", rows);
+    }
+
+    let range = (at(0), at(HOUR_MS));
+    let taken = chart_in(&store, &catalog, "shop.taken", range, TimeDelta::seconds(15));
+    assert_eq!(names(&taken), ["main, north"]);
+    // 500 in ten seconds, then 200 in ten more.
+    assert_eq!(averages(&taken.series[0]), [50.0, 20.0]);
+    let reader = store.reader().unwrap();
+    let newest = reader
+        .newest(catalog.find("shop.taken").unwrap(), at(0), at(30_000))
+        .unwrap();
+    assert_eq!(values(&newest), [("a", "main, north", 20_000, 20.0)]);
+}
+
+#[test]
+fn a_templates_metric_is_combined_across_hosts() {
+    let mut store = in_memory();
+    let catalog = with_shop(&mut store);
+    for (host, waiting) in [("a", 10), ("b", 30)] {
+        let rows = shop_rows(&[(
+            &[("instance", "main"), ("region", "north")],
+            json!({ "waiting": waiting }),
+        )]);
+        write_metric(&mut store, host, 1000, "template.shop", rows);
+    }
+    let query = CalculationQuery {
+        metric: catalog.find("shop.waiting").unwrap().clone(),
+        range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
+        calculation: Calculation::Sum,
+        members: ["a", "b"]
+            .iter()
+            .map(|host| Member {
+                host_id: host.to_string(),
+                group: "all".to_string(),
+            })
+            .collect(),
+        by_series: false,
+        max_lines: 8,
+    };
+    let combined = store.reader().unwrap().calculate(&query).unwrap();
+    assert_eq!(line(&combined.series[0]), [40.0]);
+}
+
+#[test]
+fn a_templates_metric_is_rolled_up_and_outlasts_its_samples() {
+    let mut store = with_retention(retention(2, 4, None));
+    let catalog = with_shop(&mut store);
+    let start = hours_ago(72);
+    let spike = start + MINUTE * 30;
+    for index in 0..480 {
+        let time = start + FIFTEEN_SECONDS * index;
+        let waiting = if time == spike { 500 } else { 5 };
+        // 150 more taken every 15 seconds, and once 15,000, sent as how many more.
+        let taken = if time == spike { 15_000 } else { 150 };
+        let rows = shop_rows(&[(
+            &[("instance", "main"), ("region", "north")],
+            json!({ "waiting": waiting, "taken": taken }),
+        )]);
+        write_at(&mut store, "a", time, "template.shop", rows);
+    }
+
+    settle(&mut store, crate::times::now());
+
+    // The samples themselves are gone, as they're older than two days.
+    let reader = store.reader().unwrap();
+    let waiting = catalog.find("shop.waiting").unwrap();
+    assert!(reader.newest(waiting, start, start + HOUR * 2).unwrap().is_empty());
+    // The hours are there, with the spike still in the first.
+    let range = (start, start + HOUR * 2);
+    let hours = chart_in(&store, &catalog, "shop.waiting", range, HOUR);
+    assert_eq!(names(&hours), ["main, north"]);
+    let points = &hours.series[0].points;
+    assert_eq!(points.len(), 2);
+    let (high, avg, low) = high_avg_low(&points[0]);
+    assert_eq!((high, low), (500.0, 5.0));
+    assert!((avg - (239.0 * 5.0 + 500.0) / 240.0).abs() < 1e-9, "{avg}");
+    assert_eq!(high_avg_low(&points[1]), (5.0, 5.0, 5.0));
+    // And every 5 minutes, so a close look finds when it happened.
+    let spans = chart_in(&store, &catalog, "shop.waiting", (start, start + HOUR), FIFTEEN_SECONDS);
+    let peak = spans.series[0].points.iter().find(|point| point.max == 500.0);
+    assert_eq!(peak.unwrap().time, spike);
+
+    // A running total is rolled up as the rate it's read as, with its burst kept.
+    let taken = chart_in(&store, &catalog, "shop.taken", (start, start + HOUR), HOUR);
+    let (high, _, low) = high_avg_low(&taken.series[0].points[0]);
+    assert_eq!((high, low), (1000.0, 10.0));
+}
+
+#[test]
+fn a_metric_of_a_template_added_later_is_rolled_up_from_what_is_stored() {
+    let mut store = with_retention(retention(2, 4, None));
+    let start = hours_ago(30);
+    cpu_from(&mut store, "a", start, 60, 10.0, &[]);
+    for index in 0..240 {
+        let rows = shop_rows(&[(&[("instance", "main")], json!({ "tills": 3 }))]);
+        write_at(&mut store, "a", start + FIFTEEN_SECONDS * index, "template.shop", rows);
+    }
+    // Before the template is there, only the built-in metrics are rolled up.
+    settle(&mut store, crate::times::now());
+    let range = (start, start + HOUR);
+    assert_eq!(averages(&chart_of(&store, "a", "cpu.usage", range, HOUR).series[0]), [10.0]);
+
+    // Once it is, its metrics catch up from the samples still kept, with no restart.
+    let catalog = with_shop(&mut store);
+    settle(&mut store, crate::times::now());
+    let tills = chart_in(&store, &catalog, "shop.tills", range, HOUR);
+    assert_eq!(names(&tills), ["main"]);
+    assert_eq!(high_avg_low(&tills.series[0].points[0]), (3.0, 3.0, 3.0));
+    // And what was rolled up before is as it was.
+    assert_eq!(averages(&chart_of(&store, "a", "cpu.usage", range, HOUR).series[0]), [10.0]);
 }

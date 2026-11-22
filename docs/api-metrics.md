@@ -5,7 +5,10 @@
 `GET /api/v1/metrics`
 
 Everything that can be charted or alerted on, for use in `{metric}` above and in
-[alert rules](api-alert-rules.md).
+[alert rules](api-alert-rules.md): the metrics MaxNines has built in, then those of
+every [template](templates.md) that's on, by their full names, such as `myapp.lag`.
+One of a template's has the template's `key` as `template`, and the `description` the
+template gives it; for a built-in one both are `null`.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/metrics"
@@ -17,7 +20,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/metrics"
     "name": "cpu.usage",
     "title": "CPU usage",
     "unit": "percent",
-    "collector": "cpu"
+    "collector": "cpu",
+    "description": null,
+    "template": null
   }
 ]
 ```

@@ -11,6 +11,7 @@ mod app_state;
 mod audit;
 mod built_in_rules;
 mod calculations;
+mod catalog;
 mod channels;
 mod check_history;
 mod cli;
@@ -407,7 +408,8 @@ async fn serve(path: &Path) -> Result<()> {
         .forget_old_refusals(maxnines_protocol::Protocols::SUPPORTED)
         .await?;
     let hosts = database.load_hosts().await.context("loading hosts")?;
-    let store = store::open(&config.metrics, config.retention)?;
+    let mut store = store::open(&config.metrics, config.retention)?;
+    store.use_catalog(database.shared_catalog());
     let metrics = Metrics::new(store.reader()?);
     let status = Arc::new(ServerStatus::new(
         config.metrics.path().map(Path::to_path_buf),

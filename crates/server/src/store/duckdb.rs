@@ -12,15 +12,16 @@ use tracing::warn;
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
 use super::rollups::{
     EXPIRE_EVERY, FIVE_MINUTES, HOUR, RATE_LEAD, Retention, Tier, full_resolution_cutoff,
-    hours_to_redo, is_due, kept_since, metric_names, tier_for,
+    hours_to_redo, is_due, kept_since, tier_for,
 };
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_HOST, labels_key, rebuilt_output, shortened, top_of,
 };
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats, can_store};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP, numbered};
+use crate::catalog::SharedCatalog;
 use crate::metrics::{
-    LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
+    Labelled, LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
     Source, Trend,
 };
 use crate::times::{self, Timestamp, hour_of};
@@ -425,6 +426,8 @@ pub struct DuckDbStore {
     redo: BTreeSet<Timestamp>,
     /// When to next look for old data to delete.
     next_expiry: Timestamp,
+    /// The metrics there are, which are what's rolled up.
+    catalog: SharedCatalog,
 }
 
 impl DuckDbStore {
@@ -460,6 +463,7 @@ impl DuckDbStore {
             progress,
             redo,
             next_expiry: DateTime::<Utc>::MIN_UTC,
+            catalog: SharedCatalog::default(),
         })
     }
 
@@ -590,8 +594,11 @@ impl DuckDbStore {
 
     /// Every catalog metric is rolled up this far, or `None` if one hasn't started.
     fn rolled_up_until(&self) -> Option<Timestamp> {
-        metric_names()
-            .map(|name| self.progress.get(name).copied())
+        self.catalog
+            .get()
+            .all()
+            .iter()
+            .map(|metric| self.progress.get(&metric.name).copied())
             .min()
             .flatten()
     }
@@ -617,11 +624,13 @@ impl DuckDbStore {
         if !is_due(hour, now) {
             return Ok(false);
         }
-        let due: Vec<&'static Metric> = METRICS
+        let catalog = self.catalog.get();
+        let due: Vec<&Arc<Metric>> = catalog
+            .all()
             .iter()
             .filter(|metric| {
                 self.progress
-                    .get(metric.name)
+                    .get(&metric.name)
                     .is_none_or(|done| *done <= hour)
             })
             .collect();
@@ -640,7 +649,7 @@ impl DuckDbStore {
         }
         transaction.commit()?;
         for metric in due {
-            self.progress.insert(metric.name.to_string(), hour + HOUR);
+            self.progress.insert(metric.name.clone(), hour + HOUR);
         }
         Ok(true)
     }
@@ -650,11 +659,12 @@ impl DuckDbStore {
         let Some(hour) = self.redo.first().copied() else {
             return Ok(false);
         };
+        let catalog = self.catalog.get();
         let transaction = self.connection.transaction()?;
-        for metric in METRICS {
+        for metric in catalog.all() {
             if self
                 .progress
-                .get(metric.name)
+                .get(&metric.name)
                 .is_some_and(|done| *done > hour)
             {
                 for table in ["rollups_five_minute", "rollups_hour"] {
@@ -765,6 +775,10 @@ impl Store for DuckDbStore {
         result
     }
 
+    fn use_catalog(&mut self, catalog: SharedCatalog) {
+        self.catalog = catalog;
+    }
+
     fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
         Ok(Arc::new(DuckDbReader {
             connection: Mutex::new(self.connection.try_clone()?),
@@ -847,6 +861,36 @@ fn metric_id(connection: &Connection, collector: &str, path: &str) -> Result<Opt
 enum Naming<'a> {
     Fixed(&'a str),
     Label(&'a str),
+    /// The values of these labels, of those the series has, as
+    /// [`crate::metrics::series_name`] writes them.
+    Labels(&'a [String]),
+}
+
+/// What names a template's series, and the joins that needs: each label's value,
+/// with a backslash before a comma or a backslash, and a comma and a space between
+/// them. A label the series doesn't have is left out, as `concat_ws` skips NULL.
+fn labelled_naming(labels: &[String]) -> (String, String) {
+    if labels.is_empty() {
+        return ("''".to_string(), String::new());
+    }
+    let values: Vec<String> = (0..labels.len())
+        .map(|at| format!(r"replace(replace(l{at}.value, '\', '\\'), ',', '\,')"))
+        .collect();
+    // The names are a template's, which only has ones made of lowercase letters,
+    // digits and underscores.
+    let joins: Vec<String> = labels
+        .iter()
+        .enumerate()
+        .map(|(at, label)| {
+            format!(
+                "LEFT JOIN series_labels l{at} ON l{at}.series_id = se.id AND l{at}.name = '{label}'"
+            )
+        })
+        .collect();
+    (
+        format!("concat_ws(', ', {})", values.join(", ")),
+        joins.join(" "),
+    )
 }
 
 /// One stored metric as rows of `host_id`, `time`, `series` and `v`. Metric and host
@@ -858,7 +902,7 @@ fn stored_values(
     naming: &Naming<'_>,
     scope: &Scope,
 ) -> Result<String> {
-    let Some(id) = metric_id(connection, metric.collector, path)? else {
+    let Some(id) = metric_id(connection, &metric.collector, path)? else {
         // Nothing has reported it yet. This still takes the query's parameters.
         return Ok(format!(
             "SELECT NULL::VARCHAR AS host_id, NULL::TIMESTAMP AS time,
@@ -873,6 +917,7 @@ fn stored_values(
             "l.value".to_string(),
             format!("JOIN series_labels l ON l.series_id = se.id AND l.name = '{label}'"),
         ),
+        Naming::Labels(labels) => labelled_naming(labels),
     };
     let host = scope
         .host
@@ -910,7 +955,7 @@ fn reading_values(
 
 /// One row per value, as `host_id`, `time`, `series` and `v`.
 fn readings(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
-    match metric.source {
+    match &metric.source {
         Source::Fields(fields) => {
             let selects = fields
                 .iter()
@@ -922,19 +967,22 @@ fn readings(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<S
         }
         Source::Items { name, reading } => {
             let label = Naming::Label(name.trim_start_matches("$."));
-            reading_values(connection, metric, reading, &label, scope)
+            reading_values(connection, metric, *reading, &label, scope)
         }
         Source::Entries(reading) => reading_values(
             connection,
             metric,
-            reading,
+            *reading,
             &Naming::Label(ENTRY_LABEL),
             scope,
         ),
+        Source::Labelled(Labelled { field, labels, .. }) => {
+            stored_values(connection, metric, field, &Naming::Labels(labels), scope)
+        }
     }
 }
 
-fn is_rate(source: Source) -> bool {
+fn is_rate(source: &Source) -> bool {
     match source {
         Source::Fields(fields) => fields
             .iter()
@@ -942,6 +990,7 @@ fn is_rate(source: Source) -> bool {
         Source::Items { reading, .. } | Source::Entries(reading) => {
             matches!(reading, Reading::Rate(_))
         }
+        Source::Labelled(labelled) => labelled.total,
     }
 }
 
@@ -949,7 +998,7 @@ fn is_rate(source: Source) -> bool {
 /// with counts made rates, each a second. A rate needs the sample before it, so the
 /// first is `NULL`.
 fn computed_with(connection: &Connection, metric: &Metric, scope: &Scope) -> Result<String> {
-    let values = if is_rate(metric.source) {
+    let values = if is_rate(&metric.source) {
         "SELECT host_id, time, series,
                 v / NULLIF(
                     epoch(time - lag(time) OVER (PARTITION BY host_id, series ORDER BY time)),
@@ -1005,7 +1054,7 @@ fn cells_sql(
         Some((_, done)) => format!("greatest($1::TIMESTAMP, {})", timestamp_literal(done)),
         None => "$1::TIMESTAMP".to_string(),
     };
-    let lead = if is_rate(metric.source) {
+    let lead = if is_rate(&metric.source) {
         RATE_LEAD
     } else {
         TimeDelta::zero()
@@ -1094,7 +1143,7 @@ fn calculation_sql(
     // Named lines measure different things, like memory and swap, so they can't be
     // combined. Lines of the same thing, like each disk, can. These names come from
     // the catalog, never from a request.
-    let only_main_line = match query.metric.source {
+    let only_main_line = match &query.metric.source {
         Source::Fields([(name, _), _, ..]) if !query.by_series => format!("AND series = '{name}'"),
         _ => String::new(),
     };
@@ -1138,7 +1187,7 @@ fn calculation_sql(
         bucket = bucket_of("u.time", step),
         step = interval_literal(step),
         members = members.join(", "),
-        cells = cells_sql(connection, query.metric, None, tier, done)?,
+        cells = cells_sql(connection, &query.metric, None, tier, done)?,
     ))
 }
 
@@ -1146,7 +1195,7 @@ fn calculation_sql(
 /// from those. Reads from a little before the hour, for the first rate's sample before.
 fn roll_up_hour(connection: &Connection, metric: &Metric, hour: Timestamp) -> Result<()> {
     let end = hour + HOUR;
-    let lead = if is_rate(metric.source) {
+    let lead = if is_rate(&metric.source) {
         RATE_LEAD
     } else {
         TimeDelta::zero()
@@ -1459,7 +1508,7 @@ impl MetricsReader for DuckDbReader {
         let range = query.range;
         let step = range.step.max(SMALLEST_STEP);
         let tier = tier_for(step, range.from, times::now(), &self.retention);
-        let done = rolled_up_until(&connection, query.metric)?;
+        let done = rolled_up_until(&connection, &query.metric)?;
         let sql = calculation_sql(&connection, query, &members, step, tier, done)?;
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(
@@ -2518,7 +2567,7 @@ mod tests {
 
         let readable = METRICS
             .iter()
-            .filter(|metric| !is_rate(metric.source))
+            .filter(|metric| !is_rate(&metric.source))
             .filter(|metric| !query(&store, "a", metric.name, 8).series.is_empty())
             .count();
         assert!(readable > 25, "{readable}");

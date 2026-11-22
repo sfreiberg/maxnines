@@ -24,7 +24,8 @@ use tracing::{info, warn};
 
 use crate::alert_conditions::Conditions;
 use crate::alerting::{Alert, AlertRule, AlertRuleInput, Severity};
-use crate::metrics::{Metric, Source};
+use crate::catalog::Catalog;
+use crate::metrics::Metric;
 use crate::models::Database;
 use crate::times::Timestamp;
 
@@ -154,8 +155,9 @@ pub fn check_against_hosts(
     rule: &AlertRuleInput,
     conditions: &Conditions,
     known: &KnownActions,
+    catalog: &Catalog,
 ) -> Result<()> {
-    let given = rule_variables(rule, conditions);
+    let given = rule_variables(rule, conditions, catalog);
     for wanted in &rule.actions {
         let name = &wanted.action;
         let Some(needed) = known.get(name) else {
@@ -174,10 +176,10 @@ pub fn check_against_hosts(
 /// What a metric's series are, as an action's variable, where they're one of the
 /// kinds actions know about.
 pub fn series_variable(metric: &Metric) -> Option<&'static str> {
-    if matches!(metric.source, Source::Fields(_)) {
+    if metric.is_single() {
         return None;
     }
-    match (metric.name, metric.collector) {
+    match (metric.name.as_str(), metric.collector.as_str()) {
         // Only these two are named by where the disk is mounted.
         ("disk.usage" | "disk.inodes", _) => Some("disk"),
         (_, "network") => Some("interface"),
@@ -189,13 +191,17 @@ pub fn series_variable(metric: &Metric) -> Option<&'static str> {
 }
 
 /// Which variables an alert from this rule can give an action.
-pub fn rule_variables(rule: &AlertRuleInput, conditions: &Conditions) -> Vec<&'static str> {
+pub fn rule_variables(
+    rule: &AlertRuleInput,
+    conditions: &Conditions,
+    catalog: &Catalog,
+) -> Vec<&'static str> {
     let mut given = vec!["hostname", "rule", "severity", "value"];
-    if rule.watched(conditions).is_some() {
+    if rule.watched(conditions, catalog).is_some() {
         given.push("metric");
     }
     // Only a rule worked out for each disk or such has alerts about a series.
-    if let Some(each) = conditions.fanned_out().first().map(|used| used.metric) {
+    if let Some(each) = conditions.fanned_out().first().map(|used| &used.metric) {
         given.push("series");
         given.extend(series_variable(each));
     }
@@ -203,7 +209,11 @@ pub fn rule_variables(rule: &AlertRuleInput, conditions: &Conditions) -> Vec<&'s
 }
 
 /// The values an alert gives an action. Ones without a value are left out.
-pub fn alert_variables(rule: &AlertRule, alert: &Alert) -> BTreeMap<String, String> {
+pub fn alert_variables(
+    rule: &AlertRule,
+    alert: &Alert,
+    catalog: &Catalog,
+) -> BTreeMap<String, String> {
     let mut values = BTreeMap::new();
     let mut set = |name: &str, value: String| {
         if !value.is_empty() {
@@ -216,20 +226,20 @@ pub fn alert_variables(rule: &AlertRule, alert: &Alert) -> BTreeMap<String, Stri
     if let Some(value) = alert.value {
         set("value", value.to_string());
     }
-    if let Some((metric, _)) = rule.watched() {
-        set("metric", metric.name.to_string());
+    if let Some((metric, _)) = rule.watched(catalog) {
+        set("metric", metric.name.clone());
     }
     // An alert about the host as a whole has no series, so it gives none, and an
     // action that needs one is refused for it, saying so, rather than run with
     // nothing in its place.
-    let each = rule
-        .conditions
-        .as_ref()
-        .and_then(|conditions| conditions.fanned_out().first().map(|used| used.metric));
+    let each = rule.conditions.as_ref().and_then(|conditions| {
+        let fanned = conditions.fanned_out();
+        fanned.first().map(|used| used.metric.clone())
+    });
     if let Some(each) = each {
         let series = alert.series.clone().unwrap_or_default();
         set("series", series.clone());
-        if let Some(kind) = series_variable(each) {
+        if let Some(kind) = series_variable(&each) {
             set(kind, series);
         }
     }
@@ -497,7 +507,7 @@ impl Actions {
                 alert_id: Some(alert.id),
                 action: wanted.action.clone(),
                 run_on: run_on.to_string(),
-                variables: alert_variables(rule, alert),
+                variables: alert_variables(rule, alert, &self.database.catalog()),
                 requested_by: None,
                 requested_at: now,
                 timeout: wanted.timeout(),

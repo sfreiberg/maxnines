@@ -17,11 +17,11 @@ use maxnines_protocol::templates::{Problem, Problems, Template, parse, to_hcl};
 
 use super::template_form::{TemplateForm, field_errors};
 use super::{CsrfForm, Page, local_date, server_error};
-use crate::alert_conditions::LocalKind;
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
+use crate::metrics::{INSTANCE_LABEL, Kind};
 use crate::models::{Imported, Origin, StoredTemplate, TemplateAlert};
-use crate::templates::{Refused, local_metrics};
+use crate::templates::{Refused, metrics_of};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -89,13 +89,44 @@ fn target_words(template: &Template) -> String {
     }
 }
 
-fn kind_words(kind: LocalKind) -> &'static str {
+fn kind_words(kind: Kind) -> &'static str {
     match kind {
-        LocalKind::Number => "Number",
-        LocalKind::Seconds => "Length of time",
-        LocalKind::Flag => "Yes or no",
-        LocalKind::Unknown => "As the database gives it",
+        Kind::Number => "Number",
+        Kind::Seconds => "Length of time",
+        Kind::Flag => "Yes or no",
+        Kind::Unknown => "As the database gives it",
     }
+}
+
+/// One of a template's metrics, as the pages and the API show it.
+struct OwnMetric {
+    /// Its name within the template: `lag` for `postgres.lag`.
+    short: String,
+    name: String,
+    kind: Kind,
+    /// The labels its series have besides what the template runs for, which are
+    /// what `labels.` gives a summary.
+    labels: Vec<String>,
+}
+
+/// A template's metrics, in order of name.
+fn own_metrics(template: &Template) -> Vec<OwnMetric> {
+    let mut metrics: Vec<OwnMetric> = metrics_of(template)
+        .into_iter()
+        .map(|(metric, _)| OwnMetric {
+            short: crate::alerting::short_name(&metric, &template.key).to_string(),
+            kind: metric.kind,
+            labels: metric
+                .labels()
+                .iter()
+                .filter(|label| *label != INSTANCE_LABEL)
+                .cloned()
+                .collect(),
+            name: metric.name,
+        })
+        .collect();
+    metrics.sort_by(|a, b| a.short.cmp(&b.short));
+    metrics
 }
 
 #[derive(Serialize)]
@@ -169,7 +200,7 @@ struct AlertRow {
     enabled: bool,
     /// Whether someone chose that, rather than the template shipping it so.
     enabled_chosen: bool,
-    waits_for_agents: bool,
+    waits_for_discovery: bool,
     /// The built-in template's own rule, when the one in use is someone's copy.
     built_in: Option<BuiltInValues>,
     /// When an upgrade last changed the built-in rule under someone's copy.
@@ -230,7 +261,7 @@ fn alert_rows(alerts: &[TemplateAlert]) -> Vec<AlertRow> {
                     .template
                     .as_ref()
                     .is_some_and(|link| link.enabled_choice.is_some()),
-                waits_for_agents: rule.waits_for_agents(),
+                waits_for_discovery: rule.waits_for_discovery(),
                 built_in: alert
                     .copy
                     .as_ref()
@@ -246,7 +277,6 @@ fn alert_rows(alerts: &[TemplateAlert]) -> Vec<AlertRow> {
 }
 
 fn metric_rows(template: &Template) -> Vec<MetricRow> {
-    let local = local_metrics(template);
     let detail = |short: &str| {
         template
             .queries
@@ -272,10 +302,10 @@ fn metric_rows(template: &Template) -> Vec<MetricRow> {
                 .then(|| format!("query {}", query.key))
         })
     };
-    local
-        .metrics
-        .iter()
-        .map(|(short, metric)| {
+    own_metrics(template)
+        .into_iter()
+        .map(|metric| {
+            let short = &metric.short;
             let found = detail(short);
             let from = match (short.as_str(), &found) {
                 (crate::templates::UP, None) => "the agent".to_string(),
@@ -284,7 +314,7 @@ fn metric_rows(template: &Template) -> Vec<MetricRow> {
             };
             let metric_detail = found.map(|(_, m)| m);
             MetricRow {
-                name: format!("{}.{short}", local.prefix),
+                name: metric.name.clone(),
                 short: short.clone(),
                 kind: kind_words(metric.kind),
                 labels: metric.labels.join(", "),
@@ -342,18 +372,16 @@ struct LocalSuggestion {
 }
 
 pub(super) fn local_suggestions(template: &Template) -> String {
-    let local = local_metrics(template);
-    let metrics: Vec<LocalSuggestion> = local
-        .metrics
-        .iter()
-        .map(|(short, metric)| LocalSuggestion {
-            name: short.clone(),
+    let metrics: Vec<LocalSuggestion> = own_metrics(template)
+        .into_iter()
+        .map(|metric| LocalSuggestion {
+            name: metric.short,
             kind: kind_words(metric.kind),
-            labels: metric.labels.clone(),
+            labels: metric.labels,
         })
         .collect();
     json!({
-        "prefix": local.prefix,
+        "prefix": template.key,
         "metrics": metrics,
         "discovered": crate::templates::discovered_names(template),
     })
@@ -1033,19 +1061,17 @@ struct PreviewCounters {
 }
 
 fn metric_views(template: &Template) -> Vec<MetricView> {
-    let local = local_metrics(template);
-    local
-        .metrics
-        .iter()
-        .map(|(short, metric)| MetricView {
-            name: format!("{}.{short}", local.prefix),
+    own_metrics(template)
+        .into_iter()
+        .map(|metric| MetricView {
+            name: metric.name,
             kind: match metric.kind {
-                LocalKind::Number => "number",
-                LocalKind::Seconds => "seconds",
-                LocalKind::Flag => "flag",
-                LocalKind::Unknown => "unknown",
+                Kind::Number => "number",
+                Kind::Seconds => "seconds",
+                Kind::Flag => "flag",
+                Kind::Unknown => "unknown",
             },
-            labels: metric.labels.clone(),
+            labels: metric.labels,
         })
         .collect()
 }

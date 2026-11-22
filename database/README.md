@@ -170,7 +170,6 @@ erDiagram
         text when_condition "a template's alert: CEL over what discovery found"
         string since "a template's alert: the version it's from"
         timestamp original_changed_at "when an upgrade last changed the rule a copy replaces"
-        boolean waits_for_agents "needs what only agents running the template send"
         timestamp deleted_at "kept so alerts can name it"
     }
     templates {

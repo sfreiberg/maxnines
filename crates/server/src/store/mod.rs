@@ -26,6 +26,7 @@ use tokio::sync::oneshot;
 use tracing::{error, warn};
 
 use crate::calculations::CalculationQuery;
+use crate::catalog::SharedCatalog;
 use crate::config::{MetricsConfig, RetentionConfig};
 use crate::metrics::{LastSample, Metric, NewestReading, SeriesQuery, SeriesResult, Trend};
 use crate::remote_checks::LOCAL_HOST_ID;
@@ -91,6 +92,11 @@ pub trait Store: Send {
 
     /// Something to read with, which can run alongside writes.
     fn reader(&self) -> Result<Arc<dyn MetricsReader>>;
+
+    /// Gives the store the catalog of metrics, which it asks again each time it
+    /// rolls metrics up, as templates change what there is. Until it's given one, a
+    /// store that rolls up does so for the built-in metrics alone.
+    fn use_catalog(&mut self, _catalog: SharedCatalog) {}
 
     /// Does a piece of whatever upkeep the store needs, on the writer's thread between
     /// writes. Returns whether there's more to do.

@@ -5,7 +5,7 @@
 //! Open alerts are saved, so a restart doesn't repeat them. How long a problem
 //! has lasted so far is only held in memory, so a restart starts that wait again.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -22,19 +22,22 @@ use tracing::{error, info};
 use crate::actions::Actions;
 use crate::agent_configs::AgentConfigs;
 use crate::alert_conditions::{
-    Conditions, Heading, Inputs, MetricUse, Values, Variable, bind_value, facts_value,
+    Conditions, Heading, Inputs, MetricUse, Values, Variable, bind_value, facts_value, kind_of_unit,
 };
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, NewAlert, RULE_GONE_REASON, Severity, SeverityChange,
-    SummaryValues, clean, subject,
+    SummaryValues, TemplateValues, clean, short_name, subject,
 };
 use crate::app_state::AppState;
 use crate::calculations::{
     self, Calculation, Grouping, Question, SMALLEST_STEP, Sources, over_window,
 };
+use crate::catalog::Catalog;
 use crate::facts::{FlatFacts, unflatten};
 use crate::metric_charts::format_value;
-use crate::metrics::{self, Metric, Metrics, NewestReading, Source, TimeRange, Trend};
+use crate::metrics::{
+    self, INSTANCE_LABEL, Metric, Metrics, NewestReading, TimeRange, Trend, series_values,
+};
 use crate::models::Database;
 use crate::presence::Presence;
 use crate::registration::{HostRecord, HostState, Registry};
@@ -82,7 +85,7 @@ const MISSED_SAMPLES: i32 = 3;
 const MIN_SILENCE: TimeDelta = TimeDelta::minutes(1);
 
 /// What a forecast reads: a metric over how far back it looks.
-type TrendKey = (&'static str, TimeDelta);
+type TrendKey = (String, TimeDelta);
 
 /// Trends by agent, and when they were read.
 #[derive(Clone)]
@@ -261,9 +264,14 @@ struct Reported {
 struct Snapshot {
     now: Timestamp,
     in_grace: bool,
+    /// The metrics there are, as the rules' conditions were read against.
+    catalog: Arc<Catalog>,
     rules: BTreeMap<i64, AlertRule>,
     /// Each enabled rule's conditions, read as it was loaded.
     conditions: HashMap<i64, Arc<Conditions>>,
+    /// For each template's alert, the template's metrics its summaries show that its
+    /// conditions don't use.
+    shown: HashMap<i64, Vec<Arc<Metric>>>,
     hosts: BTreeMap<String, HostRecord>,
     /// For each rule with a condition for which hosts, the hosts it applies to.
     applies: HashMap<i64, HashSet<String>>,
@@ -271,7 +279,7 @@ struct Snapshot {
     facts: HashMap<String, CelValue>,
     /// By metric and agent. A metric that couldn't be read is missing, which
     /// says nothing about whether anything is wrong.
-    readings: BTreeMap<&'static str, BTreeMap<String, Vec<NewestReading>>>,
+    readings: BTreeMap<String, BTreeMap<String, Vec<NewestReading>>>,
     /// For forecasts, the same way.
     trends: HashMap<TrendKey, Trends>,
     /// Whether each host is online, and reporting if a rule asks. Reporting is none
@@ -290,13 +298,8 @@ impl Snapshot {
     }
 
     /// The trusted trends of a metric on a host, as a forecast reads them.
-    fn trusted_trends(
-        &self,
-        rule: &AlertRuleInput,
-        metric: &'static str,
-        host_id: &str,
-    ) -> Vec<&Trend> {
-        let Some(trends) = self.trends.get(&(metric, rule.window())) else {
+    fn trusted_trends(&self, rule: &AlertRuleInput, metric: &str, host_id: &str) -> Vec<&Trend> {
+        let Some(trends) = self.trends.get(&(metric.to_string(), rule.window())) else {
             return Vec::new();
         };
         let window = rule.window();
@@ -328,13 +331,14 @@ impl Snapshot {
         for used in fanned {
             // Each series reported, and whether it's one that's checked.
             let series: Vec<(String, bool)> = if used.forecast {
-                let Some(trends) = self.trends.get(&(used.metric.name, rule.window())) else {
+                let key = (used.metric.name.clone(), rule.window());
+                let Some(trends) = self.trends.get(&key) else {
                     continue;
                 };
                 let Some(trends) = trends.by_host.get(&alert.host_id) else {
                     continue;
                 };
-                let trusted = self.trusted_trends(rule, used.metric.name, &alert.host_id);
+                let trusted = self.trusted_trends(rule, &used.metric.name, &alert.host_id);
                 trends
                     .iter()
                     .map(|trend| {
@@ -345,7 +349,7 @@ impl Snapshot {
             } else {
                 let Some(readings) = self
                     .readings
-                    .get(used.metric.name)
+                    .get(&used.metric.name)
                     .and_then(|by_host| by_host.get(&alert.host_id))
                 else {
                     continue;
@@ -385,7 +389,7 @@ impl Snapshot {
             return Some("The rule no longer applies to this host");
         }
         let conditions = self.conditions.get(&rule.id)?;
-        let fanned = conditions.fanned_out();
+        let fanned = conditions.series_sources();
         match (fanned.is_empty(), &alert.series) {
             (true, None) => None,
             (true, Some(_)) | (false, None) => Some("The rule changed"),
@@ -446,14 +450,16 @@ fn facts_for_conditions(
 
 /// What one host, or one of its series, gives a rule's conditions.
 struct Gathered {
-    metrics: BTreeMap<&'static str, Values<f64>>,
-    headings: BTreeMap<&'static str, Values<Heading>>,
+    metrics: BTreeMap<String, Values<f64>>,
+    headings: BTreeMap<String, Values<Heading>>,
     /// The newest reading among them, if there's any.
     newest: Option<Timestamp>,
     /// The first metric's reading, as alerts keep it.
     value: Option<f64>,
     /// What summaries can show, in each metric's unit.
-    shown: Vec<(&'static str, Value)>,
+    shown: Vec<(String, Value)>,
+    /// What a template's alert's summaries can show besides.
+    template: Option<TemplateValues>,
 }
 
 /// Where a forecast starts from now: the line through the past, carried on to now.
@@ -465,10 +471,10 @@ fn heading_now(trend: &Trend, now: Timestamp) -> Heading {
     }
 }
 
-fn shown_each(metric: &Metric, each: &BTreeMap<String, f64>) -> Value {
+fn shown_each(conditions: &Conditions, metric: &Metric, each: &BTreeMap<String, f64>) -> Value {
     Value::Object(
         each.iter()
-            .map(|(series, value)| (series.clone(), json!(format_value(metric.unit, *value))))
+            .map(|(series, value)| (series.clone(), json!(conditions.format(metric, *value))))
             .collect(),
     )
 }
@@ -577,6 +583,7 @@ impl Evaluator {
 
         // Saving a rule checks its conditions can be read, so one that can't was
         // saved some other way, and is left alone rather than stopping every rule.
+        let catalog = self.database.catalog();
         let mut conditions: HashMap<i64, Arc<Conditions>> = HashMap::new();
         for rule in rules.values().filter(|rule| rule.runs()) {
             match &rule.conditions {
@@ -588,7 +595,7 @@ impl Evaluator {
                     error = format!(
                         "{:#}",
                         rule.rule
-                            .conditions()
+                            .conditions(&rule.names(&catalog))
                             .err()
                             .unwrap_or_else(|| anyhow::anyhow!("unknown"))
                     ),
@@ -627,13 +634,23 @@ impl Evaluator {
         };
 
         let host_rules = || active().filter(|rule| !rule.rule.is_calculation());
-        let wanted: BTreeSet<&'static str> = host_rules()
+        let shown: HashMap<i64, Vec<Arc<Metric>>> = host_rules()
+            .filter_map(|rule| {
+                let used = conditions[&rule.id].read_metrics();
+                let mut shown = rule.rule.summary_metrics(&catalog, rule.template_key()?);
+                shown.retain(|metric| !used.contains_key(&metric.name));
+                Some((rule.id, shown))
+            })
+            .collect();
+        let mut wanted: BTreeMap<String, Arc<Metric>> = host_rules()
             .flat_map(|rule| conditions[&rule.id].read_metrics())
             .collect();
+        for metric in shown.values().flatten() {
+            wanted.insert(metric.name.clone(), metric.clone());
+        }
         let mut readings = BTreeMap::new();
-        for name in wanted {
-            let metric = metrics::find(name).context("unknown metric")?;
-            match self.metrics.newest(metric, now).await {
+        for (name, metric) in wanted {
+            match self.metrics.newest(&metric, now).await {
                 Ok(rows) => {
                     let mut by_host: BTreeMap<String, Vec<NewestReading>> = BTreeMap::new();
                     for row in rows {
@@ -651,18 +668,18 @@ impl Evaluator {
             }
         }
 
-        let forecasts: BTreeSet<TrendKey> = host_rules()
+        let forecasts: BTreeMap<TrendKey, Arc<Metric>> = host_rules()
             .flat_map(|rule| {
                 let window = rule.rule.window();
                 conditions[&rule.id]
                     .forecast_metrics()
                     .into_iter()
-                    .map(move |name| (name, window))
+                    .map(move |(name, metric)| ((name, window), metric))
             })
             .collect();
-        self.trends.retain(|key, _| forecasts.contains(key));
-        for key in forecasts {
-            self.read_trends(key, now).await?;
+        self.trends.retain(|key, _| forecasts.contains_key(key));
+        for (key, metric) in forecasts {
+            self.read_trends(key, &metric, now).await?;
         }
 
         let online: HashMap<String, Seen> = hosts
@@ -689,8 +706,10 @@ impl Evaluator {
         Ok(Snapshot {
             now,
             in_grace: now - self.started_at < STARTUP_GRACE,
+            catalog,
             rules,
             conditions,
+            shown,
             hosts,
             applies,
             facts,
@@ -848,15 +867,19 @@ impl Evaluator {
 
     /// Reads which way a metric has been heading, if it's been long enough since
     /// the last time. If it can't be read, the forecast is missing until it can be.
-    async fn read_trends(&mut self, key: TrendKey, now: Timestamp) -> Result<()> {
+    async fn read_trends(
+        &mut self,
+        key: TrendKey,
+        metric: &Arc<Metric>,
+        now: Timestamp,
+    ) -> Result<()> {
         let fresh = self.trends.get(&key).is_some_and(|trends| {
             (TimeDelta::zero()..FORECAST_EVERY).contains(&(now - trends.read_at))
         });
         if fresh {
             return Ok(());
         }
-        let (name, window) = key;
-        let metric = metrics::find(name).context("unknown metric")?;
+        let window = key.1;
         match self.metrics.trends(metric, now - window, now).await {
             Ok(rows) => {
                 let mut by_host: BTreeMap<String, Vec<Trend>> = BTreeMap::new();
@@ -872,7 +895,7 @@ impl Evaluator {
             Err(error) => {
                 self.trends.remove(&key);
                 error!(
-                    metric = name,
+                    metric = metric.name,
                     error = format!("{error:#}"),
                     "reading metrics for forecasts failed"
                 );
@@ -1013,17 +1036,17 @@ impl Evaluator {
         let is_online = online.is_none_or(|seen| seen.yes);
         let is_reporting = reporting.is_none_or(|seen| seen.yes);
 
-        let fanned = conditions.fanned_out();
+        let fanned = conditions.series_sources();
         let mut series: Vec<String> = Vec::new();
         for used in &fanned {
             let names: Vec<String> = if used.forecast {
                 snapshot
-                    .trusted_trends(&rule.rule, used.metric.name, &host.id)
+                    .trusted_trends(&rule.rule, &used.metric.name, &host.id)
                     .iter()
                     .map(|trend| clean(&trend.series))
                     .collect()
             } else {
-                self.readings_of(snapshot, used.metric, &host.id)
+                self.readings_of(snapshot, &used.metric, &host.id)
                     .iter()
                     .map(|reading| clean(&reading.series))
                     .collect()
@@ -1048,7 +1071,7 @@ impl Evaluator {
         let described = conditions
             .primary()
             .filter(|primary| !primary.bracketed && !primary.forecast)
-            .and_then(|primary| metrics::described(primary.metric));
+            .and_then(|primary| metrics::described(&primary.metric));
         // What the collector last sent, read once and only if an alert needs its words.
         let mut output = None;
 
@@ -1060,7 +1083,8 @@ impl Evaluator {
             };
             checked.insert(key.clone());
             // Missing data says nothing about whether anything is wrong.
-            let Some(gathered) = self.gather(rule, conditions, &host.id, &series, snapshot) else {
+            let Some(mut gathered) = self.gather(rule, conditions, &host.id, &series, snapshot)
+            else {
                 continue;
             };
             let tracker = self.trackers.entry(key.clone()).or_default();
@@ -1117,15 +1141,15 @@ impl Evaluator {
 
             let primary = conditions.primary();
             let subject =
-                primary.map(|primary| subject(primary.metric, &series, primary.picked.as_deref()));
+                primary.map(|primary| subject(&primary.metric, &series, primary.picked.as_deref()));
             let values = SummaryValues {
                 hostname: hostname.clone(),
                 series: series.clone(),
                 value: primary
                     .zip(gathered.value)
-                    .map(|(primary, value)| format_value(primary.metric.unit, value)),
+                    .map(|(primary, value)| conditions.format(&primary.metric, value)),
                 metrics: gathered.shown.clone(),
-                template: None,
+                template: gathered.template.take(),
             };
             // Said in the collector's own words where it has them, such as a
             // service that's failed, as the alert starts, while it lasts, and as
@@ -1135,11 +1159,13 @@ impl Evaluator {
             let says = change.is_some() || (current.is_some() && breached);
             let state = match described.filter(|_| says && rule.rule.summary.is_none()) {
                 Some(described) => {
-                    let metric = primary.map(|primary| primary.metric).context("no metric")?;
+                    let metric = primary
+                        .map(|primary| &primary.metric)
+                        .context("no metric")?;
                     if output.is_none() {
                         let latest =
                             self.metrics
-                                .latest_output(&host.id, metric.collector, snapshot.now);
+                                .latest_output(&host.id, &metric.collector, snapshot.now);
                         output = Some(latest.await.ok().flatten().unwrap_or(Value::Null));
                     }
                     let state =
@@ -1193,7 +1219,7 @@ impl Evaluator {
     ) -> &'a [NewestReading] {
         snapshot
             .readings
-            .get(metric.name)
+            .get(&metric.name)
             .and_then(|by_host| by_host.get(host_id))
             .map_or(&[], Vec::as_slice)
     }
@@ -1214,25 +1240,28 @@ impl Evaluator {
             newest: None,
             value: None,
             shown: Vec::new(),
+            template: None,
         };
         let mut seen: Vec<(&str, bool)> = Vec::new();
         for used in conditions.uses() {
-            let metric = used.metric;
-            if seen.contains(&(metric.name, used.forecast)) {
+            let metric = &used.metric;
+            let name = &metric.name;
+            if seen.contains(&(name.as_str(), used.forecast)) {
                 continue;
             }
-            seen.push((metric.name, used.forecast));
+            seen.push((name, used.forecast));
             // A metric with one series has it whatever the series looked at is, and
-            // one with a series for each disk or such has the one looked at.
-            let wanted = |name: &str| match metric.source {
-                Source::Fields(_) => true,
-                _ => clean(name) == series,
-            };
+            // one with a series for each disk or such has the one looked at, or for
+            // a template's with fewer labels, the one that goes with it.
+            let looked_at = conditions.series_of(metric, series);
+            let wanted = |name: &str| metric.is_single() || clean(name) == looked_at;
             let first = gathered.value.is_none()
                 && gathered.metrics.is_empty()
                 && gathered.headings.is_empty();
+            let is_shown =
+                |gathered: &Gathered| gathered.shown.iter().any(|(shown, _)| shown == name);
             if used.forecast {
-                let trends = snapshot.trusted_trends(&rule.rule, metric.name, host_id);
+                let trends = snapshot.trusted_trends(&rule.rule, name, host_id);
                 let newest = trends.iter().map(|trend| trend.time).max()?;
                 gathered.newest = gathered.newest.max(Some(newest));
                 let bound = if used.bracketed {
@@ -1251,8 +1280,10 @@ impl Evaluator {
                             .and_then(|picked| now.get(picked).copied());
                     }
                     // What summaries show of it, unless its readings are there too.
-                    if !gathered.shown.iter().any(|(name, _)| *name == metric.name) {
-                        gathered.shown.push((metric.name, shown_each(metric, &now)));
+                    if !is_shown(&gathered) {
+                        gathered
+                            .shown
+                            .push((name.clone(), shown_each(conditions, metric, &now)));
                     }
                     Values::Each(each)
                 } else {
@@ -1260,14 +1291,14 @@ impl Evaluator {
                     if first {
                         gathered.value = Some(trend.value);
                     }
-                    if !gathered.shown.iter().any(|(name, _)| *name == metric.name) {
+                    if !is_shown(&gathered) {
                         gathered
                             .shown
-                            .push((metric.name, json!(format_value(metric.unit, trend.value))));
+                            .push((name.clone(), json!(conditions.format(metric, trend.value))));
                     }
                     Values::One(heading_now(trend, snapshot.now))
                 };
-                gathered.headings.insert(metric.name, bound);
+                gathered.headings.insert(name.clone(), bound);
                 continue;
             }
             let readings = self.readings_of(snapshot, metric, host_id);
@@ -1284,27 +1315,79 @@ impl Evaluator {
                         .as_ref()
                         .and_then(|picked| each.get(picked).copied());
                 }
-                gathered.shown.retain(|(name, _)| *name != metric.name);
+                gathered.shown.retain(|(shown, _)| shown != name);
                 gathered
                     .shown
-                    .push((metric.name, shown_each(metric, &each)));
-                gathered.metrics.insert(metric.name, Values::Each(each));
+                    .push((name.clone(), shown_each(conditions, metric, &each)));
+                gathered.metrics.insert(name.clone(), Values::Each(each));
             } else {
                 let reading = readings.iter().find(|reading| wanted(&reading.series))?;
                 gathered.newest = gathered.newest.max(Some(reading.time));
                 if first {
                     gathered.value = Some(reading.value);
                 }
-                gathered.shown.retain(|(name, _)| *name != metric.name);
-                gathered
-                    .shown
-                    .push((metric.name, json!(format_value(metric.unit, reading.value))));
+                gathered.shown.retain(|(shown, _)| shown != name);
+                gathered.shown.push((
+                    name.clone(),
+                    json!(conditions.format(metric, reading.value)),
+                ));
                 gathered
                     .metrics
-                    .insert(metric.name, Values::One(reading.value));
+                    .insert(name.clone(), Values::One(reading.value));
             }
         }
+        gathered.template = rule
+            .template_key()
+            .map(|key| self.template_values(rule, conditions, key, host_id, series, snapshot));
         Some(gathered)
+    }
+
+    /// What a template's alert's summaries can show beside what any rule's can: what
+    /// the template ran for, the labels of the series looked at, and the template's
+    /// metrics the summaries name that the conditions don't use, each as the series
+    /// that goes with the one looked at has it. One with no reading is left out.
+    fn template_values(
+        &self,
+        rule: &AlertRule,
+        conditions: &Conditions,
+        key: &str,
+        host_id: &str,
+        series: &str,
+        snapshot: &Snapshot,
+    ) -> TemplateValues {
+        let mut labels: serde_json::Map<String, Value> = conditions
+            .series_labels()
+            .iter()
+            .cloned()
+            .zip(series_values(series).into_iter().map(Value::from))
+            .collect();
+        let instance = labels.remove(INSTANCE_LABEL);
+        let mut values = serde_json::Map::new();
+        for metric in snapshot.shown.get(&rule.id).into_iter().flatten() {
+            let looked_at = conditions.series_of(metric, series);
+            // One with labels the series looked at doesn't have has no one series
+            // that goes with it.
+            let narrower = metric
+                .labels()
+                .iter()
+                .all(|label| conditions.series_labels().contains(label));
+            let reading = self
+                .readings_of(snapshot, metric, host_id)
+                .iter()
+                .find(|reading| narrower && clean(&reading.series) == looked_at);
+            if let Some(reading) = reading {
+                let short = short_name(metric, key).to_string();
+                values.insert(short, json!(metric.format(reading.value)));
+            }
+        }
+        TemplateValues {
+            prefix: key.to_string(),
+            metrics: values,
+            instance: instance
+                .and_then(|instance| instance.as_str().map(str::to_string))
+                .unwrap_or_default(),
+            labels,
+        }
     }
 
     /// The lines of a calculation with a number for each, or nothing if it couldn't
@@ -1344,7 +1427,7 @@ impl Evaluator {
             && question.calculation == Calculation::Count
             && question.grouping == Grouping::Nothing
         {
-            lines.push((question.metric.title.to_string(), 0.0));
+            lines.push((question.metric.title.clone(), 0.0));
         }
         Some(lines)
     }
@@ -1357,7 +1440,7 @@ impl Evaluator {
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
     ) -> Result<()> {
-        let question = match rule.rule.question() {
+        let question = match rule.rule.question(&snapshot.catalog) {
             Ok(question) => question,
             Err(error) => {
                 error!(
@@ -1387,7 +1470,7 @@ impl Evaluator {
                 series: line,
                 online: true,
                 reporting: true,
-                value: Some(bind_value(unit, *value)),
+                value: Some(bind_value(kind_of_unit(unit), *value)),
                 metrics: BTreeMap::new(),
                 headings: BTreeMap::new(),
             };
@@ -1593,7 +1676,7 @@ impl Change {
 
 /// Whether each of a rule's conditions holds, mildest first.
 pub(crate) fn holds(conditions: &Conditions, inputs: &Inputs) -> Vec<(Severity, bool)> {
-    let bindings = inputs.bind();
+    let bindings = inputs.bind(conditions);
     conditions
         .levels()
         .into_iter()

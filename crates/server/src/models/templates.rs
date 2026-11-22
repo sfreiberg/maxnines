@@ -37,8 +37,9 @@ use super::{
 };
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::audit::{Kind, Snapshot};
+use crate::catalog::Catalog;
 use crate::templates::built_in::BuiltIn;
-use crate::templates::{Refused, alert_rule as template_values, local_metrics};
+use crate::templates::{Refused, alert_rule as template_values};
 use crate::times::Timestamp;
 
 /// Where a template came from, which says whose it is to change.
@@ -173,13 +174,48 @@ async fn to_metrics<C: ConnectionTrait>(
     Ok(metrics)
 }
 
-/// The template a row and its parts' rows say. Copies of parts are someone's own,
-/// and aren't the template's.
+/// Which of a template's rows are read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// The template as it was written: copies of its parts are someone's own, and
+    /// aren't the template's.
+    AsWritten,
+    /// The template as it runs: someone's copy of a query, counters or one of their
+    /// parts in place of the part it's a copy of, and each of them, and the
+    /// template, on or off as someone chose.
+    AsRun,
+}
+
+/// The rows of a kind of part to read: the template's own, or for a template as it
+/// runs, each of someone's copies in place of the row it's a copy of.
+macro_rules! parts {
+    ($entity:ident, $reading:expr, $connection:expr, $parent:ident, $id:expr, $what:literal) => {{
+        let mut rows = $entity::Entity::find()
+            .filter($entity::Column::$parent.eq($id))
+            .order_by_asc($entity::Column::Position)
+            .all($connection)
+            .await
+            .context(concat!("loading ", $what))?;
+        let copied: BTreeSet<i64> = rows.iter().filter_map(|row| row.replaces_id).collect();
+        rows.retain(|row| match $reading {
+            Reading::AsWritten => row.replaces_id.is_none(),
+            Reading::AsRun => !copied.contains(&row.id),
+        });
+        rows
+    }};
+}
+
+/// The template a row and its parts' rows say.
 async fn read_template<C: ConnectionTrait>(
     connection: &C,
     row: &template::Model,
+    reading: Reading,
 ) -> Result<Template> {
     let id = row.id;
+    let on = |enabled: bool, choice: Option<bool>| match reading {
+        Reading::AsWritten => enabled,
+        Reading::AsRun => choice.unwrap_or(enabled),
+    };
     let discover = template_discovery::Entity::find()
         .filter(template_discovery::Column::TemplateId.eq(id))
         .filter(template_discovery::Column::ReplacesId.is_null())
@@ -228,30 +264,31 @@ async fn read_template<C: ConnectionTrait>(
         .collect();
 
     let mut queries = Vec::new();
-    for query in template_query::Entity::find()
-        .filter(template_query::Column::TemplateId.eq(id))
-        .filter(template_query::Column::ReplacesId.is_null())
-        .order_by_asc(template_query::Column::Position)
-        .all(connection)
-        .await
-        .context("loading a template's queries")?
-    {
+    for query in parts!(
+        template_query,
+        reading,
+        connection,
+        TemplateId,
+        id,
+        "a template's queries"
+    ) {
         let mut fills = Vec::new();
-        for fill in template_fill::Entity::find()
-            .filter(template_fill::Column::QueryId.eq(query.id))
-            .filter(template_fill::Column::ReplacesId.is_null())
-            .order_by_asc(template_fill::Column::Position)
-            .all(connection)
-            .await
-            .context("loading a query's fills")?
-        {
-            let versions = template_fill_version::Entity::find()
-                .filter(template_fill_version::Column::FillId.eq(fill.id))
-                .filter(template_fill_version::Column::ReplacesId.is_null())
-                .order_by_asc(template_fill_version::Column::Position)
-                .all(connection)
-                .await
-                .context("loading a fill's versions")?;
+        for fill in parts!(
+            template_fill,
+            reading,
+            connection,
+            QueryId,
+            query.id,
+            "a query's fills"
+        ) {
+            let versions = parts!(
+                template_fill_version,
+                reading,
+                connection,
+                FillId,
+                fill.id,
+                "a fill's versions"
+            );
             fills.push(Fill {
                 key: fill.key,
                 versions: versions
@@ -261,20 +298,21 @@ async fn read_template<C: ConnectionTrait>(
                 older: fill.older,
             });
         }
-        let metrics = template_metric::Entity::find()
-            .filter(template_metric::Column::QueryId.eq(query.id))
-            .filter(template_metric::Column::ReplacesId.is_null())
-            .order_by_asc(template_metric::Column::Position)
-            .all(connection)
-            .await
-            .context("loading a query's metrics")?;
+        let metrics = parts!(
+            template_metric,
+            reading,
+            connection,
+            QueryId,
+            query.id,
+            "a query's metrics"
+        );
         queries.push(Query {
             key: query.key,
             sql: query.sql,
             interval: length(query.interval_secs),
             since: query.since,
             when: query.when_condition,
-            enabled: query.enabled,
+            enabled: on(query.enabled, query.enabled_choice),
             labels: template_items::query_labels::read(connection, query.id).await?,
             fills,
             metrics: to_metrics(connection, metrics).await?,
@@ -282,21 +320,22 @@ async fn read_template<C: ConnectionTrait>(
     }
 
     let mut counters = Vec::new();
-    for block in template_counters::Entity::find()
-        .filter(template_counters::Column::TemplateId.eq(id))
-        .filter(template_counters::Column::ReplacesId.is_null())
-        .order_by_asc(template_counters::Column::Position)
-        .all(connection)
-        .await
-        .context("loading a template's counters")?
-    {
-        let metrics = template_metric::Entity::find()
-            .filter(template_metric::Column::CountersId.eq(block.id))
-            .filter(template_metric::Column::ReplacesId.is_null())
-            .order_by_asc(template_metric::Column::Position)
-            .all(connection)
-            .await
-            .context("loading counters' metrics")?;
+    for block in parts!(
+        template_counters,
+        reading,
+        connection,
+        TemplateId,
+        id,
+        "a template's counters"
+    ) {
+        let metrics = parts!(
+            template_metric,
+            reading,
+            connection,
+            CountersId,
+            block.id,
+            "counters' metrics"
+        );
         counters.push(Counters {
             key: block.key,
             object: block.object,
@@ -315,7 +354,7 @@ async fn read_template<C: ConnectionTrait>(
             when: block.when_condition,
             since: block.since,
             interval: length(block.interval_secs),
-            enabled: block.enabled,
+            enabled: on(block.enabled, block.enabled_choice),
             metrics: to_metrics(connection, metrics).await?,
         });
     }
@@ -349,7 +388,7 @@ async fn read_template<C: ConnectionTrait>(
         target,
         min_version: row.min_version.clone(),
         renamed_from: template_items::renames::read(connection, row.id).await?,
-        enabled: row.enabled,
+        enabled: on(row.enabled, row.enabled_choice),
         services: template_items::services::read(connection, row.id).await?,
         discover,
         notices,
@@ -389,7 +428,7 @@ async fn to_stored<C: ConnectionTrait>(
     row: template::Model,
 ) -> Result<StoredTemplate> {
     Ok(StoredTemplate {
-        template: read_template(connection, &row).await?,
+        template: read_template(connection, &row, Reading::AsWritten).await?,
         id: row.id,
         origin: Origin::parse(&row.origin)?,
         enabled: row.enabled_choice.unwrap_or(row.enabled),
@@ -723,6 +762,7 @@ impl Database {
         .update(&self.connection)
         .await
         .unwrap();
+        self.refresh_catalog().await.unwrap();
     }
 }
 
@@ -845,32 +885,6 @@ async fn record_template<C: ConnectionTrait>(
     record_change(connection, Kind::Template, id, before, after.as_ref(), None).await
 }
 
-/// Whether a template's alert needs what only agents running the template would
-/// send: what its discovery finds, or the template's own metrics.
-fn waits_for_agents(
-    template: &Template,
-    when: &Option<String>,
-    since: &Option<String>,
-    rule: &AlertRuleInput,
-) -> bool {
-    let local = local_metrics(template);
-    when.is_some()
-        || since.is_some()
-        || rule
-            .conditions_in(Some(&local))
-            .is_ok_and(|conditions| conditions.uses_local())
-}
-
-async fn set_waits<C: ConnectionTrait>(connection: &C, rule_id: i64, waits: bool) -> Result<()> {
-    alert_rule::Entity::update_many()
-        .col_expr(alert_rule::Column::WaitsForAgents, Expr::value(waits))
-        .filter(alert_rule::Column::Id.eq(rule_id))
-        .exec(connection)
-        .await
-        .context("saving alert rule")?;
-    Ok(())
-}
-
 /// A name for a rule moved aside for a built-in template's: `Disk (yours)`, then
 /// `Disk (yours 2)` and so on.
 async fn free_name<C: ConnectionTrait>(connection: &C, name: &str) -> Result<String> {
@@ -943,7 +957,6 @@ async fn write_rules<C: ConnectionTrait>(
     let rows = own_rules(connection, id).await?;
     for (position, alert) in template.alerts.iter().enumerate() {
         let theirs = template_values(template, alert)?;
-        let waits = waits_for_agents(template, &alert.when, &alert.since, &theirs);
         let position = i32::try_from(position)?;
         let existing = rows
             .iter()
@@ -962,7 +975,6 @@ async fn write_rules<C: ConnectionTrait>(
             active.template_position = Set(Some(position));
             active.when_condition = Set(alert.when.clone());
             active.since = Set(alert.since.clone());
-            active.waits_for_agents = Set(waits);
             let rule_id = alert_rule::Entity::insert(active)
                 .exec(connection)
                 .await
@@ -995,10 +1007,8 @@ async fn write_rules<C: ConnectionTrait>(
             && row.when_condition == alert.when
             && row.since == alert.since
             && row.applies_to == applies_to;
-        let same = says_the_same
-            && row.enabled == enabled
-            && row.template_position == Some(position)
-            && row.waits_for_agents == waits;
+        let same =
+            says_the_same && row.enabled == enabled && row.template_position == Some(position);
         if same {
             continue;
         }
@@ -1021,7 +1031,6 @@ async fn write_rules<C: ConnectionTrait>(
             template_position: Set(Some(position)),
             when_condition: Set(alert.when.clone()),
             since: Set(alert.since.clone()),
-            waits_for_agents: Set(waits),
             ..Default::default()
         }
         .update(connection)
@@ -1081,7 +1090,6 @@ async fn keep_copy<C: ConnectionTrait>(connection: &C, copy: &alert_rule::Model)
         when_condition: Set(None),
         since: Set(None),
         original_changed_at: Set(None),
-        waits_for_agents: Set(false),
         ..Default::default()
     }
     .update(connection)
@@ -1458,6 +1466,7 @@ impl Database {
             .commit()
             .await
             .context("updating built-in templates")?;
+        self.refresh_catalog().await?;
         Ok(changed)
     }
 
@@ -1503,7 +1512,26 @@ impl Database {
             }
         };
         transaction.commit().await.context("importing template")?;
+        self.refresh_catalog().await?;
         Ok((id, outcome))
+    }
+
+    /// Makes the catalog of metrics again from the templates there are now, each as
+    /// it runs. Everything here that changes a template, or turns one or a part of
+    /// one on or off, ends with this, so what's read never waits for a restart.
+    pub async fn refresh_catalog(&self) -> Result<()> {
+        let rows = template::Entity::find()
+            .filter(template::Column::DeletedAt.is_null())
+            .order_by_asc(template::Column::Id)
+            .all(&self.connection)
+            .await
+            .context("loading templates")?;
+        let mut templates = Vec::with_capacity(rows.len());
+        for row in &rows {
+            templates.push(read_template(&self.connection, row, Reading::AsRun).await?);
+        }
+        self.catalog.set(Catalog::with_templates(&templates));
+        Ok(())
     }
 
     /// Built-in, imported and people's own, sorted by name.
@@ -1547,11 +1575,15 @@ impl Database {
     pub async fn template_alerts(&self, id: i64) -> Result<Vec<TemplateAlert>> {
         let mut alerts = Vec::new();
         for row in own_rules(&self.connection, id).await? {
+            let catalog = self.catalog();
             let rule = load_alert_rule(&self.connection, row.id)
                 .await?
-                .context("a template's rule went missing")?;
+                .context("a template's rule went missing")?
+                .read(&catalog);
             let copy = match copy_of(&self.connection, row.id).await? {
-                Some(copy) => load_alert_rule(&self.connection, copy.id).await?,
+                Some(copy) => load_alert_rule(&self.connection, copy.id)
+                    .await?
+                    .map(|copy| copy.read(&catalog)),
                 None => None,
             };
             alerts.push(TemplateAlert {
@@ -1585,6 +1617,7 @@ impl Database {
         write_rules(&transaction, id, template, Origin::Own, now).await?;
         record_template(&transaction, id, None).await?;
         transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
         Ok(id)
     }
 
@@ -1624,6 +1657,7 @@ impl Database {
         write_rules(&transaction, id, template, Origin::Own, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
         Ok(true)
     }
 
@@ -1641,6 +1675,7 @@ impl Database {
         }
         delete_in(&transaction, &stored, now).await?;
         transaction.commit().await.context("deleting template")?;
+        self.refresh_catalog().await?;
         Ok(true)
     }
 
@@ -1674,6 +1709,7 @@ impl Database {
             .context("saving template")?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
         Ok(true)
     }
 
@@ -1696,6 +1732,7 @@ impl Database {
         .context("saving template")?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
         Ok(true)
     }
 
@@ -1729,12 +1766,6 @@ impl Database {
             .await
             .context("loading alert rule")?
             .context("a template's rule went missing")?;
-        let waits = waits_for_agents(
-            &found.template.template,
-            &original.when_condition,
-            &original.since,
-            wanted,
-        );
         let own = [found.original, found.copy.unwrap_or(found.original)];
         refuse_taken_name(&transaction, &wanted.name, &own).await?;
 
@@ -1774,7 +1805,6 @@ impl Database {
                 active.when_condition = Set(original.when_condition.clone());
                 active.since = Set(original.since.clone());
                 active.replaces_id = Set(Some(found.original));
-                active.waits_for_agents = Set(waits);
                 let copy = alert_rule::Entity::insert(active)
                     .exec(&transaction)
                     .await
@@ -1790,7 +1820,6 @@ impl Database {
             }
         };
         write_rule_in(&transaction, target, wanted).await?;
-        set_waits(&transaction, target, waits).await?;
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
     }

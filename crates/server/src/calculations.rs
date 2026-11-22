@@ -2,15 +2,17 @@
 //! of every Linux host. Dashboards ask these, and so do alert rules.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::catalog::Catalog;
 use crate::controllers::host_list::HostSearch;
 use crate::host_filter::HostFilter;
-use crate::metrics::{Metric, Metrics, Point, SeriesResult, TimeRange, Unit, find};
+use crate::metrics::{Metric, Metrics, Point, SeriesResult, TimeRange, Unit};
 use crate::models::Database;
 use crate::registration::{HostRecord, HostState, Registry, short_id};
 
@@ -112,7 +114,7 @@ pub struct Member {
 /// A calculation with its hosts worked out, for the metrics store to answer.
 #[derive(Debug, Clone)]
 pub struct CalculationQuery {
-    pub metric: &'static Metric,
+    pub metric: Arc<Metric>,
     pub range: TimeRange,
     pub calculation: Calculation,
     pub members: Vec<Member>,
@@ -125,7 +127,7 @@ pub struct CalculationQuery {
 /// The question itself, as dashboards and rules keep it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Question {
-    pub metric: &'static Metric,
+    pub metric: Arc<Metric>,
     pub calculation: Calculation,
     pub grouping: Grouping,
     /// Which hosts, in the same form as the filter on the Hosts list.
@@ -135,12 +137,16 @@ pub struct Question {
 impl Question {
     /// From what someone chose. The error says what's wrong, to show them.
     pub fn new(
+        catalog: &Catalog,
         metric: &str,
         calculation: &str,
         group_by: &str,
         filter: &str,
     ) -> Result<Self, String> {
-        let metric = find(metric).ok_or("Choose a metric from the list.")?;
+        let metric = catalog
+            .find(metric)
+            .cloned()
+            .ok_or("Choose a metric from the list.")?;
         let calculation = Calculation::parse(calculation).ok_or("Choose how to combine values.")?;
         let grouping = Grouping::parse(group_by).ok_or("Choose what gets its own line.")?;
         if filter.len() > MAX_FILTER_LEN {
@@ -219,7 +225,7 @@ async fn members(sources: &Sources<'_>, question: &Question) -> Result<Vec<Membe
                     .get(&host.id)
                     .and_then(|facts| facts.get(*name))
                     .map_or_else(|| NO_VALUE.to_string(), fact_text),
-                _ => question.metric.title.to_string(),
+                _ => question.metric.title.clone(),
             };
             Member {
                 host_id: host.id.clone(),
@@ -263,7 +269,7 @@ pub async fn answer(
     sources
         .metrics
         .calculate(CalculationQuery {
-            metric: question.metric,
+            metric: question.metric.clone(),
             range,
             calculation: question.calculation,
             members,
@@ -339,19 +345,39 @@ mod tests {
 
     #[test]
     fn a_question_has_to_make_sense() {
-        assert!(Question::new("cpu.usage", "avg", "host", "os=linux").is_ok());
-        assert!(Question::new("nope", "avg", "host", "").is_err());
-        assert!(Question::new("cpu.usage", "median", "host", "").is_err());
-        assert!(Question::new("cpu.usage", "avg", "colour", "").is_err());
-        assert!(Question::new("cpu.usage", "avg", "host", "\"unfinished").is_err());
-        assert!(Question::new("cpu.usage", "avg", "host", &"x".repeat(501)).is_err());
+        assert!(
+            Question::new(&Catalog::built_in(), "cpu.usage", "avg", "host", "os=linux").is_ok()
+        );
+        assert!(Question::new(&Catalog::built_in(), "nope", "avg", "host", "").is_err());
+        assert!(Question::new(&Catalog::built_in(), "cpu.usage", "median", "host", "").is_err());
+        assert!(Question::new(&Catalog::built_in(), "cpu.usage", "avg", "colour", "").is_err());
+        assert!(
+            Question::new(
+                &Catalog::built_in(),
+                "cpu.usage",
+                "avg",
+                "host",
+                "\"unfinished"
+            )
+            .is_err()
+        );
+        assert!(
+            Question::new(
+                &Catalog::built_in(),
+                "cpu.usage",
+                "avg",
+                "host",
+                &"x".repeat(501)
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn a_count_is_a_plain_number_whatever_it_counts() {
-        let count = Question::new("cpu.usage", "count", "host", "").unwrap();
+        let count = Question::new(&Catalog::built_in(), "cpu.usage", "count", "host", "").unwrap();
         assert_eq!(count.unit(), Unit::Number);
-        let average = Question::new("cpu.usage", "avg", "host", "").unwrap();
+        let average = Question::new(&Catalog::built_in(), "cpu.usage", "avg", "host", "").unwrap();
         assert_eq!(average.unit(), Unit::Percent);
     }
 

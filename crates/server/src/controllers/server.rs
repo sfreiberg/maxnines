@@ -1,5 +1,7 @@
 //! The server's own dashboard: how much it's taking in, and how it's coping.
 
+use std::sync::Arc;
+
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::Response;
@@ -72,7 +74,8 @@ async fn sections(
 ) -> anyhow::Result<Vec<Section>> {
     let mut sections = Vec::with_capacity(SECTIONS.len());
     for (title, names) in SECTIONS {
-        let wanted: Vec<&'static Metric> = names.iter().filter_map(|n| metrics::find(n)).collect();
+        // The server's own metrics, which are named in code.
+        let wanted: Vec<Arc<Metric>> = names.iter().filter_map(|n| metrics::find(n)).collect();
         sections.push(Section {
             title,
             charts: charts_for(state, LOCAL_HOST_ID, &wanted, range, zone).await?,

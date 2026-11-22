@@ -15,7 +15,9 @@ use super::{Page, fleet, local_time, server_error, viewer_zone};
 use crate::app_state::AppState;
 use crate::events::TimelineEvent;
 use crate::metric_charts::{self, Chart, MAX_SERIES};
-use crate::metrics::{self, METRICS, Metric, SeriesResult, ShowChart, TimeRange, Unit};
+use std::sync::Arc;
+
+use crate::metrics::{Metric, SeriesResult, ShowChart, TimeRange, Unit};
 use crate::times::{self, Timestamp};
 
 /// The ranges pages offer: what's in the URL, what's on the link, and its length.
@@ -238,7 +240,7 @@ pub(super) const EVERY_SERIES: usize = 10_000;
 pub(super) async fn one_series(
     state: &AppState,
     host_id: &str,
-    metric: &'static Metric,
+    metric: &Arc<Metric>,
     name: &str,
     range: TimeRange,
 ) -> anyhow::Result<SeriesResult> {
@@ -316,7 +318,7 @@ pub(super) fn time_range(length: TimeDelta) -> Option<TimeRange> {
 async fn chart(
     state: &AppState,
     host_id: &str,
-    metric: &'static Metric,
+    metric: &Arc<Metric>,
     range: TimeRange,
     zone: Tz,
 ) -> anyhow::Result<Chart> {
@@ -344,15 +346,17 @@ pub(super) fn range_links(selected: &str) -> Vec<RangeLink> {
 pub(super) async fn charts_for(
     state: &AppState,
     host_id: &str,
-    metrics: &[&'static Metric],
+    metrics: &[Arc<Metric>],
     range: TimeRange,
     zone: Tz,
 ) -> anyhow::Result<Vec<Chart>> {
     let mut queries = JoinSet::new();
-    for (position, metric) in metrics.iter().copied().enumerate() {
+    for (position, metric) in metrics.iter().cloned().enumerate() {
         let (state, host_id) = (state.clone(), host_id.to_string());
-        queries
-            .spawn(async move { (position, chart(&state, &host_id, metric, range, zone).await) });
+        queries.spawn(async move {
+            let chart = chart(&state, &host_id, &metric, range, zone).await;
+            (position, chart)
+        });
     }
 
     let mut charts = Vec::with_capacity(metrics.len());
@@ -386,9 +390,13 @@ async fn show(
         return not_found(&state, &token);
     };
 
-    let shown: Vec<&'static Metric> = METRICS
+    // Every metric there is that's charted, a template's after the built-in ones.
+    let shown: Vec<Arc<Metric>> = state
+        .catalog()
+        .all()
         .iter()
         .filter(|metric| metric.chart != ShowChart::Never)
+        .cloned()
         .collect();
     let charts = match charts_for(&state, &host.id, &shown, range, viewer_zone()).await {
         Ok(charts) => charts,
@@ -509,7 +517,8 @@ async fn data(
     Query(params): Query<DataParams>,
     token: CsrfToken,
 ) -> Response {
-    let (Some(host), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
+    let catalog = state.catalog();
+    let (Some(host), Some(metric)) = (state.registry.get(&id).await, catalog.find(&name)) else {
         return not_found(&state, &token);
     };
     let range_params = RangeParams {

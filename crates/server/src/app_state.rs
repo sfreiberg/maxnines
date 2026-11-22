@@ -8,9 +8,10 @@ use tokio::sync::mpsc;
 
 use crate::actions::Actions;
 use crate::agent_configs::AgentConfigs;
-use crate::alert_conditions::Conditions;
+use crate::alert_conditions::{Conditions, Names};
 use crate::alerting::{self, AlertRuleInput};
 use crate::calculations::Sources;
+use crate::catalog::Catalog;
 use crate::events::{EventInput, TimelineEvent};
 use crate::facts::unflatten;
 use crate::host_filter::HostFilter;
@@ -231,6 +232,11 @@ impl AppState {
         self.check_alert_rule_in(input, None).await
     }
 
+    /// The metrics there are now.
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.database.catalog()
+    }
+
     /// The same, for a rule that's already saved: one of a template's alerts is
     /// checked with the template's own metrics known, and can't be a calculation.
     pub async fn check_saved_alert_rule(
@@ -245,8 +251,8 @@ impl AppState {
                     !input.is_calculation(),
                     "a template's alert is about each host, so it can't have a calculation"
                 );
-                let local = crate::templates::local_metrics(&stored.template);
-                self.check_alert_rule_in(input, Some(&local)).await
+                self.check_alert_rule_in(input, Some(&stored.template.key))
+                    .await
             }
             None => self.check_alert_rule(input).await,
         }
@@ -277,7 +283,7 @@ impl AppState {
         template: &maxnines_protocol::templates::Template,
     ) -> Result<Vec<maxnines_protocol::templates::Problem>> {
         let facts = self.example_facts().await?;
-        Ok(crate::templates::check(template, &facts))
+        Ok(crate::templates::check(template, &facts, &self.catalog()))
     }
 
     /// Takes the notice of what an upgrade changed in the built-in templates down.
@@ -293,13 +299,18 @@ impl AppState {
     async fn check_alert_rule_in(
         &self,
         input: &AlertRuleInput,
-        local: Option<&crate::alert_conditions::LocalMetrics>,
+        template: Option<&str>,
     ) -> Result<Conditions> {
         let facts = self.example_facts().await?;
-        let conditions = alerting::check_rule_in(input, &facts, local)?;
+        let catalog = self.catalog();
+        let names = Names {
+            catalog: &catalog,
+            template,
+        };
+        let conditions = alerting::check_rule_in(input, &facts, &names)?;
         if !input.actions.is_empty() {
             let known = self.database.known_actions().await?;
-            crate::actions::check_against_hosts(input, &conditions, &known)?;
+            crate::actions::check_against_hosts(input, &conditions, &known, &catalog)?;
         }
 
         // A name another rule has is refused as the rule is saved, as only the

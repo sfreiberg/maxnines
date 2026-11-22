@@ -20,6 +20,7 @@ use crate::alert_replay::{Replay, replay};
 use crate::alerting::{AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
 use crate::calculations::Calculation;
+use crate::catalog::Catalog;
 use crate::condition_builder::Builder;
 use crate::dashboards::grouping_fields;
 use crate::metrics::{METRICS, Unit};
@@ -302,16 +303,17 @@ fn calculation_options() -> Vec<CalculationOption> {
 
 #[derive(Serialize)]
 struct MetricOption {
-    name: &'static str,
+    name: String,
     label: String,
 }
 
 /// The unit goes on the label, as a calculation's value is compared in it.
-fn metric_options() -> Vec<MetricOption> {
-    METRICS
+fn metric_options(catalog: &Catalog) -> Vec<MetricOption> {
+    catalog
+        .all()
         .iter()
         .map(|metric| MetricOption {
-            name: metric.name,
+            name: metric.name.clone(),
             label: match metric.unit {
                 Unit::Percent => format!("{} (%)", metric.title),
                 Unit::Number => metric.title.to_string(),
@@ -443,7 +445,7 @@ async fn form_page_with(
         .with("id", &id)
         .with("template", &template)
         .with("rule", form)
-        .with("metrics", &metric_options())
+        .with("metrics", &metric_options(&state.catalog()))
         .with("calculations", &calculation_options())
         .with("channels", &channels)
         .with("operators", &operators())
@@ -491,6 +493,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
         Err(error) => return server_error(&error),
     };
 
+    let catalog = state.catalog();
     let rows: Vec<RuleRow> = rules
         .into_iter()
         .map(|rule| {
@@ -514,7 +517,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             RuleRow {
                 id: rule.id,
                 conditions,
-                watches: rule.rule.describe(),
+                watches: rule.rule.describe(&catalog),
                 applies_to: match (rule.rule.is_calculation(), rule.rule.applies_to.as_deref()) {
                     // A calculation picks its hosts with a filter, not a condition.
                     (true, _) => match rule.rule.filter.as_deref() {
@@ -606,10 +609,6 @@ async fn without_saving(
                 Some(id) => state.check_saved_alert_rule(id, &input).await?,
                 None => state.check_alert_rule(&input).await?,
             };
-            anyhow::ensure!(
-                !conditions.uses_local(),
-                "nothing stored covers the template's own metrics, so this can't be tried on the last day"
-            );
             replay(&state.sources(), &input, conditions, crate::times::now()).await
         };
         let replayed = replayed.await;
@@ -814,7 +813,7 @@ mod tests {
 
     #[test]
     fn metric_options_name_the_unit_to_type_in() {
-        let options = metric_options();
+        let options = metric_options(&Catalog::built_in());
         let label = |name: &str| {
             let option = options.iter().find(|option| option.name == name).unwrap();
             option.label.clone()

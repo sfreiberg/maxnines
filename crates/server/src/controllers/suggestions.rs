@@ -1,7 +1,8 @@
 //! What the CEL fields on the pages suggest as people type: metrics by their names,
 //! with the series of those that have fixed ones, facts, the names conditions know,
-//! and functions. The pages' script asks for it once, so it's the real catalog; a
-//! template's own metrics come with the form that has them.
+//! and functions. The pages' script asks for it once, so it's the real catalog, with
+//! every template's metrics by their full names; the short names of a template's own
+//! come with the form that has them.
 
 use axum::Json;
 use axum::Router;
@@ -12,7 +13,8 @@ use serde::Serialize;
 
 use crate::alert_conditions::Variable;
 use crate::app_state::AppState;
-use crate::metrics::{METRICS, Source};
+use crate::catalog::Catalog;
+use crate::metrics::Source;
 
 pub fn routes() -> Router<AppState> {
     Router::new().route("/conditions/suggestions", get(show))
@@ -25,8 +27,8 @@ pub fn api_routes() -> Router<AppState> {
 
 #[derive(Debug, Serialize)]
 pub struct MetricSuggestion {
-    name: &'static str,
-    title: &'static str,
+    name: String,
+    title: String,
     /// The series picked out with brackets, for a metric with fixed ones, like
     /// `cpu.load['5 minutes']`.
     series: Vec<&'static str>,
@@ -196,15 +198,17 @@ fn variable(variable: Variable) -> NameSuggestion {
     }
 }
 
-/// Everything there is to suggest, with facts from the hosts there are.
-pub fn suggestions(facts: Vec<String>) -> Suggestions {
+/// Everything there is to suggest: the metrics of `catalog`, and facts from the
+/// hosts there are.
+pub fn suggestions(catalog: &Catalog, facts: Vec<String>) -> Suggestions {
     Suggestions {
-        metrics: METRICS
+        metrics: catalog
+            .all()
             .iter()
             .map(|metric| MetricSuggestion {
-                name: metric.name,
-                title: metric.title,
-                series: match metric.source {
+                name: metric.name.clone(),
+                title: metric.title.clone(),
+                series: match &metric.source {
                     Source::Fields(fields) => fields.iter().map(|(name, _)| *name).collect(),
                     _ => Vec::new(),
                 },
@@ -227,7 +231,7 @@ async fn show(State(state): State<AppState>) -> Response {
         .unwrap_or_default()
         .into_keys()
         .collect();
-    Json(suggestions(facts)).into_response()
+    Json(suggestions(&state.catalog(), facts)).into_response()
 }
 
 #[cfg(test)]
@@ -236,7 +240,7 @@ mod tests {
 
     #[test]
     fn every_function_suggested_is_one_conditions_have() {
-        use crate::alert_conditions::{Condition, Scope};
+        use crate::alert_conditions::{Condition, Names, Scope};
         // CEL's macros, which aren't functions, as conditions use them.
         let macros = [
             ("has", "has(facts.gpu.model)"),
@@ -247,7 +251,8 @@ mod tests {
             assert!(suggestion.insert.starts_with(suggestion.name));
             match macros.iter().find(|(name, _)| *name == suggestion.name) {
                 Some((_, example)) => {
-                    Condition::compile(example, Scope::Hosts).unwrap();
+                    let catalog = Catalog::built_in();
+                    Condition::compile(example, Scope::Hosts, &Names::of(&catalog)).unwrap();
                 }
                 None => assert!(
                     crate::alert_conditions::is_function(suggestion.name),
@@ -260,7 +265,7 @@ mod tests {
 
     #[test]
     fn metrics_with_fixed_series_say_which() {
-        let all = suggestions(vec!["os.family".to_string()]);
+        let all = suggestions(&Catalog::built_in(), vec!["os.family".to_string()]);
         let load = all.metrics.iter().find(|m| m.name == "cpu.load").unwrap();
         assert_eq!(load.series, ["1 minute", "5 minutes", "15 minutes"]);
         let usage = all.metrics.iter().find(|m| m.name == "disk.usage").unwrap();

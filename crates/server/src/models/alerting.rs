@@ -42,21 +42,28 @@ fn to_alert_rule(
     row: alert_rule::Model,
     channels: Vec<i64>,
     actions: Vec<RuleAction>,
-    templates_off: &BTreeSet<i64>,
+    templates: &BTreeMap<i64, (String, bool)>,
 ) -> Result<AlertRule> {
     let template = match (row.template_id, &row.template_alert) {
-        (Some(id), Some(alert)) => Some(TemplateLink {
-            id,
-            alert: alert.clone(),
-            replaces_id: row.replaces_id,
-            template_enabled: !templates_off.contains(&id),
-            enabled_choice: row.enabled_choice,
-            waits_for_agents: row.waits_for_agents,
-            original_changed_at: row.original_changed_at,
-        }),
+        (Some(id), Some(alert)) => {
+            let (key, on) = templates
+                .get(&id)
+                .cloned()
+                .context("a rule's template is missing")?;
+            Some(TemplateLink {
+                id,
+                key,
+                alert: alert.clone(),
+                replaces_id: row.replaces_id,
+                template_enabled: on,
+                enabled_choice: row.enabled_choice,
+                waits_for_discovery: row.when_condition.is_some() || row.since.is_some(),
+                original_changed_at: row.original_changed_at,
+            })
+        }
         _ => None,
     };
-    let mut rule = AlertRule::new(
+    Ok(AlertRule::unread(
         row.id,
         AlertRuleInput {
             name: row.name,
@@ -85,9 +92,8 @@ fn to_alert_rule(
                 .context("invalid reminder")?,
             actions,
         },
-    );
-    rule.template = template;
-    Ok(rule)
+        template,
+    ))
 }
 
 /// A length the database keeps in whole seconds, as rules are written. One that's
@@ -556,7 +562,8 @@ impl Database {
             .into_iter()
             .filter(|row| !replaced.contains(&row.id))
             .collect();
-        let off = templates_off(&self.connection).await?;
+        let templates = template_links(&self.connection).await?;
+        let catalog = self.catalog();
 
         // Only the links and actions of rules that aren't deleted.
         let live = || {
@@ -598,13 +605,14 @@ impl Database {
             .map(|row| {
                 let mine = channels.remove(&row.id).unwrap_or_default();
                 let run = actions.remove(&row.id).unwrap_or_default();
-                to_alert_rule(row, mine, run, &off)
+                Ok(to_alert_rule(row, mine, run, &templates)?.read(&catalog))
             })
             .collect()
     }
 
     pub async fn get_alert_rule(&self, id: i64) -> Result<Option<AlertRule>> {
-        load_alert_rule(&self.connection, id).await
+        let rule = load_alert_rule(&self.connection, id).await?;
+        Ok(rule.map(|rule| rule.read(&self.catalog())))
     }
 
     pub async fn create_alert_rule(&self, input: &AlertRuleInput) -> Result<i64> {
@@ -869,7 +877,8 @@ impl Database {
     }
 }
 
-/// A rule that hasn't been deleted.
+/// A rule that hasn't been deleted, with its conditions still to read: see
+/// [`AlertRule::read`].
 pub(super) async fn load_alert_rule<C: ConnectionTrait>(
     connection: &C,
     id: i64,
@@ -897,15 +906,19 @@ pub(super) async fn load_alert_rule<C: ConnectionTrait>(
         .into_iter()
         .map(to_rule_action)
         .collect::<Result<_>>()?;
-    let off = templates_off(connection).await?;
-    to_alert_rule(row, channels, actions, &off).map(Some)
+    let templates = template_links(connection).await?;
+    to_alert_rule(row, channels, actions, &templates).map(Some)
 }
 
-/// The templates that are turned off, whose alerts don't run.
-async fn templates_off<C: ConnectionTrait>(connection: &C) -> Result<BTreeSet<i64>> {
-    let rows: Vec<(i64, bool, Option<bool>)> = template::Entity::find()
+/// Each template's key and whether it's on, by its ID. The alerts of one that's
+/// off don't run.
+async fn template_links<C: ConnectionTrait>(
+    connection: &C,
+) -> Result<BTreeMap<i64, (String, bool)>> {
+    let rows: Vec<(i64, String, bool, Option<bool>)> = template::Entity::find()
         .select_only()
         .column(template::Column::Id)
+        .column(template::Column::Key)
         .column(template::Column::Enabled)
         .column(template::Column::EnabledChoice)
         .into_tuple()
@@ -914,8 +927,7 @@ async fn templates_off<C: ConnectionTrait>(connection: &C) -> Result<BTreeSet<i6
         .context("loading templates")?;
     Ok(rows
         .into_iter()
-        .filter(|(_, enabled, choice)| !choice.unwrap_or(*enabled))
-        .map(|(id, ..)| id)
+        .map(|(id, key, enabled, choice)| (id, (key, choice.unwrap_or(enabled))))
         .collect())
 }
 

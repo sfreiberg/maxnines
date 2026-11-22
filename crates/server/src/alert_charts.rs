@@ -106,7 +106,7 @@ impl ChartSources {
 /// watches, and the readings of just the alert's series.
 pub struct Watched {
     pub rule: AlertRule,
-    pub metric: &'static Metric,
+    pub metric: Arc<Metric>,
     pub unit: Unit,
     pub result: SeriesResult,
 }
@@ -127,7 +127,7 @@ pub async fn watched(
         return Ok(None);
     };
     let (metric, unit, mut result, only) = if rule.rule.is_calculation() {
-        let Ok(question) = rule.rule.question() else {
+        let Ok(question) = rule.rule.question(&sources.database.catalog()) else {
             return Ok(None);
         };
         let mut result = calculations::answer(sources, &question, range, EVERY_SERIES).await?;
@@ -139,19 +139,19 @@ pub async fn watched(
             }
         }
         (
-            question.metric,
+            question.metric.clone(),
             question.unit(),
             result,
             alert.series.clone(),
         )
     } else {
         // A rule about a host being there, with no metric, has nothing to chart.
-        let Some((metric, picked)) = rule.watched() else {
+        let Some((metric, picked)) = rule.watched(&sources.database.catalog()) else {
             return Ok(None);
         };
         let result = sources
             .metrics
-            .series(&alert.host_id, metric, range, EVERY_SERIES)
+            .series(&alert.host_id, &metric, range, EVERY_SERIES)
             .await?;
         // The alert's own series, where its series are this metric's, or the one
         // the rule picks out of it.
@@ -165,7 +165,8 @@ pub async fn watched(
             true => alert.series.clone(),
             false => picked,
         };
-        (metric, metric.unit, result, only)
+        let unit = metric.unit;
+        (metric, unit, result, only)
     };
     result.series.retain(|series| {
         only.as_ref()
@@ -223,7 +224,7 @@ fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
         unit,
         result,
     } = watched;
-    let (metric, unit) = (*metric, *unit);
+    let unit = *unit;
     let frame = Frame {
         width: WIDTH - 2.0 * PADDING,
         height: HEIGHT - HEADER - PADDING,
@@ -233,7 +234,7 @@ fn svg(alert: &Alert, watched: &Watched, range: TimeRange) -> String {
     let Marked { chart, marks } = metric_charts::build_marked(
         metric,
         unit,
-        metric.title,
+        &metric.title,
         frame,
         result,
         range,
@@ -471,9 +472,9 @@ mod tests {
     fn disk(result: SeriesResult) -> Watched {
         let metric = metrics::find("disk.usage").unwrap();
         Watched {
-            rule: AlertRule::new(1, rule()),
-            metric,
+            rule: AlertRule::new(1, rule(), None, &crate::catalog::Catalog::built_in()),
             unit: metric.unit,
+            metric,
             result,
         }
     }

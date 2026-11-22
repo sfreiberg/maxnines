@@ -1,7 +1,8 @@
 //! What both stores share about keeping metrics: how long each resolution lasts,
 //! which one a chart reads, and when an hour is ready to roll up.
 //!
-//! Rollups are made from what charts show, a metric from the catalog at a time, with
+//! Rollups are made from what charts show, a metric from the catalog at a time, the
+//! built-in ones and each template's alike, with
 //! percentages and rates already worked out. So 5 minutes or an hour keeps the lowest,
 //! highest and total of the values a chart would have drawn, and a spike in a rate
 //! survives as well as one in a percentage. An hour is rolled up once it's over: its
@@ -12,7 +13,6 @@ use std::collections::BTreeSet;
 use chrono::TimeDelta;
 
 use crate::config::RetentionConfig;
-use crate::metrics::METRICS;
 use crate::times::{Timestamp, hour_of};
 
 /// The finer of the two rollups. A chart has at most 240 points, so this is as fine
@@ -155,11 +155,6 @@ pub fn full_resolution_cutoff(
         .chain(first_redo)
         .min()?;
     Some(hour_of(cutoff))
-}
-
-/// Every metric the catalog has, which is what gets rolled up.
-pub fn metric_names() -> impl Iterator<Item = &'static str> {
-    METRICS.iter().map(|metric| metric.name)
 }
 
 #[cfg(test)]

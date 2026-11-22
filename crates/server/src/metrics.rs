@@ -1,11 +1,13 @@
 //! What can be asked of stored metrics. The web pages, the API and alerting all
 //! read through here.
 //!
-//! The catalog is a fixed list, so what's queried never comes from a request or
-//! an agent. Only agent IDs and times do, and those are bound as parameters.
+//! What's queried never comes from a request or an agent: it's a metric named here
+//! in code, or one of a template's, whose names are checked as the template is
+//! saved. [`crate::catalog::Catalog`] has both. Only agent IDs and times come from
+//! requests, and those are bound as parameters.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta};
@@ -74,7 +76,7 @@ pub enum Reading {
 }
 
 /// How a collector's output divides into series.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// A fixed set of named series.
     Fields(&'static [(&'static str, Reading)]),
@@ -85,18 +87,123 @@ pub enum Source {
     },
     /// A map with one series per key.
     Entries(Reading),
+    /// A template's metric: one stored number, with a series for each set of labels.
+    Labelled(Labelled),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub struct Metric {
+/// How a template's metric is stored: by its key, under the template's collector,
+/// each series told apart by its labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Labelled {
+    /// What it's stored as: the metric's key, `lag` for `postgres.lag`.
+    pub field: String,
+    /// The labels that tell its series apart, in the order a series' name gives
+    /// their values: what the template runs for first, then the query's or
+    /// counters' own.
+    pub labels: Vec<String>,
+    /// A running total, which is read as a rate each second.
+    pub total: bool,
+}
+
+/// The label a template's series has for what the template ran for, such as the
+/// name of a database.
+pub const INSTANCE_LABEL: &str = "instance";
+
+/// What comes between the labels' values in a series' name.
+const SERIES_SEPARATOR: &str = ", ";
+
+/// The name of a series with these values for its labels: `main, slot_a`. A comma
+/// or backslash in a value has a backslash before it, so the values can be told
+/// apart again. The stores name series the same way.
+pub fn series_name<'a>(values: impl IntoIterator<Item = &'a str>) -> String {
+    let escaped: Vec<String> = values
+        .into_iter()
+        .map(|value| value.replace('\\', "\\\\").replace(',', "\\,"))
+        .collect();
+    escaped.join(SERIES_SEPARATOR)
+}
+
+/// The values a series' name gives for its labels, in order.
+pub fn series_values(series: &str) -> Vec<String> {
+    if series.is_empty() {
+        return Vec::new();
+    }
+    let mut values = vec![String::new()];
+    let mut chars = series.chars().peekable();
+    while let Some(c) = chars.next() {
+        let current = values.last_mut().expect("there's always one");
+        match c {
+            '\\' => current.extend(chars.next()),
+            ',' if chars.peek() == Some(&' ') => {
+                chars.next();
+                values.push(String::new());
+            }
+            other => current.push(other),
+        }
+    }
+    values
+}
+
+/// What a metric's values are to a condition. A template's query can have columns
+/// whose type only the database knows, so theirs isn't known until a condition says
+/// how it uses them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind {
+    Number,
+    /// A length of time, compared with `duration('5m')`.
+    Seconds,
+    /// True or false, stored as 1 or 0.
+    Flag,
+    Unknown,
+}
+
+/// A metric the server reads that's named here in code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticMetric {
     pub name: &'static str,
     pub title: &'static str,
     pub unit: Unit,
     pub collector: &'static str,
+    pub source: Source,
+    pub chart: ShowChart,
+}
+
+/// A metric that can be read: one named here in code, or one of a template's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Metric {
+    pub name: String,
+    pub title: String,
+    pub unit: Unit,
+    pub collector: String,
+    /// What a template says about it.
+    pub description: Option<String>,
+    /// The key of the template it's from, for one of a template's.
+    pub template: Option<String>,
+    #[serde(skip)]
+    pub kind: Kind,
     #[serde(skip)]
     pub source: Source,
     #[serde(skip)]
     pub chart: ShowChart,
+}
+
+impl From<&StaticMetric> for Metric {
+    fn from(metric: &StaticMetric) -> Self {
+        Self {
+            name: metric.name.to_string(),
+            title: metric.title.to_string(),
+            unit: metric.unit,
+            collector: metric.collector.to_string(),
+            description: None,
+            template: None,
+            kind: match metric.unit {
+                Unit::Seconds => Kind::Seconds,
+                _ => Kind::Number,
+            },
+            source: metric.source.clone(),
+            chart: metric.chart,
+        }
+    }
 }
 
 /// For a metric that only says whether something is working, the word its
@@ -117,7 +224,7 @@ pub fn described(metric: &Metric) -> Option<Described> {
         state: "state",
         working,
     };
-    match metric.name {
+    match metric.name.as_str() {
         "service.running" => Some(described("Service", "running")),
         "container.up" => Some(described("Container", "up")),
         _ => None,
@@ -155,8 +262,8 @@ pub enum ShowChart {
     Never,
 }
 
-pub const METRICS: &[Metric] = &[
-    Metric {
+pub const METRICS: &[StaticMetric] = &[
+    StaticMetric {
         name: "cpu.usage",
         title: "CPU usage",
         unit: Unit::Percent,
@@ -167,7 +274,7 @@ pub const METRICS: &[Metric] = &[
     // So one busy core shows on a host with many, where it barely moves the total.
     // Agents send a plain list, so each core is named by its number, from 0. A chart
     // keeps the busiest.
-    Metric {
+    StaticMetric {
         name: "cpu.cores",
         title: "CPU usage by core",
         unit: Unit::Percent,
@@ -178,7 +285,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "cpu.load",
         title: "Load average",
         unit: Unit::Number,
@@ -191,7 +298,7 @@ pub const METRICS: &[Metric] = &[
         // Windows has no load average, so its agents send none.
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "cpu.time",
         title: "CPU time",
         unit: Unit::Percent,
@@ -207,7 +314,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "cpu.context_switches",
         title: "Context switches",
         unit: Unit::PerSecond,
@@ -215,7 +322,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Switches", Reading::Rate("$.context_switches"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "cpu.interrupts",
         title: "Interrupts",
         unit: Unit::PerSecond,
@@ -223,7 +330,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Interrupts", Reading::Rate("$.interrupts"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "memory.usage",
         title: "Memory usage",
         unit: Unit::Percent,
@@ -246,7 +353,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::Always,
     },
-    Metric {
+    StaticMetric {
         name: "memory.detail",
         title: "Memory breakdown",
         unit: Unit::Bytes,
@@ -268,7 +375,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "memory.swap_activity",
         title: "Swap activity",
         unit: Unit::PerSecond,
@@ -279,7 +386,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.usage",
         title: "Disk usage",
         unit: Unit::Percent,
@@ -293,7 +400,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Always,
     },
-    Metric {
+    StaticMetric {
         name: "network.received",
         title: "Network received",
         unit: Unit::BytesPerSecond,
@@ -301,7 +408,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.received_bytes")),
         chart: ShowChart::Always,
     },
-    Metric {
+    StaticMetric {
         name: "network.transmitted",
         title: "Network sent",
         unit: Unit::BytesPerSecond,
@@ -310,7 +417,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Always,
     },
     // The programs using the most, by name, when a config rule turns this on.
-    Metric {
+    StaticMetric {
         name: "top.cpu",
         title: "Top processes by CPU",
         unit: Unit::Percent,
@@ -321,7 +428,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "top.memory",
         title: "Top processes by memory",
         unit: Unit::Bytes,
@@ -332,7 +439,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "process.count",
         title: "Running processes",
         unit: Unit::Number,
@@ -343,7 +450,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "process.cpu",
         title: "Process CPU usage",
         unit: Unit::Percent,
@@ -354,7 +461,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "process.memory",
         title: "Process memory usage",
         unit: Unit::Bytes,
@@ -365,7 +472,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.read",
         title: "Disk reads",
         unit: Unit::BytesPerSecond,
@@ -376,7 +483,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.written",
         title: "Disk writes",
         unit: Unit::BytesPerSecond,
@@ -389,7 +496,7 @@ pub const METRICS: &[Metric] = &[
     },
     // How hard each disk is working, which bytes alone can't show. macOS has no busy
     // time or queue, and FreeBSD reports none of these yet.
-    Metric {
+    StaticMetric {
         name: "disk.busy",
         title: "Disk busy",
         unit: Unit::Percent,
@@ -400,7 +507,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.read_ops",
         title: "Disk read operations",
         unit: Unit::PerSecond,
@@ -411,7 +518,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.write_ops",
         title: "Disk write operations",
         unit: Unit::PerSecond,
@@ -422,7 +529,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.read_latency",
         title: "Disk read latency",
         unit: Unit::Seconds,
@@ -433,7 +540,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.write_latency",
         title: "Disk write latency",
         unit: Unit::Seconds,
@@ -444,7 +551,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.queue",
         title: "Disk queue length",
         unit: Unit::Number,
@@ -455,7 +562,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "disk.inodes",
         title: "Inode usage",
         unit: Unit::Percent,
@@ -469,7 +576,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "network.packets.received",
         title: "Packets received",
         unit: Unit::PerSecond,
@@ -477,7 +584,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.packets_received")),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "network.packets.transmitted",
         title: "Packets sent",
         unit: Unit::PerSecond,
@@ -485,7 +592,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.packets_transmitted")),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "network.errors.received",
         title: "Receive errors",
         unit: Unit::PerSecond,
@@ -493,7 +600,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.receive_errors")),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "network.errors.transmitted",
         title: "Send errors",
         unit: Unit::PerSecond,
@@ -502,7 +609,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // Packets with nowhere to wait, which means the host isn't keeping up.
-    Metric {
+    StaticMetric {
         name: "network.drops.received",
         title: "Received packets dropped",
         unit: Unit::PerSecond,
@@ -510,7 +617,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.receive_drops")),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "network.drops.transmitted",
         title: "Sent packets dropped",
         unit: Unit::PerSecond,
@@ -518,7 +625,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Entries(Reading::Rate("$.transmit_drops")),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "network.link",
         title: "Network link up",
         unit: Unit::Number,
@@ -528,7 +635,7 @@ pub const METRICS: &[Metric] = &[
     },
     // Worked out by the server, which asks each agent what its clock says. How
     // far apart they are, whichever is ahead.
-    Metric {
+    StaticMetric {
         name: "clock.difference",
         title: "Clock difference from the server",
         unit: Unit::Seconds,
@@ -537,7 +644,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // Only macOS reports these so far.
-    Metric {
+    StaticMetric {
         name: "gpu.usage",
         title: "GPU usage",
         unit: Unit::Percent,
@@ -548,7 +655,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "gpu.memory",
         title: "GPU memory used",
         unit: Unit::Bytes,
@@ -559,7 +666,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "sensor.temperature",
         title: "Temperature",
         unit: Unit::Celsius,
@@ -570,7 +677,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.up",
         title: "Checks passing",
         unit: Unit::Number,
@@ -581,7 +688,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.response",
         title: "Check response time",
         unit: Unit::Seconds,
@@ -592,7 +699,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.cert_days",
         title: "Certificate days left",
         unit: Unit::Number,
@@ -603,7 +710,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.first_byte",
         title: "Time to first byte",
         unit: Unit::Seconds,
@@ -614,7 +721,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.dns",
         title: "DNS lookup time",
         unit: Unit::Seconds,
@@ -625,7 +732,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.connect",
         title: "Connection time",
         unit: Unit::Seconds,
@@ -636,7 +743,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.tls",
         title: "TLS handshake time",
         unit: Unit::Seconds,
@@ -647,7 +754,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.download",
         title: "Download time",
         unit: Unit::Seconds,
@@ -658,7 +765,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.size",
         title: "Page size",
         unit: Unit::Bytes,
@@ -669,7 +776,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.status",
         title: "HTTP status",
         unit: Unit::Number,
@@ -680,7 +787,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "check.records",
         title: "DNS records returned",
         unit: Unit::Number,
@@ -691,7 +798,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "check.domain_days",
         title: "Domain days left",
         unit: Unit::Number,
@@ -702,7 +809,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.password_sign_in",
         title: "SSH offers password sign-in",
         unit: Unit::Number,
@@ -713,7 +820,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "check.packet_loss",
         title: "Packet loss",
         unit: Unit::Percent,
@@ -724,7 +831,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "service.running",
         title: "Services running",
         unit: Unit::Number,
@@ -735,7 +842,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.up",
         title: "Containers up",
         unit: Unit::Number,
@@ -746,7 +853,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.cpu",
         title: "Container CPU usage",
         unit: Unit::Percent,
@@ -757,7 +864,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.memory",
         title: "Container memory",
         unit: Unit::Bytes,
@@ -768,7 +875,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.memory_limit",
         title: "Container memory of its limit",
         unit: Unit::Percent,
@@ -782,7 +889,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.received",
         title: "Container network received",
         unit: Unit::BytesPerSecond,
@@ -793,7 +900,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.sent",
         title: "Container network sent",
         unit: Unit::BytesPerSecond,
@@ -804,7 +911,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.read",
         title: "Container disk reads",
         unit: Unit::BytesPerSecond,
@@ -815,7 +922,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.written",
         title: "Container disk writes",
         unit: Unit::BytesPerSecond,
@@ -826,7 +933,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "container.restarts",
         title: "Container restarts",
         unit: Unit::Number,
@@ -837,7 +944,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.open_files",
         title: "Open files",
         unit: Unit::Number,
@@ -848,7 +955,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.open_files_used",
         title: "Open file limit used",
         unit: Unit::Percent,
@@ -862,7 +969,7 @@ pub const METRICS: &[Metric] = &[
         )]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.processes",
         title: "Processes",
         unit: Unit::Number,
@@ -873,7 +980,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.processes_used",
         title: "Process limit used",
         unit: Unit::Percent,
@@ -888,7 +995,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // Only Linux sends threads, as its limit is on them rather than on processes.
-    Metric {
+    StaticMetric {
         name: "system.threads",
         title: "Threads",
         unit: Unit::Number,
@@ -899,7 +1006,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.threads_used",
         title: "Thread limit used",
         unit: Unit::Percent,
@@ -914,7 +1021,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // Linux's firewall table of connections, which drops new ones when it's full.
-    Metric {
+    StaticMetric {
         name: "system.conntrack",
         title: "Tracked connections",
         unit: Unit::Number,
@@ -925,7 +1032,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.conntrack_used",
         title: "Connection tracking table used",
         unit: Unit::Percent,
@@ -939,7 +1046,7 @@ pub const METRICS: &[Metric] = &[
         )]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.sessions",
         title: "Login sessions",
         unit: Unit::Number,
@@ -949,7 +1056,7 @@ pub const METRICS: &[Metric] = &[
     },
     // Connections piling up in TIME_WAIT use up ports, and ones in CLOSE_WAIT are
     // usually a program that never closed them.
-    Metric {
+    StaticMetric {
         name: "system.tcp",
         title: "TCP connections",
         unit: Unit::Number,
@@ -964,7 +1071,7 @@ pub const METRICS: &[Metric] = &[
     },
     // Services that should be running but stopped with an error, on Linux and Windows,
     // without having to name them first.
-    Metric {
+    StaticMetric {
         name: "system.failed_services",
         title: "Failed services",
         unit: Unit::Number,
@@ -973,7 +1080,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // Looked at every 15 minutes, from the host's own package lists.
-    Metric {
+    StaticMetric {
         name: "system.updates",
         title: "Updates waiting",
         unit: Unit::Number,
@@ -984,7 +1091,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.reboot_required",
         title: "Restart needed",
         unit: Unit::Number,
@@ -992,7 +1099,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Restart needed", Reading::Field("$.reboot_required"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "system.tcp_total",
         title: "All TCP connections",
         unit: Unit::Number,
@@ -1000,7 +1107,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Connections", Reading::Field("$.tcp_connections"))]),
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "server.metrics",
         title: "Metrics per second",
         unit: Unit::PerSecond,
@@ -1008,7 +1115,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Metrics", Reading::Rate("$.values_written"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.memory",
         title: "Server memory",
         unit: Unit::Bytes,
@@ -1016,7 +1123,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Memory", Reading::Field("$.memory_bytes"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.cpu",
         title: "Server CPU",
         unit: Unit::Percent,
@@ -1024,7 +1131,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("CPU", Reading::Field("$.cpu_percent"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.samples",
         title: "Samples per second",
         unit: Unit::PerSecond,
@@ -1035,7 +1142,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.write_queue",
         title: "Write queue",
         unit: Unit::Number,
@@ -1043,7 +1150,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Waiting", Reading::Field("$.write_queue"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.write_time",
         title: "Slowest write",
         unit: Unit::Seconds,
@@ -1051,7 +1158,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Slowest", Reading::Field("$.slowest_write_secs"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.series",
         title: "Series stored",
         unit: Unit::Number,
@@ -1059,7 +1166,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Series", Reading::Field("$.series"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.hosts",
         title: "Hosts",
         unit: Unit::Number,
@@ -1071,7 +1178,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.alerts",
         title: "Open alerts",
         unit: Unit::Number,
@@ -1079,7 +1186,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Open", Reading::Field("$.alerts_firing"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.database_size",
         title: "Database size",
         unit: Unit::Bytes,
@@ -1091,7 +1198,7 @@ pub const METRICS: &[Metric] = &[
         ]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "server.open_files",
         title: "Server open files",
         unit: Unit::Number,
@@ -1099,7 +1206,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Open", Reading::Field("$.open_files"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "apache.up",
         title: "Apache status page answering",
         unit: Unit::Number,
@@ -1110,7 +1217,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "apache.requests",
         title: "Apache requests",
         unit: Unit::PerSecond,
@@ -1121,7 +1228,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "apache.traffic",
         title: "Apache traffic",
         unit: Unit::BytesPerSecond,
@@ -1132,7 +1239,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "apache.worker_usage",
         title: "Apache workers in use",
         unit: Unit::Percent,
@@ -1146,7 +1253,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "apache.busy_workers",
         title: "Apache busy workers",
         unit: Unit::Number,
@@ -1157,7 +1264,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "apache.idle_workers",
         title: "Apache idle workers",
         unit: Unit::Number,
@@ -1168,7 +1275,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "apache.connections",
         title: "Apache connections",
         unit: Unit::Number,
@@ -1179,7 +1286,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "apache.cpu_load",
         title: "Apache CPU load",
         unit: Unit::Percent,
@@ -1190,7 +1297,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "apache.uptime",
         title: "Apache uptime",
         unit: Unit::Seconds,
@@ -1201,7 +1308,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.up",
         title: "nginx status page answering",
         unit: Unit::Number,
@@ -1212,7 +1319,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.connections",
         title: "nginx connections",
         unit: Unit::Number,
@@ -1223,7 +1330,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.requests",
         title: "nginx requests",
         unit: Unit::PerSecond,
@@ -1234,7 +1341,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.accepted",
         title: "nginx connections accepted",
         unit: Unit::PerSecond,
@@ -1245,7 +1352,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.dropped",
         title: "nginx connections dropped",
         unit: Unit::PerSecond,
@@ -1256,7 +1363,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.reading",
         title: "nginx connections reading",
         unit: Unit::Number,
@@ -1267,7 +1374,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.writing",
         title: "nginx connections writing",
         unit: Unit::Number,
@@ -1278,7 +1385,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "nginx.waiting",
         title: "nginx connections waiting",
         unit: Unit::Number,
@@ -1289,7 +1396,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.up",
         title: "PHP-FPM status page answering",
         unit: Unit::Number,
@@ -1300,7 +1407,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.requests",
         title: "PHP-FPM requests",
         unit: Unit::PerSecond,
@@ -1311,7 +1418,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.active_processes",
         title: "PHP-FPM active processes",
         unit: Unit::Number,
@@ -1322,7 +1429,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.idle_processes",
         title: "PHP-FPM idle processes",
         unit: Unit::Number,
@@ -1333,7 +1440,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.total_processes",
         title: "PHP-FPM processes",
         unit: Unit::Number,
@@ -1344,7 +1451,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.listen_queue",
         title: "PHP-FPM requests waiting",
         unit: Unit::Number,
@@ -1355,7 +1462,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.max_children_reached",
         title: "PHP-FPM process limit reached",
         unit: Unit::PerSecond,
@@ -1366,7 +1473,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.slow_requests",
         title: "PHP-FPM slow requests",
         unit: Unit::PerSecond,
@@ -1377,7 +1484,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "php_fpm.uptime",
         title: "PHP-FPM uptime",
         unit: Unit::Seconds,
@@ -1391,7 +1498,7 @@ pub const METRICS: &[Metric] = &[
     // Whatever a page in the Prometheus or OpenMetrics format lists, each line a
     // series named by its page and the line. They measure all sorts of things, so
     // they're numbers here: levels as they are, and running totals as rates.
-    Metric {
+    StaticMetric {
         name: "openmetrics.up",
         title: "OpenMetrics page answering",
         unit: Unit::Number,
@@ -1402,7 +1509,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "openmetrics.value",
         title: "OpenMetrics values",
         unit: Unit::Number,
@@ -1413,7 +1520,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "openmetrics.rate",
         title: "OpenMetrics rates",
         unit: Unit::PerSecond,
@@ -1424,7 +1531,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "openmetrics.dropped",
         title: "OpenMetrics series over the limit",
         unit: Unit::Number,
@@ -1441,7 +1548,7 @@ pub const METRICS: &[Metric] = &[
     // by its name and what it's of, such as `orders standby replica1`. Running
     // totals are rates.
     // PostgreSQL.
-    Metric {
+    StaticMetric {
         name: "postgres.up",
         title: "PostgreSQL answering",
         unit: Unit::Number,
@@ -1452,7 +1559,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.uptime",
         title: "PostgreSQL uptime",
         unit: Unit::Seconds,
@@ -1463,7 +1570,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.connections",
         title: "PostgreSQL connections",
         unit: Unit::Number,
@@ -1474,7 +1581,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.connections_used",
         title: "PostgreSQL connections used",
         unit: Unit::Percent,
@@ -1485,7 +1592,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.oldest_transaction",
         title: "PostgreSQL oldest transaction",
         unit: Unit::Seconds,
@@ -1496,7 +1603,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.oldest_query",
         title: "PostgreSQL oldest query",
         unit: Unit::Seconds,
@@ -1507,7 +1614,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.rollbacks",
         title: "PostgreSQL rollbacks",
         unit: Unit::PerSecond,
@@ -1518,7 +1625,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.deadlocks",
         title: "PostgreSQL deadlocks",
         unit: Unit::PerSecond,
@@ -1529,7 +1636,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.cache_hit",
         title: "PostgreSQL cache hit rate",
         unit: Unit::Percent,
@@ -1540,7 +1647,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.replica",
         title: "PostgreSQL is a replica",
         unit: Unit::Number,
@@ -1551,7 +1658,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.receiving",
         title: "PostgreSQL replica receiving",
         unit: Unit::Number,
@@ -1562,7 +1669,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.lag",
         title: "PostgreSQL replication lag",
         unit: Unit::Seconds,
@@ -1573,7 +1680,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.size",
         title: "PostgreSQL database size",
         unit: Unit::Bytes,
@@ -1584,7 +1691,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.running_queries",
         title: "PostgreSQL queries running",
         unit: Unit::Number,
@@ -1595,7 +1702,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.idle_in_transaction",
         title: "PostgreSQL sessions idle in a transaction",
         unit: Unit::Number,
@@ -1606,7 +1713,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.lock_waits",
         title: "PostgreSQL sessions waiting on locks",
         unit: Unit::Number,
@@ -1617,7 +1724,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.oldest_idle_in_transaction",
         title: "PostgreSQL longest idle in a transaction",
         unit: Unit::Seconds,
@@ -1628,7 +1735,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.transactions",
         title: "PostgreSQL transactions",
         unit: Unit::PerSecond,
@@ -1639,7 +1746,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.temp_written",
         title: "PostgreSQL temporary files written",
         unit: Unit::BytesPerSecond,
@@ -1650,7 +1757,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.conflicts",
         title: "PostgreSQL queries cancelled by replication",
         unit: Unit::PerSecond,
@@ -1661,7 +1768,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.checksum_failures",
         title: "PostgreSQL checksum failures",
         unit: Unit::PerSecond,
@@ -1672,7 +1779,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.checkpoints_timed",
         title: "PostgreSQL scheduled checkpoints",
         unit: Unit::PerSecond,
@@ -1683,7 +1790,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.checkpoints_requested",
         title: "PostgreSQL requested checkpoints",
         unit: Unit::PerSecond,
@@ -1694,7 +1801,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.wal_written",
         title: "PostgreSQL WAL written",
         unit: Unit::BytesPerSecond,
@@ -1705,7 +1812,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.wal_size",
         title: "PostgreSQL WAL on disk",
         unit: Unit::Bytes,
@@ -1716,7 +1823,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.xid_age",
         title: "PostgreSQL oldest transaction ID age",
         unit: Unit::Number,
@@ -1727,7 +1834,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.mxid_age",
         title: "PostgreSQL oldest multixact ID age",
         unit: Unit::Number,
@@ -1738,7 +1845,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.prepared",
         title: "PostgreSQL prepared transactions",
         unit: Unit::Number,
@@ -1749,7 +1856,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.oldest_prepared",
         title: "PostgreSQL oldest prepared transaction",
         unit: Unit::Seconds,
@@ -1760,7 +1867,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.standbys",
         title: "PostgreSQL standbys",
         unit: Unit::Number,
@@ -1771,7 +1878,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.synchronous_standbys",
         title: "PostgreSQL synchronous standbys",
         unit: Unit::Number,
@@ -1782,7 +1889,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.lag_bytes",
         title: "PostgreSQL standby lag in bytes",
         unit: Unit::Bytes,
@@ -1793,7 +1900,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.streaming",
         title: "PostgreSQL standby streaming",
         unit: Unit::Number,
@@ -1804,7 +1911,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.last_received",
         title: "PostgreSQL time since the replica heard from its primary",
         unit: Unit::Seconds,
@@ -1815,7 +1922,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.replay_backlog",
         title: "PostgreSQL WAL received but not replayed",
         unit: Unit::Bytes,
@@ -1826,7 +1933,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.replay_paused",
         title: "PostgreSQL replay paused",
         unit: Unit::Number,
@@ -1837,7 +1944,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.timeline",
         title: "PostgreSQL timeline",
         unit: Unit::Number,
@@ -1848,7 +1955,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.slot_in_use",
         title: "PostgreSQL replication slot in use",
         unit: Unit::Number,
@@ -1859,7 +1966,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.slot_retained",
         title: "PostgreSQL WAL kept by replication slots",
         unit: Unit::Bytes,
@@ -1870,7 +1977,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.slot_headroom",
         title: "PostgreSQL WAL a slot can still keep",
         unit: Unit::Bytes,
@@ -1881,7 +1988,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.slot_lost",
         title: "PostgreSQL replication slot lost",
         unit: Unit::Number,
@@ -1892,7 +1999,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.archive_failing",
         title: "PostgreSQL archiving failing",
         unit: Unit::Number,
@@ -1903,7 +2010,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.archive_waiting",
         title: "PostgreSQL WAL files waiting to be archived",
         unit: Unit::Number,
@@ -1914,7 +2021,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.archived",
         title: "PostgreSQL WAL files archived",
         unit: Unit::PerSecond,
@@ -1925,7 +2032,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.archive_failures",
         title: "PostgreSQL archiving failures",
         unit: Unit::PerSecond,
@@ -1936,7 +2043,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.subscription_running",
         title: "PostgreSQL subscription running",
         unit: Unit::Number,
@@ -1947,7 +2054,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "postgres.subscription_errors",
         title: "PostgreSQL subscription errors",
         unit: Unit::PerSecond,
@@ -1959,7 +2066,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::Never,
     },
     // MySQL.
-    Metric {
+    StaticMetric {
         name: "mysql.up",
         title: "MySQL answering",
         unit: Unit::Number,
@@ -1970,7 +2077,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.uptime",
         title: "MySQL uptime",
         unit: Unit::Seconds,
@@ -1981,7 +2088,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.connections",
         title: "MySQL connections",
         unit: Unit::Number,
@@ -1992,7 +2099,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.connections_used",
         title: "MySQL connections used",
         unit: Unit::Percent,
@@ -2003,7 +2110,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.refused",
         title: "MySQL connections refused at the limit",
         unit: Unit::PerSecond,
@@ -2014,7 +2121,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.queries",
         title: "MySQL queries",
         unit: Unit::PerSecond,
@@ -2025,7 +2132,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.oldest_transaction",
         title: "MySQL oldest transaction",
         unit: Unit::Seconds,
@@ -2036,7 +2143,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.oldest_query",
         title: "MySQL oldest query",
         unit: Unit::Seconds,
@@ -2047,7 +2154,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.rollbacks",
         title: "MySQL rollbacks",
         unit: Unit::PerSecond,
@@ -2058,7 +2165,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.deadlocks",
         title: "MySQL deadlocks",
         unit: Unit::PerSecond,
@@ -2069,7 +2176,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.cache_hit",
         title: "MySQL cache hit rate",
         unit: Unit::Percent,
@@ -2080,7 +2187,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.replica",
         title: "MySQL is a replica",
         unit: Unit::Number,
@@ -2091,7 +2198,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.receiving",
         title: "MySQL replica receiving",
         unit: Unit::Number,
@@ -2102,7 +2209,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.lag",
         title: "MySQL replication lag",
         unit: Unit::Seconds,
@@ -2113,7 +2220,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.size",
         title: "MySQL database size",
         unit: Unit::Bytes,
@@ -2124,7 +2231,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.running_queries",
         title: "MySQL queries running",
         unit: Unit::Number,
@@ -2135,7 +2242,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.slow_queries",
         title: "MySQL slow queries",
         unit: Unit::PerSecond,
@@ -2146,7 +2253,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.commits",
         title: "MySQL commits",
         unit: Unit::PerSecond,
@@ -2157,7 +2264,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.aborted_connects",
         title: "MySQL failed connection attempts",
         unit: Unit::PerSecond,
@@ -2168,7 +2275,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.tmp_disk_tables",
         title: "MySQL temporary tables on disk",
         unit: Unit::PerSecond,
@@ -2179,7 +2286,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.pool_dirty",
         title: "MySQL buffer pool dirty",
         unit: Unit::Percent,
@@ -2190,7 +2297,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.pool_waits",
         title: "MySQL waits for a free buffer page",
         unit: Unit::PerSecond,
@@ -2201,7 +2308,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.lock_waits",
         title: "MySQL row lock waits",
         unit: Unit::Number,
@@ -2212,7 +2319,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.history_length",
         title: "MySQL undo history length",
         unit: Unit::Number,
@@ -2223,7 +2330,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.open_transactions",
         title: "MySQL open transactions",
         unit: Unit::Number,
@@ -2234,7 +2341,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.read_only",
         title: "MySQL read only",
         unit: Unit::Number,
@@ -2245,7 +2352,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.super_read_only",
         title: "MySQL super read only",
         unit: Unit::Number,
@@ -2256,7 +2363,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.applying",
         title: "MySQL replica applying",
         unit: Unit::Number,
@@ -2267,7 +2374,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.relay_log",
         title: "MySQL relay log size",
         unit: Unit::Bytes,
@@ -2278,7 +2385,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.replication_errno",
         title: "MySQL replication error code",
         unit: Unit::Number,
@@ -2289,7 +2396,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.semi_sync",
         title: "MySQL semi-synchronous replication on",
         unit: Unit::Number,
@@ -2300,7 +2407,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.semi_sync_clients",
         title: "MySQL semi-synchronous replicas",
         unit: Unit::Number,
@@ -2311,7 +2418,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.semi_sync_misses",
         title: "MySQL commits not acknowledged by a replica",
         unit: Unit::PerSecond,
@@ -2322,7 +2429,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.group_members",
         title: "MySQL group members",
         unit: Unit::Number,
@@ -2333,7 +2440,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.group_online",
         title: "MySQL group members online",
         unit: Unit::Number,
@@ -2344,7 +2451,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.member_online",
         title: "MySQL group member online",
         unit: Unit::Number,
@@ -2355,7 +2462,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.applier_queue",
         title: "MySQL group applier queue",
         unit: Unit::Number,
@@ -2366,7 +2473,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.certifier_queue",
         title: "MySQL group certifier queue",
         unit: Unit::Number,
@@ -2377,7 +2484,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.group_conflicts",
         title: "MySQL group conflicts",
         unit: Unit::PerSecond,
@@ -2388,7 +2495,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_primary",
         title: "Galera cluster primary",
         unit: Unit::Number,
@@ -2399,7 +2506,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_size",
         title: "Galera cluster size",
         unit: Unit::Number,
@@ -2410,7 +2517,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_ready",
         title: "Galera node ready",
         unit: Unit::Number,
@@ -2421,7 +2528,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_connected",
         title: "Galera node connected",
         unit: Unit::Number,
@@ -2432,7 +2539,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_synced",
         title: "Galera node synced",
         unit: Unit::Number,
@@ -2443,7 +2550,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_receive_queue",
         title: "Galera receive queue",
         unit: Unit::Number,
@@ -2454,7 +2561,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_send_queue",
         title: "Galera send queue",
         unit: Unit::Number,
@@ -2465,7 +2572,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_cert_failures",
         title: "Galera certification failures",
         unit: Unit::PerSecond,
@@ -2476,7 +2583,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.galera_flow_paused",
         title: "Galera paused for flow control",
         unit: Unit::Percent,
@@ -2487,7 +2594,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mysql.binlog_size",
         title: "MySQL binary logs on disk",
         unit: Unit::Bytes,
@@ -2499,7 +2606,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // MongoDB.
-    Metric {
+    StaticMetric {
         name: "mongodb.up",
         title: "MongoDB answering",
         unit: Unit::Number,
@@ -2510,7 +2617,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.uptime",
         title: "MongoDB uptime",
         unit: Unit::Seconds,
@@ -2521,7 +2628,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.connections",
         title: "MongoDB connections",
         unit: Unit::Number,
@@ -2532,7 +2639,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.connections_used",
         title: "MongoDB connections used",
         unit: Unit::Percent,
@@ -2543,7 +2650,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.refused",
         title: "MongoDB connections refused at the limit",
         unit: Unit::PerSecond,
@@ -2554,7 +2661,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.oldest_query",
         title: "MongoDB oldest query",
         unit: Unit::Seconds,
@@ -2565,7 +2672,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.replica",
         title: "MongoDB is a replica",
         unit: Unit::Number,
@@ -2576,7 +2683,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.receiving",
         title: "MongoDB replica receiving",
         unit: Unit::Number,
@@ -2587,7 +2694,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.lag",
         title: "MongoDB replication lag",
         unit: Unit::Seconds,
@@ -2598,7 +2705,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.size",
         title: "MongoDB database size",
         unit: Unit::Bytes,
@@ -2609,7 +2716,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.operations",
         title: "MongoDB operations",
         unit: Unit::PerSecond,
@@ -2620,7 +2727,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.read_latency",
         title: "MongoDB read latency",
         unit: Unit::Seconds,
@@ -2631,7 +2738,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.write_latency",
         title: "MongoDB write latency",
         unit: Unit::Seconds,
@@ -2642,7 +2749,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.queued_reads",
         title: "MongoDB reads queued",
         unit: Unit::Number,
@@ -2653,7 +2760,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.queued_writes",
         title: "MongoDB writes queued",
         unit: Unit::Number,
@@ -2664,7 +2771,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.read_tickets",
         title: "MongoDB read tickets free",
         unit: Unit::Number,
@@ -2675,7 +2782,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.write_tickets",
         title: "MongoDB write tickets free",
         unit: Unit::Number,
@@ -2686,7 +2793,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.cache_used",
         title: "MongoDB cache used",
         unit: Unit::Percent,
@@ -2697,7 +2804,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.cache_dirty",
         title: "MongoDB cache dirty",
         unit: Unit::Percent,
@@ -2708,7 +2815,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.cursors_open",
         title: "MongoDB cursors open",
         unit: Unit::Number,
@@ -2719,7 +2826,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.cursors_timed_out",
         title: "MongoDB cursors timed out",
         unit: Unit::PerSecond,
@@ -2730,7 +2837,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.asserts",
         title: "MongoDB assertions",
         unit: Unit::PerSecond,
@@ -2741,7 +2848,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.memory",
         title: "MongoDB memory in use",
         unit: Unit::Bytes,
@@ -2752,7 +2859,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.flow_control_lagged",
         title: "MongoDB held back by flow control",
         unit: Unit::Number,
@@ -2763,7 +2870,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.members",
         title: "MongoDB replica set members",
         unit: Unit::Number,
@@ -2774,7 +2881,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.members_healthy",
         title: "MongoDB replica set members healthy",
         unit: Unit::Number,
@@ -2785,7 +2892,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.has_primary",
         title: "MongoDB replica set has a primary",
         unit: Unit::Number,
@@ -2796,7 +2903,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.term",
         title: "MongoDB election term",
         unit: Unit::Number,
@@ -2807,7 +2914,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.majority_lag",
         title: "MongoDB majority commit lag",
         unit: Unit::Seconds,
@@ -2818,7 +2925,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.member_healthy",
         title: "MongoDB member healthy",
         unit: Unit::Number,
@@ -2829,7 +2936,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.member_lag",
         title: "MongoDB member lag",
         unit: Unit::Seconds,
@@ -2840,7 +2947,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "mongodb.oplog_window",
         title: "MongoDB oplog window",
         unit: Unit::Seconds,
@@ -2852,7 +2959,7 @@ pub const METRICS: &[Metric] = &[
         chart: ShowChart::WithData,
     },
     // ClickHouse.
-    Metric {
+    StaticMetric {
         name: "clickhouse.up",
         title: "ClickHouse answering",
         unit: Unit::Number,
@@ -2863,7 +2970,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.uptime",
         title: "ClickHouse uptime",
         unit: Unit::Seconds,
@@ -2874,7 +2981,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.connections",
         title: "ClickHouse connections",
         unit: Unit::Number,
@@ -2885,7 +2992,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.connections_used",
         title: "ClickHouse connections used",
         unit: Unit::Percent,
@@ -2896,7 +3003,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.queries",
         title: "ClickHouse queries",
         unit: Unit::PerSecond,
@@ -2907,7 +3014,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.oldest_query",
         title: "ClickHouse oldest query",
         unit: Unit::Seconds,
@@ -2918,7 +3025,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.lag",
         title: "ClickHouse replication lag",
         unit: Unit::Seconds,
@@ -2929,7 +3036,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.size",
         title: "ClickHouse database size",
         unit: Unit::Bytes,
@@ -2940,7 +3047,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.running_queries",
         title: "ClickHouse queries running",
         unit: Unit::Number,
@@ -2951,7 +3058,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.queries_used",
         title: "ClickHouse queries running of the most allowed",
         unit: Unit::Percent,
@@ -2962,7 +3069,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.preempted_queries",
         title: "ClickHouse queries held back by priority",
         unit: Unit::Number,
@@ -2973,7 +3080,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.interserver_connections",
         title: "ClickHouse connections between servers",
         unit: Unit::Number,
@@ -2984,7 +3091,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.selects",
         title: "ClickHouse selects",
         unit: Unit::PerSecond,
@@ -2995,7 +3102,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.inserts",
         title: "ClickHouse inserts",
         unit: Unit::PerSecond,
@@ -3006,7 +3113,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.failed_queries",
         title: "ClickHouse failed queries",
         unit: Unit::PerSecond,
@@ -3017,7 +3124,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.failed_selects",
         title: "ClickHouse failed selects",
         unit: Unit::PerSecond,
@@ -3028,7 +3135,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.failed_inserts",
         title: "ClickHouse failed inserts",
         unit: Unit::PerSecond,
@@ -3039,7 +3146,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.latency",
         title: "ClickHouse average query time",
         unit: Unit::Seconds,
@@ -3050,7 +3157,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.select_latency",
         title: "ClickHouse average select time",
         unit: Unit::Seconds,
@@ -3061,7 +3168,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.insert_latency",
         title: "ClickHouse average insert time",
         unit: Unit::Seconds,
@@ -3072,7 +3179,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.inserted_rows",
         title: "ClickHouse rows inserted",
         unit: Unit::PerSecond,
@@ -3083,7 +3190,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.inserted_bytes",
         title: "ClickHouse bytes inserted",
         unit: Unit::BytesPerSecond,
@@ -3094,7 +3201,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.rows_per_insert",
         title: "ClickHouse rows per insert",
         unit: Unit::Number,
@@ -3105,7 +3212,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.max_parts",
         title: "ClickHouse most parts in a partition",
         unit: Unit::Number,
@@ -3116,7 +3223,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.parts_used",
         title: "ClickHouse most parts in a partition of where inserts slow",
         unit: Unit::Percent,
@@ -3127,7 +3234,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.parts_total",
         title: "ClickHouse parts in total",
         unit: Unit::Number,
@@ -3138,7 +3245,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.delayed_inserts",
         title: "ClickHouse inserts being slowed",
         unit: Unit::Number,
@@ -3149,7 +3256,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.inserts_delayed",
         title: "ClickHouse inserts slowed for too many parts",
         unit: Unit::PerSecond,
@@ -3160,7 +3267,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.insert_delay",
         title: "ClickHouse time inserts were slowed each second",
         unit: Unit::Seconds,
@@ -3171,7 +3278,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.rejected_inserts",
         title: "ClickHouse inserts refused for too many parts",
         unit: Unit::PerSecond,
@@ -3182,7 +3289,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.pending_async_inserts",
         title: "ClickHouse inserts waiting to be batched",
         unit: Unit::Number,
@@ -3193,7 +3300,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.failed_async_inserts",
         title: "ClickHouse batched inserts failed",
         unit: Unit::PerSecond,
@@ -3204,7 +3311,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.async_queue_age",
         title: "ClickHouse oldest insert waiting to be batched",
         unit: Unit::Seconds,
@@ -3215,7 +3322,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.memory",
         title: "ClickHouse memory in use",
         unit: Unit::Bytes,
@@ -3226,7 +3333,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.memory_used",
         title: "ClickHouse memory used of its limit",
         unit: Unit::Percent,
@@ -3237,7 +3344,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.merge_memory",
         title: "ClickHouse memory used by merges and mutations",
         unit: Unit::Bytes,
@@ -3248,7 +3355,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.memory_limit_exceeded",
         title: "ClickHouse queries over their memory limit",
         unit: Unit::PerSecond,
@@ -3259,7 +3366,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.overcommit_wait",
         title: "ClickHouse time waiting for memory each second",
         unit: Unit::Seconds,
@@ -3270,7 +3377,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.merges_running",
         title: "ClickHouse merges running",
         unit: Unit::Number,
@@ -3281,7 +3388,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.pool_used",
         title: "ClickHouse background pool used",
         unit: Unit::Percent,
@@ -3292,7 +3399,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.pool_tasks",
         title: "ClickHouse background pool tasks",
         unit: Unit::Number,
@@ -3303,7 +3410,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.mutations_pending",
         title: "ClickHouse mutations pending",
         unit: Unit::Number,
@@ -3314,7 +3421,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.mutations_failing",
         title: "ClickHouse mutations failing",
         unit: Unit::Number,
@@ -3325,7 +3432,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.mutations_delayed",
         title: "ClickHouse mutations slowed",
         unit: Unit::PerSecond,
@@ -3336,7 +3443,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.mutations_rejected",
         title: "ClickHouse mutations refused",
         unit: Unit::PerSecond,
@@ -3347,7 +3454,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.dictionaries_failing",
         title: "ClickHouse dictionaries failing",
         unit: Unit::Number,
@@ -3358,7 +3465,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.detached_parts",
         title: "ClickHouse detached parts",
         unit: Unit::Number,
@@ -3369,7 +3476,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.detached_broken",
         title: "ClickHouse parts detached as broken",
         unit: Unit::Number,
@@ -3380,7 +3487,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.backups_failed",
         title: "ClickHouse backups and restores failed",
         unit: Unit::Number,
@@ -3391,7 +3498,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.errors",
         title: "ClickHouse errors",
         unit: Unit::PerSecond,
@@ -3402,7 +3509,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.buffer_flush_errors",
         title: "ClickHouse buffer table flush failures",
         unit: Unit::PerSecond,
@@ -3413,7 +3520,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.slow_reads",
         title: "ClickHouse slow disk reads",
         unit: Unit::PerSecond,
@@ -3424,7 +3531,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.read_failures",
         title: "ClickHouse failed disk reads",
         unit: Unit::PerSecond,
@@ -3435,7 +3542,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.write_failures",
         title: "ClickHouse failed disk writes",
         unit: Unit::PerSecond,
@@ -3446,7 +3553,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.readonly_replicas",
         title: "ClickHouse read-only replicas",
         unit: Unit::Number,
@@ -3457,7 +3564,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.replicated_tables",
         title: "ClickHouse replicated tables",
         unit: Unit::Number,
@@ -3468,7 +3575,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.readonly_tables",
         title: "ClickHouse replicated tables read only",
         unit: Unit::Number,
@@ -3479,7 +3586,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.expired_sessions",
         title: "ClickHouse tables that lost Keeper",
         unit: Unit::Number,
@@ -3490,7 +3597,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.tables_missing_replicas",
         title: "ClickHouse tables missing a replica",
         unit: Unit::Number,
@@ -3501,7 +3608,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.log_lag",
         title: "ClickHouse replication log entries behind",
         unit: Unit::Number,
@@ -3512,7 +3619,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.replication_queue",
         title: "ClickHouse replication queue",
         unit: Unit::Number,
@@ -3523,7 +3630,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.max_replication_queue",
         title: "ClickHouse longest replication queue",
         unit: Unit::Number,
@@ -3534,7 +3641,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.inserts_in_queue",
         title: "ClickHouse inserts waiting to replicate",
         unit: Unit::Number,
@@ -3545,7 +3652,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.merges_in_queue",
         title: "ClickHouse merges waiting to replicate",
         unit: Unit::Number,
@@ -3556,7 +3663,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.future_parts",
         title: "ClickHouse parts still to appear",
         unit: Unit::Number,
@@ -3567,7 +3674,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.parts_to_check",
         title: "ClickHouse parts waiting to be checked",
         unit: Unit::Number,
@@ -3578,7 +3685,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.oldest_queue_entry",
         title: "ClickHouse oldest replication queue entry",
         unit: Unit::Seconds,
@@ -3589,7 +3696,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.queue_stuck",
         title: "ClickHouse replication queue entries stuck",
         unit: Unit::Number,
@@ -3600,7 +3707,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.queue_failing",
         title: "ClickHouse replication queue entries failing",
         unit: Unit::Number,
@@ -3611,7 +3718,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.queue_update_errors",
         title: "ClickHouse replicas failing to update their queue",
         unit: Unit::Number,
@@ -3622,7 +3729,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.relative_lag",
         title: "ClickHouse replica lag behind the freshest",
         unit: Unit::Seconds,
@@ -3633,7 +3740,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.lost_parts",
         title: "ClickHouse parts lost",
         unit: Unit::PerSecond,
@@ -3644,7 +3751,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.fetches_running",
         title: "ClickHouse parts being fetched",
         unit: Unit::Number,
@@ -3655,7 +3762,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.longest_fetch",
         title: "ClickHouse longest fetch",
         unit: Unit::Seconds,
@@ -3666,7 +3773,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.failed_fetches",
         title: "ClickHouse failed fetches",
         unit: Unit::PerSecond,
@@ -3677,7 +3784,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.failed_part_checks",
         title: "ClickHouse failed part checks",
         unit: Unit::PerSecond,
@@ -3688,7 +3795,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.data_loss",
         title: "ClickHouse data lost on a replica",
         unit: Unit::PerSecond,
@@ -3699,7 +3806,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.merge_differs",
         title: "ClickHouse merges that differ from a replica",
         unit: Unit::PerSecond,
@@ -3710,7 +3817,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.mutation_differs",
         title: "ClickHouse mutations that differ from a replica",
         unit: Unit::PerSecond,
@@ -3721,7 +3828,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.partial_shutdowns",
         title: "ClickHouse replicated tables shut down",
         unit: Unit::PerSecond,
@@ -3732,7 +3839,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_files",
         title: "ClickHouse Distributed files waiting",
         unit: Unit::Number,
@@ -3743,7 +3850,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_bytes",
         title: "ClickHouse Distributed bytes waiting",
         unit: Unit::Bytes,
@@ -3754,7 +3861,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_broken_files",
         title: "ClickHouse Distributed files broken",
         unit: Unit::Number,
@@ -3765,7 +3872,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_retries",
         title: "ClickHouse connections to shards retried",
         unit: Unit::PerSecond,
@@ -3776,7 +3883,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_failures",
         title: "ClickHouse connections to shards failed",
         unit: Unit::PerSecond,
@@ -3787,7 +3894,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_rejected",
         title: "ClickHouse Distributed inserts refused",
         unit: Unit::PerSecond,
@@ -3798,7 +3905,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distributed_insert_failures",
         title: "ClickHouse Distributed inserts failed",
         unit: Unit::PerSecond,
@@ -3809,7 +3916,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distribution_blocked",
         title: "ClickHouse Distributed queues blocked",
         unit: Unit::Number,
@@ -3820,7 +3927,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.distribution_errors",
         title: "ClickHouse Distributed queue errors",
         unit: Unit::Number,
@@ -3831,7 +3938,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.cluster_errors",
         title: "ClickHouse recent errors reaching other replicas",
         unit: Unit::Number,
@@ -3842,7 +3949,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_connected",
         title: "ClickHouse connected to Keeper",
         unit: Unit::Number,
@@ -3853,7 +3960,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_session",
         title: "ClickHouse Keeper session age",
         unit: Unit::Seconds,
@@ -3864,7 +3971,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_sessions",
         title: "ClickHouse Keeper sessions",
         unit: Unit::Number,
@@ -3875,7 +3982,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_sessions_expired",
         title: "ClickHouse Keeper sessions expired",
         unit: Unit::Number,
@@ -3886,7 +3993,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_requests",
         title: "ClickHouse Keeper requests in flight",
         unit: Unit::Number,
@@ -3897,7 +4004,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_latency",
         title: "ClickHouse Keeper average wait",
         unit: Unit::Seconds,
@@ -3908,7 +4015,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_hardware_errors",
         title: "ClickHouse Keeper connection errors",
         unit: Unit::PerSecond,
@@ -3919,7 +4026,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_user_errors",
         title: "ClickHouse Keeper request errors",
         unit: Unit::PerSecond,
@@ -3930,7 +4037,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_leader",
         title: "ClickHouse embedded Keeper is leader",
         unit: Unit::Number,
@@ -3941,7 +4048,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_synced_followers",
         title: "ClickHouse embedded Keeper synced followers",
         unit: Unit::Number,
@@ -3952,7 +4059,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_memory_limit_hit",
         title: "ClickHouse embedded Keeper over its memory limit",
         unit: Unit::Number,
@@ -3963,7 +4070,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_clients",
         title: "ClickHouse embedded Keeper clients",
         unit: Unit::Number,
@@ -3974,7 +4081,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.keeper_outstanding",
         title: "ClickHouse embedded Keeper requests waiting",
         unit: Unit::Number,
@@ -3985,7 +4092,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.disk_free",
         title: "ClickHouse disk free",
         unit: Unit::Bytes,
@@ -3996,7 +4103,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.disk_used",
         title: "ClickHouse disk used",
         unit: Unit::Percent,
@@ -4007,7 +4114,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.disk_broken",
         title: "ClickHouse disk broken",
         unit: Unit::Number,
@@ -4018,7 +4125,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.disk_read_only",
         title: "ClickHouse disk read only",
         unit: Unit::Number,
@@ -4029,7 +4136,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.query_p50",
         title: "ClickHouse median query time",
         unit: Unit::Seconds,
@@ -4040,7 +4147,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.query_p95",
         title: "ClickHouse 95th percentile query time",
         unit: Unit::Seconds,
@@ -4051,7 +4158,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.query_p99",
         title: "ClickHouse 99th percentile query time",
         unit: Unit::Seconds,
@@ -4062,7 +4169,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "clickhouse.queries_failed_5m",
         title: "ClickHouse queries failed in five minutes",
         unit: Unit::Number,
@@ -4073,7 +4180,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "custom.value",
         title: "Custom metrics",
         unit: Unit::Number,
@@ -4084,7 +4191,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "custom.ok",
         title: "Custom metric working",
         unit: Unit::Number,
@@ -4097,7 +4204,7 @@ pub const METRICS: &[Metric] = &[
     },
     // Monitoring plugins in the Nagios style: 0 OK, 1 warning, 2 critical, 3 unknown,
     // and whatever performance data they give.
-    Metric {
+    StaticMetric {
         name: "command.status",
         title: "Check command status",
         unit: Unit::Number,
@@ -4108,7 +4215,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "command.ok",
         title: "Check command passing",
         unit: Unit::Number,
@@ -4119,7 +4226,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "command.value",
         title: "Check command values",
         unit: Unit::Number,
@@ -4132,7 +4239,7 @@ pub const METRICS: &[Metric] = &[
     },
     // Windows performance counters, each by its path. They measure all sorts of things,
     // so they're numbers here, and the busiest are charted together.
-    Metric {
+    StaticMetric {
         name: "counter.value",
         title: "Performance counters",
         unit: Unit::Number,
@@ -4143,7 +4250,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "counter.ok",
         title: "Performance counter working",
         unit: Unit::Number,
@@ -4154,7 +4261,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "counter.dropped",
         title: "Performance counter instances over the limit",
         unit: Unit::Number,
@@ -4165,7 +4272,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "file.exists",
         title: "File exists",
         unit: Unit::Number,
@@ -4176,7 +4283,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "file.size",
         title: "File size",
         unit: Unit::Bytes,
@@ -4187,7 +4294,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "file.age",
         title: "Time since file changed",
         unit: Unit::Seconds,
@@ -4198,7 +4305,7 @@ pub const METRICS: &[Metric] = &[
         },
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "agent.memory",
         title: "Agent memory",
         unit: Unit::Bytes,
@@ -4206,7 +4313,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Memory", Reading::Field("$.memory_bytes"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "agent.cpu",
         title: "Agent CPU",
         unit: Unit::Percent,
@@ -4214,7 +4321,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("CPU", Reading::Field("$.cpu_percent"))]),
         chart: ShowChart::WithData,
     },
-    Metric {
+    StaticMetric {
         name: "agent.uptime",
         title: "Agent uptime",
         unit: Unit::Seconds,
@@ -4222,7 +4329,7 @@ pub const METRICS: &[Metric] = &[
         source: Source::Fields(&[("Uptime", Reading::Field("$.uptime_secs"))]),
         chart: ShowChart::Never,
     },
-    Metric {
+    StaticMetric {
         name: "host.uptime",
         title: "Uptime",
         unit: Unit::Seconds,
@@ -4232,16 +4339,66 @@ pub const METRICS: &[Metric] = &[
     },
 ];
 
-pub fn find(name: &str) -> Option<&'static Metric> {
-    METRICS.iter().find(|metric| metric.name == name)
+/// The metrics named here in code, as they're read.
+pub fn built_in() -> &'static [Arc<Metric>] {
+    static BUILT_IN: LazyLock<Vec<Arc<Metric>>> = LazyLock::new(|| {
+        METRICS
+            .iter()
+            .map(|metric| Arc::new(metric.into()))
+            .collect()
+    });
+    &BUILT_IN
+}
+
+/// One of the metrics named here in code, which is all this finds: what a
+/// template adds is only in a [`crate::catalog::Catalog`].
+pub fn find(name: &str) -> Option<Arc<Metric>> {
+    static BY_NAME: LazyLock<HashMap<&'static str, Arc<Metric>>> = LazyLock::new(|| {
+        METRICS
+            .iter()
+            .zip(built_in())
+            .map(|(metric, read)| (metric.name, read.clone()))
+            .collect()
+    });
+    BY_NAME.get(name).cloned()
 }
 
 impl Metric {
     /// Where a series sits in the catalog, for metrics with fixed series.
     pub fn position(&self, series: &str) -> Option<usize> {
-        match self.source {
+        match &self.source {
             Source::Fields(fields) => fields.iter().position(|(name, _)| *name == series),
             _ => None,
+        }
+    }
+
+    /// Whether it has one value for a host whatever series is looked at, rather
+    /// than a series for each disk, database or such.
+    pub fn is_single(&self) -> bool {
+        match &self.source {
+            Source::Fields(_) => true,
+            Source::Labelled(labelled) => labelled.labels.is_empty(),
+            Source::Items { .. } | Source::Entries(_) => false,
+        }
+    }
+
+    /// The labels of a template's metric, or none for any other.
+    pub fn labels(&self) -> &[String] {
+        match &self.source {
+            Source::Labelled(labelled) => &labelled.labels,
+            _ => &[],
+        }
+    }
+
+    /// A value as people read it, in its unit, with yes or no for a flag.
+    pub fn format(&self, value: f64) -> String {
+        match self.kind {
+            Kind::Flag => match value != 0.0 {
+                true => "yes".to_string(),
+                false => "no".to_string(),
+            },
+            Kind::Seconds => crate::metric_charts::format_value(Unit::Seconds, value),
+            Kind::Number | Kind::Unknown => crate::metric_charts::format_value(self.unit, value),
         }
     }
 }
@@ -4288,7 +4445,7 @@ fn step_for(range: TimeDelta) -> TimeDelta {
 #[derive(Debug, Clone, Copy)]
 pub struct SeriesQuery<'a> {
     pub host_id: &'a str,
-    pub metric: &'static Metric,
+    pub metric: &'a Metric,
     pub range: TimeRange,
     /// Keep this many series, starting with the highest.
     pub max_series: usize,
@@ -4431,17 +4588,19 @@ impl Metrics {
     pub async fn series(
         &self,
         host_id: &str,
-        metric: &'static Metric,
+        metric: &Arc<Metric>,
         range: TimeRange,
         max_series: usize,
     ) -> Result<SeriesResult> {
         let reader = self.reader.clone();
         let host_id = host_id.to_string();
+        let metric = metric.clone();
+        let read = metric.clone();
 
         let mut result = tokio::task::spawn_blocking(move || {
             reader.series(&SeriesQuery {
                 host_id: &host_id,
-                metric,
+                metric: &read,
                 range,
                 max_series,
             })
@@ -4452,18 +4611,24 @@ impl Metrics {
         result
             .series
             .sort_by_key(|series| metric.position(&series.name));
+        // A template's metric with one series for the whole host has nothing to
+        // name it by, so it's called what the metric is, as the built-in ones are.
+        if matches!(metric.source, Source::Labelled(_)) && metric.is_single() {
+            for series in &mut result.series {
+                if series.name.is_empty() {
+                    series.name = metric.title.clone();
+                }
+            }
+        }
         Ok(result)
     }
 
     /// The newest value of each series, across every agent.
-    pub async fn newest(
-        &self,
-        metric: &'static Metric,
-        now: Timestamp,
-    ) -> Result<Vec<NewestReading>> {
+    pub async fn newest(&self, metric: &Arc<Metric>, now: Timestamp) -> Result<Vec<NewestReading>> {
         let reader = self.reader.clone();
+        let metric = metric.clone();
         tokio::task::spawn_blocking(move || {
-            reader.newest(metric, now - CURRENT_WINDOW, now + CLOCK_SKEW)
+            reader.newest(&metric, now - CURRENT_WINDOW, now + CLOCK_SKEW)
         })
         .await
         .context("reading metrics")?
@@ -4483,12 +4648,13 @@ impl Metrics {
     /// across every agent.
     pub async fn trends(
         &self,
-        metric: &'static Metric,
+        metric: &Arc<Metric>,
         since: Timestamp,
         until: Timestamp,
     ) -> Result<Vec<Trend>> {
         let reader = self.reader.clone();
-        tokio::task::spawn_blocking(move || reader.trends(metric, since, until))
+        let metric = metric.clone();
+        tokio::task::spawn_blocking(move || reader.trends(&metric, since, until))
             .await
             .context("reading metrics")?
     }
@@ -4532,7 +4698,7 @@ impl Metrics {
             let (since, until) = (now - CURRENT_WINDOW, now + CLOCK_SKEW);
             let newest = |name| {
                 let metric = find(name).context("unknown metric")?;
-                reader.newest(metric, since, until)
+                reader.newest(&metric, since, until)
             };
             Ok(current_values(
                 reader.last_samples(since, until)?,
@@ -4557,7 +4723,8 @@ mod tests {
 
     #[test]
     fn a_service_or_container_that_is_down_says_what_state_it_is_in() {
-        let services = find("service.running").and_then(described).unwrap();
+        let described_of = |name: &str| find(name).and_then(|metric| described(&metric));
+        let services = described_of("service.running").unwrap();
         assert_eq!(services.noun, "Service");
         let output = serde_json::json!([
             { "name": "nginx.service", "running": 0, "state": "failed" },
@@ -4577,20 +4744,21 @@ mod tests {
         assert_eq!(state("long.service").map(|state| state.len()), Some(60));
         assert_eq!(services.state_of(&Value::Null, "nginx.service"), None);
 
-        let containers = find("container.up").and_then(described).unwrap();
+        let containers = described_of("container.up").unwrap();
         let output = serde_json::json!([{ "name": "web", "up": 0, "state": "exited" }]);
         assert_eq!(containers.noun, "Container");
         assert_eq!(
             containers.state_of(&output, "web").as_deref(),
             Some("exited")
         );
-        assert!(find("cpu.usage").and_then(described).is_none());
+        assert!(described_of("cpu.usage").is_none());
     }
 
     #[test]
     fn every_metric_has_a_unique_name_and_can_be_found() {
-        for metric in METRICS {
-            assert_eq!(find(metric.name), Some(metric));
+        assert_eq!(built_in().len(), METRICS.len());
+        for metric in built_in() {
+            assert_eq!(find(&metric.name).as_ref(), Some(metric));
         }
         assert_eq!(find("cpu.nonsense"), None);
     }

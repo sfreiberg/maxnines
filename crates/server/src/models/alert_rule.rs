@@ -42,8 +42,6 @@ pub struct Model {
     pub since: Option<String>,
     /// When an upgrade last changed the built-in rule this is a copy of.
     pub original_changed_at: Option<DateTimeUtc>,
-    /// Whether it needs what only agents running its template would send.
-    pub waits_for_agents: bool,
     /// When it was deleted. Its alerts keep pointing at it.
     pub deleted_at: Option<DateTimeUtc>,
 }

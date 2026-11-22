@@ -8,6 +8,7 @@ use tracing::warn;
 
 use crate::app_state::AppState;
 use crate::calculations::{self, Grouping, Question};
+use crate::catalog::Catalog;
 use crate::dashboard_variables::{Picks, Variable, check_uses, check_variables, uses};
 use crate::metric_charts::{self, Chart, Frame, MAX_SERIES};
 use crate::metrics::TimeRange;
@@ -121,12 +122,16 @@ pub struct WidgetInput {
 
 impl WidgetInput {
     /// A number shows one value, so nothing gets a line of its own.
-    pub fn question(&self) -> Result<Question, String> {
-        self.question_for(self.filter.as_deref())
+    pub fn question(&self, catalog: &Catalog) -> Result<Question, String> {
+        self.question_for(catalog, self.filter.as_deref())
     }
 
     /// The question with its filter as variables fill it in.
-    pub fn question_for(&self, filter: Option<&str>) -> Result<Question, String> {
+    pub fn question_for(
+        &self,
+        catalog: &Catalog,
+        filter: Option<&str>,
+    ) -> Result<Question, String> {
         let group_by = if self.kind == "number" {
             "nothing"
         } else {
@@ -134,7 +139,7 @@ impl WidgetInput {
         };
         // The question's own filter is text, as typed for a query, where none is empty.
         let filter = filter.unwrap_or_default();
-        Question::new(&self.metric, &self.calculation, group_by, filter)
+        Question::new(catalog, &self.metric, &self.calculation, group_by, filter)
     }
 
     /// How many lines it has room for.
@@ -148,7 +153,7 @@ impl WidgetInput {
 
     /// The error says what's wrong, to show whoever chose it. Its filter can only use
     /// the dashboard's `variables`.
-    pub fn check(&self, variables: &[Variable]) -> Result<(), String> {
+    pub fn check(&self, catalog: &Catalog, variables: &[Variable]) -> Result<(), String> {
         if self
             .title
             .as_ref()
@@ -165,13 +170,13 @@ impl WidgetInput {
         if let Some(filter) = &self.filter {
             check_uses(filter, variables)?;
         }
-        self.question().map(|_| ())
+        self.question(catalog).map(|_| ())
     }
 
     pub fn title(&self, question: &Question, picks: &Picks) -> String {
         match &self.title {
             Some(title) => picks.fill_title(title),
-            None => question.metric.title.to_string(),
+            None => question.metric.title.clone(),
         }
     }
 }
@@ -292,7 +297,7 @@ pub async fn view(
             };
         }
     };
-    let question = match input.question_for(filter.as_deref()) {
+    let question = match input.question_for(&state.catalog(), filter.as_deref()) {
         Ok(question) => question,
         Err(error) => {
             warn!(
@@ -306,7 +311,7 @@ pub async fn view(
         Ok(result) => {
             let title = input.title(&question, picks);
             let chart = metric_charts::build_as(
-                question.metric,
+                &question.metric,
                 question.unit(),
                 &title,
                 input.placement.frame(),
@@ -372,7 +377,7 @@ mod tests {
         let at = |x, y, w, h| {
             let mut widget = input();
             widget.placement = Placement { x, y, w, h };
-            widget.check(&[])
+            widget.check(&Catalog::built_in(), &[])
         };
         assert!(at(0, 0, 12, 4).is_ok());
         assert!(at(6, 100, 6, 24).is_ok());
@@ -388,28 +393,31 @@ mod tests {
     fn a_widget_has_to_be_something_it_can_show() {
         let mut widget = input();
         widget.kind = "pie".to_string();
-        assert!(widget.check(&[]).is_err());
+        assert!(widget.check(&Catalog::built_in(), &[]).is_err());
 
         let mut widget = input();
         widget.metric = "nope".to_string();
-        assert!(widget.check(&[]).is_err());
+        assert!(widget.check(&Catalog::built_in(), &[]).is_err());
 
         let mut widget = input();
         widget.title = Some("x".repeat(101));
-        assert!(widget.check(&[]).is_err());
+        assert!(widget.check(&Catalog::built_in(), &[]).is_err());
     }
 
     #[test]
     fn a_number_shows_one_value_however_it_was_grouped() {
         let mut widget = input();
         widget.kind = "number".to_string();
-        assert_eq!(widget.question().unwrap().grouping, Grouping::Nothing);
+        assert_eq!(
+            widget.question(&Catalog::built_in()).unwrap().grouping,
+            Grouping::Nothing
+        );
     }
 
     #[test]
     fn a_widget_with_no_title_is_named_after_its_metric() {
         let widget = input();
-        let question = widget.question().unwrap();
+        let question = widget.question(&Catalog::built_in()).unwrap();
         assert_eq!(widget.title(&question, &Picks::default()), "CPU usage");
     }
 
@@ -458,9 +466,9 @@ mod tests {
     fn a_widget_can_only_use_the_dashboards_variables() {
         let mut widget = input();
         widget.filter = Some("$host os=linux".to_string());
-        assert!(widget.check(&[host()]).is_ok());
+        assert!(widget.check(&Catalog::built_in(), &[host()]).is_ok());
         assert_eq!(
-            widget.check(&[]),
+            widget.check(&Catalog::built_in(), &[]),
             Err("This dashboard has no variable called $host.".to_string())
         );
     }

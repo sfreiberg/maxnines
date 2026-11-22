@@ -31,7 +31,7 @@ use crate::events::EventInput;
 use crate::facts::unflatten;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
-use crate::metrics::{self, METRICS, Metric, SeriesResult, TimeRange, Unit};
+use crate::metrics::{SeriesResult, TimeRange, Unit};
 use crate::metrics_pages::{MetricsPage, MetricsPageInput, SignIn};
 use crate::models::User;
 use crate::models::{ConfigStatus, MAX_TIMELINE, RuleInput, UserChange, check_new_user, is_theme};
@@ -895,8 +895,9 @@ const DEFAULT_RANGE: TimeDelta = TimeDelta::hours(1);
 /// response huge.
 const MAX_SERIES: usize = 100;
 
-async fn metric_catalog() -> Json<&'static [Metric]> {
-    Json(METRICS)
+/// Every metric there is to read: the built-in ones, then each template's.
+async fn metric_catalog(State(state): State<AppState>) -> Response {
+    Json(state.catalog().all()).into_response()
 }
 
 async fn current_metrics(State(state): State<AppState>) -> Response {
@@ -941,7 +942,7 @@ impl MetricParams {
 
 #[derive(Debug, Serialize)]
 struct MetricView {
-    metric: &'static str,
+    metric: String,
     unit: Unit,
     from: Timestamp,
     to: Timestamp,
@@ -952,9 +953,9 @@ struct MetricView {
 }
 
 impl MetricView {
-    fn new(metric: &'static str, unit: Unit, range: TimeRange, result: SeriesResult) -> Self {
+    fn new(metric: &str, unit: Unit, range: TimeRange, result: SeriesResult) -> Self {
         Self {
-            metric,
+            metric: metric.to_string(),
             unit,
             from: range.from,
             to: range.to,
@@ -969,7 +970,8 @@ async fn host_metric(
     UrlPath((id, name)): UrlPath<(String, String)>,
     Query(params): Query<MetricParams>,
 ) -> Response {
-    let (Some(host), Some(metric)) = (state.registry.get(&id).await, metrics::find(&name)) else {
+    let catalog = state.catalog();
+    let (Some(host), Some(metric)) = (state.registry.get(&id).await, catalog.find(&name)) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -983,7 +985,7 @@ async fn host_metric(
         .await
     {
         Ok(result) => {
-            Json(MetricView::new(metric.name, metric.unit, range, result)).into_response()
+            Json(MetricView::new(&metric.name, metric.unit, range, result)).into_response()
         }
         Err(error) => server_error(&error),
     }
@@ -1260,6 +1262,7 @@ fn default_calculation() -> String {
 
 async fn query(State(state): State<AppState>, Query(params): Query<QueryParams>) -> Response {
     let question = Question::new(
+        &state.catalog(),
         &params.metric,
         &params.calculation,
         &params.group_by,
@@ -1279,7 +1282,7 @@ async fn query(State(state): State<AppState>, Query(params): Query<QueryParams>)
 
     match calculations::answer(&state.sources(), &question, range, MAX_SERIES).await {
         Ok(result) => {
-            let view = MetricView::new(question.metric.name, question.unit(), range, result);
+            let view = MetricView::new(&question.metric.name, question.unit(), range, result);
             Json(view).into_response()
         }
         Err(error) => server_error(&error),
@@ -1373,7 +1376,7 @@ async fn create_widget(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error(&error),
     };
-    if let Err(error) = input.check(&dashboard.variables) {
+    if let Err(error) = input.check(&state.catalog(), &dashboard.variables) {
         return refused(&anyhow::anyhow!(error));
     }
     if dashboard.is_full() {
@@ -1397,7 +1400,7 @@ async fn update_widget(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return server_error(&error),
     };
-    if let Err(error) = input.check(&dashboard.variables) {
+    if let Err(error) = input.check(&state.catalog(), &dashboard.variables) {
         return refused(&anyhow::anyhow!(error));
     }
     match state.database.update_widget(id, widget, &input).await {
@@ -1507,7 +1510,7 @@ async fn widget_data(
     let input = &widget.input;
     let question = picks
         .fill_filter(input.filter.as_deref())
-        .and_then(|filter| input.question_for(filter.as_deref()));
+        .and_then(|filter| input.question_for(&state.catalog(), filter.as_deref()));
     let question = match question {
         Ok(question) => question,
         Err(error) => return refused(&anyhow::anyhow!(error)),
@@ -1517,7 +1520,7 @@ async fn widget_data(
             title: input.title(&question, &picks),
             kind: input.kind.clone(),
             filter: question.filter.clone(),
-            view: MetricView::new(question.metric.name, question.unit(), range, result),
+            view: MetricView::new(&question.metric.name, question.unit(), range, result),
         })
         .into_response(),
         Err(error) => server_error(&error),
@@ -1665,7 +1668,7 @@ async fn alert_actions(State(state): State<AppState>, UrlPath(id): UrlPath<i64>)
 #[derive(Debug, Serialize)]
 struct AlertSeriesView {
     alert_id: i64,
-    metric: &'static str,
+    metric: String,
     unit: Unit,
     thresholds: Vec<ThresholdView>,
     from: Timestamp,
@@ -1706,7 +1709,7 @@ async fn alert_series(
     match alert_charts::watched(&state.sources(), &alert, range).await {
         Ok(Some(watched)) => Json(AlertSeriesView {
             alert_id: alert.id,
-            metric: watched.metric.name,
+            metric: watched.metric.name.clone(),
             unit: watched.unit,
             thresholds: watched
                 .rule

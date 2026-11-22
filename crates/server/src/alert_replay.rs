@@ -13,14 +13,14 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::alert_conditions::{
-    Conditions, Heading, Inputs, Values, Variable, bind_value, facts_value,
+    Conditions, Heading, Inputs, Values, Variable, bind_value, facts_value, kind_of_unit,
 };
 use crate::alert_evaluator::{Change, Tracker, holds};
 use crate::alerting::{AlertRuleInput, Severity, clean};
 use crate::calculations::{self, Calculation, Grouping, Sources, over_window};
 use crate::facts::unflatten;
 use crate::metric_charts::MAX_SERIES;
-use crate::metrics::{Source, TimeRange};
+use crate::metrics::{Metric, TimeRange};
 use crate::registration::HostState;
 use crate::remote_checks::FLEET_HOSTNAME;
 use crate::rule_engine::{Condition, Host};
@@ -173,7 +173,9 @@ async fn replay_calculation(
     range: TimeRange,
     since: Timestamp,
 ) -> Result<(Vec<Replayed>, usize)> {
-    let question = rule.question().map_err(|error| anyhow!("{error}"))?;
+    let question = rule
+        .question(&sources.database.catalog())
+        .map_err(|error| anyhow!("{error}"))?;
     let result = calculations::answer(sources, &question, range, MAX_SERIES).await?;
     let window = rule.window();
     let hold = rule.hold;
@@ -185,7 +187,7 @@ async fn replay_calculation(
         .map(|line| (line.name, line.points))
         .collect();
     if lines.is_empty() && counts_nothing {
-        lines.push((question.metric.title.to_string(), Vec::new()));
+        lines.push((question.metric.title.clone(), Vec::new()));
     }
     let moments: Vec<Timestamp> = (0..)
         .map(|step| range.from + range.step * step)
@@ -212,7 +214,7 @@ async fn replay_calculation(
                         series: name,
                         online: true,
                         reporting: true,
-                        value: Some(bind_value(unit, value)),
+                        value: Some(bind_value(kind_of_unit(unit), value)),
                         metrics: BTreeMap::new(),
                         headings: BTreeMap::new(),
                     };
@@ -281,30 +283,36 @@ async fn replay_hosts(
     }
 
     // Every metric of every host, a few reads at a time.
-    let wanted: BTreeSet<&'static str> = conditions.uses().map(|used| used.metric.name).collect();
-    let reads: Vec<(String, &'static str)> = hosts
+    let wanted: BTreeMap<String, Arc<Metric>> = conditions
+        .uses()
+        .map(|used| (used.metric.name.clone(), used.metric.clone()))
+        .collect();
+    let reads: Vec<(String, Arc<Metric>)> = hosts
         .iter()
-        .flat_map(|host| wanted.iter().map(|name| (host.id.clone(), *name)))
+        .flat_map(|host| {
+            wanted
+                .values()
+                .map(|metric| (host.id.clone(), metric.clone()))
+        })
         .collect();
     // Made before they're run, so the stream holds nothing borrowed.
     let reading: Vec<_> = reads
         .into_iter()
-        .map(|(host_id, name)| {
+        .map(|(host_id, metric)| {
             let metrics = sources.metrics.clone();
             async move {
-                let metric = crate::metrics::find(name).context("unknown metric")?;
                 let result = metrics
-                    .series(&host_id, metric, range, MAX_SERIES_PER_HOST)
+                    .series(&host_id, &metric, range, MAX_SERIES_PER_HOST)
                     .await?;
-                anyhow::Ok((host_id, name, by_time(&result.series)))
+                anyhow::Ok((host_id, metric.name.clone(), by_time(&result.series)))
             }
         })
         .collect();
-    let read: Vec<Result<(String, &'static str, Readings)>> = stream::iter(reading)
+    let read: Vec<Result<(String, String, Readings)>> = stream::iter(reading)
         .buffer_unordered(READS_AT_ONCE)
         .collect()
         .await;
-    let mut by_host: HashMap<String, BTreeMap<&'static str, Readings>> = HashMap::new();
+    let mut by_host: HashMap<String, BTreeMap<String, Readings>> = HashMap::new();
     for each in read {
         let (host_id, name, readings) = each?;
         by_host.entry(host_id).or_default().insert(name, readings);
@@ -313,7 +321,7 @@ async fn replay_hosts(
     // Working it out is work for a thread of its own.
     let hold = rule.hold;
     let window = rule.window();
-    let tried: Vec<(String, CelValue, BTreeMap<&'static str, Readings>)> = hosts
+    let tried: Vec<(String, CelValue, BTreeMap<String, Readings>)> = hosts
         .iter()
         .map(|host| {
             let facts = facts_value(&shaped[&host.id]);
@@ -358,7 +366,7 @@ fn by_time(series: &[crate::metrics::Series]) -> Readings {
 
 /// What's stored of a host's metrics, and the moments to try a rule at.
 struct Past<'a> {
-    readings: &'a BTreeMap<&'static str, Readings>,
+    readings: &'a BTreeMap<String, Readings>,
     /// How far back a forecast's line is drawn.
     window: TimeDelta,
     /// The first moment tried.
@@ -400,11 +408,11 @@ fn replay_host(
     hostname: &str,
 ) -> (usize, usize, bool) {
     let readings = past.readings;
-    let fanned = conditions.fanned_out();
+    let fanned = conditions.series_sources();
     let mut series: Vec<String> = Vec::new();
     for used in &fanned {
         for name in readings
-            .get(used.metric.name)
+            .get(&used.metric.name)
             .into_iter()
             .flat_map(BTreeMap::keys)
         {
@@ -430,10 +438,10 @@ fn replay_host(
             let mut metrics = BTreeMap::new();
             let mut headings = BTreeMap::new();
             for used in conditions.uses() {
-                let by_series = readings.get(used.metric.name)?;
-                let one = || match used.metric.source {
-                    Source::Fields(_) => by_series.values().next(),
-                    _ => by_series.get(series),
+                let by_series = readings.get(&used.metric.name)?;
+                let one = || match used.metric.is_single() {
+                    true => by_series.values().next(),
+                    false => by_series.get(&conditions.series_of(&used.metric, series)),
                 };
                 if used.forecast {
                     let bound = match used.bracketed {
@@ -447,7 +455,7 @@ fn replay_host(
                         ),
                         false => Values::One(past.heading(one()?, *at)?),
                     };
-                    headings.insert(used.metric.name, bound);
+                    headings.insert(used.metric.name.clone(), bound);
                 } else {
                     let bound = match used.bracketed {
                         true => Values::Each(
@@ -458,7 +466,7 @@ fn replay_host(
                         ),
                         false => Values::One(*one()?.get(at)?),
                     };
-                    metrics.insert(used.metric.name, bound);
+                    metrics.insert(used.metric.name.clone(), bound);
                 }
             }
             let inputs = Inputs {
@@ -491,7 +499,7 @@ mod tests {
         from_ms(1_795_000_000_000 + minute * 60_000)
     }
 
-    fn disk(points: &[(&str, &[f64])]) -> BTreeMap<&'static str, Readings> {
+    fn disk(points: &[(&str, &[f64])]) -> BTreeMap<String, Readings> {
         let by_series = points
             .iter()
             .map(|(series, values)| {
@@ -503,10 +511,10 @@ mod tests {
                 (series.to_string(), by_time)
             })
             .collect();
-        BTreeMap::from([("disk.usage", by_series)])
+        BTreeMap::from([("disk.usage".to_string(), by_series)])
     }
 
-    fn past<'a>(readings: &'a BTreeMap<&'static str, Readings>) -> Past<'a> {
+    fn past<'a>(readings: &'a BTreeMap<String, Readings>) -> Past<'a> {
         Past {
             readings,
             window: TimeDelta::hours(1),
@@ -520,6 +528,7 @@ mod tests {
             Some("disk.usage > 80"),
             Some("disk.usage > 90"),
             Scope::Hosts,
+            &crate::alert_conditions::Names::built_in(),
         )
         .unwrap();
         let readings = disk(&[
@@ -565,6 +574,7 @@ mod tests {
             None,
             Some("forecast(disk.usage, duration('4h')) >= 100"),
             Scope::Hosts,
+            &crate::alert_conditions::Names::built_in(),
         )
         .unwrap();
         // Rising 6% an hour from 70%: at 76% it's on course to be full within 4 hours.

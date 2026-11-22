@@ -1136,20 +1136,13 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(AlertRules::EnabledChoice).boolean())
             .col(ColumnDef::new(AlertRules::ReplacesId).big_integer())
             // Where a template's alert comes among its alerts, and what only a
-            // template's alert has: which of what discovery found it's for.
+            // template's alert has: which of what discovery found it's for. Nothing
+            // keeps what discovery finds yet, so a rule with either isn't checked.
             .col(ColumnDef::new(AlertRules::TemplatePosition).integer())
             .col(ColumnDef::new(AlertRules::WhenCondition).text())
             .col(ColumnDef::new(AlertRules::Since).string_len(64))
             // When an upgrade last changed the built-in rule under someone's copy.
             .col(moment(backend, AlertRules::OriginalChangedAt))
-            // Until agents run templates, one whose alert needs what only they'd send,
-            // the template's own metrics or what its discovery finds, isn't checked.
-            .col(
-                ColumnDef::new(AlertRules::WaitsForAgents)
-                    .boolean()
-                    .not_null()
-                    .default(false),
-            )
             .col(moment(backend, AlertRules::DeletedAt))
             .foreign_key(
                 ForeignKey::create()
@@ -2175,7 +2168,6 @@ enum AlertRules {
     WhenCondition,
     Since,
     OriginalChangedAt,
-    WaitsForAgents,
     DeletedAt,
 }
 

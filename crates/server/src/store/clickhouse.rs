@@ -22,7 +22,7 @@ use tracing::warn;
 use super::flatten::{DataType, ENTRY_LABEL, Reported, flatten};
 use super::rollups::{
     EXPIRE_EVERY, FIVE_MINUTES, HOUR, RATE_LEAD, Retention, Tier, full_resolution_cutoff,
-    hours_to_redo, is_due, kept_since, metric_names, tier_for,
+    hours_to_redo, is_due, kept_since, tier_for,
 };
 use super::shared::{
     MAX_NAME_BYTES, MAX_SERIES_PER_HOST, StoredSeries, labels_key, rebuilt_output, shortened,
@@ -30,8 +30,9 @@ use super::shared::{
 };
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats, can_store};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP, numbered};
+use crate::catalog::SharedCatalog;
 use crate::metrics::{
-    LastSample, METRICS, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
+    Labelled, LastSample, Metric, NewestReading, Point, Reading, Series, SeriesQuery, SeriesResult,
     Source, Trend,
 };
 use crate::times::{self, Timestamp, hour_of};
@@ -573,6 +574,8 @@ pub struct ClickHouseStore {
     next_expiry: Timestamp,
     /// The last version rollups were written with, as each has to be higher.
     version: u64,
+    /// The metrics there are, which are what's rolled up.
+    catalog: SharedCatalog,
 }
 
 #[derive(Row, Deserialize)]
@@ -657,6 +660,7 @@ impl ClickHouseStore {
                         redo: redo.into_iter().map(|row| row.hour).collect(),
                         next_expiry: DateTime::<Utc>::MIN_UTC,
                         version: 0,
+                        catalog: SharedCatalog::default(),
                     })
                 })
             });
@@ -735,8 +739,11 @@ impl ClickHouseStore {
 
     /// Every catalog metric is rolled up this far, or `None` if one hasn't started.
     fn rolled_up_until(&self) -> Option<Timestamp> {
-        metric_names()
-            .map(|name| self.progress.get(name).copied())
+        self.catalog
+            .get()
+            .all()
+            .iter()
+            .map(|metric| self.progress.get(&metric.name).copied())
             .min()
             .flatten()
     }
@@ -745,12 +752,12 @@ impl ClickHouseStore {
     /// from those.
     async fn roll_up_hour(&self, metric: &Metric, hour: Timestamp, version: u64) -> Result<()> {
         let end = hour + HOUR;
-        let lead = if is_rate(metric.source) {
+        let lead = if is_rate(&metric.source) {
             RATE_LEAD
         } else {
             TimeDelta::zero()
         };
-        let name = quoted(metric.name);
+        let name = quoted(&metric.name);
         let sql = format!(
             "INSERT INTO rollups_five_minute
                  (metric, host_id, series, time, low, high, summed, samples, version)
@@ -806,11 +813,13 @@ impl ClickHouseStore {
         if !is_due(hour, now) {
             return Ok(false);
         }
-        let due: Vec<&'static Metric> = METRICS
+        let catalog = self.catalog.get();
+        let due: Vec<&Arc<Metric>> = catalog
+            .all()
             .iter()
             .filter(|metric| {
                 self.progress
-                    .get(metric.name)
+                    .get(&metric.name)
                     .is_none_or(|done| *done <= hour)
             })
             .collect();
@@ -818,7 +827,7 @@ impl ClickHouseStore {
         let progress: Vec<NewProgress> = due
             .iter()
             .map(|metric| NewProgress {
-                metric: metric.name.to_string(),
+                metric: metric.name.clone(),
                 done_until: hour + HOUR,
                 version,
             })
@@ -830,7 +839,7 @@ impl ClickHouseStore {
             self.insert("rollup_progress", &progress).await
         })?;
         for metric in due {
-            self.progress.insert(metric.name.to_string(), hour + HOUR);
+            self.progress.insert(metric.name.clone(), hour + HOUR);
         }
         Ok(true)
     }
@@ -841,11 +850,13 @@ impl ClickHouseStore {
             return Ok(false);
         };
         let version = self.next_version();
-        let done: Vec<&'static Metric> = METRICS
+        let catalog = self.catalog.get();
+        let done: Vec<&Arc<Metric>> = catalog
+            .all()
             .iter()
             .filter(|metric| {
                 self.progress
-                    .get(metric.name)
+                    .get(&metric.name)
                     .is_some_and(|done| *done > hour)
             })
             .collect();
@@ -955,6 +966,10 @@ impl Store for ClickHouseStore {
         result
     }
 
+    fn use_catalog(&mut self, catalog: SharedCatalog) {
+        self.catalog = catalog;
+    }
+
     fn reader(&self) -> Result<Arc<dyn MetricsReader>> {
         Ok(Arc::new(ClickHouseReader {
             client: self.client.clone(),
@@ -988,6 +1003,9 @@ fn stored_name(metric: &Metric, path: &str) -> String {
 enum Naming<'a> {
     Fixed(&'a str),
     Label(&'a str),
+    /// The values of these labels, of those the series has, as
+    /// [`crate::metrics::series_name`] writes them.
+    Labels(&'a [String]),
 }
 
 impl Naming<'_> {
@@ -995,12 +1013,25 @@ impl Naming<'_> {
         match self {
             Self::Fixed(name) => quoted(name),
             Self::Label(label) => format!("labels[{}]", quoted(label)),
+            Self::Labels([]) => "''".to_string(),
+            // Each label's value, with a backslash before a comma or a backslash,
+            // and a comma and a space between them. A label the series doesn't
+            // have is left out.
+            Self::Labels(labels) => {
+                let names: Vec<String> = labels.iter().map(|label| quoted(label)).collect();
+                format!(
+                    r"arrayStringConcat(arrayMap(
+                         l -> replaceAll(replaceAll(labels[l], '\\', '\\\\'), ',', '\\,'),
+                         arrayFilter(l -> mapContains(labels, l), [{}])), ', ')",
+                    names.join(", ")
+                )
+            }
         }
     }
 
     fn filter(&self) -> String {
         match self {
-            Self::Fixed(_) => String::new(),
+            Self::Fixed(_) | Self::Labels(_) => String::new(),
             Self::Label(label) => format!("AND mapContains(labels, {})", quoted(label)),
         }
     }
@@ -1034,7 +1065,7 @@ fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope:
 
 /// One row per value, as `agent`, `t`, `series` and `v`.
 fn readings(metric: &Metric, scope: &str) -> String {
-    match metric.source {
+    match &metric.source {
         Source::Fields(fields) => fields
             .iter()
             .map(|(name, reading)| reading_values(metric, *reading, &Naming::Fixed(name), scope))
@@ -1042,15 +1073,21 @@ fn readings(metric: &Metric, scope: &str) -> String {
             .join(" UNION ALL "),
         Source::Items { name, reading } => {
             let label = Naming::Label(name.trim_start_matches("$."));
-            reading_values(metric, reading, &label, scope)
+            reading_values(metric, *reading, &label, scope)
         }
         Source::Entries(reading) => {
-            reading_values(metric, reading, &Naming::Label(ENTRY_LABEL), scope)
+            reading_values(metric, *reading, &Naming::Label(ENTRY_LABEL), scope)
         }
+        Source::Labelled(Labelled { field, labels, .. }) => format!(
+            "SELECT host_id, time AS t, {series} AS series, value AS v
+             FROM samples WHERE metric = {name} AND {scope}",
+            series = Naming::Labels(labels).expression(),
+            name = quoted(&stored_name(metric, field)),
+        ),
     }
 }
 
-fn is_rate(source: Source) -> bool {
+fn is_rate(source: &Source) -> bool {
     match source {
         Source::Fields(fields) => fields
             .iter()
@@ -1058,6 +1095,7 @@ fn is_rate(source: Source) -> bool {
         Source::Items { reading, .. } | Source::Entries(reading) => {
             matches!(reading, Reading::Rate(_))
         }
+        Source::Labelled(labelled) => labelled.total,
     }
 }
 
@@ -1066,7 +1104,7 @@ fn is_rate(source: Source) -> bool {
 /// dropped.
 fn computed(metric: &Metric, scope: &str) -> String {
     let readings = readings(metric, scope);
-    let value = if is_rate(metric.source) {
+    let value = if is_rate(&metric.source) {
         "v * 1000.0 / nullIf(dateDiff('millisecond', lagInFrame(toNullable(t)) OVER (
              PARTITION BY host_id, series ORDER BY t
              ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
@@ -1201,7 +1239,7 @@ impl ClickHouseReader {
         let found: Vec<DoneRow> = wait(
             self.client
                 .query("SELECT done_until FROM rollup_progress FINAL WHERE metric = ?")
-                .bind(metric.name)
+                .bind(&metric.name)
                 .fetch_all(),
         )?;
         Ok(found.first().map(|row| row.done_until))
@@ -1221,7 +1259,7 @@ fn cells(
 ) -> String {
     let rolled = tier.table().zip(done);
     let samples_from = rolled.map_or(from, |(_, done)| from.max(done));
-    let lead = if is_rate(metric.source) {
+    let lead = if is_rate(&metric.source) {
         RATE_LEAD
     } else {
         TimeDelta::zero()
@@ -1240,7 +1278,7 @@ fn cells(
              FROM {table} FINAL
              WHERE metric = {name} AND {hosts} AND {}",
             time_between(from, to.min(done), "<"),
-            name = quoted(metric.name),
+            name = quoted(&metric.name),
         ));
     }
     cells
@@ -1480,7 +1518,7 @@ impl MetricsReader for ClickHouseReader {
         let range = query.range;
         let step = range.step.max(SMALLEST_STEP);
         let tier = tier_for(step, range.from, times::now(), &self.retention);
-        let done = self.rolled_up_until(query.metric)?;
+        let done = self.rolled_up_until(&query.metric)?;
         // The list of hosts is by far the longest part of the query, so it's only
         // written once, and the list of groups only if there's more than one.
         let (places, line) = if query.by_series {
@@ -1496,7 +1534,7 @@ impl MetricsReader for ClickHouseReader {
         };
         // Named lines measure different things, like memory and swap, so they can't be
         // combined. Lines of the same thing, like each disk, can.
-        let only_main_line = match query.metric.source {
+        let only_main_line = match &query.metric.source {
             Source::Fields([(name, _), _, ..]) if !query.by_series => {
                 format!("AND series = {}", quoted(name))
             }
@@ -1537,7 +1575,7 @@ impl MetricsReader for ClickHouseReader {
              WHERE position <= {max_lines}
              ORDER BY line, bucket",
             cells = cells(
-                query.metric,
+                &query.metric,
                 "has(chosen, host_id)",
                 (range.from, range.to),
                 tier,

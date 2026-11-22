@@ -149,7 +149,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             .list_alert_rules()
             .await?
             .into_iter()
-            .filter(|rule| rule.watched().is_some())
+            .filter(|rule| rule.watched(&state.catalog()).is_some())
             .map(|rule| rule.id)
             .collect();
         anyhow::Ok((open, resolved, problems, silences, charted))
@@ -244,7 +244,7 @@ async fn show(
             Source::Fields([_]) => watched.metric.title.to_string(),
             _ => match &alert.series {
                 Some(series) => format!("{} ({series})", watched.metric.title),
-                None => watched.metric.title.to_string(),
+                None => watched.metric.title.clone(),
             },
         };
         let levels: Vec<(&'static str, f64)> = watched
@@ -254,7 +254,7 @@ async fn show(
             .map(|(severity, value)| (severity.as_str(), value))
             .collect();
         let mut chart = metric_charts::build_with_thresholds(
-            watched.metric,
+            &watched.metric,
             watched.unit,
             &title,
             CHART_FRAME,

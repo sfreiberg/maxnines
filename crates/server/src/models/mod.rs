@@ -97,6 +97,7 @@ pub use self::users::{
 };
 use crate::alerting::NameTaken;
 use crate::audit::{Kind, Snapshot};
+use crate::catalog::{Catalog, SharedCatalog};
 use crate::facts::{FlatFacts, decode, encode, flatten, unflatten};
 use crate::host_filter;
 use crate::migrations::Migrator;
@@ -184,6 +185,8 @@ pub struct Database {
     /// Two connections using one agent's key mustn't both update its facts at once,
     /// or each would close the same facts and add its own.
     facts_locks: FactLocks,
+    /// The metrics there are, made again whenever templates change.
+    catalog: SharedCatalog,
 }
 
 /// A lock for each host whose facts are being saved, kept only while they are.
@@ -264,10 +267,24 @@ impl Database {
         Migrator::up(&connection, None)
             .await
             .context("updating the database schema")?;
-        Ok(Self {
+        let database = Self {
             connection,
             facts_locks: FactLocks::default(),
-        })
+            catalog: SharedCatalog::default(),
+        };
+        database.refresh_catalog().await?;
+        Ok(database)
+    }
+
+    /// The metrics there are now: the built-in ones and those of each template.
+    pub fn catalog(&self) -> Arc<Catalog> {
+        self.catalog.get()
+    }
+
+    /// The catalog for something that outlives a request, such as the metrics
+    /// store, to ask for again each time it needs it.
+    pub fn shared_catalog(&self) -> SharedCatalog {
+        self.catalog.clone()
     }
 
     pub async fn load_hosts(&self) -> Result<Vec<HostRecord>> {

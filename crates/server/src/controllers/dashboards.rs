@@ -21,7 +21,6 @@ use crate::dashboards::{
     self, COLUMNS, Dashboard, KINDS, Placed, Placement, WidgetInput, check_layout, check_name,
     grouping_fields,
 };
-use crate::metrics::METRICS;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -264,9 +263,9 @@ impl WidgetForm {
 
 /// A choice on the form.
 #[derive(Serialize)]
-struct Choice {
-    value: &'static str,
-    label: &'static str,
+struct Choice<'a> {
+    value: &'a str,
+    label: &'a str,
 }
 
 fn widget_form(
@@ -277,11 +276,13 @@ fn widget_form(
     form: &WidgetForm,
     error: Option<&str>,
 ) -> Response {
-    let metrics: Vec<Choice> = METRICS
+    let catalog = state.catalog();
+    let metrics: Vec<Choice> = catalog
+        .all()
         .iter()
         .map(|metric| Choice {
-            value: metric.name,
-            label: metric.title,
+            value: &metric.name,
+            label: &metric.title,
         })
         .collect();
     let calculations: Vec<Choice> = Calculation::ALL
@@ -348,7 +349,7 @@ async fn create_widget(
     let problem = if dashboard.is_full() {
         Err("This dashboard has as many widgets as it can.".to_string())
     } else {
-        input.check(&dashboard.variables)
+        input.check(&state.catalog(), &dashboard.variables)
     };
     if let Err(error) = problem {
         return widget_form(&state, &form.token, &dashboard, None, &fields, Some(&error));
@@ -424,7 +425,7 @@ async fn update_widget(
     };
     let fields = WidgetForm::from_fields(&form.fields);
     let input = fields.to_input(widget.input.placement);
-    if let Err(error) = input.check(&dashboard.variables) {
+    if let Err(error) = input.check(&state.catalog(), &dashboard.variables) {
         let id = Some(widget_id);
         return widget_form(&state, &form.token, &dashboard, id, &fields, Some(&error));
     }

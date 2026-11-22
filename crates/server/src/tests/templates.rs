@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
+use crate::catalog::Catalog;
 use crate::models::{Database, Imported, Origin};
 use crate::templates::Refused;
 use crate::templates::built_in::{self, BuiltIn, from_source};
@@ -75,7 +76,11 @@ async fn template_id(database: &Database, key: &str) -> i64 {
         .id
 }
 
-const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+/// The PostgreSQL example as the docs have it, which is refused for its metrics'
+/// names: see [`crate::templates::postgres_example`].
+const POSTGRES_AS_WRITTEN: &str = include_str!("../../../../docs/examples/postgres.hcl");
+static POSTGRES: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(crate::templates::postgres_example);
 const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 /// The rule in use for a template's alert, and the template's own beside it if
@@ -127,9 +132,9 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
 #[tokio::test]
 async fn a_template_goes_from_hcl_to_rows_to_hcl_and_back_to_the_same_rows() {
     let host = built_in::all().unwrap().remove(0).source;
-    for source in [POSTGRES, IIS, host.as_str()] {
+    for source in [POSTGRES.as_str(), IIS, host.as_str()] {
         let database = Database::for_test().await;
-        let template = crate::templates::load(source, &json!({})).unwrap();
+        let template = crate::templates::load(source, &json!({}), &Catalog::built_in()).unwrap();
         let id = database
             .create_template(&template, crate::times::now())
             .await
@@ -145,7 +150,7 @@ async fn a_template_goes_from_hcl_to_rows_to_hcl_and_back_to_the_same_rows() {
                 .any(|line| line.trim_start().starts_with('#')),
             "comments aren't kept"
         );
-        let again = crate::templates::load(&written, &json!({})).unwrap();
+        let again = crate::templates::load(&written, &json!({}), &Catalog::built_in()).unwrap();
         assert!(
             database
                 .update_template(id, &again, crate::times::now())
@@ -504,16 +509,49 @@ async fn peoples_own_templates_are_changed_directly_with_no_copies() {
 }
 
 #[tokio::test]
-async fn a_template_alert_on_its_own_metrics_waits_for_agents() {
+async fn a_template_alert_on_its_own_metrics_is_checked_unless_it_needs_discovery() {
     let database = Database::for_test().await;
-    let template = crate::templates::load(POSTGRES, &json!({})).unwrap();
+    let template =
+        crate::templates::load(POSTGRES.as_str(), &json!({}), &Catalog::built_in()).unwrap();
     let id = database
         .create_template(&template, crate::times::now())
         .await
         .unwrap();
     let alerts = database.template_alerts(id).await.unwrap();
     assert_eq!(alerts.len(), template.alerts.len());
-    assert!(alerts.iter().all(|alert| alert.rule.waits_for_agents()));
+    for (alert, written) in alerts.iter().zip(&template.alerts) {
+        // Its conditions are read with the template's own metrics, by their short
+        // names, as saving it read them.
+        let conditions = alert.rule.conditions.as_ref();
+        assert!(conditions.is_some(), "{}", alert.key);
+        // Only one for some of what discovery finds is left alone, as nothing
+        // keeps what discovery finds yet.
+        let picks = written.when.is_some() || written.since.is_some();
+        assert_eq!(alert.rule.waits_for_discovery(), picks, "{}", alert.key);
+        assert_eq!(
+            alert.rule.runs(),
+            written.enabled && !picks,
+            "{}",
+            alert.key
+        );
+    }
+    let waiting: Vec<&str> = alerts
+        .iter()
+        .filter(|alert| alert.rule.waits_for_discovery())
+        .map(|alert| alert.key.as_str())
+        .collect();
+    assert_eq!(
+        waiting,
+        [
+            "checksum_failures",
+            "replica_lagging",
+            "replica_not_receiving",
+            "standby_lagging",
+            "too_few_standbys",
+            "slot_lost",
+            "archiving_failing"
+        ]
+    );
     let off = alerts
         .iter()
         .find(|alert| alert.rule.rule.name == "Too few standbys")
@@ -559,8 +597,8 @@ async fn api(server: &TestServer, method: &str, path: &str, body: &Value) -> (u1
 #[tokio::test]
 async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_names() {
     let server = start().await;
-    let postgres = include_str!("../../../../docs/examples/postgres.hcl");
-    let template = crate::templates::load(postgres, &json!({})).unwrap();
+    let postgres = POSTGRES.as_str();
+    let template = crate::templates::load(postgres, &json!({}), &Catalog::built_in()).unwrap();
     server
         .state
         .database
@@ -573,7 +611,9 @@ async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_n
     let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(status, 200, "{shown}");
     assert_eq!(shown["template"]["alert"], "replica_lagging");
-    assert_eq!(shown["template"]["waits_for_agents"], true);
+    assert_eq!(shown["template"]["key"], "pg");
+    // It's only for replicas, and nothing keeps which those are yet.
+    assert_eq!(shown["template"]["waits_for_discovery"], true);
 
     let mut changed = shown.clone();
     changed["warning"] = json!("lag > duration('1m')");
@@ -623,8 +663,8 @@ async fn with_built_in_templates() -> TestServer {
 #[tokio::test]
 async fn the_templates_pages_show_each_templates_alerts_metrics_and_hcl() {
     let server = with_built_in_templates().await;
-    let postgres = include_str!("../../../../docs/examples/postgres.hcl");
-    let template = crate::templates::load(postgres, &json!({})).unwrap();
+    let postgres = POSTGRES.as_str();
+    let template = crate::templates::load(postgres, &json!({}), &Catalog::built_in()).unwrap();
     let id = server
         .state
         .database
@@ -649,9 +689,9 @@ async fn the_templates_pages_show_each_templates_alerts_metrics_and_hcl() {
     for expected in [
         "Replica lagging",
         "<code>lag &gt; duration(&#39;30s&#39;)</code>",
-        "postgres.slot_retained",
+        "pg.slot_retained",
         "Not checked yet",
-        "template &quot;postgres&quot;",
+        "template &quot;pg&quot;",
     ] {
         assert!(page.body.contains(expected), "{expected}\n{}", page.body);
     }
@@ -1090,8 +1130,8 @@ async fn cel_fields_get_suggestions_from_the_real_catalog() {
             .contains(r#"<script src="/assets/js/cel_complete.js""#)
     );
 
-    let postgres = include_str!("../../../../docs/examples/postgres.hcl");
-    let template = crate::templates::load(postgres, &json!({})).unwrap();
+    let postgres = POSTGRES.as_str();
+    let template = crate::templates::load(postgres, &json!({}), &Catalog::built_in()).unwrap();
     let id = server
         .state
         .database
@@ -1103,7 +1143,7 @@ async fn cel_fields_get_suggestions_from_the_real_catalog() {
     let end = start + form.body[start..].find('"').unwrap();
     let local: Value =
         serde_json::from_str(&form.body[start..end].replace("&quot;", "\"")).unwrap();
-    assert_eq!(local["prefix"], "postgres");
+    assert_eq!(local["prefix"], "pg");
     assert!(
         local["metrics"]
             .as_array()
@@ -1251,14 +1291,14 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
             &server,
             "/templates/import",
             "/templates/import",
-            &[("hcl", POSTGRES)],
+            &[("hcl", POSTGRES.as_str())],
         )
         .await;
     assert_eq!(page.status, 200, "{}", page.body);
     for expected in [
         "This would add a template.",
         "Replica lagging",
-        "postgres.slot_retained",
+        "pg.slot_retained",
         "FROM pg_stat_replication",
         "invalidation_reason IS NOT NULL",
         r#"name="confirm""#,
@@ -1293,11 +1333,11 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
             &server,
             "/templates/import",
             "/templates/import",
-            &[("hcl", POSTGRES), ("confirm", "yes")],
+            &[("hcl", POSTGRES.as_str()), ("confirm", "yes")],
         )
         .await;
     assert_eq!(page.status, 303, "{}", page.body);
-    let id = template_id(&server.state.database, "postgres").await;
+    let id = template_id(&server.state.database, "pg").await;
 
     // A newer version says what it would change.
     let newer = POSTGRES.replace("connections_used > 80", "connections_used > 70");
@@ -1324,7 +1364,7 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
     assert!(
         page.header("content-disposition")
             .unwrap()
-            .contains("postgres.hcl")
+            .contains("pg.hcl")
     );
     let stored = server
         .state
@@ -1509,7 +1549,8 @@ async fn a_newer_version_turns_things_on_and_off_until_someone_chooses() {
 #[tokio::test]
 async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
     let database = Database::for_test().await;
-    let mut template = crate::templates::load(POSTGRES, &json!({})).unwrap();
+    let mut template =
+        crate::templates::load(POSTGRES.as_str(), &json!({}), &Catalog::built_in()).unwrap();
     let id = database
         .create_template(&template, crate::times::now())
         .await
@@ -1574,7 +1615,7 @@ async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
     added.fills.clear();
     added.metrics.clear();
     template.queries.push(added);
-    let problems = crate::templates::check(&template, &json!({}));
+    let problems = crate::templates::check(&template, &json!({}), &Catalog::built_in());
     assert!(problems.is_empty(), "{problems:?}");
     database
         .update_template(id, &template, crate::times::now())
@@ -1601,7 +1642,7 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
     let database = &server.state.database;
 
     // An import replaced by a newer one.
-    let iis = crate::templates::load(IIS, &json!({})).unwrap();
+    let iis = crate::templates::load(IIS, &json!({}), &Catalog::built_in()).unwrap();
     let (id, _) = database
         .import_template(&iis, crate::times::now())
         .await
@@ -1637,10 +1678,10 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
 
     // A built-in one, as the server starts with a newer version of it.
     database
-        .sync_templates(&shipped(&[POSTGRES]), crate::times::now())
+        .sync_templates(&shipped(&[POSTGRES.as_str()]), crate::times::now())
         .await
         .unwrap();
-    let postgres = template_id(database, "postgres").await;
+    let postgres = template_id(database, "pg").await;
     let ids = database.template_part_ids(postgres).await;
     let sessions = ids["query sessions"];
     database.set_query_choice(sessions, Some(false)).await;
@@ -1657,7 +1698,7 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
     // One of their own, saved from its form.
     let own = parse(
         &POSTGRES
-            .replace("\"postgres\" {", "\"mine\" {")
+            .replace("\"pg\" {", "\"mine\" {")
             .replace("\"PostgreSQL\"", "\"Mine\"")
             .replace("PostgreSQL down", "Mine down"),
     )
@@ -1735,7 +1776,7 @@ async fn the_documented_examples_are_served_to_read_and_import() {
     let mut browser = Browser::default();
     let page = browser.get(&server, "/docs/templates").await;
     assert_eq!(page.status, 200);
-    for (file, text) in [("postgres.hcl", POSTGRES), ("iis.hcl", IIS)] {
+    for (file, text) in [("postgres.hcl", POSTGRES_AS_WRITTEN), ("iis.hcl", IIS)] {
         assert!(
             page.body
                 .contains(&format!(r#"href="/docs/examples/{file}""#)),
@@ -1751,4 +1792,153 @@ async fn the_documented_examples_are_served_to_read_and_import() {
         browser.get(&server, "/docs/examples/nope.hcl").await.status,
         404
     );
+}
+
+/// A template whose own alert watches its own metrics, with a series for each
+/// region of each database it runs for.
+const SHOP: &str = r#"template "shop" {
+  name     = "Shop"
+  database = "postgres"
+  query "orders" {
+    sql    = "SELECT region, count(*) AS waiting FROM orders GROUP BY region"
+    labels = ["region"]
+  }
+  query "tills" {
+    sql = "SELECT count(*) AS tills FROM tills"
+  }
+  alert "backlog" {
+    name             = "Orders backing up"
+    warning          = "waiting > 10"
+    summary          = "{{ hostname }}: {{ waiting }} orders waiting in {{ labels.region }} on {{ instance }}, with {{ tills }} tills"
+    resolved_summary = "{{ hostname }}: {{ labels.region }} on {{ instance }} is down to {{ shop.waiting }}"
+  }
+}"#;
+
+/// Stores what an agent running the shop's template would send, straight through
+/// the metrics writer, and waits until it's stored.
+async fn store_shop(server: &TestServer, host_id: &str, time: Timestamp, waiting: u64) {
+    let rows = json!([
+        { "labels": { "instance": "main", "region": "north" }, "waiting": waiting },
+        { "labels": { "instance": "main", "region": "south" }, "waiting": 2 },
+        { "labels": { "instance": "main" }, "tills": 3 },
+    ]);
+    let (acks, mut stored) = tokio::sync::mpsc::channel(1);
+    let command = crate::store::WriterCommand::SaveAndAck {
+        sample: crate::store::NewSample {
+            host_id: host_id.to_string(),
+            hostname: "web-1".to_string(),
+            sample: Sample {
+                time,
+                metrics: BTreeMap::from([("template.shop".to_string(), rows)]),
+            },
+        },
+        acks,
+    };
+    server.state.writer.send(command).await.unwrap();
+    assert_eq!(stored.recv().await, Some(time));
+}
+
+#[tokio::test]
+async fn a_templates_metrics_are_listed_charted_and_alerted_on_like_any_other() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let database = &server.state.database;
+    let template = crate::templates::load(SHOP, &json!({}), &database.catalog()).unwrap();
+    let id = database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    let first = crate::times::now() - TimeDelta::seconds(2);
+    store_shop(&server, &host.id(), first, 40).await;
+
+    // Listed with what the template says of it.
+    let listed = json_body(
+        &server
+            .http("GET", "/api/v1/metrics", Some(&server.api_key))
+            .await,
+    );
+    let waiting = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|metric| metric["name"] == "shop.waiting")
+        .unwrap();
+    assert_eq!(waiting["template"], "shop");
+    assert_eq!(waiting["collector"], "template.shop");
+
+    // Charted on the host's page and read through the API, a series for each region.
+    let path = format!("/api/v1/hosts/{}/metrics/shop.waiting", host.id());
+    let read = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    let names: Vec<&str> = read["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|series| series["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["main, north", "main, south"]);
+    let mut browser = Browser::default();
+    let page = browser
+        .get(&server, &format!("/hosts/{}/metrics", host.id()))
+        .await;
+    assert_eq!(page.status, 200);
+    assert!(page.body.contains("Shop waiting"), "{}", page.body);
+
+    // Its alert is checked, and only the region over the line fires, saying what
+    // the template's other metrics and labels are.
+    let mut evaluator = crate::alert_evaluator::Evaluator::new(
+        &server.state,
+        crate::times::now() - TimeDelta::hours(1),
+    );
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    let open = database.open_alerts().await.unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].series.as_deref(), Some("main, north"));
+    assert_eq!(
+        open[0].summary,
+        "web-1: 40 orders waiting in north on main, with 3 tills"
+    );
+
+    let second = crate::times::now() - TimeDelta::seconds(1);
+    store_shop(&server, &host.id(), second, 4).await;
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert!(database.open_alerts().await.unwrap().is_empty());
+    let resolved = database.resolved_alerts(10).await.unwrap();
+    assert_eq!(
+        resolved[0].resolved_summary.as_deref(),
+        Some("web-1: north on main is down to 4")
+    );
+
+    // Turned off, its metrics go from what's read straight away, and come back.
+    database
+        .set_template_enabled(id, false, crate::times::now())
+        .await
+        .unwrap();
+    assert!(database.catalog().find("shop.waiting").is_none());
+    let read = server.http("GET", &path, Some(&server.api_key)).await;
+    assert!(read.starts_with("HTTP/1.1 404"), "{read}");
+    database
+        .set_template_enabled(id, true, crate::times::now())
+        .await
+        .unwrap();
+    assert!(database.catalog().find("shop.waiting").is_some());
+}
+
+#[tokio::test]
+async fn a_template_alert_with_no_samples_yet_does_not_fire() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let _client = server.connect_approved(&host, "web-1").await;
+    let database = &server.state.database;
+    let template = crate::templates::load(SHOP, &json!({}), &database.catalog()).unwrap();
+    database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    let mut evaluator = crate::alert_evaluator::Evaluator::new(
+        &server.state,
+        crate::times::now() - TimeDelta::hours(1),
+    );
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert!(database.open_alerts().await.unwrap().is_empty());
 }

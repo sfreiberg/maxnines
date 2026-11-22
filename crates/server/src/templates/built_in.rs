@@ -8,6 +8,8 @@ use serde_json::{Map, Value};
 
 use maxnines_protocol::templates::{Template, to_hcl};
 
+use crate::catalog::Catalog;
+
 #[derive(RustEmbed)]
 #[folder = "templates/"]
 #[include = "*.hcl"]
@@ -54,7 +56,9 @@ pub fn all() -> Result<Vec<BuiltIn>> {
 
 /// A built-in template from its file, read and checked.
 pub fn from_source(source: String) -> Result<BuiltIn> {
-    let template = super::load(&source, &Value::Object(Map::new()))?;
+    // A built-in template is checked against the metrics the code has, as it's
+    // read before there's a database to have any others.
+    let template = super::load(&source, &Value::Object(Map::new()), &Catalog::built_in())?;
     Ok(BuiltIn {
         fingerprint: fingerprint(&template),
         template,

@@ -18,7 +18,8 @@ use cel::extractors::Arguments;
 use cel::{Context as CelContext, Env, ExecutionError, Program, Value as CelValue};
 use chrono::TimeDelta;
 
-use crate::metrics::{self, METRICS, Metric, Source, Unit};
+use crate::catalog::Catalog;
+use crate::metrics::{self, Kind, Metric, Source, Unit};
 
 /// What the database column holds, with room to spare for anyone's condition.
 pub const MAX_CONDITION_LEN: usize = 2000;
@@ -106,7 +107,10 @@ pub enum Scope {
 /// A metric as a condition uses it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricUse {
-    pub metric: &'static Metric,
+    pub metric: Arc<Metric>,
+    /// Its name as the condition writes it, which for a template's own can be
+    /// its short one, `lag` for `postgres.lag`.
+    pub written: String,
     /// Picked out with brackets, `cpu.load['5 minutes']`, so it's a map of each
     /// series to its value rather than one value.
     pub bracketed: bool,
@@ -116,67 +120,69 @@ pub struct MetricUse {
     pub forecast: bool,
 }
 
-/// What kind of value a template's own metric is, as far as can be told before an
-/// agent sends one: a query's column could be a number, a length of time or a yes or
-/// no until the database says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LocalKind {
-    Number,
-    Seconds,
-    Flag,
-    Unknown,
+/// Where a condition's names are looked up: the metrics there are, and for a
+/// template's alert, the template whose metrics it can use by their short names,
+/// `lag` for `postgres.lag`.
+#[derive(Debug, Clone, Copy)]
+pub struct Names<'a> {
+    pub catalog: &'a Catalog,
+    pub template: Option<&'a str>,
 }
 
-impl LocalKind {
-    fn sample(self) -> CelValue {
-        match self {
-            Self::Number | Self::Unknown => CelValue::Float(50.0),
-            Self::Seconds => duration(50.0),
-            Self::Flag => CelValue::Bool(true),
+#[cfg(test)]
+impl Names<'static> {
+    /// Only the metrics named in code, for tests that have no templates.
+    pub fn built_in() -> Self {
+        static BUILT_IN: LazyLock<Catalog> = LazyLock::new(Catalog::built_in);
+        Self::of(&BUILT_IN)
+    }
+}
+
+impl<'a> Names<'a> {
+    /// For a rule that isn't a template's.
+    pub fn of(catalog: &'a Catalog) -> Self {
+        Self {
+            catalog,
+            template: None,
         }
     }
-}
 
-/// One of a template's own metrics.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LocalMetric {
-    pub kind: LocalKind,
-    /// What tells its series apart, such as `slot`. Metrics pair up when these match.
-    pub labels: Vec<String>,
-}
-
-/// A template's own metrics, which its conditions use by their short names, `lag`,
-/// or by their full ones, `postgres.lag`.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct LocalMetrics {
-    /// The template's key, which starts their full names.
-    pub prefix: String,
-    pub metrics: BTreeMap<String, LocalMetric>,
-}
-
-impl LocalMetrics {
-    /// The short name of the metric a dotted name means, if it's one of these.
-    fn find(&self, name: &[String]) -> Option<String> {
-        let short = match name {
-            [short] => short,
-            [prefix, short] if *prefix == self.prefix => short,
-            _ => return None,
-        };
-        self.metrics.contains_key(short).then(|| short.clone())
+    /// The metric a dotted name means: the template's own by its short name first,
+    /// then any by its full name.
+    fn find(&self, name: &[String]) -> Option<&'a Arc<Metric>> {
+        if let (Some(template), [short]) = (self.template, name)
+            && let Some(own) = self.catalog.find_known(&format!("{template}.{short}"))
+        {
+            return Some(own);
+        }
+        self.catalog.find_known(&name.join("."))
     }
 
-    fn full_name(&self, short: &str) -> String {
-        format!("{}.{short}", self.prefix)
+    /// The metric a name starts with, the longest that fits, and how many of its
+    /// parts that takes.
+    fn metric_in(&self, name: &[String]) -> Option<(&'a Arc<Metric>, usize)> {
+        (1..=name.len())
+            .rev()
+            .find_map(|parts| Some((self.find(&name[..parts])?, parts)))
     }
-}
 
-/// One of a template's own metrics as a condition uses it.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LocalUse {
-    pub short: String,
-    pub bracketed: bool,
-    pub picked: Option<String>,
-    pub forecast: bool,
+    /// The name closest to a mistyped one: a short name of the template's own, or
+    /// any metric's full name.
+    fn closest(&self, name: &str) -> Option<String> {
+        let prefix = self.template.map(|template| format!("{template}."));
+        let own = self
+            .template
+            .into_iter()
+            .flat_map(|template| self.catalog.of_template(template))
+            .filter_map(|metric| metric.name.strip_prefix(prefix.as_deref()?));
+        let all = self.catalog.all().iter().map(|metric| metric.name.as_str());
+        own.map(|name| (0, name))
+            .chain(all.map(|name| (1, name)))
+            .map(|(order, known)| (strsim::levenshtein(name, known), order, known))
+            .filter(|(distance, ..)| *distance <= 3)
+            .min()
+            .map(|(_, _, closest)| closest.to_string())
+    }
 }
 
 /// A condition, read and ready to work out.
@@ -186,8 +192,6 @@ pub struct Condition {
     /// The condition with every metric named as it's bound.
     expr: IdedExpr,
     uses: Vec<MetricUse>,
-    /// A template's own metrics it uses, which only a template's checks bind.
-    local: Vec<LocalUse>,
     variables: BTreeSet<Variable>,
 }
 
@@ -218,24 +222,6 @@ fn name_of(expr: &Expr) -> Option<Vec<String>> {
     }
 }
 
-/// The metric a name starts with, the longest that fits, and how many of its parts
-/// that takes.
-fn metric_in(name: &[String]) -> Option<(&'static Metric, usize)> {
-    (1..=name.len())
-        .rev()
-        .find_map(|parts| Some((metrics::find(&name[..parts].join("."))?, parts)))
-}
-
-/// The catalog's name closest to a mistyped one.
-fn closest_metric(name: &str) -> Option<&'static str> {
-    METRICS
-        .iter()
-        .map(|metric| (strsim::levenshtein(name, metric.name), metric.name))
-        .filter(|(distance, _)| *distance <= 3)
-        .min()
-        .map(|(_, closest)| closest)
-}
-
 fn string_literal(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Literal(LiteralValue::String(text)) => Some(text.inner().to_string()),
@@ -246,9 +232,8 @@ fn string_literal(expr: &Expr) -> Option<String> {
 /// Reads a condition's names, binding each metric under its own name.
 struct Reader<'a> {
     scope: Scope,
-    local_metrics: Option<&'a LocalMetrics>,
+    names: Names<'a>,
     uses: Vec<MetricUse>,
-    local: Vec<LocalUse>,
     variables: BTreeSet<Variable>,
     functions: BTreeSet<String>,
     /// Names a macro such as `exists` brings in.
@@ -260,53 +245,10 @@ impl Reader<'_> {
         ensure!(
             self.scope == Scope::Hosts,
             "a rule with a calculation watches the calculated value, like value > 80, not {}",
-            used.metric.name
+            used.written
         );
         self.uses.push(used);
         Ok(())
-    }
-
-    /// The template's own metric most like a name that isn't one, if any is close.
-    fn closest_local(&self, name: &str) -> Option<String> {
-        let local = self.local_metrics?;
-        local
-            .metrics
-            .keys()
-            .map(|short| (strsim::levenshtein(name, short), short))
-            .filter(|(distance, _)| *distance <= 3)
-            .min()
-            .map(|(_, short)| short.clone())
-    }
-
-    /// Notes a template's own metric being used, giving the name it's bound as.
-    fn use_local(&mut self, used: LocalUse) -> Result<String> {
-        let local = self.local_metrics.expect("only found with local metrics");
-        let full = local.full_name(&used.short);
-        ensure!(
-            self.scope == Scope::Hosts,
-            "a rule with a calculation watches the calculated value, like value > 80, not {full}"
-        );
-        let bound = match used.forecast {
-            true => format!("forecast:{full}"),
-            false => full,
-        };
-        self.local.push(used);
-        Ok(bound)
-    }
-
-    /// The template's own metric an expression names, by itself or picked out with
-    /// brackets, and whether it's bracketed.
-    fn local_named(&self, expr: &Expr) -> Option<(String, bool)> {
-        let local = self.local_metrics?;
-        let (target, bracketed) = match expr {
-            Expr::Call(call) if is_index(call) => (&call.args[0].expr, true),
-            other => (other, false),
-        };
-        let name = name_of(target)?;
-        if self.locals.contains(&name[0]) {
-            return None;
-        }
-        Some((local.find(&name)?, bracketed))
     }
 
     fn read(&mut self, expr: &mut IdedExpr) -> Result<()> {
@@ -365,17 +307,7 @@ impl Reader<'_> {
             return Ok(());
         }
         let whole = name.join(".");
-        if let Some(short) = self.local_metrics.and_then(|local| local.find(name)) {
-            let full = self.use_local(LocalUse {
-                short,
-                bracketed: false,
-                picked: None,
-                forecast: false,
-            })?;
-            expr.expr = Expr::Ident(full);
-            return Ok(());
-        }
-        if let Some((metric, parts)) = metric_in(name) {
+        if let Some((metric, parts)) = self.names.metric_in(name) {
             ensure!(
                 parts == name.len(),
                 "{} has no part called {:?}",
@@ -383,12 +315,13 @@ impl Reader<'_> {
                 name[parts..].join(".")
             );
             self.use_metric(MetricUse {
-                metric,
+                metric: metric.clone(),
+                written: whole,
                 bracketed: false,
                 picked: None,
                 forecast: false,
             })?;
-            expr.expr = Expr::Ident(metric.name.to_string());
+            expr.expr = Expr::Ident(metric.name.clone());
             return Ok(());
         }
         let variable = Variable::ALL
@@ -406,10 +339,7 @@ impl Reader<'_> {
             (Some(_), Scope::Calculation) => bail!(
                 "a rule with a calculation watches the calculated value, like value > 80, not {whole}"
             ),
-            (None, _) => match self
-                .closest_local(&whole)
-                .or_else(|| closest_metric(&whole).map(str::to_string))
-            {
+            (None, _) => match self.names.closest(&whole) {
                 Some(closest) => bail!("there's no metric called {whole}: did you mean {closest}?"),
                 None => bail!(
                     "{whole} isn't a metric or anything else a condition knows: it can use metrics by their names, facts, online, reporting, hostname and series"
@@ -420,7 +350,7 @@ impl Reader<'_> {
 
     /// The metric an expression names, by itself or picked out with brackets, and
     /// whether it's bracketed.
-    fn metric_named(&self, expr: &Expr) -> Option<(&'static Metric, bool)> {
+    fn metric_named(&self, expr: &Expr) -> Option<(Arc<Metric>, String, bool)> {
         let (target, bracketed) = match expr {
             Expr::Call(call) if is_index(call) => (&call.args[0].expr, true),
             other => (other, false),
@@ -429,40 +359,20 @@ impl Reader<'_> {
         if self.locals.contains(&name[0]) {
             return None;
         }
-        Some((metrics::find(&name.join("."))?, bracketed))
+        Some((self.names.find(&name)?.clone(), name.join("."), bracketed))
     }
 
     /// Binds a metric written by itself or picked out with brackets, as a forecast's
     /// starting point if it's in `forecast()`. False if it isn't a metric.
     fn metric_argument(&mut self, expr: &mut IdedExpr, forecast: bool) -> Result<bool> {
-        if let Some((short, bracketed)) = self.local_named(&expr.expr) {
-            let picked = match &expr.expr {
-                Expr::Call(call) if bracketed => string_literal(&call.args[1].expr),
-                _ => None,
-            };
-            let bound = Expr::Ident(self.use_local(LocalUse {
-                short,
-                bracketed,
-                picked,
-                forecast,
-            })?);
-            match &mut expr.expr {
-                Expr::Call(call) if bracketed => {
-                    call.args[0].expr = bound;
-                    self.read(&mut call.args[1])?;
-                }
-                _ => expr.expr = bound,
-            }
-            return Ok(true);
-        }
-        let Some((metric, bracketed)) = self.metric_named(&expr.expr) else {
+        let Some((metric, written, bracketed)) = self.metric_named(&expr.expr) else {
             return Ok(false);
         };
         let picked = match &expr.expr {
             Expr::Call(call) if bracketed => string_literal(&call.args[1].expr),
             _ => None,
         };
-        if let (Source::Fields(fields), Some(picked)) = (metric.source, &picked) {
+        if let (Source::Fields(fields), Some(picked)) = (&metric.source, &picked) {
             ensure!(
                 fields.iter().any(|(field, _)| field == picked),
                 "{} has no series called {picked:?}: it has {}",
@@ -470,17 +380,18 @@ impl Reader<'_> {
                 parts_of(fields)
             );
         }
+        let bound = Expr::Ident(if forecast {
+            heading_name(&metric)
+        } else {
+            metric.name.clone()
+        });
         self.use_metric(MetricUse {
             metric,
+            written,
             bracketed,
             picked,
             forecast,
         })?;
-        let bound = Expr::Ident(if forecast {
-            heading_name(metric)
-        } else {
-            metric.name.to_string()
-        });
         match &mut expr.expr {
             Expr::Call(call) if bracketed => {
                 call.args[0].expr = bound;
@@ -592,11 +503,21 @@ pub fn facts_value(facts: &serde_json::Value) -> CelValue {
 }
 
 /// A reading as a condition sees it: a length of time for a metric in seconds, so
-/// it's compared with `duration('5m')`, and a number otherwise.
-pub fn bind_value(unit: Unit, value: f64) -> CelValue {
+/// it's compared with `duration('5m')`, true or false for a template's yes or no,
+/// and a number otherwise.
+pub fn bind_value(kind: Kind, value: f64) -> CelValue {
+    match kind {
+        Kind::Seconds => duration(value),
+        Kind::Flag => CelValue::Bool(value != 0.0),
+        Kind::Number | Kind::Unknown => CelValue::Float(value),
+    }
+}
+
+/// What a value in a unit is to a condition.
+pub fn kind_of_unit(unit: Unit) -> Kind {
     match unit {
-        Unit::Seconds => duration(value),
-        _ => CelValue::Float(value),
+        Unit::Seconds => Kind::Seconds,
+        _ => Kind::Number,
     }
 }
 
@@ -607,11 +528,11 @@ pub struct Heading {
     pub slope_per_sec: f64,
 }
 
-fn heading_value(unit: Unit, heading: Heading) -> CelValue {
+fn heading_value(kind: Kind, heading: Heading) -> CelValue {
     let fields: HashMap<String, CelValue> = HashMap::from([
         ("value".to_string(), CelValue::Float(heading.value)),
         ("slope".to_string(), CelValue::Float(heading.slope_per_sec)),
-        ("seconds".to_string(), CelValue::Bool(unit == Unit::Seconds)),
+        ("seconds".to_string(), CelValue::Bool(kind == Kind::Seconds)),
     ]);
     fields.into()
 }
@@ -708,12 +629,7 @@ pub fn is_function(name: &str) -> bool {
 impl Condition {
     /// Reads a condition, refusing one that isn't CEL, uses a name nothing has, or
     /// uses a metric in a way that can't work.
-    pub fn compile(text: &str, scope: Scope) -> Result<Self> {
-        Self::compile_in(text, scope, None)
-    }
-
-    /// Reads a condition that can use a template's own metrics as well.
-    pub fn compile_in(text: &str, scope: Scope, local: Option<&LocalMetrics>) -> Result<Self> {
+    pub fn compile(text: &str, scope: Scope, names: &Names) -> Result<Self> {
         ensure!(!text.trim().is_empty(), "a condition can't be empty");
         ensure!(
             text.len() <= MAX_CONDITION_LEN,
@@ -723,9 +639,8 @@ impl Condition {
         let mut expr = program.expression().clone();
         let mut reader = Reader {
             scope,
-            local_metrics: local,
+            names: *names,
             uses: Vec::new(),
-            local: Vec::new(),
             variables: BTreeSet::new(),
             functions: BTreeSet::new(),
             locals: Vec::new(),
@@ -738,7 +653,6 @@ impl Condition {
             text: text.to_string(),
             expr,
             uses: reader.uses,
-            local: reader.local,
             variables: reader.variables,
         })
     }
@@ -781,13 +695,13 @@ impl Condition {
         }
         let used = self.uses.first().filter(|used| !used.forecast);
         let watched = |expr: &IdedExpr| match (&expr.expr, used) {
-            (Expr::Ident(name), Some(used)) if !used.bracketed && used.metric.name == name => {
-                Some((Some(used.metric.name), None))
+            (Expr::Ident(name), Some(used)) if !used.bracketed && used.metric.name == *name => {
+                Some((Some(used.metric.name.clone()), None))
             }
             (Expr::Ident(name), None) if name == Variable::Value.name() => Some((None, None)),
             (Expr::Call(call), Some(used)) if call.func_name == operators::INDEX => {
                 matches!(&call.args[0].expr, Expr::Ident(name) if *name == used.metric.name)
-                    .then(|| (Some(used.metric.name), used.picked.clone()))
+                    .then(|| (Some(used.metric.name.clone()), used.picked.clone()))
             }
             _ => None,
         };
@@ -826,7 +740,7 @@ impl Condition {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Threshold {
     /// The metric, or none for a calculation's value.
-    pub metric: Option<&'static str>,
+    pub metric: Option<String>,
     /// The series picked out with brackets, if one is.
     pub picked: Option<String>,
     pub level: f64,
@@ -852,15 +766,22 @@ pub struct Inputs<'a> {
     pub reporting: bool,
     /// The calculated value, for a rule with a calculation.
     pub value: Option<CelValue>,
-    pub metrics: BTreeMap<&'static str, Values<f64>>,
-    pub headings: BTreeMap<&'static str, Values<Heading>>,
+    pub metrics: BTreeMap<String, Values<f64>>,
+    pub headings: BTreeMap<String, Values<Heading>>,
 }
 
 /// What conditions are worked out against.
 pub struct Bindings(CelContext<'static, 'static>);
 
 impl Inputs<'_> {
-    pub fn bind(&self) -> Bindings {
+    /// Everything bound for `conditions`, each metric as the kind of value they
+    /// take it to be.
+    pub fn bind(&self, conditions: &Conditions) -> Bindings {
+        self.bind_as(&conditions.kinds)
+    }
+
+    fn bind_as(&self, kinds: &BTreeMap<String, Kind>) -> Bindings {
+        let kind_of = |name: &str| kinds.get(name).copied().unwrap_or(Kind::Number);
         let mut context = BASE.new_inner_scope();
         context.add_variable_from_value(Variable::Facts.name(), self.facts.clone());
         context.add_variable_from_value(Variable::Hostname.name(), self.hostname.to_string());
@@ -871,32 +792,28 @@ impl Inputs<'_> {
             context.add_variable_from_value(Variable::Value.name(), value.clone());
         }
         for (name, values) in &self.metrics {
-            let Some(metric) = metrics::find(name) else {
-                continue;
-            };
+            let kind = kind_of(name);
             let bound = match values {
-                Values::One(value) => bind_value(metric.unit, *value),
+                Values::One(value) => bind_value(kind, *value),
                 Values::Each(each) => each
                     .iter()
-                    .map(|(series, value)| (series.clone(), bind_value(metric.unit, *value)))
+                    .map(|(series, value)| (series.clone(), bind_value(kind, *value)))
                     .collect::<HashMap<String, CelValue>>()
                     .into(),
             };
-            context.add_variable_from_value(*name, bound);
+            context.add_variable_from_value(name.clone(), bound);
         }
         for (name, headings) in &self.headings {
-            let Some(metric) = metrics::find(name) else {
-                continue;
-            };
+            let kind = kind_of(name);
             let bound = match headings {
-                Values::One(heading) => heading_value(metric.unit, *heading),
+                Values::One(heading) => heading_value(kind, *heading),
                 Values::Each(each) => each
                     .iter()
-                    .map(|(series, heading)| (series.clone(), heading_value(metric.unit, *heading)))
+                    .map(|(series, heading)| (series.clone(), heading_value(kind, *heading)))
                     .collect::<HashMap<String, CelValue>>()
                     .into(),
             };
-            context.add_variable_from_value(heading_name(metric), bound);
+            context.add_variable_from_value(format!("forecast:{name}"), bound);
         }
         Bindings(context)
     }
@@ -907,22 +824,43 @@ impl Inputs<'_> {
 pub struct Conditions {
     pub warning: Option<Condition>,
     pub critical: Option<Condition>,
+    /// What kind of value each metric they use is bound as. One whose kind only a
+    /// database knows, a column of a template's query, is the first of a number, a
+    /// length of time and a yes or no that the conditions work with.
+    kinds: BTreeMap<String, Kind>,
+}
+
+/// What a metric's series are, so two metrics used by themselves only pair up when
+/// their series name the same things, such as mount points.
+#[derive(Debug, PartialEq, Eq)]
+enum SeriesKind<'a> {
+    /// One for each item a collector lists, by the field that names it.
+    Named(&'a str, &'a str),
+    /// One for each set of a template's labels.
+    Labelled(&'a str, &'a [String]),
+}
+
+fn series_kind(metric: &Metric) -> Option<SeriesKind<'_>> {
+    match &metric.source {
+        Source::Fields(_) => None,
+        Source::Items { name, .. } => Some(SeriesKind::Named(&metric.collector, name)),
+        Source::Entries(_) => Some(SeriesKind::Named(&metric.collector, "")),
+        Source::Labelled(labelled) if labelled.labels.is_empty() => None,
+        Source::Labelled(labelled) => {
+            Some(SeriesKind::Labelled(&metric.collector, &labelled.labels))
+        }
+    }
 }
 
 impl Conditions {
     /// Reads a rule's conditions, and checks they can work together: metrics with a
     /// series for each of something are worked out for each, so the ones used by
     /// themselves have to be about the same things to pair up.
-    pub fn compile(warning: Option<&str>, critical: Option<&str>, scope: Scope) -> Result<Self> {
-        Self::compile_in(warning, critical, scope, None)
-    }
-
-    /// Reads conditions that can use a template's own metrics as well.
-    pub fn compile_in(
+    pub fn compile(
         warning: Option<&str>,
         critical: Option<&str>,
         scope: Scope,
-        local: Option<&LocalMetrics>,
+        names: &Names,
     ) -> Result<Self> {
         ensure!(
             warning.is_some() || critical.is_some(),
@@ -930,80 +868,87 @@ impl Conditions {
         );
         let read = |text: Option<&str>, which: &str| {
             text.map(|text| {
-                Condition::compile_in(text, scope, local)
+                Condition::compile(text, scope, names)
                     .map_err(|error| anyhow!("the {which} condition: {error:#}"))
             })
             .transpose()
         };
-        let conditions = Self {
+        let mut conditions = Self {
             warning: read(warning, "warning")?,
             critical: read(critical, "critical")?,
+            kinds: BTreeMap::new(),
         };
         conditions.check_series()?;
-        if let Some(local) = local {
-            conditions.check_local_series(local)?;
-        }
+        conditions.kinds = conditions.settled_kinds();
         Ok(conditions)
     }
 
-    /// The template's own metrics they use, each time they use one.
-    pub fn local_uses(&self) -> impl Iterator<Item = &LocalUse> {
-        let warning = self.warning.iter().flat_map(|condition| &condition.local);
-        let critical = self.critical.iter().flat_map(|condition| &condition.local);
-        warning.chain(critical)
-    }
-
-    /// Whether they use any of a template's own metrics, which only an agent running
-    /// the template sends.
-    pub fn uses_local(&self) -> bool {
-        self.local_uses().next().is_some()
-    }
-
-    /// A template's own metrics used by themselves are worked out for each series, so
-    /// those with labels have to have the same ones to pair up, and can't pair with a
-    /// metric that has a series for each disk or such.
-    fn check_local_series(&self, local: &LocalMetrics) -> Result<()> {
-        let uses: Vec<&LocalUse> = self.local_uses().collect();
-        for used in &uses {
-            let both = uses.iter().any(|other| {
-                other.short == used.short
-                    && other.bracketed != used.bracketed
-                    && other.forecast == used.forecast
-            });
-            ensure!(
-                !both,
-                "{} is used both with and without brackets, which can't be worked out together: pick a series with brackets each time, or none",
-                used.short
-            );
-        }
-        let labelled: Vec<(&str, &Vec<String>)> = uses
-            .iter()
-            .filter(|used| !used.bracketed)
-            .map(|used| (used.short.as_str(), &local.metrics[&used.short].labels))
-            .filter(|(_, labels)| !labels.is_empty())
+    /// The kind of value each metric is bound as. Those that aren't known are tried
+    /// every way, while there are few enough, or all the same way, and the first
+    /// way the conditions work with is the one. With none, they're numbers, and
+    /// trying the conditions says what's wrong.
+    fn settled_kinds(&self) -> BTreeMap<String, Kind> {
+        let mut kinds: BTreeMap<String, Kind> = self
+            .uses()
+            .map(|used| (used.metric.name.clone(), used.metric.kind))
             .collect();
-        fn sorted(labels: &[String]) -> BTreeSet<&String> {
-            labels.iter().collect()
+        let unknown: Vec<String> = kinds
+            .iter()
+            .filter(|(_, kind)| **kind == Kind::Unknown)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if unknown.is_empty() {
+            return kinds;
         }
-        if let Some((first, labels)) = labelled.first()
-            && let Some((other, theirs)) = labelled
+        const CHOICES: [Kind; 3] = [Kind::Number, Kind::Seconds, Kind::Flag];
+        let ways: Vec<Vec<Kind>> = match u32::try_from(unknown.len()) {
+            Ok(count) if count <= 5 => (0..3usize.pow(count))
+                .map(|mut way| {
+                    (0..unknown.len())
+                        .map(|_| {
+                            let kind = CHOICES[way % 3];
+                            way /= 3;
+                            kind
+                        })
+                        .collect()
+                })
+                .collect(),
+            _ => CHOICES
                 .iter()
-                .find(|(_, theirs)| sorted(theirs) != sorted(labels))
-        {
-            bail!(
-                "{first} and {other} have series labelled differently ({} and {}), so they can't be paired up: pick a series of one of them with brackets, like {other}['name']",
-                labels.join(", "),
-                theirs.join(", ")
-            );
+                .map(|kind| vec![*kind; unknown.len()])
+                .collect(),
+        };
+        let nothing = serde_json::Value::Null;
+        let mut chosen = vec![Kind::Number; unknown.len()];
+        for way in ways {
+            kinds.extend(unknown.iter().cloned().zip(way.iter().copied()));
+            if self.try_on_samples(&nothing, Unit::Number, &kinds).is_ok() {
+                chosen = way;
+                break;
+            }
         }
-        if let (Some((first, _)), Some(fanned)) = (labelled.first(), self.fanned_out().first()) {
-            bail!(
-                "{first} and {} have series of different things, so they can't be paired up: pick a series of one of them with brackets, like {}['name']",
-                fanned.metric.name,
-                fanned.metric.name
-            );
+        kinds.extend(unknown.into_iter().zip(chosen));
+        kinds
+    }
+
+    /// What kind of value a metric the conditions use is bound as.
+    pub fn kind_of(&self, metric: &Metric) -> Kind {
+        self.kinds.get(&metric.name).copied().unwrap_or(metric.kind)
+    }
+
+    /// A reading of a metric as people read it, in the unit the conditions take it
+    /// to be in.
+    pub fn format(&self, metric: &Metric, value: f64) -> String {
+        match (metric.kind, self.kind_of(metric)) {
+            (Kind::Unknown, Kind::Seconds) => {
+                crate::metric_charts::format_value(Unit::Seconds, value)
+            }
+            (Kind::Unknown, Kind::Flag) => match value != 0.0 {
+                true => "yes".to_string(),
+                false => "no".to_string(),
+            },
+            _ => metric.format(value),
         }
-        Ok(())
     }
 
     /// Each condition with the severity it's for, mildest first.
@@ -1033,18 +978,18 @@ impl Conditions {
     }
 
     /// The metrics whose newest readings are needed.
-    pub fn read_metrics(&self) -> BTreeSet<&'static str> {
+    pub fn read_metrics(&self) -> BTreeMap<String, Arc<Metric>> {
         self.uses()
             .filter(|used| !used.forecast)
-            .map(|used| used.metric.name)
+            .map(|used| (used.metric.name.clone(), used.metric.clone()))
             .collect()
     }
 
     /// The metrics whose forecasts are needed.
-    pub fn forecast_metrics(&self) -> BTreeSet<&'static str> {
+    pub fn forecast_metrics(&self) -> BTreeMap<String, Arc<Metric>> {
         self.uses()
             .filter(|used| used.forecast)
-            .map(|used| used.metric.name)
+            .map(|used| (used.metric.name.clone(), used.metric.clone()))
             .collect()
     }
 
@@ -1053,7 +998,7 @@ impl Conditions {
     pub fn fanned_out(&self) -> Vec<&MetricUse> {
         let mut fanned: Vec<&MetricUse> = Vec::new();
         for used in self.uses() {
-            let each = !used.bracketed && !matches!(used.metric.source, Source::Fields(_));
+            let each = !used.bracketed && !used.metric.is_single();
             if each
                 && !fanned.iter().any(|seen| {
                     seen.metric.name == used.metric.name && seen.forecast == used.forecast
@@ -1065,11 +1010,49 @@ impl Conditions {
         fanned
     }
 
+    /// The labels of the series the rule is worked out for each of, where they're
+    /// a template's: those of the metric with the most, which the others' are among.
+    pub fn series_labels(&self) -> &[String] {
+        self.fanned_out()
+            .into_iter()
+            .map(|used| used.metric.labels())
+            .max_by_key(|labels| labels.len())
+            .unwrap_or_default()
+    }
+
+    /// Of [`Self::fanned_out`], the metrics whose series are the ones the rule is
+    /// worked out for: all of them, but for a template's, only those with every
+    /// label, as one with fewer has a series for several of the others'.
+    pub fn series_sources(&self) -> Vec<&MetricUse> {
+        let widest = self.series_labels().len();
+        self.fanned_out()
+            .into_iter()
+            .filter(|used| used.metric.labels().len() == widest)
+            .collect()
+    }
+
+    /// The name of a metric's series that goes with `series`, one of those the rule
+    /// is worked out for: the same, but for a template's metric with fewer labels,
+    /// the one with the same values for the labels it has.
+    pub fn series_of(&self, metric: &Metric, series: &str) -> String {
+        let widest = self.series_labels();
+        let labels = metric.labels();
+        if labels.is_empty() || labels == widest {
+            return series.to_string();
+        }
+        let values = metrics::series_values(series);
+        let value_of = |label: &String| {
+            let at = widest.iter().position(|each| each == label)?;
+            values.get(at).map(String::as_str)
+        };
+        metrics::series_name(labels.iter().filter_map(value_of))
+    }
+
     fn check_series(&self) -> Result<()> {
         let uses: Vec<&MetricUse> = self.uses().collect();
         for used in &uses {
-            let name = used.metric.name;
-            if let (Source::Fields(fields), false) = (used.metric.source, used.bracketed)
+            let name = &used.written;
+            if let (Source::Fields(fields), false) = (&used.metric.source, used.bracketed)
                 && fields.len() > 1
             {
                 bail!(
@@ -1079,7 +1062,7 @@ impl Conditions {
                 );
             }
             let both = uses.iter().any(|other| {
-                other.metric.name == name
+                other.metric.name == used.metric.name
                     && other.bracketed != used.bracketed
                     && other.forecast == used.forecast
             });
@@ -1089,17 +1072,52 @@ impl Conditions {
             );
         }
         let fanned = self.fanned_out();
-        if let Some((first, rest)) = fanned.split_first()
-            && let Some(other) = rest
-                .iter()
-                .find(|other| series_kind(other.metric) != series_kind(first.metric))
-        {
-            bail!(
-                "{} and {} have series of different things, so they can't be paired up: pick a series of one of them with brackets, like {}['name']",
-                first.metric.name,
-                other.metric.name,
-                other.metric.name
-            );
+        // The first of those with the most labels, as it's the one named first.
+        let Some(widest) = fanned
+            .iter()
+            .rev()
+            .max_by_key(|used| used.metric.labels().len())
+            .copied()
+        else {
+            return Ok(());
+        };
+        for other in &fanned {
+            let kinds = (series_kind(&widest.metric), series_kind(&other.metric));
+            let (first, other) = (&widest.written, &other.written);
+            match kinds {
+                (one, two) if one == two => {}
+                // A template's metric with some of another's labels has a series
+                // for each of the other's that share them.
+                (
+                    Some(SeriesKind::Labelled(collector, most)),
+                    Some(SeriesKind::Labelled(theirs, fewer)),
+                ) if collector == theirs => {
+                    // Which database a series is from goes without saying.
+                    let said = |labels: &[String]| {
+                        let own: Vec<&str> = labels
+                            .iter()
+                            .filter(|label| *label != metrics::INSTANCE_LABEL)
+                            .map(String::as_str)
+                            .collect();
+                        own.join(", ")
+                    };
+                    ensure!(
+                        fewer.iter().all(|label| most.contains(label)),
+                        "{} and {} have series labelled differently ({} and {}), so they can't be paired up: pick a series of one of them with brackets, like {}['name']",
+                        first,
+                        other,
+                        said(most),
+                        said(fewer),
+                        other
+                    );
+                }
+                _ => bail!(
+                    "{} and {} have series of different things, so they can't be paired up: pick a series of one of them with brackets, like {}['name']",
+                    first,
+                    other,
+                    other
+                ),
+            }
         }
         Ok(())
     }
@@ -1108,151 +1126,38 @@ impl Conditions {
     /// from a real host if there is one, and says what's wrong in plain words. A fact
     /// that isn't there is fine, as hosts differ.
     pub fn dry_run(&self, facts: &serde_json::Value, value_unit: Unit) -> Result<()> {
-        self.dry_run_in(facts, value_unit, None)
+        self.try_on_samples(facts, value_unit, &self.kinds)
     }
 
-    /// The same, with a template's own metrics bound as well. One whose kind can't be
-    /// told yet, a query's column, is tried as each kind it could be, and the
-    /// conditions only have to work for one way of choosing them.
-    pub fn dry_run_in(
+    fn try_on_samples(
         &self,
         facts: &serde_json::Value,
         value_unit: Unit,
-        local: Option<&LocalMetrics>,
+        kinds: &BTreeMap<String, Kind>,
     ) -> Result<()> {
-        let inputs = self.sample_inputs(facts, value_unit);
-        let mut unknown: Vec<&str> = Vec::new();
-        if let Some(local) = local {
-            for used in self.local_uses() {
-                if local.metrics[&used.short].kind == LocalKind::Unknown
-                    && !unknown.contains(&used.short.as_str())
-                {
-                    unknown.push(&used.short);
-                }
-            }
-        }
-        const CHOICES: [LocalKind; 3] = [LocalKind::Number, LocalKind::Seconds, LocalKind::Flag];
-        // Every way of choosing, while there are few enough; otherwise the same kind
-        // for all of them.
-        let ways: Vec<Vec<LocalKind>> = match u32::try_from(unknown.len()) {
-            Ok(count) if count <= 5 => (0..3usize.pow(count))
-                .map(|mut way| {
-                    (0..unknown.len())
-                        .map(|_| {
-                            let kind = CHOICES[way % 3];
-                            way /= 3;
-                            kind
-                        })
-                        .collect()
-                })
-                .collect(),
-            _ => CHOICES
-                .iter()
-                .map(|kind| vec![*kind; unknown.len()])
-                .collect(),
-        };
-        let mut first_error = None;
-        for way in ways {
-            let mut bindings = inputs.bind();
-            if let Some(local) = local {
-                let kind_of = |short: &str| match unknown.iter().position(|name| *name == short) {
-                    Some(at) => way[at],
-                    None => local.metrics[short].kind,
-                };
-                self.bind_local(&mut bindings, local, &kind_of);
-            }
-            let tried = self
-                .levels()
-                .into_iter()
-                .try_for_each(|(severity, condition)| {
-                    condition
-                        .dry_run(&bindings)
-                        .map_err(|error| anyhow!("the {} condition: {error:#}", severity.as_str()))
-                });
-            match tried {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        Err(first_error.expect("there's always a way to try"))
-    }
-
-    /// Binds a sample of each of a template's own metrics that's used, as `kind_of` says.
-    fn bind_local(
-        &self,
-        bindings: &mut Bindings,
-        local: &LocalMetrics,
-        kind_of: &dyn Fn(&str) -> LocalKind,
-    ) {
-        let mut picked: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
-        for used in self.local_uses() {
-            picked
-                .entry(&used.short)
-                .or_default()
-                .extend(used.picked.clone());
-        }
-        for used in self.local_uses() {
-            let sample = kind_of(&used.short).sample();
-            let full = local.full_name(&used.short);
-            let value = match used.bracketed {
-                true => picked[used.short.as_str()]
-                    .iter()
-                    .map(|series| (series.clone(), sample.clone()))
-                    .collect::<HashMap<String, CelValue>>()
-                    .into(),
-                false => sample,
-            };
-            let name = match used.forecast {
-                true => format!("forecast:{full}"),
-                false => full,
-            };
-            let value = match used.forecast {
-                // A forecast's starting point, as a catalog metric's is bound.
-                true => {
-                    let heading = |value: &CelValue| {
-                        let unit = match value {
-                            CelValue::Duration(_) => Unit::Seconds,
-                            _ => Unit::Number,
-                        };
-                        heading_value(
-                            unit,
-                            Heading {
-                                value: 50.0,
-                                slope_per_sec: 0.0,
-                            },
-                        )
-                    };
-                    match &value {
-                        CelValue::Map(map) => map
-                            .map
-                            .iter()
-                            .map(|(key, value)| (key.clone(), heading(value)))
-                            .collect::<HashMap<cel::objects::Key, CelValue>>()
-                            .into(),
-                        other => heading(other),
-                    }
-                }
-                false => value,
-            };
-            bindings.0.add_variable_from_value(name, value);
-        }
+        let bindings = self.sample_inputs(facts, value_unit).bind_as(kinds);
+        self.levels()
+            .into_iter()
+            .try_for_each(|(severity, condition)| {
+                condition
+                    .dry_run(&bindings)
+                    .map_err(|error| anyhow!("the {} condition: {error:#}", severity.as_str()))
+            })
     }
 
     fn sample_inputs(&self, facts: &serde_json::Value, value_unit: Unit) -> Inputs<'static> {
         // Every series a condition picks out by name, so a picked one is there.
-        let mut picked: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+        let mut picked: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
         for used in self.uses() {
-            let names = picked.entry(used.metric.name).or_default();
+            let names = picked.entry(&used.metric.name).or_default();
             names.extend(used.picked.clone());
-            if let Source::Fields(fields) = used.metric.source {
+            if let Source::Fields(fields) = &used.metric.source {
                 names.extend(fields.iter().map(|(name, _)| name.to_string()));
             }
         }
         let sample = 50.0;
         let values = |used: &MetricUse| -> BTreeMap<String, f64> {
-            picked[used.metric.name]
+            picked[used.metric.name.as_str()]
                 .iter()
                 .map(|name| (name.clone(), sample))
                 .collect()
@@ -1263,12 +1168,12 @@ impl Conditions {
             series: "/",
             online: true,
             reporting: true,
-            value: Some(bind_value(value_unit, sample)),
+            value: Some(bind_value(kind_of_unit(value_unit), sample)),
             metrics: BTreeMap::new(),
             headings: BTreeMap::new(),
         };
         for used in self.uses() {
-            let name = used.metric.name;
+            let name = used.metric.name.clone();
             if used.forecast {
                 let heading = Heading {
                     value: sample,
@@ -1290,16 +1195,6 @@ impl Conditions {
             }
         }
         inputs
-    }
-}
-
-/// What a metric's series are, so two metrics used by themselves only pair up when
-/// their series name the same things, such as mount points.
-fn series_kind(metric: &Metric) -> Option<(&'static str, &'static str)> {
-    match metric.source {
-        Source::Fields(_) => None,
-        Source::Items { name, .. } => Some((metric.collector, name)),
-        Source::Entries(_) => Some((metric.collector, "")),
     }
 }
 
@@ -1444,11 +1339,11 @@ impl Condition {
         let timed = self
             .uses
             .iter()
-            .find(|used| used.metric.unit == Unit::Seconds);
+            .find(|used| used.metric.kind == Kind::Seconds);
         match timed {
             Some(used) if problem.contains("length of time") => format!(
                 "{problem}: {} is a length of time, so compare it with one, like duration('30s')",
-                used.metric.name
+                used.written
             ),
             _ => problem,
         }
@@ -1492,14 +1387,28 @@ mod tests {
     use crate::alerting::Severity;
     use serde_json::json;
 
+    impl Inputs<'_> {
+        /// Bound as the built-in metrics are: lengths of time for those in seconds.
+        fn bind_built_in(&self) -> Bindings {
+            let kinds = self
+                .metrics
+                .keys()
+                .chain(self.headings.keys())
+                .filter_map(|name| Some((name.clone(), metrics::find(name)?.kind)))
+                .collect();
+            self.bind_as(&kinds)
+        }
+    }
+
     fn hosts(text: &str) -> Result<Condition> {
-        Condition::compile(text, Scope::Hosts)
+        Condition::compile(text, Scope::Hosts, &Names::built_in())
     }
 
     fn error(text: &str) -> String {
-        let read = Conditions::compile(None, Some(text), Scope::Hosts).and_then(|conditions| {
-            conditions.dry_run(&json!({ "cpu": { "logical_cores": 8 } }), Unit::Number)
-        });
+        let read = Conditions::compile(None, Some(text), Scope::Hosts, &Names::built_in())
+            .and_then(|conditions| {
+                conditions.dry_run(&json!({ "cpu": { "logical_cores": 8 } }), Unit::Number)
+            });
         format!("{:#}", read.unwrap_err())
     }
 
@@ -1514,14 +1423,17 @@ mod tests {
             online: true,
             reporting: true,
             value: None,
-            metrics: metrics.iter().cloned().collect(),
+            metrics: metrics
+                .iter()
+                .map(|(name, values)| (name.to_string(), values.clone()))
+                .collect(),
             headings: BTreeMap::new(),
         }
     }
 
     #[test]
     fn every_metric_can_be_written_by_its_name() {
-        for metric in METRICS {
+        for metric in metrics::built_in() {
             let condition = hosts(&format!("{} == 1", metric.name))
                 .unwrap_or_else(|error| panic!("{}: {error:#}", metric.name));
             assert_eq!(condition.uses()[0].metric.name, metric.name);
@@ -1538,26 +1450,26 @@ mod tests {
     #[test]
     fn metrics_are_compared_by_their_names() {
         let condition = hosts("disk.usage > 90").unwrap();
-        let full = inputs(&[("disk.usage", Values::One(95.0))]).bind();
-        let fine = inputs(&[("disk.usage", Values::One(50.0))]).bind();
+        let full = inputs(&[("disk.usage", Values::One(95.0))]).bind_built_in();
+        let fine = inputs(&[("disk.usage", Values::One(50.0))]).bind_built_in();
         assert!(condition.holds(&full));
         assert!(!condition.holds(&fine));
         // Missing isn't true.
-        assert!(!condition.holds(&inputs(&[]).bind()));
+        assert!(!condition.holds(&inputs(&[]).bind_built_in()));
     }
 
     #[test]
     fn seconds_are_lengths_of_time_and_bytes_have_units() {
         let lag = hosts("clock.difference > duration('30s')").unwrap();
-        assert!(lag.holds(&inputs(&[("clock.difference", Values::One(31.0))]).bind()));
-        assert!(!lag.holds(&inputs(&[("clock.difference", Values::One(29.0))]).bind()));
+        assert!(lag.holds(&inputs(&[("clock.difference", Values::One(31.0))]).bind_built_in()));
+        assert!(!lag.holds(&inputs(&[("clock.difference", Values::One(29.0))]).bind_built_in()));
 
         let memory = hosts("process.memory > gib(2) && process.memory < tib(1)").unwrap();
         let three = 3.0 * 1024.0 * 1024.0 * 1024.0;
-        assert!(memory.holds(&inputs(&[("process.memory", Values::One(three))]).bind()));
-        assert!(!memory.holds(&inputs(&[("process.memory", Values::One(1024.0))]).bind()));
+        assert!(memory.holds(&inputs(&[("process.memory", Values::One(three))]).bind_built_in()));
+        assert!(!memory.holds(&inputs(&[("process.memory", Values::One(1024.0))]).bind_built_in()));
         let small = hosts("process.memory > kib(1) + mib(1)").unwrap();
-        assert!(small.holds(&inputs(&[("process.memory", Values::One(three))]).bind()));
+        assert!(small.holds(&inputs(&[("process.memory", Values::One(three))]).bind_built_in()));
     }
 
     #[test]
@@ -1569,8 +1481,8 @@ mod tests {
                 ("5 minutes".to_string(), five),
             ]))
         };
-        assert!(load.holds(&inputs(&[("cpu.load", each(6.0))]).bind()));
-        assert!(!load.holds(&inputs(&[("cpu.load", each(2.0))]).bind()));
+        assert!(load.holds(&inputs(&[("cpu.load", each(6.0))]).bind_built_in()));
+        assert!(!load.holds(&inputs(&[("cpu.load", each(2.0))]).bind_built_in()));
         assert_eq!(load.uses()[0].picked.as_deref(), Some("5 minutes"));
         assert!(load.uses()[0].bracketed);
     }
@@ -1578,12 +1490,12 @@ mod tests {
     #[test]
     fn host_series_online_and_reporting_can_be_used() {
         let condition = hosts("series != '/boot' && hostname == 'web-1' && online && reporting && facts.os.family == 'linux'").unwrap();
-        assert!(condition.holds(&inputs(&[]).bind()));
+        assert!(condition.holds(&inputs(&[]).bind_built_in()));
         let offline = hosts("!online").unwrap();
         let mut gone = inputs(&[]);
         gone.online = false;
-        assert!(offline.holds(&gone.bind()));
-        assert!(!offline.holds(&inputs(&[]).bind()));
+        assert!(offline.holds(&gone.bind_built_in()));
+        assert!(!offline.holds(&inputs(&[]).bind_built_in()));
     }
 
     #[test]
@@ -1591,7 +1503,7 @@ mod tests {
         let filling = hosts("forecast(disk.usage, duration('4h')) >= 100").unwrap();
         let heading = |slope_per_hour: f64| Inputs {
             headings: BTreeMap::from([(
-                "disk.usage",
+                "disk.usage".to_string(),
                 Values::One(Heading {
                     value: 90.0,
                     slope_per_sec: slope_per_hour / 3600.0,
@@ -1599,14 +1511,14 @@ mod tests {
             )]),
             ..inputs(&[])
         };
-        assert!(filling.holds(&heading(3.0).bind()));
-        assert!(!filling.holds(&heading(2.0).bind()));
+        assert!(filling.holds(&heading(3.0).bind_built_in()));
+        assert!(!filling.holds(&heading(2.0).bind_built_in()));
         assert!(filling.uses()[0].forecast);
 
         let lag = hosts("forecast(clock.difference, duration('1h')) > duration('1m')").unwrap();
         let drifting = Inputs {
             headings: BTreeMap::from([(
-                "clock.difference",
+                "clock.difference".to_string(),
                 Values::One(Heading {
                     value: 30.0,
                     slope_per_sec: 1.0 / 60.0,
@@ -1614,15 +1526,16 @@ mod tests {
             )]),
             ..inputs(&[])
         };
-        assert!(lag.holds(&drifting.bind()));
+        assert!(lag.holds(&drifting.bind_built_in()));
     }
 
     #[test]
     fn a_calculation_is_about_its_value() {
-        let busy = Condition::compile("value > 80", Scope::Calculation).unwrap();
+        let busy =
+            Condition::compile("value > 80", Scope::Calculation, &Names::built_in()).unwrap();
         let mut line = inputs(&[]);
         line.value = Some(CelValue::Float(85.0));
-        assert!(busy.holds(&line.bind()));
+        assert!(busy.holds(&line.bind_built_in()));
         assert_eq!(
             busy.threshold().map(|threshold| threshold.level),
             Some(80.0)
@@ -1635,7 +1548,7 @@ mod tests {
         ] {
             let error = format!(
                 "{:#}",
-                Condition::compile(text, Scope::Calculation).unwrap_err()
+                Condition::compile(text, Scope::Calculation, &Names::built_in()).unwrap_err()
             );
             assert!(error.contains(expected), "{text}: {error}");
         }
@@ -1714,6 +1627,7 @@ mod tests {
             None,
             Some("facts.virtualization.role == 'guest'"),
             Scope::Hosts,
+            &Names::built_in(),
         )
         .unwrap()
         .dry_run(&json!({}), Unit::Number)
@@ -1723,13 +1637,19 @@ mod tests {
             None,
             Some("cpu.load['5 minutes'] > facts.cpu.logical_cores"),
             Scope::Hosts,
+            &Names::built_in(),
         )
         .unwrap()
         .dry_run(&serde_json::Value::Null, Unit::Number)
         .unwrap();
         // A calculation's value is in its metric's unit.
-        let lag =
-            Conditions::compile(None, Some("value > duration('2s')"), Scope::Calculation).unwrap();
+        let lag = Conditions::compile(
+            None,
+            Some("value > duration('2s')"),
+            Scope::Calculation,
+            &Names::built_in(),
+        )
+        .unwrap();
         lag.dry_run(&json!({}), Unit::Seconds).unwrap();
         assert!(lag.dry_run(&json!({}), Unit::Number).is_err());
     }
@@ -1740,12 +1660,13 @@ mod tests {
             Some("disk.usage > 80"),
             Some("disk.usage > 90 && disk.inodes > 80"),
             Scope::Hosts,
+            &Names::built_in(),
         )
         .unwrap();
         let fanned: Vec<&str> = conditions
             .fanned_out()
             .iter()
-            .map(|used| used.metric.name)
+            .map(|used| used.metric.name.as_str())
             .collect();
         assert_eq!(fanned, ["disk.usage", "disk.inodes"]);
         assert_eq!(conditions.primary().unwrap().metric.name, "disk.usage");
@@ -1762,13 +1683,14 @@ mod tests {
             None,
             Some("disk.usage > 90 && check.up['www'] == 0"),
             Scope::Hosts,
+            &Names::built_in(),
         )
         .unwrap();
     }
 
     #[test]
     fn whole_numbers_mix_with_metrics_and_facts() {
-        let at = |usage: f64| inputs(&[("cpu.usage", Values::One(usage))]).bind();
+        let at = |usage: f64| inputs(&[("cpu.usage", Values::One(usage))]).bind_built_in();
         for text in [
             "cpu.usage / 2 > 40",
             "cpu.usage * 100 > 8000",
@@ -1784,7 +1706,7 @@ mod tests {
         ] {
             let condition = hosts(text).unwrap_or_else(|error| panic!("{text}: {error:#}"));
             assert!(condition.holds(&at(81.0)), "{text}");
-            Conditions::compile(None, Some(text), Scope::Hosts)
+            Conditions::compile(None, Some(text), Scope::Hosts, &Names::built_in())
                 .unwrap()
                 .dry_run(&json!({ "cpu": { "logical_cores": 4 } }), Unit::Number)
                 .unwrap_or_else(|error| panic!("{text}: {error:#}"));

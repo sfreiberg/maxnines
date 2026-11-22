@@ -177,7 +177,7 @@ async fn start_on(
 
 async fn start_with_heartbeat(
     config: &str,
-    store: Box<dyn Store>,
+    mut store: Box<dyn Store>,
     reader: Arc<dyn MetricsReader>,
     saved: Saved,
     folder: Option<tempfile::TempDir>,
@@ -229,6 +229,7 @@ async fn start_with_heartbeat(
         .await
         .unwrap();
     let status = Arc::new(ServerStatus::new(None).unwrap());
+    store.use_catalog(database.shared_catalog());
     let (writer, _thread) = spawn_writer(store, status.writes.clone());
     let proxies = crate::proxies::Proxies::new(config.trusted_networks().unwrap());
     proxies.set_decisions(&database.list_proxies().await.unwrap());
@@ -3842,7 +3843,7 @@ async fn stored_points(server: &TestServer, host: &Identity) -> usize {
     let range = TimeRange::new(now - hour, now + hour).unwrap();
     let metric = crate::metrics::find("cpu.usage").unwrap();
     let id = host.id();
-    let result = server.state.metrics.series(&id, metric, range, 8);
+    let result = server.state.metrics.series(&id, &metric, range, 8);
     let result = result.await.unwrap();
     result
         .series
@@ -4111,9 +4112,17 @@ async fn the_metrics_api_lists_what_can_be_asked_for() {
         catalog.as_array().unwrap().len(),
         crate::metrics::METRICS.len()
     );
+    // One that's built in has nothing a template says of it.
     assert_eq!(
         catalog[0],
-        json!({ "name": "cpu.usage", "title": "CPU usage", "unit": "percent", "collector": "cpu" })
+        json!({
+            "name": "cpu.usage",
+            "title": "CPU usage",
+            "unit": "percent",
+            "collector": "cpu",
+            "description": null,
+            "template": null,
+        })
     );
 }
 

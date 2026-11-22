@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::actions::{ActionRun, RuleAction, check_rule_actions};
-use crate::alert_conditions::{Conditions, LocalMetrics, MetricUse, Scope};
+use crate::alert_conditions::{Conditions, MetricUse, Names, Scope};
 use crate::calculations::{Calculation, Question};
+use crate::catalog::Catalog;
 use crate::channels;
-use crate::metric_charts::format_value;
-use crate::metrics::{Metric, Source, Unit};
+use crate::metrics::{INSTANCE_LABEL, Metric, Source, Unit};
 use crate::times::Timestamp;
 
 /// Why an alert ends when its rule goes, however it goes.
@@ -85,6 +85,9 @@ pub struct AlertRule {
 pub struct TemplateLink {
     /// The template's ID.
     pub id: i64,
+    /// The template's key, which starts its metrics' names: the rule's conditions
+    /// and summaries can use them by their short names, `lag` for `postgres.lag`.
+    pub key: String,
     /// The alert's key in the template.
     pub alert: String,
     /// For someone's own copy of a built-in template's rule, the rule it's used in
@@ -95,45 +98,82 @@ pub struct TemplateLink {
     pub enabled_choice: Option<bool>,
     /// Whether the template is on. Its alerts aren't checked while it's off.
     pub template_enabled: bool,
-    /// Whether it needs what only agents running the template would send, its own
-    /// metrics or what its discovery finds, so it isn't checked yet.
-    pub waits_for_agents: bool,
+    /// Whether the alert has a `when` or `since`, which pick the databases or hosts
+    /// it's for by what the template's discovery finds on each. Nothing keeps what
+    /// discovery finds yet, so there's no telling which those are, and the rule
+    /// isn't checked.
+    pub waits_for_discovery: bool,
     /// When an upgrade last changed the built-in rule this is a copy of.
     pub original_changed_at: Option<Timestamp>,
 }
 
 impl AlertRule {
-    pub fn new(id: i64, rule: AlertRuleInput) -> Self {
-        let conditions = rule.conditions().ok().map(Arc::new);
+    /// A rule as stored, with its conditions read against the metrics there are.
+    pub fn new(
+        id: i64,
+        rule: AlertRuleInput,
+        template: Option<TemplateLink>,
+        catalog: &Catalog,
+    ) -> Self {
+        Self::unread(id, rule, template).read(catalog)
+    }
+
+    /// A rule as stored, with its conditions still to read.
+    pub fn unread(id: i64, rule: AlertRuleInput, template: Option<TemplateLink>) -> Self {
         Self {
             id,
             rule,
-            template: None,
-            conditions,
+            template,
+            conditions: None,
         }
     }
 
-    /// Whether it's left alone for now, as only agents running its template could
-    /// give it what it needs.
-    pub fn waits_for_agents(&self) -> bool {
+    /// The rule with its conditions read against the metrics there are.
+    pub fn read(mut self, catalog: &Catalog) -> Self {
+        self.conditions = self
+            .rule
+            .conditions(&self.names(catalog))
+            .ok()
+            .map(Arc::new);
+        self
+    }
+
+    /// Where the rule's names are looked up: a template's alert can use the
+    /// template's metrics by their short names.
+    pub fn names<'a>(&'a self, catalog: &'a Catalog) -> Names<'a> {
+        Names {
+            catalog,
+            template: self.template_key(),
+        }
+    }
+
+    /// Whether it's left alone for now, as it's only for some of what its template
+    /// runs for, and what discovery finds isn't kept to say which.
+    pub fn waits_for_discovery(&self) -> bool {
         self.template
             .as_ref()
-            .is_some_and(|template| template.waits_for_agents)
+            .is_some_and(|template| template.waits_for_discovery)
     }
 
     /// Whether it's checked: it's on, and if it's a template's alert, so is the
-    /// template, and it isn't waiting for agents.
+    /// template, and it isn't waiting for what discovery finds.
     pub fn runs(&self) -> bool {
         self.rule.enabled
             && self
                 .template
                 .as_ref()
-                .is_none_or(|template| template.template_enabled && !template.waits_for_agents)
+                .is_none_or(|template| template.template_enabled && !template.waits_for_discovery)
+    }
+
+    /// The template whose metrics the rule can use by their short names, if it's
+    /// one's alert.
+    pub fn template_key(&self) -> Option<&str> {
+        self.template.as_ref().map(|template| template.key.as_str())
     }
 
     /// See [`AlertRuleInput::watched`].
-    pub fn watched(&self) -> Option<(&'static Metric, Option<String>)> {
-        self.rule.watched(self.conditions.as_deref()?)
+    pub fn watched(&self, catalog: &Catalog) -> Option<(Arc<Metric>, Option<String>)> {
+        self.rule.watched(self.conditions.as_deref()?, catalog)
     }
 
     /// See [`AlertRuleInput::thresholds`].
@@ -225,18 +265,14 @@ const MIN_REMINDER: TimeDelta = TimeDelta::minutes(5);
 /// Checks a rule before it's saved, with no host's facts to try its conditions on.
 #[cfg(test)]
 pub fn check_rule(rule: &AlertRuleInput) -> Result<()> {
-    check_rule_in(rule, &Value::Null, None).map(|_| ())
+    check_rule_in(rule, &Value::Null, &Names::of(&Catalog::built_in())).map(|_| ())
 }
 
 /// Checks a rule before it's saved, trying its conditions on `facts`, a real host's
 /// if there is one, and gives its conditions, read. A template's alert's conditions
-/// and summaries can use the template's own metrics, `local`, too. Whether its
-/// channels exist is up to the caller, which can see them.
-pub fn check_rule_in(
-    rule: &AlertRuleInput,
-    facts: &Value,
-    local: Option<&LocalMetrics>,
-) -> Result<Conditions> {
+/// and summaries can use the template's own metrics by their short names too.
+/// Whether its channels exist is up to the caller, which can see them.
+pub fn check_rule_in(rule: &AlertRuleInput, facts: &Value, names: &Names) -> Result<Conditions> {
     ensure!(!rule.name.trim().is_empty(), "a rule needs a name");
     ensure!(rule.name.len() <= MAX_NAME_LEN, "the rule name is too long");
     ensure!(
@@ -253,12 +289,12 @@ pub fn check_rule_in(
         "choose every channel or some of them, not both"
     );
 
-    let conditions = rule.conditions_in(local)?;
+    let conditions = rule.conditions(names)?;
     // A calculation's value is in the unit it's worked out in.
     let value_unit = rule
-        .question()
+        .question(names.catalog)
         .map_or(Unit::Number, |question| question.unit());
-    conditions.dry_run_in(facts, value_unit, local)?;
+    conditions.dry_run(facts, value_unit)?;
     if let Some(applies_to) = &rule.applies_to {
         ensure!(
             !rule.is_calculation(),
@@ -268,7 +304,8 @@ pub fn check_rule_in(
             .map_err(|error| anyhow!("invalid condition for which hosts: {error}"))?;
     }
     if rule.is_calculation() {
-        rule.question().map_err(|error| anyhow!("{error}"))?;
+        rule.question(names.catalog)
+            .map_err(|error| anyhow!("{error}"))?;
         ensure!(
             (MIN_WINDOW..=MAX_WINDOW).contains(&rule.window()),
             "the window has to be between a minute and a day"
@@ -278,9 +315,7 @@ pub fn check_rule_in(
             rule.metric.is_none() && rule.group_by.is_none() && rule.filter.is_none(),
             "only a rule with a calculation takes a metric, grouping or filter"
         );
-        let forecasts = !conditions.forecast_metrics().is_empty()
-            || conditions.local_uses().any(|used| used.forecast);
-        if !forecasts {
+        if conditions.forecast_metrics().is_empty() {
             ensure!(
                 rule.window.is_none(),
                 "only a calculation or forecast() looks back over a window"
@@ -297,7 +332,7 @@ pub fn check_rule_in(
         (&rule.resolved_summary, "resolved summary"),
     ] {
         if let Some(template) = template {
-            rule.check_summary(template, &conditions, local)
+            rule.check_summary(template, &conditions, names)
                 .map_err(|error| anyhow!("the {which}: {error:#}"))?;
         }
     }
@@ -311,12 +346,13 @@ pub struct SummaryValues {
     pub series: String,
     /// The first metric's reading, or the calculated value.
     pub value: Option<String>,
-    pub metrics: Vec<(&'static str, Value)>,
+    pub metrics: Vec<(String, Value)>,
     /// What a template's alert can show besides.
     pub template: Option<TemplateValues>,
 }
 
 /// What a template's alert can show besides what any rule can.
+#[derive(Debug, Clone, PartialEq)]
 pub struct TemplateValues {
     /// The template's key, which starts its metrics' full names.
     pub prefix: String,
@@ -335,6 +371,13 @@ impl SummaryValues {
             insert_at(&mut fields, name, value.clone());
         }
         if let Some(template) = &self.template {
+            // The template's metrics the conditions use, by their short names too.
+            let prefix = format!("{}.", template.prefix);
+            for (name, value) in &self.metrics {
+                if let Some(short) = name.strip_prefix(&prefix) {
+                    fields.entry(short).or_insert_with(|| value.clone());
+                }
+            }
             for (short, value) in &template.metrics {
                 fields.entry(short.clone()).or_insert_with(|| value.clone());
                 insert_at(
@@ -351,6 +394,27 @@ impl SummaryValues {
         fields.insert("value".to_string(), json!(self.value));
         Value::Object(fields)
     }
+}
+
+/// The dotted names a summary shows, between `{{` and `}}`.
+fn summary_names(text: &str) -> impl Iterator<Item = &str> {
+    text.split("{{")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("}}"))
+        .flat_map(|(shown, _)| {
+            shown
+                .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+                .filter(|name| !name.is_empty())
+        })
+}
+
+/// A template's metric's name within the template: `lag` for `postgres.lag`.
+pub fn short_name<'a>(metric: &'a Metric, template: &str) -> &'a str {
+    metric
+        .name
+        .strip_prefix(template)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(&metric.name)
 }
 
 /// Puts `value` at a dotted name, leaving anything already there.
@@ -384,28 +448,25 @@ impl AlertRuleInput {
         self.calculation.is_some()
     }
 
-    /// The rule's conditions, read. Saving a rule checks they can be.
-    pub fn conditions(&self) -> Result<Conditions> {
-        self.conditions_in(None)
-    }
-
-    /// The rule's conditions, read with a template's own metrics known as well.
-    pub fn conditions_in(&self, local: Option<&LocalMetrics>) -> Result<Conditions> {
+    /// The rule's conditions, read, with names looked up in `names`. Saving a rule
+    /// checks they can be.
+    pub fn conditions(&self, names: &Names) -> Result<Conditions> {
         let scope = match self.is_calculation() {
             true => Scope::Calculation,
             false => Scope::Hosts,
         };
-        Conditions::compile_in(
+        Conditions::compile(
             self.warning.as_deref(),
             self.critical.as_deref(),
             scope,
-            local,
+            names,
         )
     }
 
     /// What a calculation rule asks. The error says what's wrong, to show whoever chose it.
-    pub fn question(&self) -> Result<Question, String> {
+    pub fn question(&self, catalog: &Catalog) -> Result<Question, String> {
         Question::new(
+            catalog,
             self.metric.as_deref().unwrap_or_default(),
             self.calculation.map_or("", Calculation::as_str),
             self.group_by.as_deref().unwrap_or_default(),
@@ -442,7 +503,7 @@ impl AlertRuleInput {
         let charted = match self.is_calculation() {
             true => (None, None),
             false => match conditions.primary() {
-                Some(primary) => (Some(primary.metric.name), primary.picked.clone()),
+                Some(primary) => (Some(primary.metric.name.clone()), primary.picked.clone()),
                 None => return Vec::new(),
             },
         };
@@ -459,19 +520,24 @@ impl AlertRuleInput {
 
     /// The metric the rule's alerts are about, which they chart: the calculation's,
     /// or the first one its conditions use, with the series that one picks out.
-    pub fn watched(&self, conditions: &Conditions) -> Option<(&'static Metric, Option<String>)> {
+    pub fn watched(
+        &self,
+        conditions: &Conditions,
+        catalog: &Catalog,
+    ) -> Option<(Arc<Metric>, Option<String>)> {
         if self.is_calculation() {
-            return self.question().ok().map(|question| (question.metric, None));
+            let question = self.question(catalog).ok()?;
+            return Some((question.metric, None));
         }
         let primary: &MetricUse = conditions.primary()?;
-        Some((primary.metric, primary.picked.clone()))
+        Some((primary.metric.clone(), primary.picked.clone()))
     }
 
     /// What the rule watches, in a few words, beside its conditions.
-    pub fn describe(&self) -> String {
+    pub fn describe(&self, catalog: &Catalog) -> String {
         let mut words = Vec::new();
         if self.is_calculation()
-            && let Ok(question) = self.question()
+            && let Ok(question) = self.question(catalog)
         {
             words.push(format!(
                 "{} of {} over {}",
@@ -486,22 +552,37 @@ impl AlertRuleInput {
         words.join(", ")
     }
 
+    /// The metrics of the template `key` that the rule's summaries name, by their
+    /// short or full names, so a template's alert can show any of them.
+    pub fn summary_metrics(&self, catalog: &Catalog, key: &str) -> Vec<Arc<Metric>> {
+        let texts = [&self.summary, &self.resolved_summary];
+        let named: BTreeSet<&str> = texts
+            .into_iter()
+            .flatten()
+            .flat_map(|text| summary_names(text))
+            .collect();
+        let mut metrics: Vec<Arc<Metric>> = catalog
+            .of_template(key)
+            .filter(|metric| {
+                named.contains(metric.name.as_str()) || named.contains(short_name(metric, key))
+            })
+            .cloned()
+            .collect();
+        metrics.sort_by(|a, b| a.name.cmp(&b.name));
+        metrics
+    }
+
     /// Fills in a summary template with example values, to find mistakes when a
     /// rule is saved: a metric the conditions don't use can't be shown.
-    fn check_summary(
-        &self,
-        template: &str,
-        conditions: &Conditions,
-        local: Option<&LocalMetrics>,
-    ) -> Result<()> {
+    fn check_summary(&self, template: &str, conditions: &Conditions, names: &Names) -> Result<()> {
         ensure!(
             template.len() <= MAX_SUMMARY_LEN,
             "it can be up to {MAX_SUMMARY_LEN} characters"
         );
         let mut metrics = Vec::new();
         for used in conditions.uses() {
-            let example = format_value(used.metric.unit, 50.0);
-            let value = match used.metric.source {
+            let example = conditions.format(&used.metric, 50.0);
+            let value = match &used.metric.source {
                 Source::Fields(fields) if used.bracketed => Value::Object(
                     fields
                         .iter()
@@ -516,7 +597,7 @@ impl AlertRuleInput {
                 ),
                 _ => json!(example),
             };
-            metrics.push((used.metric.name, value));
+            metrics.push((used.metric.name.clone(), value));
         }
         let mut example = SummaryValues {
             hostname: "web-1".to_string(),
@@ -527,17 +608,17 @@ impl AlertRuleInput {
         };
         // A template's alert can show any of its metrics, by either name, what it's
         // running for and its series' labels.
-        if let Some(local) = local {
+        if let Some(key) = names.template {
             let mut labels = Map::new();
             let mut metrics = Map::new();
-            for (short, metric) in &local.metrics {
-                metrics.insert(short.clone(), json!("50"));
-                for label in &metric.labels {
+            for metric in names.catalog.of_template(key) {
+                metrics.insert(short_name(metric, key).to_string(), json!("50"));
+                for label in metric.labels().iter().filter(|l| *l != INSTANCE_LABEL) {
                     labels.insert(label.clone(), json!("main"));
                 }
             }
             example.template = Some(TemplateValues {
-                prefix: local.prefix.clone(),
+                prefix: key.to_string(),
                 metrics,
                 instance: "main".to_string(),
                 labels,
@@ -632,9 +713,9 @@ pub fn subject(metric: &Metric, series: &str, picked: Option<&str>) -> String {
     if !series.is_empty() {
         return series.to_string();
     }
-    match (metric.source, picked) {
-        (_, Some(picked)) => format!("{} ({picked})", metric.title),
-        _ => metric.title.to_string(),
+    match picked {
+        Some(picked) => format!("{} ({picked})", metric.title),
+        None => metric.title.clone(),
     }
 }
 
@@ -1267,8 +1348,8 @@ mod tests {
             series: series.to_string(),
             value: value.map(str::to_string),
             metrics: vec![
-                ("disk.usage", json!("92%")),
-                ("cpu.load", json!({ "5 minutes": "4.2" })),
+                ("disk.usage".to_string(), json!("92%")),
+                ("cpu.load".to_string(), json!({ "5 minutes": "4.2" })),
             ],
             template: None,
         }
@@ -1352,17 +1433,17 @@ mod tests {
         let disk = crate::metrics::find("disk.usage").unwrap();
         let load = crate::metrics::find("cpu.load").unwrap();
         let cpu = crate::metrics::find("cpu.usage").unwrap();
-        assert_eq!(subject(disk, "/", None), "/");
+        assert_eq!(subject(&disk, "/", None), "/");
         assert_eq!(
-            subject(load, "", Some("5 minutes")),
+            subject(&load, "", Some("5 minutes")),
             "Load average (5 minutes)"
         );
-        assert_eq!(subject(cpu, "", None), "CPU usage");
+        assert_eq!(subject(&cpu, "", None), "CPU usage");
     }
 
     #[test]
     fn rules_describe_their_thresholds_and_what_they_chart() {
-        let stored = |rule: AlertRuleInput| AlertRule::new(1, rule);
+        let stored = |rule: AlertRuleInput| AlertRule::new(1, rule, None, &Catalog::built_in());
         let disk = stored(AlertRuleInput {
             warning: Some("disk.usage > 80".to_string()),
             critical: Some("disk.usage > 90 && series != '/boot'".to_string()),
@@ -1374,8 +1455,11 @@ mod tests {
             [Severity::Warning, Severity::Critical]
         );
         assert_eq!(disk.rule.worst_severity(), Severity::Critical);
-        assert_eq!(disk.watched().unwrap().0.name, "disk.usage");
-        assert_eq!(disk.rule.describe(), "for 5 minutes");
+        assert_eq!(
+            disk.watched(&Catalog::built_in()).unwrap().0.name,
+            "disk.usage"
+        );
+        assert_eq!(disk.rule.describe(&Catalog::built_in()), "for 5 minutes");
 
         let load = stored(AlertRuleInput {
             warning: Some("cpu.load['5 minutes'] > 4".to_string()),
@@ -1385,7 +1469,7 @@ mod tests {
         });
         assert_eq!(load.rule.worst_severity(), Severity::Critical);
         assert_eq!(
-            load.watched(),
+            load.watched(&Catalog::built_in()),
             Some((
                 crate::metrics::find("cpu.load").unwrap(),
                 Some("5 minutes".to_string())
@@ -1393,7 +1477,7 @@ mod tests {
         );
         // Only the level of the series charted is drawn on it.
         assert_eq!(load.thresholds(), [(Severity::Warning, 4.0)]);
-        assert_eq!(load.rule.describe(), "");
+        assert_eq!(load.rule.describe(&Catalog::built_in()), "");
 
         // And only that metric's: a level of another would be at the wrong height.
         let two = stored(AlertRuleInput {
@@ -1405,9 +1489,12 @@ mod tests {
 
         let busy = stored(calculation_rule());
         assert_eq!(busy.thresholds(), [(Severity::Critical, 80.0)]);
-        assert_eq!(busy.watched().unwrap().0.name, "cpu.usage");
         assert_eq!(
-            busy.rule.describe(),
+            busy.watched(&Catalog::built_in()).unwrap().0.name,
+            "cpu.usage"
+        );
+        assert_eq!(
+            busy.rule.describe(&Catalog::built_in()),
             "Average of CPU usage over 5 minutes, for 5 minutes"
         );
 
@@ -1415,7 +1502,7 @@ mod tests {
             critical: Some("!online".to_string()),
             ..metric_rule()
         });
-        assert_eq!(offline.watched(), None);
+        assert_eq!(offline.watched(&Catalog::built_in()), None);
         assert!(offline.thresholds().is_empty());
     }
 

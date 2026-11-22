@@ -9,6 +9,9 @@ const ITEM_KEYS: [&str; 4] = ["mount_point", "path", "label", "name"];
 pub const ENTRY_LABEL: &str = "key";
 /// The label of an item with nothing to name it.
 const INDEX_LABEL: &str = "index";
+/// Where an item in a list says its own labels, by their names, as a template's
+/// series do: `{"labels": {"instance": "main", "slot": "a"}, "retained": 5}`.
+pub const LABELS: &str = "labels";
 /// Deep enough for anything real, and it keeps an agent from exhausting the stack.
 const MAX_DEPTH: usize = 8;
 
@@ -90,6 +93,17 @@ fn with_label(labels: &[(String, String)], name: &str, value: &str) -> Vec<(Stri
     labels
 }
 
+/// The labels an item gives itself, if it does: an object of text under `labels`,
+/// which can be empty for the one series of something that has no others.
+fn own_labels(fields: &serde_json::Map<String, Value>) -> Option<Vec<(String, String)>> {
+    fields
+        .get(LABELS)?
+        .as_object()?
+        .iter()
+        .map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+        .collect()
+}
+
 fn walk<'a>(
     value: &'a Value,
     path: &str,
@@ -135,6 +149,14 @@ fn walk<'a>(
                     Some((*key, name))
                 });
                 match (named, item.as_object()) {
+                    (_, Some(fields)) if own_labels(fields).is_some() => {
+                        let mut labels = labels.to_vec();
+                        labels.extend(own_labels(fields).into_iter().flatten());
+                        for (field, value) in fields.iter().filter(|(field, _)| *field != LABELS) {
+                            let path = joined(path, field);
+                            walk(value, &path, &labels, depth + 1, readings);
+                        }
+                    }
                     (Some((key, name)), Some(fields)) => {
                         let labels = with_label(labels, key, name);
                         for (field, value) in fields.iter().filter(|(field, _)| *field != key) {
@@ -218,6 +240,37 @@ mod tests {
             readings[1],
             labelled(number("used_bytes", 5.0, DataType::Int), "mount_point", "/")
         );
+    }
+
+    #[test]
+    fn an_item_that_says_its_own_labels_has_them_all() {
+        let output = json!([
+            { "labels": { "instance": "main", "slot": "a" }, "name": "x", "retained": 5 },
+            { "labels": {}, "up": true },
+        ]);
+        let readings = flatten(&output, Top::Fields);
+
+        let labels = |names: &[(&str, &str)]| -> Vec<(String, String)> {
+            names
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(readings.len(), 3, "{readings:?}");
+        // Its other fields are values like any others, a name among them.
+        assert_eq!(readings[0].metric, "name");
+        assert_eq!(readings[1].metric, "retained");
+        assert_eq!(
+            readings[1].labels,
+            labels(&[("instance", "main"), ("slot", "a")])
+        );
+        assert_eq!(readings[2], number("up", 1.0, DataType::Bool));
+
+        // Labels that aren't all text are a field like any other.
+        let output = json!([{ "labels": { "slot": 1 }, "retained": 5 }]);
+        let readings = flatten(&output, Top::Fields);
+        assert_eq!(readings[0].metric, "labels.slot");
+        assert_eq!(readings[0].labels, labels(&[("index", "0")]));
     }
 
     #[test]

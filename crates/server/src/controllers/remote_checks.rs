@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -25,7 +26,7 @@ use crate::app_state::{AppState, CheckHost};
 use crate::check_history;
 use crate::host_filter;
 use crate::metric_charts::{self, Chart, Frame};
-use crate::metrics::{self, METRICS, Metric, Series, SeriesResult, TimeRange, Unit};
+use crate::metrics::{self, Metric, Series, SeriesResult, TimeRange, Unit};
 use crate::registration::HostState;
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn, SignInWith};
 use crate::silences::{ActiveSilences, SilenceInput};
@@ -498,19 +499,21 @@ async fn charts(
     range: TimeRange,
     range_key: &str,
 ) -> Result<Vec<CheckChart>> {
-    let about_checks: Vec<&'static Metric> = METRICS
+    // What checks report is named in code, as they're the server's own.
+    let about_checks: Vec<Arc<Metric>> = metrics::built_in()
         .iter()
         .filter(|metric| metric.collector == "checks")
+        .cloned()
         .collect();
     let mut queries = tokio::task::JoinSet::new();
-    for metric in about_checks.iter().copied() {
+    for metric in about_checks.iter().cloned() {
         let (state, host_id, name) = (state.clone(), host_id.to_string(), name.to_string());
         queries.spawn(async move {
-            let found = one_series(&state, &host_id, metric, &name, range).await;
-            (metric.name, found)
+            let found = one_series(&state, &host_id, &metric, &name, range).await;
+            (metric.name.clone(), found)
         });
     }
-    let mut found: BTreeMap<&str, SeriesResult> = BTreeMap::new();
+    let mut found: BTreeMap<String, SeriesResult> = BTreeMap::new();
     while let Some(finished) = queries.join_next().await {
         let (metric, result) = finished?;
         found.insert(metric, result?);
@@ -531,10 +534,10 @@ async fn charts(
     };
 
     // Whether it passed is always there, even with nothing to show yet.
-    let passed = found.remove(up.name).unwrap_or_default();
+    let passed = found.remove(&up.name).unwrap_or_default();
     add(
         metric_charts::build_as(
-            up,
+            &up,
             up.unit,
             "Passing",
             Frame::STANDARD,
@@ -548,7 +551,7 @@ async fn charts(
     let phases: Vec<Series> = PHASES
         .iter()
         .filter_map(|(metric, label)| {
-            let series = found.remove(metric)?.series.pop()?;
+            let series = found.remove(*metric)?.series.pop()?;
             Some(Series {
                 name: (*label).to_string(),
                 points: series.points,
@@ -562,16 +565,23 @@ async fn charts(
         };
         let frame = Frame::STANDARD;
         let unit = Unit::Seconds;
-        let chart =
-            metric_charts::build_as(response, unit, "Response time", frame, &phases, range, zone);
+        let chart = metric_charts::build_as(
+            &response,
+            unit,
+            "Response time",
+            frame,
+            &phases,
+            range,
+            zone,
+        );
         add(chart, false);
     }
 
     for metric in about_checks {
-        if let Some(result) = found.remove(metric.name)
+        if let Some(result) = found.remove(&metric.name)
             && !result.series.is_empty()
         {
-            add(metric_charts::build(metric, &result, range, zone), true);
+            add(metric_charts::build(&metric, &result, range, zone), true);
         }
     }
     Ok(charts)
@@ -656,7 +666,7 @@ async fn passing(
 ) -> Result<(Vec<metrics::Point>, TimeRange)> {
     let range = time_range(length).context("no such time range")?;
     let up = metrics::find("check.up").context("the metrics checks report are missing")?;
-    let mut found = one_series(state, host_id, up, name, range).await?;
+    let mut found = one_series(state, host_id, &up, name, range).await?;
     let points = found
         .series
         .pop()

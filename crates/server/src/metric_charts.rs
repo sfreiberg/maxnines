@@ -181,7 +181,7 @@ const MARKER_REACH: f64 = 6.0;
 
 #[derive(Debug, Serialize)]
 pub struct Chart {
-    pub name: &'static str,
+    pub name: String,
     pub title: String,
     pub has_data: bool,
     /// Series left out because a chart only shows so many.
@@ -221,7 +221,7 @@ pub fn build(metric: &Metric, result: &SeriesResult, range: TimeRange, zone: Tz)
     build_as(
         metric,
         metric.unit,
-        metric.title,
+        &metric.title,
         Frame::STANDARD,
         result,
         range,
@@ -317,7 +317,7 @@ fn chart_on(
     let slots = colour_slots(metric, &result.series);
 
     Chart {
-        name: metric.name,
+        name: metric.name.clone(),
         title: title.to_string(),
         has_data: !result.series.is_empty(),
         hidden: result.hidden,
@@ -888,7 +888,7 @@ mod tests {
 
     fn chart(metric: &str, series: Vec<Series>) -> Chart {
         let result = SeriesResult { series, hidden: 0 };
-        build(find(metric).unwrap(), &result, range(), Tz::UTC)
+        build(&find(metric).unwrap(), &result, range(), Tz::UTC)
     }
 
     fn labels(ticks: &[Tick]) -> Vec<&str> {
@@ -1227,7 +1227,7 @@ mod tests {
         };
 
         let chart = build_as(
-            find("cpu.usage").unwrap(),
+            &find("cpu.usage").unwrap(),
             Unit::Percent,
             "Busy hosts",
             frame,
@@ -1440,7 +1440,7 @@ mod tests {
             hidden: 0,
         };
         let chart = build(
-            find("cpu.usage").unwrap(),
+            &find("cpu.usage").unwrap(),
             &result,
             range(),
             Tz::Asia__Kathmandu,

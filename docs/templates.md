@@ -67,7 +67,9 @@ template "myapp" {
 The **key**, `myapp`, starts the names of the template's metrics, so the column
 `connections` is the metric `myapp.connections`. It's lowercase letters, digits and
 underscores, starting with a letter, and no two templates share one. So are the keys of
-the blocks inside it, such as `sessions` and `busy`.
+the blocks inside it, such as `sessions` and `busy`. A template whose metric would
+have the name of one MaxNines has built in, such as `postgres.lag`, is refused: give
+it another key.
 
 Lengths of time are written like `"30s"`, `"5m"`, `"1h"` or `"1h 30m"`, in whole
 seconds. Versions are numbers with dots, compared as numbers, so 9.6 < 13 < 16.2, and
@@ -213,9 +215,16 @@ is: names against the metrics there are and the template's own, and a try on sam
 values. A column whose type only the database knows is tried as a number, a length of
 time and a yes or no, and the condition has to work for one of them.
 
-An alert that needs what only agents running the template send, the template's own
-metrics or what its discovery finds, says **Not checked yet** on the template's page,
-and isn't worked out until then.
+A template's metrics are like any others once agents send them: they're charted on a
+host's metrics page, listed by the [API](api-metrics.md), and can be used in
+dashboards and any alert rule by their full names. Each series is named by its
+labels' values, such as `main, slot_a`, what a database template runs for coming
+first. An alert on them with nothing sent yet doesn't fire, as missing data never
+does.
+
+An alert with `when` or `since` says **Not checked yet** on the template's page, and
+isn't worked out yet: which databases or hosts it's for depends on what discovery
+finds on each, which isn't kept yet.
 
 ### Notices
 

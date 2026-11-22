@@ -58,13 +58,14 @@ Everything listed, with:
 | `metrics` | Its own metrics, each with its full `name`, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
 | `alerts` | Each of its alerts, by `key`, with the `rule` in use, as [alert rules](api-alert-rules.md) are given, and where that's your own copy of a built-in template's, the built-in one as `built_in_rule`, `null` otherwise |
 
-A template's rule has a `template` field saying so: the template's `id`, the `alert`'s
-key, `replaces_id`, which for your own copy is the built-in rule it's used in place of,
+A template's rule has a `template` field saying so: the template's `id` and `key`, the
+`alert`'s key, `replaces_id`, which for your own copy is the built-in rule it's used in place of,
 `enabled_choice`, what you chose for a built-in or imported template's own rule, or
 `null` while it follows the template,
-`template_enabled`, `waits_for_agents`, true while it needs what only agents running
-the template would send, which leaves it unchecked, and `original_changed_at`, when an
-upgrade last changed the built-in rule under a copy.
+`template_enabled`, `waits_for_discovery`, true for an alert with `when` or `since`,
+which pick what it's for by what the template's discovery finds, and which isn't
+checked until that's kept, and `original_changed_at`, when an upgrade last changed the
+built-in rule under a copy.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/templates/1"
