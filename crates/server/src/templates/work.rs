@@ -7,8 +7,10 @@
 //! depends on what discovery finds waits until something has been found. When what
 //! discovery finds changes, so does what's sent.
 //!
-//! Only database templates are sent so far: performance counters and the registry,
-//! which Windows templates read, aren't yet.
+//! A template that isn't for a database is sent once for the host, if it reads
+//! anything there. What those read is performance counters and the registry, which
+//! aren't sent yet, so agents have nothing to run for them so far. Templates for a
+//! Windows service aren't sent until then either.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -76,17 +78,36 @@ pub fn work_for(
     let mut work = Vec::new();
     for assigned in templates.for_host(host) {
         let template = assigned.template();
-        if !matches!(template.target, Some(Target::Database(_))) {
-            continue;
-        }
-        for database in assigned.instances(host.facts).into_iter().flatten() {
-            let found = discoveries.get(&(assigned.id(), database.clone()));
-            work.push(TemplateWork {
-                template: template.key.clone(),
-                discover: discover_work(template),
-                queries: query_work(template, found),
-                database,
-            });
+        match &template.target {
+            Some(Target::Database(_)) => {
+                for database in assigned.instances(host.facts).into_iter().flatten() {
+                    let found = discoveries.get(&(assigned.id(), database.clone()));
+                    work.push(TemplateWork {
+                        template: template.key.clone(),
+                        discover: discover_work(template),
+                        queries: query_work(template, found),
+                        database: Some(database),
+                    });
+                }
+            }
+            // Counters and the registry are for the Windows services' templates,
+            // which agents don't read yet.
+            Some(Target::Service(_)) => {}
+            // Once on the host, for what it reads there, which is only counters and
+            // the registry so far, as SQL needs a database: a template with nothing
+            // for the agent to read isn't sent.
+            Some(Target::Os(_)) | None => {
+                let reads_something =
+                    !template.discover.is_empty() || !template.counters.is_empty();
+                if reads_something && !assigned.instances(host.facts).is_empty() {
+                    work.push(TemplateWork {
+                        template: template.key.clone(),
+                        database: None,
+                        discover: Vec::new(),
+                        queries: Vec::new(),
+                    });
+                }
+            }
         }
     }
     work
@@ -216,7 +237,7 @@ mod tests {
         // database, every discover block with it.
         let work = work_for(&templates, &host, &Discoveries::new());
         assert_eq!(work.len(), 1);
-        assert_eq!(work[0].database, "orders");
+        assert_eq!(work[0].database.as_deref(), Some("orders"));
         assert_eq!(work[0].discover.len(), 2);
         assert_eq!(work[0].discover[0].interval, DEFAULT_DISCOVERY_INTERVAL);
         assert_eq!(work[0].discover[1].interval, Duration::from_secs(10));
@@ -250,6 +271,36 @@ mod tests {
         let work = work_for(&templates, &host, &found("9.6", "primary"));
         assert!(keys(&work[0]).is_empty());
         assert_eq!(work[0].discover.len(), 2);
+    }
+
+    #[test]
+    fn a_template_not_for_a_database_is_sent_once_if_it_reads_anything() {
+        let os = |reads: &str| {
+            running(&format!(
+                r#"template "win" {{
+                     name = "Win"
+                     os   = ["windows"]
+                     {reads}
+                   }}"#
+            ))
+        };
+        let windows = json!({ "os": { "family": "windows" } });
+        let linux = json!({ "os": { "family": "linux" } });
+        let counters = r#"counters "cpu" {
+                            object  = "Processor"
+                            metrics = { busy = "% Processor Time" }
+                          }"#;
+        let work = work_for(
+            &os(counters),
+            &Host::new(&windows, "a"),
+            &Discoveries::new(),
+        );
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].database, None);
+        assert!(work[0].queries.is_empty() && work[0].discover.is_empty());
+        // Not on the systems it's for, or with nothing to read.
+        assert!(work_for(&os(counters), &Host::new(&linux, "a"), &Discoveries::new()).is_empty());
+        assert!(work_for(&os(""), &Host::new(&windows, "a"), &Discoveries::new()).is_empty());
     }
 
     #[test]

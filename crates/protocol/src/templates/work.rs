@@ -32,13 +32,16 @@ pub fn collector_of(key: &str) -> String {
     format!("template.{key}")
 }
 
-/// One template, run for one database in the agent's own config.
+/// One template, run for one database in the agent's own config, or once on the
+/// host for a template that isn't for a database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateWork {
     /// The template's key.
     pub template: String,
-    /// The database, by its name in the agent's own config.
-    pub database: String,
+    /// The database, by its name in the agent's own config, for a template that's
+    /// for a kind of database. Only those run SQL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discover: Vec<DiscoverWork>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -96,16 +99,22 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
             "{:?} isn't a template's key",
             one.template
         );
+        if let Some(database) = &one.database {
+            ensure!(
+                crate::is_page_name(database),
+                "{database:?} isn't a database's name"
+            );
+        }
         ensure!(
-            crate::is_page_name(&one.database),
-            "{:?} isn't a database's name",
-            one.database
+            one.database.is_some() || one.discover.is_empty() && one.queries.is_empty(),
+            "template {:?} has SQL but no database to run it on",
+            one.template
         );
         ensure!(
             !work[..index]
                 .iter()
                 .any(|other| other.template == one.template && other.database == one.database),
-            "template {:?} is sent twice for database {:?}",
+            "template {:?} is sent twice for {:?}",
             one.template,
             one.database
         );
@@ -154,7 +163,7 @@ mod tests {
     fn work() -> TemplateWork {
         TemplateWork {
             template: "pg".to_string(),
-            database: "orders".to_string(),
+            database: Some("orders".to_string()),
             discover: vec![DiscoverWork {
                 key: "role".to_string(),
                 interval: Duration::from_secs(10),
@@ -188,7 +197,16 @@ mod tests {
         };
         assert!(refused(&|all| all.push(work())).contains("sent twice"));
         assert!(refused(&|all| all[0].template = "Bad".into()).contains("isn't a template's key"));
-        assert!(refused(&|all| all[0].database = "two words".into()).contains("database"));
+        assert!(refused(&|all| all[0].database = Some("two words".into())).contains("database"));
+        assert!(refused(&|all| all[0].database = None).contains("no database to run it on"));
+        // One that isn't for a database runs once on the host.
+        let host_wide = TemplateWork {
+            template: "host".to_string(),
+            database: None,
+            discover: Vec::new(),
+            queries: Vec::new(),
+        };
+        check_work(&[host_wide]).unwrap();
         assert!(refused(&|all| all[0].queries[0].sql = " ".into()).contains("needs SQL"));
         assert!(refused(&|all| all[0].discover[0].interval = Duration::ZERO).contains("interval"));
     }

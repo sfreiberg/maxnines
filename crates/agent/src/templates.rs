@@ -54,15 +54,20 @@ impl TemplateCollector {
         let read = Arc::new(Mutex::new(Read::default()));
         let mut tasks = Vec::new();
         for one in work {
-            let key = (one.template.clone(), one.database.clone());
+            // Only a database template has anything this agent can read so far.
+            let Some(name) = &one.database else {
+                continue;
+            };
+            let key = (one.template.clone(), name.clone());
             let database = definitions
-                .get(&one.database)
+                .get(name)
                 .ok_or_else(|| anyhow::anyhow!("the agent's config has no database by that name"))
-                .and_then(|definition| definition.database(&one.database));
+                .and_then(|definition| definition.database(name));
             match database {
                 Ok(database) => {
                     let task = runtime()?.spawn(run(
                         one.clone(),
+                        name.clone(),
                         Session::new(database),
                         interval,
                         read.clone(),
@@ -72,7 +77,7 @@ impl TemplateCollector {
                 Err(error) => {
                     warn!(
                         template = one.template,
-                        database = one.database,
+                        database = name,
                         error = format!("{error:#}"),
                         "a template can't read a database"
                     );
@@ -131,7 +136,13 @@ impl Collector for TemplateCollector {
 }
 
 /// Reads one database for one template, for as long as the config lasts.
-async fn run(work: TemplateWork, mut session: Session, every: Duration, read: Arc<Mutex<Read>>) {
+async fn run(
+    work: TemplateWork,
+    database: String,
+    mut session: Session,
+    every: Duration,
+    read: Arc<Mutex<Read>>,
+) {
     let start = Instant::now();
     let mut discover_at = vec![start; work.discover.len()];
     // Queries start at a random point in their first interval, as samples do.
@@ -144,7 +155,7 @@ async fn run(work: TemplateWork, mut session: Session, every: Duration, read: Ar
     let mut found = Map::new();
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
     let mut connections = 0;
-    let key = (work.template.clone(), work.database.clone());
+    let key = (work.template.clone(), database.clone());
 
     loop {
         let now = Instant::now();
@@ -164,7 +175,7 @@ async fn run(work: TemplateWork, mut session: Session, every: Duration, read: Ar
                 }
                 Err(error) => {
                     unreachable = !session.is_up();
-                    note(&work, &discover.key, &error, &mut errors);
+                    note(&work, &database, &discover.key, &error, &mut errors);
                 }
             }
         }
@@ -176,17 +187,12 @@ async fn run(work: TemplateWork, mut session: Session, every: Duration, read: Ar
             query_at[index] = now + query.interval.unwrap_or(every);
             match session.run(&query.sql, TIMEOUT).await {
                 Ok(read) => {
-                    rows.extend(metric_rows(
-                        &read,
-                        query,
-                        &work.database,
-                        &mut totals[index],
-                    ));
+                    rows.extend(metric_rows(&read, query, &database, &mut totals[index]));
                     errors.remove(&query.key);
                 }
                 Err(error) => {
                     unreachable = !session.is_up();
-                    note(&work, &query.key, &error, &mut errors);
+                    note(&work, &database, &query.key, &error, &mut errors);
                 }
             }
         }
@@ -202,7 +208,7 @@ async fn run(work: TemplateWork, mut session: Session, every: Duration, read: Ar
                     .retain(|d| (&d.template, &d.database) != (&key.0, &key.1));
                 read.discovered.push(Discovered {
                     template: work.template.clone(),
-                    database: work.database.clone(),
+                    database: database.clone(),
                     values: found.clone(),
                 });
             }
@@ -228,6 +234,7 @@ async fn run(work: TemplateWork, mut session: Session, every: Duration, read: Ar
 /// to go wrong the same way every time.
 fn note(
     work: &TemplateWork,
+    database: &str,
     key: &str,
     error: &anyhow::Error,
     errors: &mut BTreeMap<String, String>,
@@ -236,7 +243,7 @@ fn note(
     if errors.get(key) != Some(&text) {
         warn!(
             template = work.template,
-            database = work.database,
+            database,
             statement = key,
             error = text,
             "a template's SQL failed"
@@ -257,7 +264,7 @@ mod tests {
     fn work(database: &str) -> TemplateWork {
         TemplateWork {
             template: "pg".to_string(),
-            database: database.to_string(),
+            database: Some(database.to_string()),
             discover: vec![DiscoverWork {
                 key: "server".to_string(),
                 interval: Duration::from_secs(3600),

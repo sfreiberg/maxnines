@@ -91,6 +91,19 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
     }
 
     let dialect = dialect_for(template.target.as_ref());
+    // SQL runs on a database, so only a template for a kind of database has any.
+    if !matches!(template.target, Some(Target::Database(_))) {
+        const NO_DATABASE: &str =
+            "needs a database to run on: SQL is only for a template with database = \"<kind>\"";
+        for (index, discover) in template.discover.iter().enumerate() {
+            if discover.sql.is_some() {
+                problems.push(Problem::new(Place::Discover(index), "sql", NO_DATABASE));
+            }
+        }
+        for index in 0..template.queries.len() {
+            problems.push(Problem::new(Place::Query(index), "sql", NO_DATABASE));
+        }
+    }
     // What each discover block finds is looked at together, so no two find the same.
     let mut found: Vec<String> = Vec::new();
     for (index, discover) in template.discover.iter().enumerate() {

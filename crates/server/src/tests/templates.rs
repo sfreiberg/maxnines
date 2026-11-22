@@ -2067,8 +2067,8 @@ async fn an_agent_is_sent_what_its_database_templates_read_and_again_when_they_c
     assert_eq!(config.templates.len(), 1, "{config:?}");
     let work = &config.templates[0];
     assert_eq!(
-        (work.template.as_str(), work.database.as_str()),
-        ("pg", "orders")
+        (work.template.as_str(), work.database.as_deref()),
+        ("pg", Some("orders"))
     );
     let discover: Vec<&str> = work.discover.iter().map(|d| d.key.as_str()).collect();
     assert_eq!(discover, ["server", "role"]);
@@ -2147,7 +2147,7 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
         config
             .templates
             .iter()
-            .find(|work| work.database == database)
+            .find(|work| work.database.as_deref() == Some(database))
             .unwrap()
             .queries
             .iter()

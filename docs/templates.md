@@ -86,6 +86,10 @@ One field says what a template is for, and it runs once for each match on a host
 | `os = ["linux", "freebsd"]` | Once on each host running one of these: `freebsd`, `linux`, `macos` and `windows`. Its alerts only apply to those hosts |
 | none | Once on every host, agentless ones too |
 
+Only a template for a database has SQL, its `query` blocks and the `sql` of its
+discover blocks, as there's nothing else to run SQL on. The others read Windows
+performance counters and the registry, which agents don't read yet.
+
 `min_version` is the oldest version it's for. `services` lists services that the
 host's own **Service stopped** alert should watch.
 
@@ -133,7 +137,10 @@ last found there, their SQL filled in for that version. A query with a `when`,
 `since` or `fill`, or in a template with a `min_version`, waits until discovery has
 found something, and below `min_version` only discovery runs. When what discovery
 finds changes, the agent is sent what to read again. The agent itself only runs the
-SQL it's sent. Performance counters and registry values aren't read yet.
+SQL it's sent. A template that isn't for a database is sent once for each host it's
+for that runs what it's for, if it reads anything, but performance counters and
+registry values aren't sent or read yet, so agents have nothing to run for one so far.
+Templates for a Windows service aren't sent until then.
 
 ### Queries
 

@@ -214,7 +214,8 @@ fn a_metric_with_a_built_in_metrics_name_is_refused() {
     // One name is enough, and it's the column that says where.
     let found = problems(
         r#"template "cpu" {
-             name = "Processor"
+             name     = "Processor"
+             database = "postgres"
              query "q" { sql = "SELECT 1 AS usage, 2 AS heat" }
            }"#,
     );
@@ -470,4 +471,23 @@ fn an_os_template_alerts_only_on_those_systems() {
         Some("facts.os.family in ['linux', 'freebsd']")
     );
     cel::Program::compile(&applies_to(&template).unwrap()).unwrap();
+}
+
+#[test]
+fn sql_needs_a_template_for_a_database() {
+    let found = problems(
+        r#"template "app" {
+             name = "App"
+             os   = ["linux"]
+             discover "d" { sql = "SELECT 1 AS one" }
+             query "q" { sql = "SELECT 1 AS two" }
+           }"#,
+    );
+    for place in [r#"discover "d", sql"#, r#"query "q", sql"#] {
+        let expected = format!(r#"template "app", {place}: needs a database to run on"#);
+        assert!(
+            found.iter().any(|problem| problem.starts_with(&expected)),
+            "{expected}\n{found:#?}"
+        );
+    }
 }
