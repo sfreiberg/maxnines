@@ -113,6 +113,7 @@ fn template_block(template: &Template) -> Block {
         Some(Target::Os(systems)) => attributes.add("os", list(systems)),
         None => {}
     }
+    attributes.text("applies_to", template.applies_to.as_ref());
     attributes.text("min_version", template.min_version.as_ref());
     attributes.list("renamed_from", &template.renamed_from);
     attributes.off(template.enabled);

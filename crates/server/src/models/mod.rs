@@ -53,6 +53,7 @@ mod template_counters;
 mod template_discovery;
 mod template_fill;
 mod template_fill_version;
+mod template_host;
 mod template_items;
 mod template_metric;
 mod template_notice;
@@ -103,6 +104,7 @@ use crate::host_filter;
 use crate::migrations::Migrator;
 use crate::registration::{HostKind, HostRecord, HostState, Refusal};
 use crate::roles::Role;
+use crate::templates::hosts::SharedTemplates;
 use crate::times::Timestamp;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -187,6 +189,11 @@ pub struct Database {
     facts_locks: FactLocks,
     /// The metrics there are, made again whenever templates change.
     catalog: SharedCatalog,
+    /// The templates as they run, with which hosts each is for, made again with
+    /// the catalog.
+    templates: SharedTemplates,
+    /// Bumped each time they're made again.
+    template_changes: Arc<tokio::sync::watch::Sender<u64>>,
 }
 
 /// A lock for each host whose facts are being saved, kept only while they are.
@@ -271,6 +278,8 @@ impl Database {
             connection,
             facts_locks: FactLocks::default(),
             catalog: SharedCatalog::default(),
+            templates: SharedTemplates::default(),
+            template_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
         };
         database.refresh_catalog().await?;
         Ok(database)

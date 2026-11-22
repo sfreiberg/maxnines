@@ -55,6 +55,11 @@
       {% endfor %}
       {% set e = errors | get(key="os", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
     </div>
+    <label>Which hosts
+      <input type="text" name="applies_to" value="{{ form.applies_to }}" spellcheck="false" autocomplete="off" data-cel="applies_to" placeholder="facts.custom.role == 'db'">
+      <small>CEL over a host's facts. Leave empty for every host. Hosts can also be given it by hand on its page.</small>
+      {% set e = errors | get(key="applies_to", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
     <label>Oldest version
       <input type="text" name="min_version" value="{{ form.min_version }}" spellcheck="false" placeholder="10">
       {% set e = errors | get(key="min_version", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}

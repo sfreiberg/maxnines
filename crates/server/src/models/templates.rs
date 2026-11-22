@@ -32,13 +32,14 @@ use super::alerting::{
 use super::audit::record_change;
 use super::{
     Database, alert, alert_rule, maintenance_window, name_key, name_taken_or, silence, template,
-    template_counters, template_discovery, template_fill, template_fill_version, template_items,
-    template_metric, template_notice, template_query, template_registry_read,
+    template_counters, template_discovery, template_fill, template_fill_version, template_host,
+    template_items, template_metric, template_notice, template_query, template_registry_read,
 };
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::audit::{Kind, Snapshot};
 use crate::catalog::Catalog;
 use crate::templates::built_in::BuiltIn;
+use crate::templates::hosts::{Running, RunningTemplates};
 use crate::templates::{Refused, alert_rule as template_values};
 use crate::times::Timestamp;
 
@@ -100,6 +101,13 @@ pub struct StoredTemplate {
     /// What someone chose, for a built-in or imported one, or nothing while it
     /// follows what the template ships.
     pub enabled_choice: Option<bool>,
+    /// Which hosts it's for, by their facts: what someone chose for a built-in or
+    /// imported one, or what the template says.
+    pub applies_to: Option<String>,
+    /// Whether someone chose that, for a built-in or imported one.
+    pub applies_to_chosen: bool,
+    /// The hosts given it by hand, on top of those `applies_to` picks.
+    pub host_ids: Vec<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     /// When an upgrade last changed it, for a built-in one.
@@ -386,6 +394,10 @@ async fn read_template<C: ConnectionTrait>(
         name: row.name.clone(),
         description: row.description.clone(),
         target,
+        applies_to: match reading {
+            Reading::AsWritten => row.applies_to.clone(),
+            Reading::AsRun => row.applies_to_choice.clone().or(row.applies_to.clone()),
+        },
         min_version: row.min_version.clone(),
         renamed_from: template_items::renames::read(connection, row.id).await?,
         enabled: on(row.enabled, row.enabled_choice),
@@ -433,6 +445,9 @@ async fn to_stored<C: ConnectionTrait>(
         origin: Origin::parse(&row.origin)?,
         enabled: row.enabled_choice.unwrap_or(row.enabled),
         enabled_choice: row.enabled_choice,
+        applies_to: row.applies_to_choice.clone().or(row.applies_to.clone()),
+        applies_to_chosen: row.applies_to_choice.is_some(),
+        host_ids: hosts_given(connection, row.id).await?,
         created_at: row.created_at,
         updated_at: row.updated_at,
         upgraded_at: row.upgraded_at,
@@ -855,7 +870,22 @@ fn template_snapshot(stored: &StoredTemplate) -> Result<Snapshot> {
     let mut fields = serde_json::to_value(&stored.template).context("recording a template")?;
     fields["enabled"] = json!(stored.enabled);
     fields["origin"] = json!(stored.origin.as_str());
+    fields["applies_to"] = json!(stored.applies_to);
+    fields["host_ids"] = json!(stored.host_ids);
     Ok(Snapshot::new(stored.template.name.clone(), fields))
+}
+
+/// The hosts given a template by hand.
+async fn hosts_given<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Vec<String>> {
+    Ok(template_host::Entity::find()
+        .filter(template_host::Column::TemplateId.eq(id))
+        .order_by_asc(template_host::Column::HostId)
+        .all(connection)
+        .await
+        .context("loading a template's hosts")?
+        .into_iter()
+        .map(|row| row.host_id)
+        .collect())
 }
 
 async fn load_template<C: ConnectionTrait>(
@@ -1155,6 +1185,7 @@ fn described(row: &mut template::ActiveModel, template: &Template) {
     row.description = Set(template.description.clone());
     row.target_kind = Set(template.target.as_ref().map(|t| t.kind().to_string()));
     row.target = Set(template.target.as_ref().map(Target::value));
+    row.applies_to = Set(template.applies_to.clone());
     row.min_version = Set(template.min_version.clone());
 }
 
@@ -1517,8 +1548,9 @@ impl Database {
     }
 
     /// Makes the catalog of metrics again from the templates there are now, each as
-    /// it runs. Everything here that changes a template, or turns one or a part of
-    /// one on or off, ends with this, so what's read never waits for a restart.
+    /// it runs, and says again which hosts each is for, telling agents' connections.
+    /// Everything here that changes a template, turns one or a part of one on or off,
+    /// or changes which hosts it's for, ends with this, so nothing waits for a restart.
     pub async fn refresh_catalog(&self) -> Result<()> {
         let rows = template::Entity::find()
             .filter(template::Column::DeletedAt.is_null())
@@ -1526,11 +1558,30 @@ impl Database {
             .all(&self.connection)
             .await
             .context("loading templates")?;
+        let mut given: HashMap<i64, BTreeSet<String>> = HashMap::new();
+        for row in template_host::Entity::find()
+            .all(&self.connection)
+            .await
+            .context("loading templates' hosts")?
+        {
+            given
+                .entry(row.template_id)
+                .or_default()
+                .insert(row.host_id);
+        }
         let mut templates = Vec::with_capacity(rows.len());
         for row in &rows {
-            templates.push(read_template(&self.connection, row, Reading::AsRun).await?);
+            templates.push(Running {
+                id: row.id,
+                template: read_template(&self.connection, row, Reading::AsRun).await?,
+                host_ids: given.remove(&row.id).unwrap_or_default(),
+            });
         }
-        self.catalog.set(Catalog::with_templates(&templates));
+        self.catalog.set(Catalog::with_templates(
+            templates.iter().map(|t| &t.template),
+        ));
+        self.templates.set(RunningTemplates::new(templates));
+        self.template_changes.send_modify(|revision| *revision += 1);
         Ok(())
     }
 
@@ -1734,6 +1785,77 @@ impl Database {
         transaction.commit().await.context("saving template")?;
         self.refresh_catalog().await?;
         Ok(true)
+    }
+
+    /// Says which hosts a template is for: those `applies_to` picks by their facts,
+    /// and `host_ids` given it by hand. For a built-in or imported template the
+    /// condition is someone's choice, kept beside what the template says, and
+    /// choosing what it says again goes back to following it. Returns false if
+    /// there's no such template.
+    pub async fn set_template_hosts(
+        &self,
+        id: i64,
+        applies_to: Option<String>,
+        host_ids: &BTreeSet<String>,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving template")?;
+        let Some(stored) = load_template(&transaction, id).await? else {
+            return Ok(false);
+        };
+        let before = template_snapshot(&stored)?;
+        let mut active = template::ActiveModel {
+            id: Set(id),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        match stored.origin.is_original() {
+            true => {
+                let ships = &stored.template.applies_to;
+                active.applies_to_choice = Set(match (&applies_to, ships) {
+                    (wanted, ships) if wanted == ships => None,
+                    // Every host, in place of the hosts the template picks.
+                    (None, Some(_)) => Some("true".to_string()),
+                    (wanted, _) => wanted.clone(),
+                });
+            }
+            false => active.applies_to = Set(applies_to),
+        }
+        active
+            .update(&transaction)
+            .await
+            .context("saving template")?;
+        template_host::Entity::delete_many()
+            .filter(template_host::Column::TemplateId.eq(id))
+            .exec(&transaction)
+            .await
+            .context("saving a template's hosts")?;
+        if !host_ids.is_empty() {
+            template_host::Entity::insert_many(host_ids.iter().map(|host_id| {
+                template_host::ActiveModel {
+                    template_id: Set(id),
+                    host_id: Set(host_id.clone()),
+                    ..Default::default()
+                }
+            }))
+            .exec(&transaction)
+            .await
+            .context("saving a template's hosts")?;
+        }
+        record_template(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
+        Ok(true)
+    }
+
+    /// The templates as they run, each with which hosts it's for.
+    pub fn running_templates(&self) -> std::sync::Arc<RunningTemplates> {
+        self.templates.get()
+    }
+
+    /// Told each time a template, or which hosts one is for, changes.
+    pub fn template_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.template_changes.subscribe()
     }
 
     /// The template a rule is one of the alerts of, whether it's the template's own

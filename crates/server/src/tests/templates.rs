@@ -1942,3 +1942,110 @@ async fn a_template_alert_with_no_samples_yet_does_not_fire() {
     evaluator.evaluate(crate::times::now()).await.unwrap();
     assert!(database.open_alerts().await.unwrap().is_empty());
 }
+
+/// A template whose alert fires on every host it's for that's online.
+const HERE: &str = r#"
+template "here" {
+  name       = "Here"
+  applies_to = "facts.custom.role == 'web'"
+  alert "here" {
+    name     = "Here"
+    critical = "online"
+  }
+}
+"#;
+
+#[tokio::test]
+async fn a_template_is_for_the_hosts_given_it_and_those_it_picks_and_its_alerts_too() {
+    let server = start_with_metrics().await;
+    let (a, b) = (identity(), identity());
+    let _a = server.connect_approved(&a, "web-1").await;
+    let _b = server.connect_approved(&b, "db-1").await;
+    let database = &server.state.database;
+    database
+        .sync_templates(&shipped(&[HERE]), crate::times::now())
+        .await
+        .unwrap();
+    let id = template_id(database, "here").await;
+    let mut evaluator = crate::alert_evaluator::Evaluator::new(
+        &server.state,
+        crate::times::now() - TimeDelta::hours(1),
+    );
+    let firing_on = |open: Vec<crate::alerting::Alert>| {
+        let mut hosts: Vec<String> = open.into_iter().map(|alert| alert.host_id).collect();
+        hosts.sort();
+        hosts
+    };
+
+    // As it comes, it picks hosts whose role is web, which neither has.
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert!(database.open_alerts().await.unwrap().is_empty());
+
+    // Given b by hand, it's for b as well as those it picks.
+    let path = format!("/api/v1/templates/{id}/hosts");
+    let given_b = json!({ "applies_to": "facts.custom.role == 'web'", "host_ids": [b.id()] });
+    assert_eq!(api(&server, "PUT", &path, &given_b).await.0, 204);
+    let (_, shown) = api(
+        &server,
+        "GET",
+        &format!("/api/v1/templates/{id}"),
+        &json!(null),
+    )
+    .await;
+    assert_eq!(shown["host_ids"], json!([b.id()]));
+    // The same condition as it comes isn't a choice.
+    assert_eq!(shown["applies_to_chosen"], false);
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert_eq!(firing_on(database.open_alerts().await.unwrap()), [b.id()]);
+
+    // Every host, chosen in place of the hosts it picks, lasts through an upgrade.
+    let everywhere = json!({ "applies_to": null, "host_ids": [] });
+    assert_eq!(api(&server, "PUT", &path, &everywhere).await.0, 204);
+    database
+        .sync_templates(
+            &shipped(&[&HERE.replace("\"online\"", "\"online || false\"")]),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert!(stored.applies_to_chosen);
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    let mut both = vec![a.id(), b.id()];
+    both.sort();
+    assert_eq!(firing_on(database.open_alerts().await.unwrap()), both);
+
+    // A condition has to be CEL, and a host has to be there.
+    let broken = json!({ "applies_to": "facts.custom.role ==" });
+    let (status, body) = api(&server, "PUT", &path, &broken).await;
+    assert_eq!(status, 422);
+    assert!(
+        body["error"].as_str().unwrap().contains("isn't CEL"),
+        "{body}"
+    );
+    let nowhere = json!({ "host_ids": ["nowhere"] });
+    assert_eq!(api(&server, "PUT", &path, &nowhere).await.0, 422);
+
+    // The page shows and saves the same.
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/templates/{id}")).await;
+    assert!(page.body.contains("Save hosts"), "{}", page.body);
+    assert!(page.body.contains("db-1"), "{}", page.body);
+    let token = page.token();
+    let host_field = format!("host.{}", a.id());
+    let form = [
+        ("authenticity_token", token.as_str()),
+        ("applies_to", "trusted.host_id == 'nowhere'"),
+        (host_field.as_str(), "on"),
+    ];
+    let saved = browser
+        .post(&server, &format!("/templates/{id}/hosts"), &form)
+        .await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert_eq!(stored.host_ids, [a.id()]);
+    assert_eq!(
+        stored.applies_to.as_deref(),
+        Some("trusted.host_id == 'nowhere'")
+    );
+}

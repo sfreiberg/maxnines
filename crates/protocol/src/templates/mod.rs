@@ -44,6 +44,9 @@ pub struct Template {
     pub description: Option<String>,
     /// What it runs once for on each host. With none, it runs once on every host.
     pub target: Option<Target>,
+    /// CEL over a host's facts saying which hosts it's for, before what it runs for
+    /// is looked for on them. With none, it's for every host.
+    pub applies_to: Option<String>,
     /// The oldest version it's for.
     pub min_version: Option<String>,
     /// Keys it had before, so a renamed template keeps what people changed.

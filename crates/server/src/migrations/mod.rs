@@ -1049,6 +1049,11 @@ impl MigrationTrait for CreateTables {
             // operating systems, comma separated. Neither for every host.
             .col(ColumnDef::new(Templates::TargetKind).string_len(16))
             .col(ColumnDef::new(Templates::Target).string_len(255))
+            // CEL over a host's facts saying which hosts it's for, as it ships, and
+            // what someone chose instead for a built-in or imported one, if they have.
+            // With neither, it's for every host, unless hosts are given it by hand.
+            .col(ColumnDef::new(Templates::AppliesTo).text())
+            .col(ColumnDef::new(Templates::AppliesToChoice).text())
             .col(ColumnDef::new(Templates::MinVersion).string_len(64))
             // What a built-in one says, hashed, so an upgrade can tell it changed.
             .col(ColumnDef::new(Templates::Fingerprint).string_len(64))
@@ -1099,6 +1104,48 @@ impl MigrationTrait for CreateTables {
             .await?;
         }
         template_parts(manager).await?;
+        // Hosts given a template by hand, on top of those its condition picks.
+        manager
+            .create_table(
+                Table::create()
+                    .table(TemplateHosts::Table)
+                    .col(id(TemplateHosts::Id))
+                    .col(
+                        ColumnDef::new(TemplateHosts::TemplateId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(TemplateHosts::HostId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_hosts_template_id")
+                            .from(TemplateHosts::Table, TemplateHosts::TemplateId)
+                            .to(Templates::Table, Templates::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_hosts_host_id")
+                            .from(TemplateHosts::Table, TemplateHosts::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        index_of(
+            manager,
+            Unique,
+            "idx_template_hosts_template_host",
+            "template_hosts",
+            "template_id, host_id",
+            None,
+        )
+        .await?;
         // A rule is only ever marked deleted, as its alerts keep it, and its name is
         // used once among those that aren't. A template's alert is a rule, which for
         // a built-in template belongs to the server: someone changing it makes a copy
@@ -2181,6 +2228,8 @@ enum Templates {
     Origin,
     TargetKind,
     Target,
+    AppliesTo,
+    AppliesToChoice,
     MinVersion,
     Fingerprint,
     Enabled,
@@ -2191,6 +2240,14 @@ enum Templates {
     UpgradeSeen,
     UpgradeNote,
     DeletedAt,
+}
+
+#[derive(Iden)]
+enum TemplateHosts {
+    Table,
+    Id,
+    TemplateId,
+    HostId,
 }
 
 #[derive(Iden)]

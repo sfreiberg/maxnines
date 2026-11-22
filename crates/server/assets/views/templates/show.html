@@ -29,6 +29,30 @@
 {% if original %}<p class="hint">{% if origin == "imported" %}Importing a newer version replaces{% else %}Upgrades replace{% endif %} what this template says. Changing one of its alerts makes a copy of your own, used in its place, which that leaves alone, and turning it or an alert off lasts through it.</p>{% endif %}
 
 <section class="card">
+  <h2>Hosts</h2>
+  <p class="hint">It's for the hosts given it here and those the condition picks by their facts. With neither, it's for every host. On each, it runs for {{ target | lower }}.</p>
+  {% if can_edit %}
+  <form method="post" action="/templates/{{ id }}/hosts" class="stacked" hx-post="/templates/{{ id }}/hosts" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <label>Hosts matching
+      <input type="text" name="applies_to" value="{{ applies_to | default(value='') }}" spellcheck="false" autocomplete="off" data-cel="applies_to" placeholder="facts.custom.role == 'db'">
+      <small>CEL over a host's facts. Leave empty for every host, or only those given it below.{% if original %} {% if applies_to_chosen %}Your choice, whatever a newer version says{% if ships_applies_to %}: it comes as <code>{{ ships_applies_to }}</code>{% else %}: it comes for every host{% endif %}.{% else %}As the template comes, which a newer version can change.{% endif %}{% endif %}</small>
+    </label>
+    {% if hosts %}
+    <div class="checks" role="group" aria-label="Hosts given it">
+      {% for host in hosts %}
+      <label class="checkbox"><input type="checkbox" name="host.{{ host.id }}"{% if host.given %} checked{% endif %}> {{ host.hostname }}</label>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="actions"><button type="submit" class="secondary">Save hosts</button></div>
+  </form>
+  {% else %}
+  <p>{% if applies_to %}Hosts where <code>{{ applies_to }}</code>{% if given_hosts %}, and {{ given_hosts | join(sep=", ") }}{% endif %}{% elif given_hosts %}{{ given_hosts | join(sep=", ") }}{% else %}Every host{% endif %}</p>
+  {% endif %}
+</section>
+
+<section class="card">
   <h2>Alerts</h2>
   {% if alerts %}
   <div class="table-scroll"><table>

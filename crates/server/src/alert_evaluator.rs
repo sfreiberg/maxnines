@@ -5,7 +5,7 @@
 //! Open alerts are saved, so a restart doesn't repeat them. How long a problem
 //! has lasted so far is only held in memory, so a restart starts that wait again.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -44,6 +44,7 @@ use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
 use crate::rule_engine::{Condition, Host};
 use crate::server_stats::ServerStatus;
+use crate::templates::hosts::RunningTemplates;
 use crate::times::{self, Timestamp};
 
 /// How often rules are checked. Matches the default sample interval.
@@ -275,6 +276,9 @@ struct Snapshot {
     hosts: BTreeMap<String, HostRecord>,
     /// For each rule with a condition for which hosts, the hosts it applies to.
     applies: HashMap<i64, HashSet<String>>,
+    /// For each template that says which hosts it's for, those hosts, by the
+    /// template's ID.
+    template_hosts: HashMap<i64, HashSet<String>>,
     /// Each host's facts, ready for conditions, if any condition uses them.
     facts: HashMap<String, CelValue>,
     /// By metric and agent. A metric that couldn't be read is missing, which
@@ -290,11 +294,17 @@ struct Snapshot {
 
 impl Snapshot {
     fn rule_applies(&self, rule: &AlertRule, host_id: &str) -> bool {
-        rule.rule.applies_to.is_none()
-            || self
-                .applies
-                .get(&rule.id)
-                .is_some_and(|hosts| hosts.contains(host_id))
+        let template_is_for = rule.template.as_ref().is_none_or(|template| {
+            self.template_hosts
+                .get(&template.id)
+                .is_none_or(|hosts| hosts.contains(host_id))
+        });
+        template_is_for
+            && (rule.rule.applies_to.is_none()
+                || self
+                    .applies
+                    .get(&rule.id)
+                    .is_some_and(|hosts| hosts.contains(host_id)))
     }
 
     /// The trusted trends of a metric on a host, as a forecast reads them.
@@ -432,6 +442,30 @@ fn hosts_each_applies_to(
         }
     }
     applies
+}
+
+/// For each of these templates, by ID, the hosts it's for. Without facts, only
+/// hosts given it by hand count.
+fn hosts_each_template_is_for(
+    templates: &RunningTemplates,
+    narrowed: &BTreeSet<i64>,
+    host_ids: &[String],
+    facts: Option<&BTreeMap<String, FlatFacts>>,
+) -> HashMap<i64, HashSet<String>> {
+    let mut is_for: HashMap<i64, HashSet<String>> =
+        narrowed.iter().map(|id| (*id, HashSet::new())).collect();
+    for id in host_ids {
+        let shape = facts
+            .and_then(|facts| facts.get(id))
+            .map_or(Value::Null, unflatten);
+        let host = Host::new(&shape, id);
+        for template in narrowed.iter().filter_map(|id| templates.get(*id)) {
+            if template.is_for(&host) {
+                is_for.entry(template.id()).or_default().insert(id.clone());
+            }
+        }
+    }
+    is_for
 }
 
 /// Each host's facts as conditions see them.
@@ -615,23 +649,36 @@ impl Evaluator {
             .filter_map(|rule| Some((rule.id, rule.rule.applies_to.clone()?)))
             .collect();
         let wants_facts = uses(Variable::Facts);
-        let (applies, facts) = if applies_to.is_empty() && !wants_facts {
-            (HashMap::new(), HashMap::new())
-        } else {
-            let facts = self.database.all_current_facts().await?;
-            let ids: Vec<String> = hosts.keys().cloned().collect();
-            // Every condition against every host is work for a thread of its own.
-            tokio::task::spawn_blocking(move || {
-                let applies = hosts_each_applies_to(&applies_to, &ids, &facts);
-                let shaped = match wants_facts {
-                    true => facts_for_conditions(&ids, &facts),
-                    false => HashMap::new(),
-                };
-                (applies, shaped)
-            })
-            .await
-            .context("checking alert rules' conditions")?
-        };
+        // A template's alerts are only for the hosts the template is for.
+        let templates = self.database.running_templates();
+        let narrowed: BTreeSet<i64> = active()
+            .filter_map(|rule| Some(rule.template.as_ref()?.id))
+            .filter(|id| templates.get(*id).is_some_and(|t| t.is_narrowed()))
+            .collect();
+        let templates_use_facts = narrowed
+            .iter()
+            .any(|id| templates.get(*id).is_some_and(|t| t.uses_facts()));
+        let ids: Vec<String> = hosts.keys().cloned().collect();
+        let (applies, facts, template_hosts) =
+            if applies_to.is_empty() && !wants_facts && !templates_use_facts {
+                let template_hosts = hosts_each_template_is_for(&templates, &narrowed, &ids, None);
+                (HashMap::new(), HashMap::new(), template_hosts)
+            } else {
+                let facts = self.database.all_current_facts().await?;
+                // Every condition against every host is work for a thread of its own.
+                tokio::task::spawn_blocking(move || {
+                    let applies = hosts_each_applies_to(&applies_to, &ids, &facts);
+                    let shaped = match wants_facts {
+                        true => facts_for_conditions(&ids, &facts),
+                        false => HashMap::new(),
+                    };
+                    let template_hosts =
+                        hosts_each_template_is_for(&templates, &narrowed, &ids, Some(&facts));
+                    (applies, shaped, template_hosts)
+                })
+                .await
+                .context("checking alert rules' conditions")?
+            };
 
         let host_rules = || active().filter(|rule| !rule.rule.is_calculation());
         let shown: HashMap<i64, Vec<Arc<Metric>>> = host_rules()
@@ -712,6 +759,7 @@ impl Evaluator {
             shown,
             hosts,
             applies,
+            template_hosts,
             facts,
             readings,
             trends: self.trends.clone(),

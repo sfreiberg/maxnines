@@ -66,7 +66,12 @@ impl fmt::Debug for DatabaseDefinition {
 }
 
 impl DatabaseDefinition {
-    fn database(&self, name: &str) -> Result<Database> {
+    /// What kind of database it says it is, such as `postgres`.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    pub fn database(&self, name: &str) -> Result<Database> {
         let kind = CheckKind::parse(&self.kind)
             .filter(|kind| is_database(*kind))
             .with_context(|| {

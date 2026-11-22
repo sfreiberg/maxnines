@@ -18,6 +18,10 @@ pub struct Model {
     pub target_kind: Option<String>,
     /// The kind of database, the service, or the operating systems, comma separated.
     pub target: Option<String>,
+    /// CEL over a host's facts saying which hosts it's for, as it ships.
+    pub applies_to: Option<String>,
+    /// What someone chose instead, for a built-in or imported one, if they have.
+    pub applies_to_choice: Option<String>,
     pub min_version: Option<String>,
     /// For a built-in one, a hash of what it says.
     pub fingerprint: Option<String>,

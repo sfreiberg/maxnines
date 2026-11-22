@@ -15,6 +15,9 @@ themselves, which gives `422`.
 | `enabled` | Whether it's on. Turning it off turns off its alerts |
 | `enabled_choice` | For a built-in or imported one, what you chose, `true` or `false`, or `null` while it follows what the template ships, which a newer version can change |
 | `target` | What it runs for: `{"kind": "database", "value": "postgres"}`, `service`, or `os` with a list of systems, or `null` for every host |
+| `applies_to` | CEL over a host's facts saying which hosts it's for: your choice for a built-in or imported one, or what the template says. `null` for every host |
+| `applies_to_chosen` | Whether `applies_to` is your choice, which newer versions leave alone |
+| `host_ids` | The hosts you gave it by hand, on top of those `applies_to` picks |
 | `created_at`, `updated_at` | When it was added, and last changed |
 | `upgraded_at` | When a newer version last changed a built-in or imported one, or `null` |
 | `changed` | Whether you have your own copy of any of its alerts |
@@ -156,6 +159,21 @@ rule](api-alert-rules.md#delete-an-alert-rule) does.
 For a built-in or imported template this is your choice, which newer versions leave
 alone. `POST /api/v1/templates/{id}/follow` forgets it, so the template is on or off as
 it comes again.
+
+## Say which hosts a template is for
+
+`PUT /api/v1/templates/{id}/hosts`
+
+```json
+{ "applies_to": "facts.custom.role == 'db'", "host_ids": ["3f1c…"] }
+```
+
+A template is for the hosts in `host_ids` and those `applies_to` picks by their facts.
+With neither, it's for every host, and with only `host_ids`, only those. Its alerts are
+only checked on the hosts it's for. For a built-in or imported template, `applies_to`
+is your choice, which newer versions leave alone, and giving the one the template
+comes with goes back to following it. `applies_to` has to be CEL and each host has to
+be there, or the answer is `422` saying which. Gives back `204`.
 
 ## Change one of a template's alerts
 

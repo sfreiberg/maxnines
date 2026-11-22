@@ -89,6 +89,20 @@ One field says what a template is for, and it runs once for each match on a host
 `min_version` is the oldest version it's for. `services` lists services that the
 host's own **Service stopped** alert should watch.
 
+Databases are found from the `agent.databases` fact, which names each database in the
+agent's config with its kind, such as `{"orders": "postgres"}`, and services from the
+`services` fact, the services Windows has installed.
+
+### Which hosts it's for
+
+`applies_to` is CEL over a host's facts, as a [config rule's](agents.md) is, saying
+which hosts a template is for: `applies_to = "facts.custom.role == 'db'"`. Without
+it, a template is for every host. On a template's page, under **Hosts**, you can change
+that, and give it hosts by hand: it's then for those as well as the ones `applies_to`
+picks, or with no condition, for only those. For a built-in or imported template
+that's your choice, which newer versions leave alone. A template's alerts are only
+checked on the hosts it's for, and what it runs for is only looked for on them.
+
 ### Discovery
 
 `discover` runs first, then every `interval`, and again when what's monitored

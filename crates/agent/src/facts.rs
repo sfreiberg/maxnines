@@ -20,7 +20,9 @@ pub struct Allowed {
     pub check_commands: Vec<String>,
     pub checks: Vec<String>,
     pub openmetrics: Vec<String>,
-    pub databases: Vec<String>,
+    /// Each database by name, with its kind, such as `postgres`, which says which
+    /// templates run for it.
+    pub databases: BTreeMap<String, String>,
 }
 
 /// Asks for the canonical name. The value is the same on every platform we build for.
@@ -223,7 +225,40 @@ fn gather_named(
             "action_variables": action_variables,
         },
         "custom": custom,
+        // Which templates run for a service is up to whether the host has it.
+        "services": installed_services(),
     }))
+}
+
+/// The services Windows has installed, by the names it knows them by, such as
+/// `W3SVC`. Drivers are left out. Other systems don't list theirs yet.
+#[cfg(windows)]
+fn installed_services() -> Option<Vec<String>> {
+    use windows_registry::LOCAL_MACHINE;
+
+    // Any of these bits makes it a service of its own or sharing a process,
+    // rather than a driver.
+    const SERVICE: u32 = 0x10 | 0x20;
+    let services = LOCAL_MACHINE
+        .open(r"SYSTEM\CurrentControlSet\Services")
+        .ok()?;
+    let mut names: Vec<String> = services
+        .keys()
+        .ok()?
+        .filter(|name| {
+            services
+                .open(name)
+                .and_then(|key| key.get_u32("Type"))
+                .is_ok_and(|kind| kind & SERVICE != 0)
+        })
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    Some(names)
+}
+
+#[cfg(not(windows))]
+fn installed_services() -> Option<Vec<String>> {
+    None
 }
 
 /// The processor's architecture and name.
@@ -468,7 +503,7 @@ mod tests {
             check_commands: vec!["check_raid".to_string()],
             checks: vec!["bastion".to_string()],
             openmetrics: vec!["node".to_string()],
-            databases: vec!["orders".to_string()],
+            databases: BTreeMap::from([("orders".to_string(), "postgres".to_string())]),
         };
         let facts = gather(&BTreeMap::new(), &allowed, &Actions::new(), true).unwrap();
 
@@ -476,7 +511,7 @@ mod tests {
         assert_eq!(facts["agent"]["check_commands"], json!(["check_raid"]));
         assert_eq!(facts["agent"]["checks"], json!(["bastion"]));
         assert_eq!(facts["agent"]["openmetrics"], json!(["node"]));
-        assert_eq!(facts["agent"]["databases"], json!(["orders"]));
+        assert_eq!(facts["agent"]["databases"], json!({ "orders": "postgres" }));
     }
 
     #[test]

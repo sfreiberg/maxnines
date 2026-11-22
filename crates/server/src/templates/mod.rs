@@ -8,6 +8,7 @@
 //! full names.
 
 pub mod built_in;
+pub mod hosts;
 
 use anyhow::{Result, bail};
 use cel::{Context as CelContext, Program, Value as CelValue};
@@ -68,6 +69,7 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
             say(place, field, format!("isn't CEL: {error}"));
         }
     };
+    cel(Place::Template, "applies_to", &template.applies_to);
     for (index, notice) in template.notices.iter().enumerate() {
         cel(Place::Notice(index), "when", &notice.when);
     }

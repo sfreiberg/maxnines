@@ -40,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         .route("/templates/{id}/enable", post(enable))
         .route("/templates/{id}/disable", post(disable))
         .route("/templates/{id}/follow", post(follow))
+        .route("/templates/{id}/hosts", post(set_hosts))
         .route("/templates/{id}/alerts/{rule}/enable", post(enable_alert))
         .route("/templates/{id}/alerts/{rule}/disable", post(disable_alert))
         .route("/templates/{id}/alerts/{rule}/reset", post(reset_alert))
@@ -60,6 +61,7 @@ pub fn api_routes() -> Router<AppState> {
         .route("/templates/{id}/enable", post(api_enable))
         .route("/templates/{id}/disable", post(api_disable))
         .route("/templates/{id}/follow", post(api_follow))
+        .route("/templates/{id}/hosts", put(api_set_hosts))
         .route(
             "/templates/{id}/alerts/{key}",
             put(api_override_alert).delete(api_reset_alert),
@@ -343,6 +345,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         Ok(None) => return not_found(&state, &token),
         Err(error) => return server_error(&error),
     };
+    let hosts = host_choices(&state, &stored.host_ids).await;
     Page::new(&state, &token, "templates/show.html")
         .with("id", &stored.id)
         .with("template", &stored.template)
@@ -351,11 +354,101 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         .with("enabled", &stored.enabled)
         .with("enabled_choice", &stored.enabled_choice.is_some())
         .with("target", &target_words(&stored.template))
+        .with(
+            "applies_to",
+            &stored.applies_to.clone().filter(|text| text != "true"),
+        )
+        .with("applies_to_chosen", &stored.applies_to_chosen)
+        .with("ships_applies_to", &stored.template.applies_to)
+        .with("hosts", &hosts)
+        .with(
+            "given_hosts",
+            &hosts
+                .iter()
+                .filter(|host| host.given)
+                .map(|host| host.hostname.as_str())
+                .collect::<Vec<_>>(),
+        )
         .with("upgraded", &stored.upgraded_at.map(local_date))
         .with("source", &stored.hcl())
         .with("alerts", &alert_rows(&alerts))
         .with("metrics", &metric_rows(&stored.template))
         .render()
+}
+
+/// A host the template's page can give it by hand.
+#[derive(Serialize)]
+struct HostChoice {
+    id: String,
+    hostname: String,
+    given: bool,
+}
+
+async fn host_choices(state: &AppState, given: &[String]) -> Vec<HostChoice> {
+    let mut hosts: Vec<HostChoice> = state
+        .registry
+        .list()
+        .await
+        .into_iter()
+        .map(|host| HostChoice {
+            given: given.contains(&host.id),
+            id: host.id,
+            hostname: host.hostname,
+        })
+        .collect();
+    hosts.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.id.cmp(&b.id)));
+    hosts
+}
+
+/// Which hosts a template is for, as a page or the API asks: the condition, which
+/// has to be CEL, and hosts that have to be there. Says what's wrong otherwise.
+async fn save_hosts(
+    state: &AppState,
+    id: i64,
+    applies_to: Option<String>,
+    host_ids: Vec<String>,
+) -> Result<Result<bool, String>> {
+    let applies_to = applies_to
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    if let Some(text) = &applies_to
+        && let Err(error) = crate::rule_engine::Condition::compile(text)
+    {
+        return Ok(Err(format!("applies_to isn't CEL: {error}")));
+    }
+    let known = state.registry.list().await;
+    let mut given = std::collections::BTreeSet::new();
+    for host_id in host_ids {
+        if !known.iter().any(|host| host.id == host_id) {
+            return Ok(Err(format!("there's no host {host_id:?}")));
+        }
+        given.insert(host_id);
+    }
+    Ok(Ok(state
+        .database
+        .set_template_hosts(id, applies_to, &given, crate::times::now())
+        .await?))
+}
+
+async fn set_hosts(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    let applies_to = form.fields.get("applies_to").cloned();
+    let host_ids: Vec<String> = form
+        .fields
+        .iter()
+        .filter_map(|(name, value)| {
+            (value == "on").then(|| name.strip_prefix("host.").map(str::to_string))?
+        })
+        .collect();
+    match save_hosts(&state, id, applies_to, host_ids).await {
+        Ok(Ok(true)) => (
+            form.token.clone(),
+            Redirect::to(&format!("/templates/{id}")),
+        )
+            .into_response(),
+        Ok(Ok(false)) => not_found(&state, &form.token),
+        Ok(Err(message)) => (StatusCode::UNPROCESSABLE_ENTITY, message).into_response(),
+        Err(error) => server_error(&error),
+    }
 }
 
 fn not_found(state: &AppState, token: &CsrfToken) -> Response {
@@ -756,6 +849,13 @@ struct TemplateSummary {
     /// follows what the template ships.
     enabled_choice: Option<bool>,
     target: Option<maxnines_protocol::templates::Target>,
+    /// CEL over a host's facts saying which hosts it's for: someone's choice for a
+    /// built-in or imported one, or what the template says.
+    applies_to: Option<String>,
+    /// Whether that's someone's choice.
+    applies_to_chosen: bool,
+    /// The hosts given it by hand, on top of those `applies_to` picks.
+    host_ids: Vec<String>,
     created_at: crate::times::Timestamp,
     updated_at: crate::times::Timestamp,
     upgraded_at: Option<crate::times::Timestamp>,
@@ -773,6 +873,9 @@ fn summary(stored: &StoredTemplate, rules: &[AlertRule]) -> TemplateSummary {
         enabled: stored.enabled,
         enabled_choice: stored.enabled_choice,
         target: stored.template.target.clone(),
+        applies_to: stored.applies_to.clone(),
+        applies_to_chosen: stored.applies_to_chosen,
+        host_ids: stored.host_ids.clone(),
         created_at: stored.created_at,
         updated_at: stored.updated_at,
         upgraded_at: stored.upgraded_at,
@@ -934,6 +1037,26 @@ async fn api_follow(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => super::api::server_error(&error),
+    }
+}
+
+#[derive(Deserialize)]
+struct HostsInput {
+    applies_to: Option<String>,
+    #[serde(default)]
+    host_ids: Vec<String>,
+}
+
+async fn api_set_hosts(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<HostsInput>,
+) -> Response {
+    match save_hosts(&state, id, input.applies_to, input.host_ids).await {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(message)) => refused(&anyhow::anyhow!(message)),
         Err(error) => super::api::server_error(&error),
     }
 }

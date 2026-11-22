@@ -101,6 +101,7 @@ struct TemplateFields {
     database: Option<String>,
     service: Option<String>,
     os: Option<Vec<String>>,
+    applies_to: Option<String>,
     min_version: Option<String>,
     #[serde(default)]
     renamed_from: Vec<String>,
@@ -127,6 +128,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
         name: fields.name,
         description: fields.description,
         target,
+        applies_to: fields.applies_to,
         min_version: fields.min_version,
         renamed_from: fields.renamed_from,
         enabled: fields.enabled,

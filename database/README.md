@@ -69,6 +69,8 @@ erDiagram
     template_fills ||--o{ template_fill_versions : "by version"
     templates ||--o{ template_counters : "counts"
     template_queries |o--o{ template_metrics : "gives"
+    templates ||--o{ template_hosts : "given by hand"
+    hosts ||--o{ template_hosts : "given"
     templates ||--o{ template_renames : "was called"
     templates ||--o{ template_services : "watches"
     template_discoveries ||--o{ template_counter_sets : "looks for"
@@ -181,6 +183,8 @@ erDiagram
         string origin "built_in, imported or own"
         string target_kind "database, service or os, or NULL for every host"
         string target "the kind of database, the service, or systems, comma separated"
+        text applies_to "CEL over facts saying which hosts it's for, as it ships, or NULL for all"
+        text applies_to_choice "what someone chose instead, for a built-in or imported one"
         string min_version
         string fingerprint "a hash of what a built-in or imported one says, or NULL"
         boolean enabled "whether it ships on, for a built-in or imported one"
@@ -191,6 +195,11 @@ erDiagram
         boolean upgrade_seen "whether admins dismissed the notice of it"
         text upgrade_note "what else that notice says, such as what became of copies"
         timestamp deleted_at "kept so its rules can name it"
+    }
+    template_hosts {
+        int id PK
+        int template_id FK
+        string host_id FK "unique with template_id"
     }
     template_discoveries {
         int id PK

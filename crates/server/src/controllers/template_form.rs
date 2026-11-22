@@ -23,6 +23,8 @@ pub struct TemplateForm {
     pub database: String,
     pub service: String,
     pub os: Vec<String>,
+    /// CEL over a host's facts saying which hosts it's for, or empty for all.
+    pub applies_to: String,
     pub min_version: String,
     /// Comma separated.
     pub renamed_from: String,
@@ -278,6 +280,7 @@ impl TemplateForm {
             database,
             service,
             os,
+            applies_to: text(&template.applies_to),
             min_version: text(&template.min_version),
             renamed_from: comma_list(&template.renamed_from),
             services: comma_list(&template.services),
@@ -516,6 +519,7 @@ impl TemplateForm {
             name: self.name.trim().to_string(),
             description: optional(&self.description),
             target,
+            applies_to: optional(&self.applies_to),
             min_version: optional(&self.min_version),
             renamed_from: from_comma_list(&self.renamed_from),
             enabled: self.enabled,
@@ -566,6 +570,7 @@ impl TemplateForm {
                 .filter(|system| on(&format!("os.{system}")))
                 .map(|system| system.to_string())
                 .collect(),
+            applies_to: get("applies_to"),
             min_version: get("min_version"),
             renamed_from: get("renamed_from"),
             services: get("services"),
@@ -783,6 +788,7 @@ impl TemplateForm {
         for system in &self.os {
             put(format!("os.{system}"), "on");
         }
+        put("applies_to".into(), &self.applies_to);
         put("min_version".into(), &self.min_version);
         put("renamed_from".into(), &self.renamed_from);
         put("services".into(), &self.services);

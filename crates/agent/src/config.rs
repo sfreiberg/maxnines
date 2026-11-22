@@ -126,7 +126,11 @@ impl Config {
             check_commands: names(self.check_commands.keys().collect()),
             checks: names(self.checks.keys().collect()),
             openmetrics: names(self.metrics_pages.keys().collect()),
-            databases: names(self.databases.keys().collect()),
+            databases: self
+                .databases
+                .iter()
+                .map(|(name, definition)| (name.clone(), definition.kind().to_string()))
+                .collect(),
         }
     }
 
