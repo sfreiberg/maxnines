@@ -593,6 +593,28 @@ impl Database {
         Ok(names.into_iter().collect())
     }
 
+    /// Every name any agent's map fact has, such as each database in
+    /// `agent.databases`, which maps names to kinds.
+    pub async fn keyed_by_agents(&self, map: &str) -> Result<Vec<String>> {
+        let entries = format!("{map}.");
+        let names: Vec<String> = host_fact::Entity::find()
+            .select_only()
+            .column(host_fact::Column::Name)
+            .distinct()
+            .filter(host_fact::Column::ValidTo.is_null())
+            .filter(starting_with(host_fact::Column::Name, &entries))
+            .into_tuple()
+            .all(&self.connection)
+            .await
+            .context("loading what agents have")?;
+        let keys: BTreeSet<String> = names
+            .iter()
+            .filter_map(|name| name.strip_prefix(&entries))
+            .map(str::to_string)
+            .collect();
+        Ok(keys.into_iter().collect())
+    }
+
     /// Every value each fact has had, oldest first. Rows are ordered by ID, not
     /// time, because two reports can share a timestamp and clocks can go back.
     pub async fn facts_history(&self, host_id: &str) -> Result<Vec<FactVersion>> {
@@ -2171,7 +2193,7 @@ mod tests {
             database.save_host(&record(host)).await.unwrap();
             let facts = flatten(&json!({
                 "os": { "version": version },
-                "agent": { "checks": [check] },
+                "agent": { "checks": [check], "databases": { check: "postgres" } },
                 "agent_x": { "checks": ["not a check"] },
             }))
             .unwrap();
@@ -2191,6 +2213,10 @@ mod tests {
         );
         assert_eq!(
             database.listed_by_agents("agent.checks").await.unwrap(),
+            ["Web_1", "web_1", "web_2", "webx1"]
+        );
+        assert_eq!(
+            database.keyed_by_agents("agent.databases").await.unwrap(),
             ["Web_1", "web_1", "web_2", "webx1"]
         );
         assert!(

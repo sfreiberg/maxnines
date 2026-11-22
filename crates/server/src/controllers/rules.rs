@@ -689,13 +689,7 @@ async fn form_view<'a>(
     let known: Vec<String> = known_facts(state).await.into_keys().collect();
     // What agents' own configs allow, to choose from. The form works without.
     let mut allowed = BTreeMap::new();
-    for list in [
-        "custom_metrics",
-        "check_commands",
-        "checks",
-        "openmetrics",
-        "databases",
-    ] {
+    for list in ["custom_metrics", "check_commands", "checks", "openmetrics"] {
         let names = state
             .database
             .listed_by_agents(&format!("agent.{list}"))
@@ -703,6 +697,9 @@ async fn form_view<'a>(
             .unwrap_or_default();
         allowed.insert(list, names);
     }
+    // Databases are named with their kind, `{"orders": "postgres"}`.
+    let databases = state.database.keyed_by_agents("agent.databases").await;
+    allowed.insert("databases", databases.unwrap_or_default());
 
     Page::new(state, token, "rules/form.html")
         .with("allowed", &allowed)
