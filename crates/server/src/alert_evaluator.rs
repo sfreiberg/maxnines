@@ -459,27 +459,19 @@ fn picked_by_discovery(
     rules: &[&AlertRule],
     found: &BTreeMap<String, Discoveries>,
 ) -> HashMap<i64, HashSet<(String, String)>> {
-    let mut picked: HashMap<i64, HashSet<(String, String)>> = HashMap::new();
-    for rule in rules {
-        let Some(link) = &rule.template else {
-            continue;
-        };
-        let mine = picked.entry(rule.id).or_default();
-        for (host, discoveries) in found {
-            for ((template, database), values) in discoveries {
-                if *template == link.id
-                    && template_work::picked(
-                        link.when.as_deref(),
-                        link.since.as_deref(),
-                        Some(values),
-                    )
-                {
-                    mine.insert((host.clone(), database.clone()));
-                }
-            }
-        }
-    }
-    picked
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let link = rule.template.as_ref()?;
+            let picked = template_work::picked_databases(
+                link.id,
+                link.when.as_deref(),
+                link.since.as_deref(),
+                found,
+            );
+            Some((rule.id, picked))
+        })
+        .collect()
 }
 
 /// For each of these templates, by ID, the hosts it's for. Without facts, only
@@ -1153,17 +1145,8 @@ impl Evaluator {
             series.push(String::new());
         }
         // Only the databases discovery picks, for a rule that's for some of them.
-        if let Some(picked) = snapshot.picked.get(&rule.id)
-            && let Some(at) = conditions
-                .series_labels()
-                .iter()
-                .position(|label| label == INSTANCE_LABEL)
-        {
-            series.retain(|series| {
-                series_values(series)
-                    .get(at)
-                    .is_some_and(|database| picked.contains(&(host.id.clone(), database.clone())))
-            });
+        if let Some(picked) = snapshot.picked.get(&rule.id) {
+            template_work::keep_picked(&mut series, conditions.series_labels(), &host.id, picked);
         }
         series.truncate(MAX_SERIES_PER_HOST);
 

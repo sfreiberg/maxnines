@@ -2203,6 +2203,47 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
     };
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].series.as_deref(), Some("a"));
+    // Trying it on the last day picks the same: the replica's series, not both.
+    let backlog = rule(database, "Replica backlog").await;
+    let (_, shown) = api(
+        &server,
+        "GET",
+        &format!("/api/v1/alert-rules/{}", backlog.id),
+        &Value::Null,
+    )
+    .await;
+    let path = format!("/api/v1/alert-rules/{}/replay", backlog.id);
+    let (status, replayed) = api(&server, "POST", &path, &shown).await;
+    assert_eq!(status, 200, "{replayed}");
+    assert_eq!(replayed["warned"], 1, "{replayed}");
+    assert_eq!(replayed["alerted"][0]["name"], "db-1");
+    // Given to another host only, it isn't tried on this one.
+    let stock = template_id(database, "stock").await;
+    let other = identity();
+    let _other = server.connect_approved(&other, "db-2").await;
+    database
+        .set_template_hosts(
+            stock,
+            None,
+            &std::collections::BTreeSet::from([other.id()]),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    let (_, replayed) = api(&server, "POST", &path, &shown).await;
+    assert_eq!(replayed["warned"], 0, "{replayed}");
+    database
+        .set_template_hosts(
+            stock,
+            None,
+            &std::collections::BTreeSet::new(),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    TestServer::next_config(&mut client).await;
+    TestServer::next_config(&mut client).await;
+
     // What was found isn't stored as metrics.
     assert!(database.catalog().find("discovered").is_none());
     // What the template works out with CEL is worked out as the sample arrives.

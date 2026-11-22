@@ -605,11 +605,19 @@ async fn without_saving(
         // Tried as it would be saved, so a mistake says what it would on saving.
         let replayed = async {
             let input = fields.to_rule(&known_facts(state).await)?;
-            let conditions = match id {
-                Some(id) => state.check_saved_alert_rule(id, &input).await?,
-                None => state.check_alert_rule(&input).await?,
+            let (conditions, template) = match id {
+                Some(id) => (
+                    state.check_saved_alert_rule(id, &input).await?,
+                    state
+                        .database
+                        .get_alert_rule(id)
+                        .await?
+                        .and_then(|rule| rule.template),
+                ),
+                None => (state.check_alert_rule(&input).await?, None),
             };
-            replay(&state.sources(), &input, conditions, crate::times::now()).await
+            let now = crate::times::now();
+            replay(&state.sources(), &input, template.as_ref(), conditions, now).await
         };
         let replayed = replayed.await;
         return Some(match replayed {

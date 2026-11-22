@@ -148,6 +148,12 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 }
 ```
 
+`POST /api/v1/alert-rules/{id}/replay` does the same for a saved rule changed as the
+body says, as its form does, which for one of a [template's](templates.md) alerts can
+use the template's metrics by their short names. It's tried on the hosts the template
+is for, and for an alert with `when` or `since`, only on the databases where what the
+template's discovery last found fits them, as the rule is checked, which `notes` say.
+
 ## Suggestions for conditions
 
 `GET /api/v1/conditions/suggestions`

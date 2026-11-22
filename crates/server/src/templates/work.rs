@@ -12,7 +12,7 @@
 //! aren't sent yet, so agents have nothing to run for them so far. Templates for a
 //! Windows service aren't sent until then either.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
@@ -23,6 +23,7 @@ use maxnines_protocol::templates::{
 };
 
 use super::hosts::RunningTemplates;
+use crate::metrics::{INSTANCE_LABEL, series_values};
 use crate::rule_engine::{Condition, Host};
 
 /// What discovery found on one host, by template ID and database.
@@ -61,6 +62,43 @@ pub fn picked(when: Option<&str>, since: Option<&str>, found: Option<&Map<String
     when.is_none_or(|when| {
         Condition::compile(when).is_ok_and(|condition| condition.check_values(found))
     })
+}
+
+/// The hosts and databases where what a template's discovery found fits a `when`
+/// and `since`, as `(host ID, database)`, from what was found on every host.
+pub fn picked_databases(
+    template_id: i64,
+    when: Option<&str>,
+    since: Option<&str>,
+    found: &BTreeMap<String, Discoveries>,
+) -> HashSet<(String, String)> {
+    let mut picked = HashSet::new();
+    for (host, discoveries) in found {
+        for ((template, database), values) in discoveries {
+            if *template == template_id && self::picked(when, since, Some(values)) {
+                picked.insert((host.clone(), database.clone()));
+            }
+        }
+    }
+    picked
+}
+
+/// Keeps only the series of the databases picked on a host, for a rule whose series
+/// have a label for the database. `labels` are the series' labels, in order.
+pub fn keep_picked(
+    series: &mut Vec<String>,
+    labels: &[String],
+    host_id: &str,
+    picked: &HashSet<(String, String)>,
+) {
+    let Some(at) = labels.iter().position(|label| label == INSTANCE_LABEL) else {
+        return;
+    };
+    series.retain(|series| {
+        series_values(series)
+            .get(at)
+            .is_some_and(|database| picked.contains(&(host_id.to_string(), database.clone())))
+    });
 }
 
 fn seconds(text: Option<&String>) -> Option<Duration> {

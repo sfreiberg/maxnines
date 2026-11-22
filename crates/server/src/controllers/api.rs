@@ -160,6 +160,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             get(list_alert_rules).post(create_alert_rule),
         )
         .route("/alert-rules/replay", post(replay_alert_rule))
+        .route("/alert-rules/{id}/replay", post(replay_saved_alert_rule))
         .route(
             "/alert-rules/{id}",
             get(show_alert_rule)
@@ -1964,7 +1965,31 @@ async fn replay_alert_rule(
         Err(error) => return refused(&error),
     };
     let now = crate::times::now();
-    match crate::alert_replay::replay(&state.sources(), &input, conditions, now).await {
+    match crate::alert_replay::replay(&state.sources(), &input, None, conditions, now).await {
+        Ok(replay) => Json(replay).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// How often a saved rule, changed as the body says, would have alerted over the
+/// last day: for one of a template's alerts, on what the template's alert is for.
+async fn replay_saved_alert_rule(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<i64>,
+    Json(input): Json<AlertRuleInput>,
+) -> Response {
+    let saved = match state.database.get_alert_rule(id).await {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
+    let conditions = match state.check_saved_alert_rule(id, &input).await {
+        Ok(conditions) => conditions,
+        Err(error) => return refused(&error),
+    };
+    let now = crate::times::now();
+    let template = saved.template.as_ref();
+    match crate::alert_replay::replay(&state.sources(), &input, template, conditions, now).await {
         Ok(replay) => Json(replay).into_response(),
         Err(error) => server_error(&error),
     }

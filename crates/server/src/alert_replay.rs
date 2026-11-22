@@ -2,7 +2,7 @@
 //! stored, so its conditions can be tried before it's saved, on its form or through
 //! the API.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -16,7 +16,7 @@ use crate::alert_conditions::{
     Conditions, Heading, Inputs, Values, Variable, bind_value, facts_value, kind_of_unit,
 };
 use crate::alert_evaluator::{Change, Tracker, holds};
-use crate::alerting::{AlertRuleInput, Severity, clean};
+use crate::alerting::{AlertRuleInput, Severity, TemplateLink, clean};
 use crate::calculations::{self, Calculation, Grouping, Sources, over_window};
 use crate::facts::unflatten;
 use crate::metric_charts::MAX_SERIES;
@@ -24,6 +24,7 @@ use crate::metrics::{Metric, TimeRange};
 use crate::registration::HostState;
 use crate::remote_checks::FLEET_HOSTNAME;
 use crate::rule_engine::{Condition, Host};
+use crate::templates::work::{keep_picked, picked_databases};
 use crate::times::Timestamp;
 
 /// How far back a rule is tried.
@@ -109,6 +110,7 @@ fn count<'a>(
 pub async fn replay(
     sources: &Sources<'_>,
     rule: &AlertRuleInput,
+    template: Option<&TemplateLink>,
     conditions: Conditions,
     now: Timestamp,
 ) -> Result<Replay> {
@@ -135,7 +137,10 @@ pub async fn replay(
     let (mut replayed, tried) = if rule.is_calculation() {
         replay_calculation(sources, rule, conditions, range, since).await?
     } else {
-        replay_hosts(sources, rule, conditions, range, since, &mut notes).await?
+        replay_hosts(
+            sources, rule, template, conditions, range, since, &mut notes,
+        )
+        .await?
     };
     replayed.sort_by(|a, b| {
         (b.warned + b.critical)
@@ -242,6 +247,7 @@ async fn replay_calculation(
 async fn replay_hosts(
     sources: &Sources<'_>,
     rule: &AlertRuleInput,
+    template: Option<&TemplateLink>,
     conditions: Arc<Conditions>,
     range: TimeRange,
     since: Timestamp,
@@ -274,6 +280,32 @@ async fn replay_hosts(
             condition.check(&host).unwrap_or(false)
         })
     });
+    // A template's alert is only for the hosts the template is for, and with a
+    // `when` or `since`, only for the databases what discovery found picks.
+    let mut picked = None;
+    if let Some(link) = template {
+        let templates = sources.database.running_templates();
+        if let Some(assigned) = templates.get(link.id) {
+            if !assigned.template().enabled {
+                notes.push(
+                    "Its template is off, so it isn't checked now: this is what it would do were it on."
+                        .to_string(),
+                );
+            }
+            hosts.retain(|host| assigned.is_for(&Host::new(&shaped[&host.id], &host.id)));
+        }
+        if link.when.is_some() || link.since.is_some() {
+            let found = sources.database.all_discoveries().await?;
+            let databases =
+                picked_databases(link.id, link.when.as_deref(), link.since.as_deref(), &found);
+            hosts.retain(|host| databases.iter().any(|(id, _)| *id == host.id));
+            notes.push(
+                "It's tried on the databases where what discovery last found fits its when or since."
+                    .to_string(),
+            );
+            picked = Some(databases);
+        }
+    }
     if hosts.len() > MAX_HOSTS {
         notes.push(format!(
             "It's tried on {MAX_HOSTS} of the {} hosts it covers.",
@@ -321,25 +353,26 @@ async fn replay_hosts(
     // Working it out is work for a thread of its own.
     let hold = rule.hold;
     let window = rule.window();
-    let tried: Vec<(String, CelValue, BTreeMap<String, Readings>)> = hosts
+    let tried: Vec<(String, String, CelValue, BTreeMap<String, Readings>)> = hosts
         .iter()
         .map(|host| {
             let facts = facts_value(&shaped[&host.id]);
             let readings = by_host.remove(&host.id).unwrap_or_default();
-            (clean(&host.hostname), facts, readings)
+            (host.id.clone(), clean(&host.hostname), facts, readings)
         })
         .collect();
     let each = tokio::task::spawn_blocking(move || {
         tried
             .iter()
-            .map(|(hostname, facts, readings)| {
+            .map(|(host_id, hostname, facts, readings)| {
                 let past = Past {
                     readings,
                     window,
                     since,
                 };
+                let picked = picked.as_ref().map(|picked| (host_id.as_str(), picked));
                 let (warned, critical, tried) =
-                    replay_host(&conditions, hold, &past, facts, hostname);
+                    replay_host(&conditions, hold, &past, facts, hostname, picked);
                 let replayed = Replayed {
                     name: hostname.clone(),
                     warned,
@@ -406,6 +439,7 @@ fn replay_host(
     past: &Past,
     facts: &CelValue,
     hostname: &str,
+    picked: Option<(&str, &HashSet<(String, String)>)>,
 ) -> (usize, usize, bool) {
     let readings = past.readings;
     let fanned = conditions.series_sources();
@@ -423,6 +457,9 @@ fn replay_host(
     }
     if fanned.is_empty() {
         series.push(String::new());
+    }
+    if let Some((host_id, picked)) = picked {
+        keep_picked(&mut series, conditions.series_labels(), host_id, picked);
     }
     series.truncate(MAX_SERIES_PER_HOST);
     let times: BTreeSet<Timestamp> = readings
@@ -542,6 +579,7 @@ mod tests {
             &past(&readings),
             &none,
             "web-1",
+            None,
         );
         // `/` warns twice and goes critical once; `/data` is critical from the start.
         assert_eq!(counted, (2, 2, true));
@@ -553,6 +591,7 @@ mod tests {
             &past(&readings),
             &none,
             "web-1",
+            None,
         );
         assert_eq!(counted, (1, 1, true));
 
@@ -564,6 +603,7 @@ mod tests {
             &past(&nothing),
             &none,
             "web-1",
+            None,
         );
         assert_eq!(counted, (0, 0, false));
     }
@@ -587,6 +627,7 @@ mod tests {
             &past(&readings),
             &none,
             "web-1",
+            None,
         );
         assert_eq!(counted, (0, 1, true));
         // Steady, it never is.
@@ -597,6 +638,7 @@ mod tests {
             &past(&readings),
             &none,
             "web-1",
+            None,
         );
         assert_eq!(counted, (0, 0, true));
     }
