@@ -240,7 +240,9 @@ notice "cannot_see_sessions" {
 ## Examples
 
 Two full templates, to read, copy from and import. They're examples of the format,
-not templates that come with MaxNines.
+not templates that come with MaxNines. The PostgreSQL one can't be imported with its
+key as it is, `postgres`, because MaxNines already reads PostgreSQL itself under the
+same metric names. Change the key, such as to `pg`, to import it.
 
 **[postgres.hcl](examples/postgres.hcl)**, for PostgreSQL, is all SQL:
 
