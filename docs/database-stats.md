@@ -99,6 +99,7 @@ runs at once, and a discover block that fails is tried again within a minute. A
 database that doesn't answer is tried again after 5 seconds, then waits doubling to a
 minute, with nothing else run meanwhile, and one with nothing due is checked each
 sample, so `<key>.up` is as recent as a sample. Templates can read PostgreSQL and MySQL so far.
+What the account may do beyond reading is read too, as [below](#what-the-account-may-do).
 
 ## Hosts without an agent
 
@@ -172,6 +173,33 @@ Everything it reads is in the `system` tables, and the grant is needed even for
 those. The profile limits what a read can cost, as an account that can only read
 can't be sent settings of its own. Users are kept on each server unless access
 control is replicated, so make it on each.
+
+### What the account may do
+
+For each database a template reads, the agent also reads what its account may do
+beyond reading, when it connects and every 5 minutes, as metrics named after the
+database. Each is 1 if it may and 0 if not:
+
+| Metric | It may |
+| --- | --- |
+| `database_account.overprivileged` | Do any of the below |
+| `database_account.superuser` | Do anything: a PostgreSQL superuser, or MySQL's `SUPER` or every privilege on `*.*` |
+| `database_account.writes` | Change data or tables anywhere: insert, update, delete, truncate, create, alter, drop, or add triggers, routines or events, including through a role or only some columns |
+| `database_account.manages` | Manage accounts or the server: create accounts, roles or databases, pass its privileges on (`WITH GRANT OPTION`, `WITH ADMIN OPTION`), replicate, or, on MySQL and MariaDB, `RELOAD`, `SHUTDOWN` or any admin privilege |
+| `database_account.server_files` | Read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE` |
+
+MaxNines only ever reads, in transactions that can't write, but an account that can do
+more is one a template's SQL, or anyone who learns its password, could misuse, so the
+built-in **Database account can do more than read** alert fires for it. The account is
+still used. The accounts above can do none of these, but a template that reads your own
+tables needs `SELECT` on them and nothing more, such as `GRANT SELECT ON shop.orders TO
+maxnines`. On MySQL and MariaDB, roles count whether or not they're in use, as the
+account could start using one. On PostgreSQL 14 and older, everyone can create tables
+in the `public` schema unless that's taken away, which counts as writing:
+
+```sql
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
 
 ## What's read
 

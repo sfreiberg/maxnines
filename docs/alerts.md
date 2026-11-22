@@ -2,7 +2,7 @@
 
 ## The built-in rules
 
-Every server starts with eight alert rules, from the built-in **Host**
+Every server starts with nine alert rules, from the built-in **Host**
 [template](templates.md):
 
 | Rule | Fires when | Severity |
@@ -15,6 +15,7 @@ Every server starts with eight alert rules, from the built-in **Host**
 | **Service stopped** | A [watched service](agents.md#watching-services-and-processes) hasn't been running for a minute | Critical |
 | **Clock is wrong** | A host's [clock](agents.md#clock) has been over 5 seconds from the server's for a minute, or over 30 seconds | Warning, then critical |
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
+| **Database account can do more than read** | A [template](templates.md) reads a database with an account that [can do more than read](database-stats.md#what-the-account-may-do) | Warning |
 
 Each disk alerts on its own. Every alert resolves as soon as its problem is gone,
 without waiting, so a recovery is known at once, and something that keeps failing and

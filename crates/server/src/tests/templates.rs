@@ -109,7 +109,7 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
     assert!(templates[0].origin == Origin::BuiltIn && templates[0].enabled);
     assert_eq!(templates[0].template.key, "host");
     let rules = database.list_alert_rules().await.unwrap();
-    assert_eq!(rules.len(), 8);
+    assert_eq!(rules.len(), 9);
     for rule in &rules {
         let link = rule.template.as_ref().unwrap();
         assert_eq!(link.id, templates[0].id);
@@ -492,7 +492,7 @@ async fn peoples_own_templates_are_changed_directly_with_no_copies() {
             .await
             .unwrap()
     );
-    assert_eq!(database.list_alert_rules().await.unwrap().len(), 8);
+    assert_eq!(database.list_alert_rules().await.unwrap().len(), 9);
 
     // The built-in one stays as it ships.
     let host_id = template_id(&database, "host").await;
@@ -1226,7 +1226,7 @@ async fn an_imported_template_is_replaced_by_a_newer_one_keeping_copies_and_what
             .unwrap()
     );
     let left = database.list_alert_rules().await.unwrap();
-    assert_eq!(left.len(), 9);
+    assert_eq!(left.len(), 10);
     let kept = left
         .iter()
         .find(|rule| rule.rule.name == "App slow")

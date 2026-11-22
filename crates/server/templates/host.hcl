@@ -4,7 +4,7 @@
 
 template "host" {
   name        = "Host"
-  description = "Whether each host is online and sending metrics, and its disks, clock, services and containers."
+  description = "Whether each host is online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read."
 
   alert "offline" {
     name             = "Host offline"
@@ -65,5 +65,13 @@ template "host" {
     for              = "5m"
     summary          = "{{ hostname }} is connected but sending no metrics"
     resolved_summary = "{{ hostname }} is sending metrics again"
+  }
+
+  # MaxNines only ever reads, but an account that could do more is one a
+  # template's SQL, or anyone with its password, could misuse.
+  alert "database_account_overprivileged" {
+    name    = "Database account can do more than read"
+    warning = "database_account.overprivileged > 0"
+    for     = "1m"
   }
 }

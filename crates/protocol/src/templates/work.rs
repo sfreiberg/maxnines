@@ -5,8 +5,9 @@
 //! an agent runs only what it's sent, with no CEL and no templates of its own.
 //!
 //! What an agent reads goes back in its samples: the rows of each template under
-//! `template.<key>`, labelled with the database they're from, and what discovery
-//! found under [`DISCOVERED`].
+//! `template.<key>`, labelled with the database they're from, what discovery
+//! found under [`DISCOVERED`], and what the account each database is read with may
+//! do beyond reading under [`ACCOUNTS`].
 
 use std::time::Duration;
 
@@ -26,6 +27,11 @@ pub const MAX_SQL_LEN: usize = 64 * 1024;
 pub const MAX_COLUMNS: usize = 256;
 /// What a sample calls what discovery found.
 pub const DISCOVERED: &str = "discovered";
+/// The collector a sample has what each database's account may do beyond reading
+/// under: one item for each database a template reads, with its `name` and a 1 or 0
+/// for each of `overprivileged`, `superuser`, `writes`, `manages` and
+/// `server_files`.
+pub const ACCOUNTS: &str = "database_accounts";
 /// What each of a template's rows says it's from: the query's key. It can't be a
 /// metric's, as a key starts with a letter, and the server takes it out before the
 /// rows are stored.

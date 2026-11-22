@@ -35,7 +35,7 @@ shown afterwards is written out from the parts.
 
 | Template | What it watches |
 | --- | --- |
-| **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, and its disks, clock, services and containers. It has the eight [built-in alert rules](alerts.md#the-built-in-rules) |
+| **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules) |
 
 ## The format
 
@@ -208,7 +208,10 @@ own, as a prepared statement, in a read-only transaction that's rolled back afte
 and the database stops it after 5 seconds. PostgreSQL and MySQL databases can be read
 so far. A template can run any `SELECT` its account is allowed to, so give MaxNines an
 account that can only read what monitoring needs, such as one in PostgreSQL's
-`pg_monitor` role.
+`pg_monitor` role. MaxNines checks what the account may do whenever it connects and
+every 5 minutes, and an account that can do more than read, such as change data or
+create accounts, fires **Database account can do more than read**. It's still used:
+[what the account may do](database-stats.md#what-the-account-may-do) is up to you.
 
 ### Performance counters
 

@@ -11,6 +11,7 @@ use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta};
+use maxnines_protocol::templates::work::ACCOUNTS;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -1539,6 +1540,64 @@ pub const METRICS: &[StaticMetric] = &[
         source: Source::Items {
             name: "$.name",
             reading: Reading::Field("$.dropped"),
+        },
+        chart: ShowChart::Never,
+    },
+    // What the account each database a template reads is signed in as may do
+    // beyond reading, a 1 or a 0 by the database's name. MaxNines only reads, but
+    // an account that could do more could be misused, so it's an alert.
+    StaticMetric {
+        name: "database_account.overprivileged",
+        title: "Database account can do more than read",
+        unit: Unit::Number,
+        collector: ACCOUNTS,
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.overprivileged"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "database_account.superuser",
+        title: "Database account is a superuser",
+        unit: Unit::Number,
+        collector: ACCOUNTS,
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.superuser"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "database_account.writes",
+        title: "Database account can change data",
+        unit: Unit::Number,
+        collector: ACCOUNTS,
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.writes"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "database_account.manages",
+        title: "Database account can manage accounts",
+        unit: Unit::Number,
+        collector: ACCOUNTS,
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.manages"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "database_account.server_files",
+        title: "Database account can reach server files",
+        unit: Unit::Number,
+        collector: ACCOUNTS,
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.server_files"),
         },
         chart: ShowChart::Never,
     },

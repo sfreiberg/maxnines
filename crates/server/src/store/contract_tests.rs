@@ -299,6 +299,30 @@ fn failed_services_are_counted_and_named() {
 }
 
 #[test]
+fn what_each_databases_account_may_do_is_a_series_by_its_name() {
+    let mut store = in_memory();
+    let account = |name: &str, writes: u8| {
+        json!({
+            "name": name, "overprivileged": writes, "superuser": 0, "writes": writes,
+            "manages": 0, "server_files": 0,
+        })
+    };
+    let accounts = json!([account("orders", 1), account("reports", 0)]);
+    write_metric(&mut store, "a", 1000, maxnines_protocol::templates::work::ACCOUNTS, accounts);
+
+    for metric in ["database_account.overprivileged", "database_account.writes"] {
+        let result = query(&store, "a", metric, 8);
+        let mut found: Vec<(&str, Vec<f64>)> = result
+            .series
+            .iter()
+            .map(|series| (series.name.as_str(), averages(series)))
+            .collect();
+        found.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(found, [("orders", vec![1.0]), ("reports", vec![0.0])], "{metric}");
+    }
+}
+
+#[test]
 fn each_core_is_a_series_named_by_its_number() {
     let mut store = in_memory();
     let cpu = json!({ "usage_percent": 40.0, "per_core_percent": [10.0, 90.0, 20.0] });

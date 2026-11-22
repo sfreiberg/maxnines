@@ -441,6 +441,13 @@ fn the_host_template_keeps_the_built_in_alert_rules() {
                 300,
                 None
             ),
+            (
+                "Database account can do more than read",
+                Some("database_account.overprivileged > 0"),
+                None,
+                60,
+                None
+            ),
         ]
     );
     for rule in &rules {

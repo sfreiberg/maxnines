@@ -8,6 +8,9 @@
 //! SQL with a second statement after a `;` is refused by the database itself. What
 //! the account may read is up to whoever gave it to MaxNines.
 //!
+//! What the account it signs in as may do is read as [`Privileges`], so an account
+//! that can change things can be reported, though it's still used.
+//!
 //! A [`Session`] keeps its connection open between rounds, and opens a new one when
 //! the old one stops working, counting each time it does, so whoever runs it can
 //! tell the database may have restarted and run discovery again.
@@ -27,6 +30,9 @@ use tokio_postgres::types::{FromSql, Type};
 
 use crate::databases::Database;
 use crate::sign_in::{mysql_connection, pg_short, postgres_client, short};
+
+mod privileges;
+pub use privileges::Privileges;
 
 /// How long one statement gets before the database stops it.
 pub const STATEMENT_LIMIT: Duration = Duration::from_secs(5);
@@ -55,7 +61,11 @@ enum Open {
         client: tokio_postgres::Client,
         running: JoinHandle<()>,
     },
-    Mysql(Box<mysql_async::Conn>),
+    Mysql {
+        connection: Box<mysql_async::Conn>,
+        /// MariaDB, which answers to some things differently.
+        mariadb: bool,
+    },
 }
 
 impl Drop for Open {
@@ -136,7 +146,7 @@ impl Session {
     async fn alive(&mut self) -> bool {
         match &mut self.open {
             Some(Open::Postgres { client, .. }) => !client.is_closed(),
-            Some(Open::Mysql(connection)) => {
+            Some(Open::Mysql { connection, .. }) => {
                 use mysql_async::prelude::Queryable;
                 connection.ping().await.is_ok()
             }
@@ -164,7 +174,8 @@ impl Session {
                     .await
                     .map_err(short)?;
                 let ms = STATEMENT_LIMIT.as_millis();
-                let limit = match version.is_some_and(|v| v.to_lowercase().contains("mariadb")) {
+                let mariadb = version.is_some_and(|v| v.to_lowercase().contains("mariadb"));
+                let limit = match mariadb {
                     true => format!("SET SESSION max_statement_time = {}", ms / 1000),
                     false => format!("SET SESSION max_execution_time = {ms}"),
                 };
@@ -173,7 +184,10 @@ impl Session {
                 for setting in [limit.as_str(), "SET SESSION TRANSACTION READ ONLY"] {
                     connection.query_drop(setting).await.map_err(short)?;
                 }
-                Ok(Open::Mysql(Box::new(connection)))
+                Ok(Open::Mysql {
+                    connection: Box::new(connection),
+                    mariadb,
+                })
             }
             other => bail!("templates can't read {} yet", other.as_str()),
         }
@@ -186,7 +200,7 @@ impl Session {
         }
         match self.open.as_mut() {
             Some(Open::Postgres { client, .. }) => run_postgres(client, sql).await,
-            Some(Open::Mysql(connection)) => run_mysql(connection, sql).await,
+            Some(Open::Mysql { connection, .. }) => run_mysql(connection, sql).await,
             None => bail!("not connected"),
         }
     }

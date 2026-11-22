@@ -1228,6 +1228,7 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
         [
             "Clock is wrong",
             "Container down",
+            "Database account can do more than read",
             "Disk filling up",
             "Disk running out of inodes",
             "Disk will be full soon",
@@ -1329,6 +1330,33 @@ async fn a_failing_container_alerts_after_a_minute() {
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].series.as_deref(), Some("web"));
     assert_eq!(open[0].severity, Severity::Critical);
+}
+
+#[tokio::test]
+async fn a_database_read_with_an_account_that_can_do_more_than_read_warns() {
+    let mut test = Harness::start().await;
+    let rule = built_in("Database account can do more than read").await;
+    assert_eq!(
+        rule.warning.as_deref(),
+        Some("database_account.overprivileged > 0")
+    );
+    assert_eq!(rule.critical, None);
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    for minute in [0, 5] {
+        let offset = MINUTE * minute;
+        let readings = vec![
+            test.reading("orders", test.now + offset, 1.0),
+            test.reading("reports", test.now + offset, 0.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(offset).await;
+    }
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].series.as_deref(), Some("orders"));
+    assert_eq!(open[0].severity, Severity::Warning);
 }
 
 #[tokio::test]

@@ -8,10 +8,12 @@
 //! first, then on its own schedule, and again whenever the connection had to be
 //! opened, as the database may have restarted. A database that doesn't answer is
 //! tried once each time a growing wait runs out, and one that has nothing due is
-//! checked every sample, so `up` is always as recent as a sample. A sample takes
-//! what's been read since the last one: each template's rows under
-//! `template.<key>`, whether each database answered as `up`, and what discovery
-//! found under `discovered`, which the server uses to work out what to send next.
+//! checked every sample, so `up` is always as recent as a sample. What the account
+//! it signs in as may do beyond reading is read each time it connects, and every
+//! few minutes. A sample takes what's been read since the last one: each
+//! template's rows under `template.<key>`, whether each database answered as `up`,
+//! what discovery found under `discovered`, which the server uses to work out what
+//! to send next, and each database's account under `database_accounts`.
 //!
 //! A new config changes each task only as much as its work changed: one whose work
 //! is the same carries on, and one whose work changed keeps its connection, what it
@@ -23,8 +25,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use maxnines_checks::databases::TIMEOUT;
-use maxnines_checks::templates::{INSTANCE_LABEL, Session, Totals, discovered, metric_rows};
-use maxnines_protocol::templates::work::{DISCOVERED, Discovered, TemplateWork, collector_of};
+use maxnines_checks::templates::{
+    INSTANCE_LABEL, Privileges, Session, Totals, discovered, metric_rows,
+};
+use maxnines_protocol::templates::work::{
+    ACCOUNTS, DISCOVERED, Discovered, TemplateWork, collector_of,
+};
 use serde_json::{Map, Value, json};
 use tokio::sync::watch;
 use tokio::task::AbortHandle;
@@ -43,6 +49,9 @@ struct Read {
     /// Whether each database answered last time, by template and database.
     up: BTreeMap<(String, String), bool>,
     discovered: Vec<Discovered>,
+    /// What each database's account may do beyond reading, by the database's name,
+    /// once it's been read.
+    accounts: BTreeMap<String, Privileges>,
 }
 
 /// How long after failing to reach a database it's tried again, at first, and at
@@ -60,6 +69,11 @@ const MAX_RETRY: Duration = Duration::from_millis(400);
 const ALIVE: &str = "SELECT 1";
 /// What errors reaching a database are noted under.
 const CONNECTING: &str = "connecting";
+/// How often what the account may do is read again while connected, so taking a
+/// privilege away shows within minutes.
+const ACCOUNT_EVERY: Duration = Duration::from_secs(5 * 60);
+/// What errors reading what the account may do are noted under.
+const ACCOUNT: &str = "account";
 
 /// What one database's task is told to do: its work, and how often a sample is.
 type Told = (TemplateWork, Duration);
@@ -115,9 +129,12 @@ impl TemplateCollector {
             }
             keep
         });
-        lock(&self.read)
-            .up
-            .retain(|key, _| wanted.contains_key(key));
+        {
+            let mut read = lock(&self.read);
+            read.up.retain(|key, _| wanted.contains_key(key));
+            read.accounts
+                .retain(|database, _| wanted.keys().any(|(_, name)| name == database));
+        }
 
         for (key, one) in wanted {
             if let Some(task) = self.tasks.get(&key) {
@@ -199,6 +216,19 @@ impl Collector for TemplateCollector {
             .into_iter()
             .map(|(template, rows)| (collector_of(&template), Value::Array(rows)))
             .collect();
+        if !read.accounts.is_empty() {
+            let accounts = read.accounts.iter().map(|(database, account)| {
+                json!({
+                    "name": database,
+                    "overprivileged": u8::from(account.overprivileged()),
+                    "superuser": u8::from(account.superuser),
+                    "writes": u8::from(account.writes),
+                    "manages": u8::from(account.manages),
+                    "server_files": u8::from(account.server_files),
+                })
+            });
+            entries.insert(ACCOUNTS.to_string(), accounts.collect());
+        }
         let found = std::mem::take(&mut read.discovered);
         if !found.is_empty() {
             entries.insert(DISCOVERED.to_string(), serde_json::to_value(found)?);
@@ -329,6 +359,7 @@ async fn run(
     let mut retry_at = start;
     let mut retry = FIRST_RETRY;
     let mut check_at = start;
+    let mut account_at = start;
 
     loop {
         let now = Instant::now();
@@ -341,6 +372,7 @@ async fn run(
         let every = *every;
         let key = (work.template.clone(), database.clone());
         let mut discovered_now = false;
+        let mut account = None;
         let mut rows = Vec::new();
         // One try at reaching it each time the wait runs out, whatever's due.
         let reachable = session.is_up() || {
@@ -365,6 +397,18 @@ async fn run(
             if session.connections() != connections {
                 connections = session.connections();
                 discover_at.iter_mut().for_each(|block| block.at = now);
+                account_at = now;
+            }
+            if account_at <= now && session.is_up() {
+                match session.privileges().await {
+                    Ok(privileges) => {
+                        account = Some(privileges);
+                        errors.remove(ACCOUNT);
+                    }
+                    Err(error) => note(work, &database, ACCOUNT, &error, &mut errors),
+                }
+                account_at = now + ACCOUNT_EVERY;
+                check_at = now + every;
             }
             for (block, discover) in discover_at.iter_mut().zip(&work.discover) {
                 if block.at > now || !session.is_up() {
@@ -420,6 +464,9 @@ async fn run(
                 .or_default()
                 .extend(rows);
             read.up.insert(key.clone(), session.is_up());
+            if let Some(account) = account {
+                read.accounts.insert(database.clone(), account);
+            }
             if discovered_now {
                 read.discovered
                     .retain(|d| (&d.template, &d.database) != (&key.0, &key.1));
@@ -436,7 +483,7 @@ async fn run(
                 .iter()
                 .map(|block| block.at)
                 .chain(query_at.iter().map(|query| query.at))
-                .chain([check_at])
+                .chain([check_at, account_at])
                 .min()
                 .unwrap_or(check_at),
             // Nothing runs until it answers again.
@@ -662,6 +709,31 @@ mod tests {
                 .as_array()
                 .is_some_and(|rows| rows.iter().any(|row| row["up"] == 1))
         });
+    }
+
+    #[test]
+    fn what_each_databases_account_may_do_is_sent_once_read() {
+        let Some(definitions) = real() else {
+            return;
+        };
+        let mut collector =
+            TemplateCollector::new(&[work("main")], &definitions, Duration::from_millis(200))
+                .unwrap();
+        let output = collect_until(&mut collector, |output| output.get(ACCOUNTS).is_some());
+        // The tests sign in as the throwaway server's superuser.
+        assert_eq!(
+            output[ACCOUNTS],
+            json!([{
+                "name": "main",
+                "overprivileged": 1,
+                "superuser": 1,
+                "writes": 1,
+                "manages": 1,
+                "server_files": 1,
+            }])
+        );
+        // It's sent with every sample, not only when it's read.
+        assert_eq!(collector.collect().unwrap()[ACCOUNTS], output[ACCOUNTS]);
     }
 
     #[test]
