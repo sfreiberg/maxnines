@@ -69,6 +69,16 @@ async fn several_connections() -> Option<Database> {
     (backend != DatabaseBackend::Sqlite).then_some(database)
 }
 
+/// When any test last read MySQL's transactions. MySQL keeps what it shows in
+/// `innodb_trx` in a cache it only fills again when nobody has read it for a tenth of a
+/// second, so with several tests reading it in turn it never would, and a wait would go
+/// unseen until the lock timed out. Every test reads it through this, one at a time and
+/// further apart than that, so each read sees transactions as they are.
+static LAST_MYSQL_READ: tokio::sync::Mutex<Option<Instant>> = tokio::sync::Mutex::const_new(None);
+
+/// MySQL fills its cache again for a read when nobody read it for this long before.
+const MYSQL_CACHE_IDLE: Duration = Duration::from_millis(150);
+
 /// Whether a connection to this database is waiting for another's lock.
 async fn someone_waits(database: &Database) -> bool {
     let connection = database.connection();
@@ -84,22 +94,30 @@ async fn someone_waits(database: &Database) -> bool {
              (SELECT id FROM information_schema.processlist WHERE db = DATABASE())"
         }
     };
+    let mut last_read = match backend {
+        DatabaseBackend::Postgres => None,
+        _ => Some(LAST_MYSQL_READ.lock().await),
+    };
+    if let Some(Some(read_at)) = last_read.as_deref() {
+        tokio::time::sleep_until((*read_at + MYSQL_CACHE_IDLE).into()).await;
+    }
     let row = connection
         .query_one_raw(Statement::from_string(backend, sql))
         .await
         .unwrap()
         .unwrap();
+    if let Some(read_at) = last_read.as_deref_mut() {
+        *read_at = Some(Instant::now());
+    }
     row.try_get_by_index::<i64>(0).unwrap() > 0
 }
 
 /// Until `task` has finished, or is waiting for a lock another connection holds.
-/// MySQL only reads its transactions again when they weren't asked for in the last
-/// tenth of a second, so this asks less often than that.
 async fn until_done_or_waiting<T>(database: &Database, task: &JoinHandle<T>) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !task.is_finished() && !someone_waits(database).await {
         assert!(Instant::now() < deadline, "it neither finished nor waited");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
