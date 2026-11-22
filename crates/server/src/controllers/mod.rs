@@ -37,7 +37,7 @@ mod settings;
 mod sign_ins;
 mod silences;
 mod suggestions;
-mod template_form;
+pub(crate) mod template_form;
 mod templates;
 mod update_notice;
 mod users;

@@ -1492,3 +1492,228 @@ async fn a_newer_version_turns_things_on_and_off_until_someone_chooses() {
     let stored = database.get_template(id).await.unwrap().unwrap();
     assert!(!stored.enabled && stored.enabled_choice.is_none());
 }
+
+/// A template's parts are written over the rows they have, each matched by its key,
+/// so a row keeps its ID while its part is there.
+#[tokio::test]
+async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
+    let database = Database::for_test().await;
+    let mut template = crate::templates::load(POSTGRES, &json!({})).unwrap();
+    let id = database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    let ids = database.template_part_ids(id).await;
+    assert!(ids.contains_key("discovery"));
+    assert!(ids.contains_key("notice cannot_see_sessions"));
+    assert!(ids.contains_key("query slots fill lost version 17"));
+    assert!(ids.contains_key("query throughput metric cache_hit"));
+
+    // Saved as it is, nothing moves.
+    database
+        .update_template(id, &template, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!(database.template_part_ids(id).await, ids);
+
+    // A choice someone made of a query stays as its SQL changes, as does every row.
+    let sessions = ids["query sessions"];
+    database.set_query_choice(sessions, Some(false)).await;
+    template.queries[0].sql = template.queries[0].sql.replace("AS uptime", "AS up_for");
+    template.queries[0].interval = Some("2m".to_string());
+    template.discover.as_mut().unwrap().interval = Some("5m".to_string());
+    let slots = template
+        .queries
+        .iter_mut()
+        .find(|q| q.key == "slots")
+        .unwrap();
+    slots.fills[2].versions.insert(
+        "17".to_string(),
+        "invalidation_reason IS NOT NULL".to_string(),
+    );
+    database
+        .update_template(id, &template, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!(database.template_part_ids(id).await, ids);
+    assert_eq!(database.query_choice(sessions).await, Some(false));
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert_eq!(stored.template, template);
+
+    // Parts in another order keep their rows, and are read back in the new order.
+    template.queries.swap(0, 1);
+    template.alerts.swap(0, 2);
+    database
+        .update_template(id, &template, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!(database.template_part_ids(id).await, ids);
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert_eq!(stored.template, template);
+    assert_eq!(stored.template.queries[0].key, "throughput");
+
+    // One that's gone takes only its own rows, and a new one gets rows of its own.
+    template.queries.retain(|query| query.key != "slots");
+    template
+        .alerts
+        .retain(|alert| !alert.key.starts_with("slot_"));
+    let mut added = template.queries[2].clone();
+    added.key = "more".to_string();
+    added.sql = "SELECT count(*) AS more FROM pg_stat_activity".to_string();
+    added.fills.clear();
+    added.metrics.clear();
+    template.queries.push(added);
+    let problems = crate::templates::check(&template, &json!({}));
+    assert!(problems.is_empty(), "{problems:?}");
+    database
+        .update_template(id, &template, crate::times::now())
+        .await
+        .unwrap();
+    let after = database.template_part_ids(id).await;
+    assert!(after.contains_key("query more"));
+    assert!(!after.keys().any(|part| part.starts_with("query slots")));
+    for (part, row) in &after {
+        if part != "query more" {
+            assert_eq!(ids.get(part), Some(row), "{part}");
+        }
+    }
+    assert_eq!(
+        after.len(),
+        ids.len() - ids.keys().filter(|p| p.starts_with("query slots")).count() + 1
+    );
+    assert_eq!(database.query_choice(sessions).await, Some(false));
+}
+
+#[tokio::test]
+async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there() {
+    let server = with_built_in_templates().await;
+    let database = &server.state.database;
+
+    // An import replaced by a newer one.
+    let iis = crate::templates::load(IIS, &json!({})).unwrap();
+    let (id, _) = database
+        .import_template(&iis, crate::times::now())
+        .await
+        .unwrap();
+    let ids = database.template_part_ids(id).await;
+    assert!(ids.contains_key("registry HKLM\\SOFTWARE\\Microsoft\\InetStp"));
+    assert!(ids.contains_key("counters app_pools metric pool_running"));
+    let mut newer = iis.clone();
+    newer.counters[0].metrics[0].counter = Some("Total Method Requests".to_string());
+    newer.counters[0].metrics[0].total = true;
+    newer
+        .counters
+        .retain(|counters| counters.key != "asp_net_apps");
+    newer.alerts[0].hold = Some("2m".to_string());
+    let (_, outcome) = database
+        .import_template(&newer, crate::times::now())
+        .await
+        .unwrap();
+    assert_eq!(outcome, Imported::Updated);
+    let after = database.template_part_ids(id).await;
+    assert!(
+        !after
+            .keys()
+            .any(|part| part.starts_with("counters asp_net_apps"))
+    );
+    for (part, row) in &after {
+        assert_eq!(ids.get(part), Some(row), "{part}");
+    }
+    assert_eq!(
+        database.get_template(id).await.unwrap().unwrap().template,
+        newer
+    );
+
+    // A built-in one, as the server starts with a newer version of it.
+    database
+        .sync_templates(&shipped(&[POSTGRES]), crate::times::now())
+        .await
+        .unwrap();
+    let postgres = template_id(database, "postgres").await;
+    let ids = database.template_part_ids(postgres).await;
+    let sessions = ids["query sessions"];
+    database.set_query_choice(sessions, Some(false)).await;
+    database
+        .sync_templates(
+            &shipped(&[&POSTGRES.replace("AS uptime", "AS up_for")]),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(database.template_part_ids(postgres).await, ids);
+    assert_eq!(database.query_choice(sessions).await, Some(false));
+
+    // One of their own, saved from its form.
+    let own = parse(
+        &POSTGRES
+            .replace("\"postgres\" {", "\"mine\" {")
+            .replace("\"PostgreSQL\"", "\"Mine\"")
+            .replace("PostgreSQL down", "Mine down"),
+    )
+    .unwrap();
+    let mut own = own;
+    for alert in &mut own.alerts {
+        alert.name = format!("Mine: {}", alert.name);
+    }
+    let mine = database
+        .create_template(&own, crate::times::now())
+        .await
+        .unwrap();
+    let ids = database.template_part_ids(mine).await;
+    let mut form = crate::controllers::template_form::TemplateForm::from_template(&own);
+    form.queries[0].interval = "3m".to_string();
+    let fields = form.to_fields();
+    let mut browser = Browser::default();
+    let token = browser
+        .get(&server, &format!("/templates/{mine}/edit"))
+        .await
+        .token();
+    let mut sent: Vec<(&str, &str)> = vec![("authenticity_token", token.as_str())];
+    sent.extend(
+        fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    let page = browser
+        .post(&server, &format!("/templates/{mine}"), &sent)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    assert_eq!(database.template_part_ids(mine).await, ids);
+    let stored = database.get_template(mine).await.unwrap().unwrap();
+    assert_eq!(stored.template.queries[0].interval.as_deref(), Some("3m"));
+}
+
+#[tokio::test]
+async fn a_copy_of_an_alert_a_newer_version_drops_becomes_a_rule_of_ones_own() {
+    let database = Database::for_test().await;
+    database
+        .sync_templates(&shipped(&[APP]), crate::times::now())
+        .await
+        .unwrap();
+    let gone = rule(&database, "App host gone").await;
+    let wanted = AlertRuleInput {
+        hold: chrono::TimeDelta::minutes(3),
+        ..gone.rule.clone()
+    };
+    database.update_alert_rule(gone.id, &wanted).await.unwrap();
+    let copy = rule(&database, "App host gone").await;
+
+    database
+        .sync_templates(&shipped(&[APP_UPGRADED]), crate::times::now())
+        .await
+        .unwrap();
+    let kept = rule(&database, "App host gone").await;
+    assert_eq!(kept.id, copy.id);
+    assert_eq!(kept.rule, wanted);
+    assert!(kept.template.is_none(), "an ordinary rule now");
+    assert_eq!(
+        database.template_upgrades().await.unwrap(),
+        ["App (it no longer has App host gone, so your own copy is now a rule of yours)"]
+    );
+    assert!(
+        database
+            .delete_alert_rule(kept.id, crate::times::now())
+            .await
+            .unwrap()
+    );
+}

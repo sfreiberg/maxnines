@@ -994,6 +994,8 @@ impl MigrationTrait for CreateTables {
                     .not_null()
                     .default(true),
             )
+            // What else the notice of the newest version says.
+            .col(ColumnDef::new(Templates::UpgradeNote).text())
             .col(moment(backend, Templates::DeletedAt))
             .to_owned();
         let live = "deleted_at IS NULL";
@@ -2124,6 +2126,7 @@ enum Templates {
     UpdatedAt,
     UpgradedAt,
     UpgradeSeen,
+    UpgradeNote,
     DeletedAt,
 }
 

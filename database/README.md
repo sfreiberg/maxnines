@@ -184,6 +184,7 @@ erDiagram
         timestamp updated_at
         timestamp upgraded_at "when a newer version last changed a built-in or imported one"
         boolean upgrade_seen "whether admins dismissed the notice of it"
+        text upgrade_note "what else that notice says, such as what became of copies"
         timestamp deleted_at "kept so its rules can name it"
     }
     template_discoveries {
@@ -594,7 +595,7 @@ erDiagram
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A template's alert is a rule too. A built-in or imported template's rule isn't people's to change, and is rewritten by a newer version, `enabled` included, which is what it ships: what someone chose instead is in `enabled_choice`, which a newer version never writes; someone changing it makes a copy of their own, a second rule whose `replaces_id` points at it, which is used in its place until it's deleted. Making or deleting a copy hands the open alerts, silences and maintenance windows of one to the other |
 | `templates` | What MaxNines watches for in something it monitors: by `origin`, the built-in ones, which the server writes each time it starts, imported ones, which importing a newer version rewrites the same way, and people's own. HCL is only how they come in and go out. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
-| `template_discoveries`, `template_registry_reads`, `template_notices`, `template_queries`, `template_fills`, `template_fill_versions`, `template_counters`, `template_metrics` | A template's parts, one row to a block or entry, each with its key as the HCL has it and its `position` among the others. They go with their template, query, counters or fill. Each has a `replaces_id` for someone's own copy of a built-in part, as alert rules have, which nothing makes yet |
+| `template_discoveries`, `template_registry_reads`, `template_notices`, `template_queries`, `template_fills`, `template_fill_versions`, `template_counters`, `template_metrics` | A template's parts, one row to a block or entry, each with its key as the HCL has it and its `position` among the others. A save, an import or a start writes each part over the row with its key, within its template, query, counters or fill, so a row keeps its `id` while its part is there, and only the rows of parts that are gone are deleted. A fill's versions are matched by `version`, and a part given another key is a new part. They go with their template, query, counters or fill. Each has a `replaces_id` for someone's own copy of a built-in part, as alert rules have, which nothing makes yet |
 | `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |
 | `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |

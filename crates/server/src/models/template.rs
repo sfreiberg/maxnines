@@ -35,6 +35,8 @@ pub struct Model {
     pub upgraded_at: Option<DateTimeUtc>,
     /// Whether admins have dismissed the notice of that upgrade.
     pub upgrade_seen: bool,
+    /// What else the notice of that version says, such as what became of copies.
+    pub upgrade_note: Option<String>,
     pub deleted_at: Option<DateTimeUtc>,
 }
 

@@ -622,7 +622,15 @@ impl Template {
                 say(place, "sql", "can't be empty".to_string());
             }
             let mut found = BTreeSet::new();
+            let mut keys = BTreeSet::new();
             for read in &discover.registry {
+                if !keys.insert(&read.key) {
+                    say(
+                        place,
+                        "registry",
+                        format!("{:?} is read twice: put its values in one block", read.key),
+                    );
+                }
                 if read.key.trim().is_empty() {
                     say(place, "registry", "needs a registry key".to_string());
                 }
