@@ -227,6 +227,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("since").string_len(64))
         .col(part("when_condition").text())
         .col(part("enabled").boolean().not_null())
+        .col(part("enabled_choice").boolean())
         .col(json(backend, Alias::new("labels")));
     manager.create_table(queries).await?;
 
@@ -259,7 +260,8 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("when_condition").text())
         .col(part("since").string_len(64))
         .col(part("interval_secs").big_integer())
-        .col(part("enabled").boolean().not_null());
+        .col(part("enabled").boolean().not_null())
+        .col(part("enabled_choice").boolean());
     manager.create_table(counters).await?;
 
     // A metric is a query's or a counters block's.
@@ -977,7 +979,10 @@ impl MigrationTrait for CreateTables {
             .col(json(backend, Templates::Services))
             // What a built-in one says, hashed, so an upgrade can tell it changed.
             .col(ColumnDef::new(Templates::Fingerprint).string_len(64))
+            // Whether it ships on, and what someone chose instead, if they have: until
+            // they do, a newer version's say is followed.
             .col(ColumnDef::new(Templates::Enabled).boolean().not_null())
+            .col(ColumnDef::new(Templates::EnabledChoice).boolean())
             .col(moment(backend, Templates::CreatedAt).not_null())
             .col(moment(backend, Templates::UpdatedAt).not_null())
             // When an upgrade last changed a built-in one, and whether admins have
@@ -1051,6 +1056,9 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(AlertRules::RemindEverySecs).big_integer())
             .col(ColumnDef::new(AlertRules::TemplateId).big_integer())
             .col(exact_text(backend, AlertRules::TemplateAlert, 64))
+            // For a built-in or imported template's rule, what someone chose in place
+            // of the template's `enabled`, if they have.
+            .col(ColumnDef::new(AlertRules::EnabledChoice).boolean())
             .col(ColumnDef::new(AlertRules::ReplacesId).big_integer())
             // Where a template's alert comes among its alerts, and what only a
             // template's alert has: which of what discovery found it's for.
@@ -2086,6 +2094,7 @@ enum AlertRules {
     RemindEverySecs,
     TemplateId,
     TemplateAlert,
+    EnabledChoice,
     ReplacesId,
     TemplatePosition,
     WhenCondition,
@@ -2110,6 +2119,7 @@ enum Templates {
     Services,
     Fingerprint,
     Enabled,
+    EnabledChoice,
     CreatedAt,
     UpdatedAt,
     UpgradedAt,

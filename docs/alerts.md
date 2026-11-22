@@ -24,10 +24,11 @@ as there's a channel to tell. Until then they show on the Alerts page and the ov
 
 They're ordinary rules, under **Settings > Alert rules**, that come from a template,
 and an upgrade can bring a new version of them. Changing one makes a copy of your own,
-which is used in its place and which upgrades leave alone; **Reset to template** deletes
-your copy and puts the one that comes with MaxNines back. Turning one off needs no
-copy, and lasts through upgrades. They can't be deleted, but the whole template can be
-disabled under **Settings > Templates**.
+which is used in its place and which upgrades leave alone; an alert that's open carries
+on as the same alert. **Reset to template** deletes your copy and puts the one that
+comes with MaxNines back. Turning one on or off needs no copy: it's your choice from
+then on, and until you choose, an upgrade can turn one on or off. They can't be
+deleted, but the whole template can be disabled under **Settings > Templates**.
 
 Any rule can tell every channel this way, with **Every channel, including ones added
 later**, or tell only the channels chosen.

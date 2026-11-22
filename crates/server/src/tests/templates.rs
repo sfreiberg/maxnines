@@ -1391,3 +1391,104 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
         .collect();
     assert_eq!(postgres, ["changed", "created"]);
 }
+
+/// Whether a template or one of its alerts is on follows what a newer version
+/// ships until someone chooses, and then it's theirs.
+#[tokio::test]
+async fn a_newer_version_turns_things_on_and_off_until_someone_chooses() {
+    let database = Database::for_test().await;
+    let shipped_off = APP
+        .replace("name = \"App\"", "name = \"App\"\n  enabled = false")
+        .replace(
+            "name     = \"App slow\"",
+            "name     = \"App slow\"\n    enabled = false",
+        );
+    database
+        .sync_templates(&shipped(&[APP]), crate::times::now())
+        .await
+        .unwrap();
+    let id = template_id(&database, "app").await;
+    let gone = rule(&database, "App host gone").await;
+
+    // Never touched: a newer version turns the template and an alert off, and on again.
+    database
+        .sync_templates(&shipped(&[&shipped_off]), crate::times::now())
+        .await
+        .unwrap();
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert!(!stored.enabled && stored.enabled_choice.is_none());
+    let slow = rule(&database, "App slow").await;
+    assert!(!slow.rule.enabled);
+    assert_eq!(slow.template.as_ref().unwrap().enabled_choice, None);
+    database
+        .sync_templates(&shipped(&[APP]), crate::times::now())
+        .await
+        .unwrap();
+    assert!(database.get_template(id).await.unwrap().unwrap().enabled);
+    assert!(rule(&database, "App slow").await.rule.enabled);
+
+    // Chosen off: a newer version that ships it on leaves it off.
+    let off = AlertRuleInput {
+        enabled: false,
+        ..slow.rule.clone()
+    };
+    database.update_alert_rule(slow.id, &off).await.unwrap();
+    database
+        .set_template_enabled(id, false, crate::times::now())
+        .await
+        .unwrap();
+    let newer = APP.replace("cpu.usage > 95", "cpu.usage > 96");
+    database
+        .sync_templates(&shipped(&[&newer]), crate::times::now())
+        .await
+        .unwrap();
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert!(!stored.enabled);
+    assert_eq!(stored.enabled_choice, Some(false));
+    let slow = rule(&database, "App slow").await;
+    assert!(!slow.rule.enabled);
+    assert_eq!(slow.template.as_ref().unwrap().enabled_choice, Some(false));
+
+    // Chosen on: a newer version that ships it off leaves it on.
+    let on = AlertRuleInput {
+        enabled: true,
+        ..slow.rule.clone()
+    };
+    database.update_alert_rule(slow.id, &on).await.unwrap();
+    database
+        .set_template_enabled(id, true, crate::times::now())
+        .await
+        .unwrap();
+    database
+        .sync_templates(&shipped(&[&shipped_off]), crate::times::now())
+        .await
+        .unwrap();
+    assert!(database.get_template(id).await.unwrap().unwrap().enabled);
+    let slow = rule(&database, "App slow").await;
+    assert!(slow.rule.enabled);
+    assert_eq!(slow.template.as_ref().unwrap().enabled_choice, Some(true));
+    assert!(
+        rule(&database, "App host gone").await.rule.enabled,
+        "never shipped off"
+    );
+    assert_eq!(rule(&database, "App host gone").await.id, gone.id);
+
+    // Putting them back follows the template again, which ships them off.
+    assert!(
+        database
+            .reset_template_rule(slow.id, crate::times::now())
+            .await
+            .unwrap()
+    );
+    let slow = rule(&database, "App slow").await;
+    assert!(!slow.rule.enabled);
+    assert_eq!(slow.template.as_ref().unwrap().enabled_choice, None);
+    assert!(
+        database
+            .follow_template_enabled(id, crate::times::now())
+            .await
+            .unwrap()
+    );
+    let stored = database.get_template(id).await.unwrap().unwrap();
+    assert!(!stored.enabled && stored.enabled_choice.is_none());
+}

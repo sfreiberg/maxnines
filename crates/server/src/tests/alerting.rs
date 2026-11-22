@@ -11132,3 +11132,103 @@ mod deleted_channels {
         assert_eq!(after.notifications_failed, 0);
     }
 }
+
+/// Someone making their own copy of a template's rule, or deleting it, changes
+/// which rule is used while the problem it was watching carries on.
+#[tokio::test]
+async fn an_open_alert_carries_on_as_a_templates_rule_is_copied_and_put_back() {
+    let mut test = Harness::start().await;
+    let disks = crate::templates::built_in::from_source(
+        r#"template "disks" {
+             name = "Disks"
+             alert "filling" {
+               name     = "Disks filling"
+               warning  = "disk.usage > 80"
+               critical = "disk.usage > 95"
+               for      = "5m"
+             }
+           }"#
+        .to_string(),
+    )
+    .unwrap();
+    test.database()
+        .sync_templates(&[disks], test.now)
+        .await
+        .unwrap();
+    let channel = webhook_channel("http://127.0.0.1:9/hook");
+    test.database().create_channel(&channel).await.unwrap();
+    let original = test.database().list_alert_rules().await.unwrap().remove(0);
+
+    disk_at(&mut test, 0, 85.0).await;
+    let open = disk_at(&mut test, 5, 85.0).await;
+    assert_eq!(open.len(), 1);
+    let alert = open[0].clone();
+    assert_eq!(alert.rule_id, original.id);
+    assert_eq!(deliver_all(&test).await, [Event::Firing]);
+    let silence = crate::silences::SilenceInput {
+        rule_id: Some(original.id),
+        filter: None,
+        series: None,
+        all_alerts: false,
+        reason: "Known".to_string(),
+        duration: HOUR,
+    };
+    test.database()
+        .create_silence(&silence, "sam", test.now + MINUTE * 5)
+        .await
+        .unwrap();
+
+    // A copy of their own, waiting longer: the same alert, now the copy's.
+    let wanted = AlertRuleInput {
+        hold: MINUTE * 10,
+        ..original.rule.clone()
+    };
+    assert!(
+        test.database()
+            .update_alert_rule(original.id, &wanted)
+            .await
+            .unwrap()
+    );
+    let copy = test.database().list_alert_rules().await.unwrap().remove(0);
+    assert_ne!(copy.id, original.id);
+    let open = disk_at(&mut test, 6, 85.0).await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].id, alert.id);
+    assert_eq!(open[0].rule_id, copy.id);
+    assert_eq!(open[0].started_at, alert.started_at);
+    assert!(open[0].resolved_at.is_none());
+    assert_eq!(deliver_all(&test).await, [], "nobody is told");
+    let silences = test
+        .database()
+        .active_silences(test.now + MINUTE * 6)
+        .await
+        .unwrap();
+    assert_eq!(silences.len(), 1);
+    assert_eq!(
+        silences[0].rule_id,
+        Some(copy.id),
+        "the silence still applies"
+    );
+
+    // Putting the template's back: the same alert again, its own once more.
+    assert!(
+        test.database()
+            .reset_template_rule(copy.id, test.now + MINUTE * 6)
+            .await
+            .unwrap()
+    );
+    let open = disk_at(&mut test, 7, 85.0).await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].id, alert.id);
+    assert_eq!(open[0].rule_id, original.id);
+    assert_eq!(deliver_all(&test).await, []);
+    let silences = test
+        .database()
+        .active_silences(test.now + MINUTE * 7)
+        .await
+        .unwrap();
+    assert_eq!(silences[0].rule_id, Some(original.id));
+
+    // And it ends when the problem does, as any alert.
+    assert!(disk_at(&mut test, 8, 10.0).await.is_empty());
+}

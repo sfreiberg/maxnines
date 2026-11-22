@@ -15,7 +15,11 @@ pub struct Model {
     pub resolved_summary: Option<String>,
     pub for_secs: i64,
     pub applies_to: Option<String>,
+    /// Whether it's on, which for a built-in or imported template's rule is what
+    /// the template ships.
     pub enabled: bool,
+    /// What someone chose instead of what the template ships, if they have.
+    pub enabled_choice: Option<bool>,
     pub calculation: Option<String>,
     pub metric: Option<String>,
     pub group_by: Option<String>,

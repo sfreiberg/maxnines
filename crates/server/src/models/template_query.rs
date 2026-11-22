@@ -14,6 +14,8 @@ pub struct Model {
     pub since: Option<String>,
     pub when_condition: Option<String>,
     pub enabled: bool,
+    /// What someone chose in place of the template's `enabled`, if they have.
+    pub enabled_choice: Option<bool>,
     pub labels: Option<Json>,
     /// The built-in part this is someone's own copy of, if it's one.
     pub replaces_id: Option<i64>,

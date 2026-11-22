@@ -25,7 +25,10 @@ pub struct Model {
     pub services: Option<Json>,
     /// For a built-in one, a hash of what it says.
     pub fingerprint: Option<String>,
+    /// Whether it ships on.
     pub enabled: bool,
+    /// What someone chose instead, for a built-in or imported one, if they have.
+    pub enabled_choice: Option<bool>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     /// When an upgrade last changed it.

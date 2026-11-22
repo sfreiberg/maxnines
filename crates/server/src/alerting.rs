@@ -90,6 +90,9 @@ pub struct TemplateLink {
     /// For someone's own copy of a built-in template's rule, the rule it's used in
     /// place of.
     pub replaces_id: Option<i64>,
+    /// For a built-in or imported template's own rule, what someone chose in place
+    /// of whether the template ships it on, or nothing while it follows the template.
+    pub enabled_choice: Option<bool>,
     /// Whether the template is on. Its alerts aren't checked while it's off.
     pub template_enabled: bool,
     /// Whether it needs what only agents running the template would send, its own

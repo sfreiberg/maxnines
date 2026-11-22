@@ -21,6 +21,8 @@ pub struct Model {
     pub since: Option<String>,
     pub interval_secs: Option<i64>,
     pub enabled: bool,
+    /// What someone chose in place of the template's `enabled`, if they have.
+    pub enabled_choice: Option<bool>,
     /// The built-in part this is someone's own copy of, if it's one.
     pub replaces_id: Option<i64>,
 }

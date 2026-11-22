@@ -486,6 +486,10 @@ pub struct Evaluator {
     actions: Arc<Actions>,
     started_at: Timestamp,
     trackers: HashMap<Key, Tracker>,
+    /// Each copy someone has of a template's rule, with the rule it's used in place
+    /// of, as of the last pass, so what one was watching is handed to the other
+    /// when a copy is made or deleted.
+    copies: HashMap<i64, i64>,
     /// Kept between passes, as forecasts read less often than rules are checked.
     trends: HashMap<TrendKey, Trends>,
     /// The newest sample seen from each host while it stays connected, as a sample
@@ -511,6 +515,7 @@ impl Evaluator {
             actions: state.actions.clone(),
             started_at,
             trackers: HashMap::new(),
+            copies: HashMap::new(),
             trends: HashMap::new(),
             newest_samples: HashMap::new(),
             silences: HashMap::new(),
@@ -878,6 +883,57 @@ impl Evaluator {
 
     /// Checks every rule once. Stopping partway is safe, as anything not done
     /// this time still needs doing next time.
+    /// When someone makes a copy of a template's rule, or deletes one, the rule
+    /// that's used changes while the problems it was watching carry on: their open
+    /// alerts are moved in the database, and here how long each has lasted is moved
+    /// with them, and an alert read just before the move is taken as the new rule's.
+    fn hand_over(&mut self, rules: &BTreeMap<i64, AlertRule>, open: &mut HashMap<Key, Alert>) {
+        let copies: HashMap<i64, i64> = rules
+            .values()
+            .filter_map(|rule| Some((rule.id, rule.template.as_ref()?.replaces_id?)))
+            .collect();
+        // From the rule that was used to the one that is now.
+        let mut moved: HashMap<i64, i64> = copies
+            .iter()
+            .map(|(copy, original)| (*original, *copy))
+            .collect();
+        for (copy, original) in &self.copies {
+            if !rules.contains_key(copy) && rules.contains_key(original) {
+                moved.insert(*copy, *original);
+            }
+        }
+        self.copies = copies;
+        if moved.is_empty() {
+            return;
+        }
+        let stale: Vec<Key> = self
+            .trackers
+            .keys()
+            .filter(|key| moved.contains_key(&key.rule_id))
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(tracker) = self.trackers.remove(&key) {
+                let now_under = Key {
+                    rule_id: moved[&key.rule_id],
+                    ..key
+                };
+                self.trackers.entry(now_under).or_insert(tracker);
+            }
+        }
+        let stale: Vec<Key> = open
+            .keys()
+            .filter(|key| moved.contains_key(&key.rule_id))
+            .cloned()
+            .collect();
+        for key in stale {
+            if let Some(mut alert) = open.remove(&key) {
+                alert.rule_id = moved[&key.rule_id];
+                open.entry(Key::of(&alert)).or_insert(alert);
+            }
+        }
+    }
+
     pub async fn evaluate(&mut self, now: Timestamp) -> Result<()> {
         let open_alerts = self.database.open_alerts().await?;
         let mut open: HashMap<Key, Alert> = open_alerts
@@ -885,6 +941,7 @@ impl Evaluator {
             .map(|alert| (Key::of(&alert), alert))
             .collect();
         let snapshot = self.snapshot(now, &open).await?;
+        self.hand_over(&snapshot.rules, &mut open);
 
         let mut checked = HashSet::new();
         for rule in snapshot.rules.values() {

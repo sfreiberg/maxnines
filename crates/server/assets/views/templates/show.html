@@ -6,6 +6,7 @@
 <div class="title-row">
   <div>
     <h1>{{ template.name }}{% if not enabled %} <span class="badge neutral">Disabled</span>{% endif %}</h1>
+    {% if original %}<p class="hint">{% if enabled_choice %}{% if enabled %}Enabled{% else %}Disabled{% endif %} by your choice, whatever a newer version says.{% else %}{% if enabled %}Enabled{% else %}Disabled{% endif %} as the template comes, which a newer version can change.{% endif %}</p>{% endif %}
     <p class="hint">{% if origin == "built_in" %}Comes with MaxNines{% if upgraded %} · updated {{ upgraded }}{% endif %}{% elif origin == "imported" %}Imported{% if upgraded %} · updated {{ upgraded }}{% endif %}{% else %}Yours{% endif %} · <code>{{ template.key }}</code> · {{ target }}</p>
   </div>
   {% if can_edit %}
@@ -14,6 +15,12 @@
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="secondary">{% if enabled %}Disable{% else %}Enable{% endif %}</button>
     </form>
+    {% if enabled_choice %}
+    <form method="post" action="/templates/{{ id }}/follow" hx-post="/templates/{{ id }}/follow" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">Follow the template</button>
+    </form>
+    {% endif %}
     {% if not original %}<a class="button" href="/templates/{{ id }}/edit">Edit</a>{% endif %}
   </div>
   {% endif %}
@@ -39,7 +46,7 @@
           {% if alert.waits_for_agents %}<div class="hint">Not checked yet: it needs what agents running this template would send.</div>{% endif %}
         </td>
         <td class="nowrap">{{ alert.hold }}</td>
-        <td>{% if not alert.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if alert.built_in %} <span class="badge hollow">Yours</span>{% endif %}</td>
+        <td>{% if not alert.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if alert.built_in %} <span class="badge hollow">Yours</span>{% endif %}{% if alert.enabled_chosen and not alert.built_in %}<span class="under">{% if alert.enabled %}On{% else %}Off{% endif %} by your choice</span>{% endif %}</td>
         <td>
           {% if can_edit %}
           <div class="actions row-actions">
@@ -48,7 +55,7 @@
               <button type="submit" class="secondary">{% if alert.enabled %}Disable{% else %}Enable{% endif %}</button>
             </form>
             <a class="button secondary" href="/alerts/rules/{{ alert.rule_id }}/edit">Change</a>
-            {% if alert.built_in %}
+            {% if alert.built_in or alert.enabled_chosen %}
             <form method="post" action="/templates/{{ id }}/alerts/{{ alert.rule_id }}/reset" hx-post="/templates/{{ id }}/alerts/{{ alert.rule_id }}/reset" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
               <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
               <button type="submit" class="secondary">Reset to template</button>

@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         .route("/templates/{id}/delete", post(delete))
         .route("/templates/{id}/enable", post(enable))
         .route("/templates/{id}/disable", post(disable))
+        .route("/templates/{id}/follow", post(follow))
         .route("/templates/{id}/alerts/{rule}/enable", post(enable_alert))
         .route("/templates/{id}/alerts/{rule}/disable", post(disable_alert))
         .route("/templates/{id}/alerts/{rule}/reset", post(reset_alert))
@@ -58,6 +59,7 @@ pub fn api_routes() -> Router<AppState> {
         )
         .route("/templates/{id}/enable", post(api_enable))
         .route("/templates/{id}/disable", post(api_disable))
+        .route("/templates/{id}/follow", post(api_follow))
         .route(
             "/templates/{id}/alerts/{key}",
             put(api_override_alert).delete(api_reset_alert),
@@ -165,6 +167,8 @@ struct AlertRow {
     critical: String,
     hold: String,
     enabled: bool,
+    /// Whether someone chose that, rather than the template shipping it so.
+    enabled_chosen: bool,
     waits_for_agents: bool,
     /// The built-in template's own rule, when the one in use is someone's copy.
     built_in: Option<BuiltInValues>,
@@ -221,6 +225,11 @@ fn alert_rows(alerts: &[TemplateAlert]) -> Vec<AlertRow> {
                 critical: rule.rule.critical.clone().unwrap_or_default(),
                 hold: crate::alerting::format_duration(rule.rule.hold),
                 enabled: rule.rule.enabled,
+                enabled_chosen: alert
+                    .rule
+                    .template
+                    .as_ref()
+                    .is_some_and(|link| link.enabled_choice.is_some()),
                 waits_for_agents: rule.waits_for_agents(),
                 built_in: alert
                     .copy
@@ -310,6 +319,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
         .with("origin", stored.origin.as_str())
         .with("original", &stored.origin.is_original())
         .with("enabled", &stored.enabled)
+        .with("enabled_choice", &stored.enabled_choice.is_some())
         .with("target", &target_words(&stored.template))
         .with("upgraded", &stored.upgraded_at.map(local_date))
         .with("source", &stored.hcl())
@@ -589,6 +599,18 @@ async fn turn(state: &AppState, id: i64, enabled: bool, form: CsrfForm) -> Respo
     }
 }
 
+async fn follow(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
+    match state
+        .database
+        .follow_template_enabled(id, crate::times::now())
+        .await
+    {
+        Ok(true) => (form.token.clone(), Redirect::to(&back(&form, id))).into_response(),
+        Ok(false) => not_found(&state, &form.token),
+        Err(error) => server_error(&error),
+    }
+}
+
 async fn enable(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfForm) -> Response {
     turn(&state, id, true, form).await
 }
@@ -702,6 +724,9 @@ struct TemplateSummary {
     /// `built_in`, `imported` or `own`.
     origin: Origin,
     enabled: bool,
+    /// What someone chose for a built-in or imported one, or nothing while it
+    /// follows what the template ships.
+    enabled_choice: Option<bool>,
     target: Option<maxnines_protocol::templates::Target>,
     created_at: crate::times::Timestamp,
     updated_at: crate::times::Timestamp,
@@ -718,6 +743,7 @@ fn summary(stored: &StoredTemplate, rules: &[AlertRule]) -> TemplateSummary {
         description: stored.template.description.clone(),
         origin: stored.origin,
         enabled: stored.enabled,
+        enabled_choice: stored.enabled_choice,
         target: stored.template.target.clone(),
         created_at: stored.created_at,
         updated_at: stored.updated_at,
@@ -864,6 +890,18 @@ async fn api_turn(state: &AppState, id: i64, enabled: bool) -> Response {
     match state
         .database
         .set_template_enabled(id, enabled, crate::times::now())
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => super::api::server_error(&error),
+    }
+}
+
+async fn api_follow(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match state
+        .database
+        .follow_template_enabled(id, crate::times::now())
         .await
     {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),

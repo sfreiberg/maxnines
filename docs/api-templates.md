@@ -13,6 +13,7 @@ themselves, which gives `422`.
 | `name`, `description` | From the HCL |
 | `origin` | `built_in` for one that comes with MaxNines, `imported`, or `own` |
 | `enabled` | Whether it's on. Turning it off turns off its alerts |
+| `enabled_choice` | For a built-in or imported one, what you chose, `true` or `false`, or `null` while it follows what the template ships, which a newer version can change |
 | `target` | What it runs for: `{"kind": "database", "value": "postgres"}`, `service`, or `os` with a list of systems, or `null` for every host |
 | `created_at`, `updated_at` | When it was added, and last changed |
 | `upgraded_at` | When a newer version last changed a built-in or imported one, or `null` |
@@ -59,6 +60,8 @@ Everything listed, with:
 
 A template's rule has a `template` field saying so: the template's `id`, the `alert`'s
 key, `replaces_id`, which for your own copy is the built-in rule it's used in place of,
+`enabled_choice`, what you chose for a built-in or imported template's own rule, or
+`null` while it follows the template,
 `template_enabled`, `waits_for_agents`, true while it needs what only agents running
 the template would send, which leaves it unchecked, and `original_changed_at`, when an
 upgrade last changed the built-in rule under a copy.
@@ -149,7 +152,9 @@ rule](api-alert-rules.md#delete-an-alert-rule) does.
 
 `POST /api/v1/templates/{id}/enable` and `POST /api/v1/templates/{id}/disable`
 
-Turning a built-in template off lasts through upgrades.
+For a built-in or imported template this is your choice, which newer versions leave
+alone. `POST /api/v1/templates/{id}/follow` forgets it, so the template is on or off as
+it comes again.
 
 ## Change one of a template's alerts
 
@@ -161,8 +166,10 @@ names, and it can't have a calculation.
 
 For a built-in or imported template, the first change makes your own copy of the rule, with an `id`
 of its own, which is checked in place of the built-in one from then on, and later
-changes update the copy. A body that differs from the built-in rule only in `enabled`
-sets that on the built-in rule and makes no copy. For a template of your own, the rule
+changes update the copy. Its open alerts, silences and maintenance windows move to the
+copy, so an alert that's open stays the same alert and nobody is told again. A body
+that differs from the built-in rule only in `enabled` makes no copy: it's kept as your
+choice, in `enabled_choice`. For a template of your own, the rule
 itself, and so the template, is changed.
 
 ```sh
@@ -183,9 +190,10 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `DELETE /api/v1/templates/{id}/alerts/{key}`, or `POST /api/v1/templates/{id}/alerts/{key}/reset`
 
-Deletes your copy of a built-in template's alert, as deleting the copy as an
-[alert rule](api-alert-rules.md#delete-an-alert-rule) does, so the built-in rule is
-checked again. `404` if there's no copy.
+Deletes your copy of a built-in or imported template's alert, as deleting the copy as an
+[alert rule](api-alert-rules.md#delete-an-alert-rule) does, so the template's own rule
+is checked again, taking the copy's open alerts, silences and maintenance windows with
+it. It also forgets whether you chose the alert on or off. `404` if there's neither.
 
 ## What an upgrade changed
 

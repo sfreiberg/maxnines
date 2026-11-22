@@ -32,9 +32,9 @@ use super::alerting::{
 };
 use super::audit::record_change;
 use super::{
-    Database, alert_rule, name_key, name_taken_or, template, template_counters, template_discovery,
-    template_fill, template_fill_version, template_metric, template_notice, template_query,
-    template_registry_read,
+    Database, alert, alert_rule, maintenance_window, name_key, name_taken_or, silence, template,
+    template_counters, template_discovery, template_fill, template_fill_version, template_metric,
+    template_notice, template_query, template_registry_read,
 };
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::audit::{Kind, Snapshot};
@@ -95,7 +95,11 @@ pub struct StoredTemplate {
     pub id: i64,
     pub template: Template,
     pub origin: Origin,
+    /// Whether it's on: what someone chose, or what the template ships.
     pub enabled: bool,
+    /// What someone chose, for a built-in or imported one, or nothing while it
+    /// follows what the template ships.
+    pub enabled_choice: Option<bool>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     /// When an upgrade last changed it, for a built-in one.
@@ -391,7 +395,8 @@ async fn to_stored<C: ConnectionTrait>(
         template: read_template(connection, &row).await?,
         id: row.id,
         origin: Origin::parse(&row.origin)?,
-        enabled: row.enabled,
+        enabled: row.enabled_choice.unwrap_or(row.enabled),
+        enabled_choice: row.enabled_choice,
         created_at: row.created_at,
         updated_at: row.updated_at,
         upgraded_at: row.upgraded_at,
@@ -737,10 +742,8 @@ async fn write_rules<C: ConnectionTrait>(
             true => theirs.applies_to.clone(),
             false => row.applies_to.clone(),
         };
-        let enabled = match original {
-            true => row.enabled,
-            false => alert.enabled,
-        };
+        // What the template ships. Someone's own choice is kept beside it.
+        let enabled = alert.enabled;
         let says_the_same = row.name == theirs.name
             && row.warning == theirs.warning
             && row.critical == theirs.critical
@@ -949,6 +952,8 @@ async fn rewrite_original<C: ConnectionTrait>(
     let mut active = template::ActiveModel {
         id: Set(row.id),
         fingerprint: Set(Some(fingerprint.to_string())),
+        // What it ships. Someone's own choice is kept beside it.
+        enabled: Set(template.enabled),
         updated_at: Set(now),
         upgraded_at: Set(Some(now)),
         upgrade_seen: Set(false),
@@ -993,6 +998,39 @@ async fn add_original<C: ConnectionTrait>(
     write_rules(connection, id, template, origin, now).await?;
     record_template(connection, id, None).await?;
     Ok(id)
+}
+
+/// Hands what one rule is watching to another, as someone's copy takes over from a
+/// template's rule or gives way to it again: its open alerts, which stay the same
+/// alerts and tell nobody, its silences that haven't ended and its maintenance
+/// windows.
+pub(super) async fn move_rule_state<C: ConnectionTrait>(
+    connection: &C,
+    from: i64,
+    to: i64,
+    now: Timestamp,
+) -> Result<()> {
+    alert::Entity::update_many()
+        .col_expr(alert::Column::RuleId, Expr::value(to))
+        .filter(alert::Column::RuleId.eq(from))
+        .filter(alert::Column::ResolvedAt.is_null())
+        .exec(connection)
+        .await
+        .context("moving a rule's open alerts")?;
+    silence::Entity::update_many()
+        .col_expr(silence::Column::RuleId, Expr::value(Some(to)))
+        .filter(silence::Column::RuleId.eq(from))
+        .filter(silence::Column::EndsAt.gt(now))
+        .exec(connection)
+        .await
+        .context("moving a rule's silences")?;
+    maintenance_window::Entity::update_many()
+        .col_expr(maintenance_window::Column::RuleId, Expr::value(Some(to)))
+        .filter(maintenance_window::Column::RuleId.eq(from))
+        .exec(connection)
+        .await
+        .context("moving a rule's maintenance windows")?;
+    Ok(())
 }
 
 /// What's known of the template a rule is one of the alerts of.
@@ -1322,13 +1360,38 @@ impl Database {
         let Some(stored) = load_template(&transaction, id).await? else {
             return Ok(false);
         };
-        if stored.enabled == enabled {
-            return Ok(true);
+        let before = template_snapshot(&stored)?;
+        // For a built-in or imported one it's their choice, kept beside what it
+        // ships; their own is simply changed.
+        let mut active = template::ActiveModel {
+            id: Set(id),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        match stored.origin.is_original() {
+            true => active.enabled_choice = Set(Some(enabled)),
+            false => active.enabled = Set(enabled),
         }
+        active
+            .update(&transaction)
+            .await
+            .context("saving template")?;
+        record_template(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving template")?;
+        Ok(true)
+    }
+
+    /// Goes back to following whether a built-in or imported template ships on,
+    /// forgetting what someone chose. Returns false if there's no such template.
+    pub async fn follow_template_enabled(&self, id: i64, now: Timestamp) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving template")?;
+        let Some(stored) = load_template(&transaction, id).await? else {
+            return Ok(false);
+        };
         let before = template_snapshot(&stored)?;
         template::ActiveModel {
             id: Set(id),
-            enabled: Set(enabled),
+            enabled_choice: Set(None),
             updated_at: Set(now),
             ..Default::default()
         }
@@ -1395,7 +1458,10 @@ impl Database {
                     if wanted.enabled != theirs.rule.enabled {
                         let before = alert_rule_snapshot(&transaction, &theirs).await?;
                         alert_rule::Entity::update_many()
-                            .col_expr(alert_rule::Column::Enabled, Expr::value(wanted.enabled))
+                            .col_expr(
+                                alert_rule::Column::EnabledChoice,
+                                Expr::value(Some(wanted.enabled)),
+                            )
                             .filter(alert_rule::Column::Id.eq(found.original))
                             .exec(&transaction)
                             .await
@@ -1421,6 +1487,8 @@ impl Database {
                 save_links(&transaction, copy, &wanted.channels).await?;
                 save_actions(&transaction, copy, &wanted.actions).await?;
                 record_alert_rule(&transaction, copy, None).await?;
+                // The problems it's watching carry on under the copy.
+                move_rule_state(&transaction, found.original, copy, crate::times::now()).await?;
                 transaction.commit().await.context("saving alert rule")?;
                 return Ok(true);
             }
@@ -1431,18 +1499,41 @@ impl Database {
         Ok(true)
     }
 
-    /// Puts one of a built-in template's alerts back to the template's own rule, by
-    /// deleting someone's copy of it. Returns false if there's no such rule, or no
-    /// copy of it.
+    /// Puts one of a built-in or imported template's alerts back to the template's
+    /// own: deletes someone's copy of it, handing what the copy was watching back,
+    /// and forgets whether they chose it on or off. Returns false if there's no such
+    /// rule, or nothing of theirs to put back.
     pub async fn reset_template_rule(&self, rule_id: i64, now: Timestamp) -> Result<bool> {
         let transaction = self.connection.begin().await.context("saving alert rule")?;
         let Some(found) = template_rule_in(&transaction, rule_id).await? else {
             return Ok(false);
         };
-        let Some(copy) = found.copy else {
+        let original = alert_rule::Entity::find_by_id(found.original)
+            .one(&transaction)
+            .await
+            .context("loading alert rule")?
+            .context("a template's rule went missing")?;
+        if found.copy.is_none() && original.enabled_choice.is_none() {
             return Ok(false);
-        };
-        delete_rule_in(&transaction, copy, now).await?;
+        }
+        if let Some(copy) = found.copy {
+            // The problems it's watching carry on under the template's own rule.
+            move_rule_state(&transaction, copy, found.original, now).await?;
+            delete_rule_in(&transaction, copy, now).await?;
+        }
+        if original.enabled_choice.is_some() {
+            let before = match load_alert_rule(&transaction, found.original).await? {
+                Some(rule) => Some(alert_rule_snapshot(&transaction, &rule).await?),
+                None => None,
+            };
+            alert_rule::Entity::update_many()
+                .col_expr(alert_rule::Column::EnabledChoice, Expr::value(None::<bool>))
+                .filter(alert_rule::Column::Id.eq(found.original))
+                .exec(&transaction)
+                .await
+                .context("saving alert rule")?;
+            record_alert_rule(&transaction, found.original, before.as_ref()).await?;
+        }
         transaction.commit().await.context("saving alert rule")?;
         Ok(true)
     }

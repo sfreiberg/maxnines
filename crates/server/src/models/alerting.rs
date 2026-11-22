@@ -50,6 +50,7 @@ fn to_alert_rule(
             alert: alert.clone(),
             replaces_id: row.replaces_id,
             template_enabled: !templates_off.contains(&id),
+            enabled_choice: row.enabled_choice,
             waits_for_agents: row.waits_for_agents,
             original_changed_at: row.original_changed_at,
         }),
@@ -65,7 +66,7 @@ fn to_alert_rule(
             resolved_summary: row.resolved_summary,
             hold: whole_seconds(row.for_secs).context("invalid duration")?,
             applies_to: row.applies_to,
-            enabled: row.enabled,
+            enabled: row.enabled_choice.unwrap_or(row.enabled),
             channels,
             all_channels: row.all_channels,
             calculation: row.calculation.as_deref().and_then(Calculation::parse),
@@ -683,11 +684,19 @@ impl Database {
             .await
             .context("loading alert rule")?;
         // Someone's copy of a template's alert can go, which puts the template's back.
-        if row.is_some_and(|row| row.template_id.is_some() && row.replaces_id.is_none()) {
+        if row
+            .as_ref()
+            .is_some_and(|row| row.template_id.is_some() && row.replaces_id.is_none())
+        {
             bail!(crate::templates::Refused(
                 "this rule is one of a template's alerts, so it can be disabled but not deleted"
                     .to_string()
             ));
+        }
+        // Deleting someone's copy puts the template's own rule back, with the copy's
+        // open alerts, silences and maintenance windows.
+        if let Some(original) = row.as_ref().and_then(|row| row.replaces_id) {
+            super::templates::move_rule_state(&transaction, id, original, now).await?;
         }
         let deleted = delete_rule_in(&transaction, id, now).await?;
         transaction.commit().await.context("deleting alert rule")?;
@@ -894,15 +903,20 @@ pub(super) async fn load_alert_rule<C: ConnectionTrait>(
 
 /// The templates that are turned off, whose alerts don't run.
 async fn templates_off<C: ConnectionTrait>(connection: &C) -> Result<BTreeSet<i64>> {
-    let ids: Vec<i64> = template::Entity::find()
+    let rows: Vec<(i64, bool, Option<bool>)> = template::Entity::find()
         .select_only()
         .column(template::Column::Id)
-        .filter(template::Column::Enabled.eq(false))
+        .column(template::Column::Enabled)
+        .column(template::Column::EnabledChoice)
         .into_tuple()
         .all(connection)
         .await
         .context("loading templates")?;
-    Ok(ids.into_iter().collect())
+    Ok(rows
+        .into_iter()
+        .filter(|(_, enabled, choice)| !choice.unwrap_or(*enabled))
+        .map(|(id, ..)| id)
+        .collect())
 }
 
 /// Writes `input` over a rule that's there, with its channels and actions, and

@@ -233,13 +233,20 @@ notice "cannot_see_sessions" {
 Open the alert from the template's page, or from **Settings > Alert rules**, where it
 says which template it's from, and change it with the usual form.
 
-For a **built-in** template, saving a change makes a copy of your own. From then on your
-copy is the rule that's checked, and the built-in one isn't: any alerts it had open
-end, and your copy raises its own. The template's page and the copy's form show what
+For a **built-in** or imported template, saving a change makes a copy of your own. From
+then on your copy is the rule that's checked, and the template's own isn't. A problem
+that's already alerting carries on as the same alert, now your copy's, with nobody told
+again, and its silences and maintenance windows come with it. If your copy's
+conditions no longer hold, it resolves as any alert does. The template's page and the copy's form show what
 the built-in one says beside yours, and when an upgrade last changed it, so you can
-compare. **Reset to template** deletes your copy, ending its open alerts, and the
-built-in rule is checked again. Turning a built-in alert on or off, and nothing else,
-only sets a flag on it, with no copy.
+compare. **Reset to template** deletes your copy and the template's own rule is checked again,
+taking over open alerts, silences and maintenance windows the same way.
+
+Turning one of these alerts on or off, and nothing else, makes no copy: it's kept as
+your choice. Until you choose, an alert is on or off as the template comes, so a newer
+version can turn it on or off; once you've chosen, a newer version leaves it. **Reset
+to template** forgets the choice too. The template itself works the same way, with
+**Follow the template** to forget your choice. The page says which it is.
 
 For a template of **your own**, there are no copies: changing an alert with its form
 changes the template itself, as editing the template does.
