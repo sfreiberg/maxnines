@@ -106,33 +106,47 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
         }
     }
     // What each discover block finds is looked at together, so no two find the same.
-    let mut found: Vec<String> = Vec::new();
+    // The format checks registry values and counter sets against each other, so here
+    // it's columns against each other and against those.
+    let mut found: Vec<(String, usize, bool)> = Vec::new();
     for (index, discover) in template.discover.iter().enumerate() {
-        let names: Vec<String> = discover
+        let place = Place::Discover(index);
+        let columns = match discover
+            .sql
+            .as_deref()
+            .map(|sql| columns(dialect.as_ref(), sql))
+        {
+            Some(Ok(columns)) => columns,
+            Some(Err(message)) => {
+                problems.push(Problem::new(place, "sql", message));
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
+        let others = discover
             .registry
             .iter()
-            .flat_map(|read| read.values.keys().cloned())
-            .chain(discover.counter_sets.keys().cloned())
-            .collect();
-        found.extend(names);
-        let Some(sql) = &discover.sql else {
-            continue;
-        };
-        match columns(dialect.as_ref(), sql) {
-            Ok(columns) => {
-                for column in columns {
-                    if found.contains(&column) {
-                        problems.push(Problem::new(
-                            Place::Discover(index),
-                            "sql",
-                            format!("{column:?} is found by another discover block too"),
-                        ));
-                    } else {
-                        found.push(column);
-                    }
-                }
+            .flat_map(|read| read.values.keys().map(|name| (name, "registry")))
+            .chain(
+                discover
+                    .counter_sets
+                    .keys()
+                    .map(|name| (name, "counter_sets")),
+            );
+        let named = columns.iter().map(|name| (name, "sql")).chain(others);
+        for (name, field) in named {
+            let column = field == "sql";
+            let earlier = found
+                .iter()
+                .find(|(seen, _, seen_column)| seen == name && (column || *seen_column));
+            if let Some((_, block, _)) = earlier {
+                let message = match *block == index {
+                    true => format!("{name:?} is found twice"),
+                    false => format!("{name:?} is found by another discover block too"),
+                };
+                problems.push(Problem::new(place, field, message));
             }
-            Err(message) => problems.push(Problem::new(Place::Discover(index), "sql", message)),
+            found.push((name.clone(), index, column));
         }
     }
     for (index, query) in template.queries.iter().enumerate() {

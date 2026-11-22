@@ -491,3 +491,27 @@ fn sql_needs_a_template_for_a_database() {
         );
     }
 }
+
+#[test]
+fn what_discover_blocks_find_is_found_once() {
+    let found = problems(
+        r#"template "app" {
+             name     = "App"
+             database = "postgres"
+             discover "one" { sql = "SELECT 1 AS version, 2 AS role" }
+             discover "two" {
+               sql = "SELECT 3 AS role"
+               registry "HKLM\\SOFTWARE\\App" { version = "Version" }
+             }
+           }"#,
+    );
+    for expected in [
+        r#"template "app", discover "two", sql: "role" is found by another discover block too"#,
+        r#"template "app", discover "two", registry: "version" is found by another discover block too"#,
+    ] {
+        assert!(
+            found.iter().any(|p| p == expected),
+            "{expected}\n{found:#?}"
+        );
+    }
+}

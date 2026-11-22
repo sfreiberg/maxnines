@@ -345,3 +345,47 @@ fn lengths_of_time_are_whole_seconds() {
     assert!(parse_duration("soon").is_err());
     assert_eq!(format_duration(5400), "1h 30m");
 }
+
+#[test]
+fn a_template_can_only_ask_what_an_agent_takes() {
+    let long = "x".repeat(work::MAX_SQL_LEN);
+    let mut queries = String::new();
+    for number in 0..=work::MAX_STATEMENTS {
+        queries.push_str(&format!(
+            "query \"q{number}\" {{ sql = \"SELECT 1 AS one\" }}\n"
+        ));
+    }
+    let found = problems(&format!(
+        r#"template "app" {{
+             name     = "App"
+             database = "postgres"
+             discover "d" {{
+               interval = "7d"
+               sql      = "SELECT '{long}' AS version"
+             }}
+             {queries}
+           }}"#
+    ));
+    for expected in [
+        r#"template "app", discover "d", interval: can be up to a day"#,
+        r#"template "app", discover "d", sql: can be up to 64 KB"#,
+        r#"template "app": has more than 64 discover blocks and queries together"#,
+    ] {
+        assert!(
+            found.iter().any(|problem| problem.starts_with(expected)),
+            "{expected}\n{found:#?}"
+        );
+    }
+    // A day is fine.
+    let found = problems(
+        r#"template "app" {
+             name     = "App"
+             database = "postgres"
+             query "q" {
+               interval = "24h"
+               sql      = "SELECT 1 AS one"
+             }
+           }"#,
+    );
+    assert!(found.is_empty(), "{found:#?}");
+}

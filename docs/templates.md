@@ -71,6 +71,12 @@ the blocks inside it, such as `sessions` and `busy`. A template whose metric wou
 have the name of one MaxNines has built in, such as `postgres.lag`, is refused: give
 it another key.
 
+An agent is sent what it reads all at once, so a template can have up to 64 discover
+blocks and queries together, each SQL statement up to 64 KB with what fills it, each
+query up to 256 labels and metrics, and each `interval` up to a day. A host is sent
+up to 64 templates to run, counting each database one runs for, and any more aren't
+sent, which the server logs.
+
 Lengths of time are written like `"30s"`, `"5m"`, `"1h"` or `"1h 30m"`, in whole
 seconds. Versions are numbers with dots, compared as numbers, so 9.6 < 13 < 16.2, and
 13 is the same as 13.0.

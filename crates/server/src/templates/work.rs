@@ -17,10 +17,12 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use maxnines_protocol::templates::work::{DiscoverWork, QueryWork, TemplateWork};
+use maxnines_protocol::is_page_name;
+use maxnines_protocol::templates::work::{DiscoverWork, MAX_WORK, QueryWork, TemplateWork};
 use maxnines_protocol::templates::{
     DEFAULT_DISCOVERY_INTERVAL, Query, Target, Template, Version, fill, parse_duration,
 };
+use tracing::warn;
 
 use super::hosts::RunningTemplates;
 use crate::metrics::{INSTANCE_LABEL, series_values};
@@ -118,7 +120,9 @@ pub fn work_for(
         let template = assigned.template();
         match &template.target {
             Some(Target::Database(_)) => {
-                for database in assigned.instances(host.facts).into_iter().flatten() {
+                // A name an agent's config couldn't have is a fact gone wrong.
+                let databases = assigned.instances(host.facts).into_iter().flatten();
+                for database in databases.filter(|name| is_page_name(name)) {
                     let found = discoveries.get(&(assigned.id(), database.clone()));
                     work.push(TemplateWork {
                         template: template.key.clone(),
@@ -147,6 +151,16 @@ pub fn work_for(
                 }
             }
         }
+    }
+    // An agent takes so much at once, so the rest isn't sent rather than all of it
+    // being refused.
+    if work.len() > MAX_WORK {
+        warn!(
+            host = host.id,
+            templates = work.len(),
+            "a host has more templates to run than an agent takes, sending the first {MAX_WORK}"
+        );
+        work.truncate(MAX_WORK);
     }
     work
 }
@@ -363,6 +377,22 @@ mod tests {
         // Not on the systems it's for, or with nothing to read.
         assert!(work_for(&os(counters), &Host::new(&linux, "a"), &Discoveries::new()).is_empty());
         assert!(work_for(&os(""), &Host::new(&windows, "a"), &Discoveries::new()).is_empty());
+    }
+
+    #[test]
+    fn a_host_is_sent_no_more_than_an_agent_takes() {
+        let templates = running(APP);
+        let databases: Map<String, Value> = (0..=MAX_WORK)
+            .map(|number| (format!("db{number}"), json!("postgres")))
+            .chain([("two words".to_string(), json!("postgres"))])
+            .collect();
+        let facts = json!({ "agent": { "databases": databases } });
+        let work = work_for(&templates, &Host::new(&facts, "a"), &Discoveries::new());
+        assert_eq!(work.len(), MAX_WORK);
+        assert!(
+            work.iter()
+                .all(|one| one.database.as_deref() != Some("two words"))
+        );
     }
 
     #[test]

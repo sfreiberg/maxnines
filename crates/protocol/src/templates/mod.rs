@@ -643,7 +643,10 @@ impl Template {
         for (index, discover) in self.discover.iter().enumerate() {
             let place = Place::Discover(index);
             if let Some(interval) = &discover.interval {
-                check_interval(interval, &mut |message| say(place, "interval", message));
+                check_run_interval(interval, &mut |message| say(place, "interval", message));
+            }
+            if let Some(sql) = &discover.sql {
+                check_sql_len(sql, &mut |message| say(place, "sql", message));
             }
             if discover.sql.is_none()
                 && discover.registry.is_empty()
@@ -701,6 +704,17 @@ impl Template {
             }
         }
 
+        // An agent is sent its discover blocks and queries together, which has a limit.
+        if self.discover.len() + self.queries.len() > work::MAX_STATEMENTS {
+            say(
+                top,
+                "",
+                format!(
+                    "has more than {} discover blocks and queries together",
+                    work::MAX_STATEMENTS
+                ),
+            );
+        }
         check_keys(self.queries.iter().map(|q| &q.key), Place::Query, &mut say);
         for (index, query) in self.queries.iter().enumerate() {
             check_query(index, query, &mut say);
@@ -782,6 +796,26 @@ fn check_interval(interval: &str, say: &mut dyn FnMut(String)) {
     }
 }
 
+/// How often something an agent runs runs: more than nothing, and at least daily,
+/// as an agent takes.
+fn check_run_interval(interval: &str, say: &mut dyn FnMut(String)) {
+    match parse_duration(interval) {
+        Ok(secs) if secs > crate::MAX_INTERVAL.as_secs() => {
+            say("can be up to a day, \"24h\"".to_string());
+        }
+        _ => check_interval(interval, say),
+    }
+}
+
+fn check_sql_len(sql: &str, say: &mut dyn FnMut(String)) {
+    if sql.len() > work::MAX_SQL_LEN {
+        say(format!(
+            "can be up to {} KB, with what fills it",
+            work::MAX_SQL_LEN / 1024
+        ));
+    }
+}
+
 fn check_keys<'a>(
     keys: impl Iterator<Item = &'a String>,
     place: impl Fn(usize) -> Place,
@@ -845,7 +879,24 @@ fn check_query(index: usize, query: &Query, say: &mut dyn FnMut(Place, &str, Str
         say(place, "sql", "can't be empty".to_string());
     }
     if let Some(interval) = &query.interval {
-        check_interval(interval, &mut |message| say(place, "interval", message));
+        check_run_interval(interval, &mut |message| say(place, "interval", message));
+    }
+    for sql in filled_sql(query) {
+        check_sql_len(&sql, &mut |message| say(place, "sql", message));
+    }
+    if query.labels.len() > work::MAX_COLUMNS {
+        say(
+            place,
+            "labels",
+            format!("can be up to {}", work::MAX_COLUMNS),
+        );
+    }
+    if query.metrics.len() > work::MAX_COLUMNS {
+        say(
+            place,
+            "metrics",
+            format!("can be up to {}", work::MAX_COLUMNS),
+        );
     }
     if let Some(since) = &query.since {
         check_version(since, &mut |message| say(place, "since", message));
@@ -934,7 +985,7 @@ fn check_counters(index: usize, counters: &Counters, say: &mut dyn FnMut(Place, 
         say(place, "label", format!("{label:?} {KEY_RULE}"));
     }
     if let Some(interval) = &counters.interval {
-        check_interval(interval, &mut |message| say(place, "interval", message));
+        check_run_interval(interval, &mut |message| say(place, "interval", message));
     }
     if let Some(since) = &counters.since {
         check_version(since, &mut |message| say(place, "since", message));
