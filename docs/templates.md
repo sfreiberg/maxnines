@@ -182,6 +182,13 @@ query "checkpoints" {
 `interval` runs a query less often than the agent samples, and `enabled = false`
 ships it turned off.
 
+**How SQL runs.** Each query and discover block has to be one `SELECT`. It runs on its
+own, as a prepared statement, in a read-only transaction that's rolled back afterwards,
+and the database stops it after 5 seconds. PostgreSQL and MySQL databases can be read
+so far. A template can run any `SELECT` its account is allowed to, so give MaxNines an
+account that can only read what monitoring needs, such as one in PostgreSQL's
+`pg_monitor` role.
+
 ### Performance counters
 
 `counters` blocks read a Windows performance counter set. Each entry under `metrics`

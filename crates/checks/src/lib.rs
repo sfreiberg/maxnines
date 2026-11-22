@@ -12,6 +12,7 @@ pub mod openmetrics;
 mod ping;
 mod rdap;
 mod sign_in;
+pub mod templates;
 
 pub use sign_in::Credentials;
 
