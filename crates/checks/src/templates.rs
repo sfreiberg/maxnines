@@ -93,6 +93,19 @@ impl Session {
         self.open.is_some()
     }
 
+    /// Connects, in `limit` at most, unless it is already.
+    pub async fn open(&mut self, limit: Duration) -> Result<()> {
+        if self.open.is_some() {
+            return Ok(());
+        }
+        let open = timeout(limit, self.connect())
+            .await
+            .map_err(|_| anyhow!("timed out"))??;
+        self.open = Some(open);
+        self.connections += 1;
+        Ok(())
+    }
+
     /// The rows one statement gives, in `limit` at most, connecting first if it
     /// has to.
     pub async fn run(&mut self, sql: &str, limit: Duration) -> Result<Vec<Row>> {

@@ -93,9 +93,12 @@ runs for each `database` block of that kind in the agent's config, whether or no
 config rule reads its stats, signing in the same way. The agent reads what the server
 sends it for each: the template's discover blocks first, and then its queries, each
 on its own schedule and over one connection, and sends their rows with its samples
-under the template's key, with whether the database answered as `<key>.up`. When the
-connection has to be opened again, as after the database restarts, discovery runs
-again. Templates can read PostgreSQL and MySQL so far.
+under the template's key, with whether the database answered as `<key>.up`. Whenever the
+connection is opened, the first time or again after the database restarts, discovery
+runs at once, and a discover block that fails is tried again within a minute. A
+database that doesn't answer is tried again after 5 seconds, then waits doubling to a
+minute, with nothing else run meanwhile, and one with nothing due is checked each
+sample, so `<key>.up` is as recent as a sample. Templates can read PostgreSQL and MySQL so far.
 
 ## Hosts without an agent
 
