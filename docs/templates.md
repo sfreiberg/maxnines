@@ -290,8 +290,8 @@ A template's alerts can be turned off but not deleted.
 A built-in template is known by its key, so an upgrade can rename it or change
 anything else about it and still keep your copies of its alerts and what's turned off.
 The same goes for its parts, each known by its key: one that's renamed is a new part.
-If a newer version drops an alert you have your own copy of, your copy stays, as an
-ordinary alert rule of yours, and the notice says so. One whose key changes says so
+If a newer version drops an alert you have your own copy of, or the whole template
+goes, your copy stays, as an ordinary alert rule of yours, and the notice says so. One whose key changes says so
 with `renamed_from = ["old_key"]`. If an upgrade brings a built-in template with the
 key or name of one of yours, yours keeps everything it has under a key and name of its
 own, such as `myapp_yours` and `My app (yours)`, and a rule of yours with the name of

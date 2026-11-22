@@ -266,21 +266,18 @@ erDiagram
     template_renames {
         int id PK
         int template_id FK
-        int replaces_id FK
         string old_key "a key the template had before"
         int position
     }
     template_services {
         int id PK
         int template_id FK
-        int replaces_id FK
         string service "one the host's alerts should watch"
         int position
     }
     template_counter_sets {
         int id PK
         int discovery_id FK
-        int replaces_id FK
         string key "what it's found as"
         int position
         text counter_set
@@ -288,7 +285,6 @@ erDiagram
     template_registry_values {
         int id PK
         int registry_read_id FK
-        int replaces_id FK
         string key "what it's found as"
         int position
         text value_name
@@ -296,21 +292,18 @@ erDiagram
     template_query_labels {
         int id PK
         int query_id FK
-        int replaces_id FK
         string label "a column that tells rows apart"
         int position
     }
     template_counters_excludes {
         int id PK
         int counters_id FK
-        int replaces_id FK
         string instance "one left out"
         int position
     }
     template_counters_groups {
         int id PK
         int counters_id FK
-        int replaces_id FK
         string key "the group"
         int position
         text counter "the counter its value is read from"
@@ -318,7 +311,6 @@ erDiagram
     template_metric_states {
         int id PK
         int metric_id FK
-        int replaces_id FK
         string number
         int position
         text word
@@ -655,7 +647,7 @@ erDiagram
 | `config_rules`, `config_rule_settings` | What agents monitor, chosen by operating system and facts. The server writes its built-in rules, marked by `built_in`, each time it starts |
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A template's alert is a rule too. A built-in or imported template's rule isn't people's to change, and is rewritten by a newer version, `enabled` included, which is what it ships: what someone chose instead is in `enabled_choice`, which a newer version never writes; someone changing it makes a copy of their own, a second rule whose `replaces_id` points at it, which is used in its place until it's deleted. Making or deleting a copy hands the open alerts, silences and maintenance windows of one to the other |
 | `templates` | What MaxNines watches for in something it monitors: by `origin`, the built-in ones, which the server writes each time it starts, imported ones, which importing a newer version rewrites the same way, and people's own. HCL is only how they come in and go out. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
-| `template_renames`, `template_services`, `template_counter_sets`, `template_registry_values`, `template_query_labels`, `template_counters_excludes`, `template_counters_groups`, `template_metric_states` | The short lists and maps of a template and its parts, a row to an item, in order by `position`, written over the rows they have by the item's name as the parts are. None of a template is kept as JSON |
+| `template_renames`, `template_services`, `template_counter_sets`, `template_registry_values`, `template_query_labels`, `template_counters_excludes`, `template_counters_groups`, `template_metric_states` | The short lists and maps of a template and its parts, a row to an item, in order by `position`, written over the rows they have by the item's name as the parts are. A copy of a part brings its items with it, so they have no `replaces_id` of their own. None of a template is kept as JSON |
 | `template_discoveries`, `template_registry_reads`, `template_notices`, `template_queries`, `template_fills`, `template_fill_versions`, `template_counters`, `template_metrics` | A template's parts, one row to a block or entry, each with its key as the HCL has it and its `position` among the others. A save, an import or a start writes each part over the row with its key, within its template, query, counters or fill, so a row keeps its `id` while its part is there, and only the rows of parts that are gone are deleted. A fill's versions are matched by `version`, and a part given another key is a new part. They go with their template, query, counters or fill. Each has a `replaces_id` for someone's own copy of a built-in part, as alert rules have, which nothing makes yet |
 | `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |

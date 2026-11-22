@@ -326,10 +326,14 @@ async fn a_renamed_template_keeps_its_rules_and_one_no_longer_shipped_goes() {
         .unwrap();
     assert_eq!(changed, ["App"]);
     assert!(database.list_templates().await.unwrap().is_empty());
-    assert!(database.list_alert_rules().await.unwrap().is_empty());
+    // Their copy of one of its alerts stays, as an ordinary rule of theirs.
+    let left = database.list_alert_rules().await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].rule.hold, chrono::TimeDelta::minutes(15));
+    assert!(left[0].template.is_none());
     assert_eq!(
         database.template_upgrades().await.unwrap(),
-        ["App (removed)"]
+        ["App (removed; your own copy of App slow is kept as a rule of yours)"]
     );
 }
 
@@ -1180,14 +1184,21 @@ async fn an_imported_template_is_replaced_by_a_newer_one_keeping_copies_and_what
         ["App (its version of App slow changed, which you have your own of)"]
     );
 
-    // Unlike a built-in one, it can be deleted, with its rules and copies.
+    // Unlike a built-in one, it can be deleted, with its rules. Their copy stays.
     assert!(
         database
             .delete_template(id, crate::times::now())
             .await
             .unwrap()
     );
-    assert_eq!(database.list_alert_rules().await.unwrap().len(), 8);
+    let left = database.list_alert_rules().await.unwrap();
+    assert_eq!(left.len(), 9);
+    let kept = left
+        .iter()
+        .find(|rule| rule.rule.name == "App slow")
+        .unwrap();
+    assert!(kept.template.is_none());
+    assert_eq!(kept.rule, wanted);
 }
 
 #[tokio::test]

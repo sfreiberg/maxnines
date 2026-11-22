@@ -1058,52 +1058,70 @@ async fn write_rules<C: ConnectionTrait>(
         // Someone's copy of an alert the template no longer has is theirs to keep,
         // as an ordinary rule, and the notice of the new version says so.
         if let Some(copy) = copy {
-            let before = match load_alert_rule(connection, copy.id).await? {
-                Some(rule) => Some(alert_rule_snapshot(connection, &rule).await?),
-                None => None,
-            };
-            alert_rule::ActiveModel {
-                id: Set(copy.id),
-                template_id: Set(None),
-                template_alert: Set(None),
-                template_position: Set(None),
-                replaces_id: Set(None),
-                when_condition: Set(None),
-                since: Set(None),
-                original_changed_at: Set(None),
-                waits_for_agents: Set(false),
-                ..Default::default()
-            }
-            .update(connection)
-            .await
-            .map_err(|error| {
-                let taken = NameTaken::AlertRule(copy.name.clone());
-                name_taken_or(error, taken, "keeping a copy of a template's alert rule")
-            })?;
-            record_alert_rule(connection, copy.id, before.as_ref()).await?;
+            keep_copy(connection, &copy).await?;
             kept.push(copy.name);
         }
     }
     Ok(kept)
 }
 
-/// Deletes a template, marking it deleted, and its rules and their copies with it.
+/// Makes someone's copy of a template's alert, whose original is going, an ordinary
+/// rule of theirs.
+async fn keep_copy<C: ConnectionTrait>(connection: &C, copy: &alert_rule::Model) -> Result<()> {
+    let before = match load_alert_rule(connection, copy.id).await? {
+        Some(rule) => Some(alert_rule_snapshot(connection, &rule).await?),
+        None => None,
+    };
+    alert_rule::ActiveModel {
+        id: Set(copy.id),
+        template_id: Set(None),
+        template_alert: Set(None),
+        template_position: Set(None),
+        replaces_id: Set(None),
+        when_condition: Set(None),
+        since: Set(None),
+        original_changed_at: Set(None),
+        waits_for_agents: Set(false),
+        ..Default::default()
+    }
+    .update(connection)
+    .await
+    .map_err(|error| {
+        let taken = NameTaken::AlertRule(copy.name.clone());
+        name_taken_or(error, taken, "keeping a copy of a template's alert rule")
+    })?;
+    record_alert_rule(connection, copy.id, before.as_ref()).await
+}
+
+/// Deletes a template, marking it deleted, and its rules with it. People's copies of
+/// its alerts stay, as ordinary rules of theirs, and the notice of it going says so.
 async fn delete_in<C: ConnectionTrait>(
     connection: &C,
     stored: &StoredTemplate,
     now: Timestamp,
 ) -> Result<()> {
     let before = template_snapshot(stored)?;
-    let rules: Vec<alert_rule::Model> = alert_rule::Entity::find()
-        .filter(alert_rule::Column::DeletedAt.is_null())
-        .filter(alert_rule::Column::TemplateId.eq(stored.id))
-        .order_by_desc(alert_rule::Column::ReplacesId)
-        .all(connection)
-        .await
-        .context("loading a template's alert rules")?;
-    for rule in rules {
+    let mut kept = Vec::new();
+    for rule in own_rules(connection, stored.id).await? {
+        let copy = copy_of(connection, rule.id).await?;
         delete_rule_in(connection, rule.id, now).await?;
+        if let Some(copy) = copy {
+            keep_copy(connection, &copy).await?;
+            kept.push(copy.name);
+        }
     }
+    let note = (!kept.is_empty()).then(|| {
+        format!(
+            "your own copy of {} is kept as a rule of yours",
+            kept.join(", ")
+        )
+    });
+    template::Entity::update_many()
+        .col_expr(template::Column::UpgradeNote, Expr::value(note))
+        .filter(template::Column::Id.eq(stored.id))
+        .exec(connection)
+        .await
+        .context("noting what became of a template's copies")?;
     template::Entity::update_many()
         .col_expr(template::Column::DeletedAt, Expr::value(now))
         .filter(template::Column::Id.eq(stored.id))
@@ -1830,7 +1848,10 @@ impl Database {
         let mut notices = Vec::new();
         for row in rows {
             if row.deleted_at.is_some() {
-                notices.push(format!("{} (removed)", row.name));
+                notices.push(match &row.upgrade_note {
+                    Some(note) => format!("{} (removed; {note})", row.name),
+                    None => format!("{} (removed)", row.name),
+                });
                 continue;
             }
             let copies: Vec<String> = alert_rule::Entity::find()

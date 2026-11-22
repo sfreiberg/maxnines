@@ -167,7 +167,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     };
     let position = || part("position").integer().not_null().to_owned();
     // What every part has, and the template, query, counters or fill it's part of.
-    let table = |name: &str, parents: &[(&str, &str, bool)]| {
+    let table = |name: &str, parents: &[(&str, &str, bool)], copied: bool| {
         let mut table = Table::create()
             .table(Alias::new(name))
             .col(id(Alias::new("id")))
@@ -185,28 +185,32 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
                     .on_delete(ForeignKeyAction::Cascade),
             );
         }
-        table.col(part("replaces_id").big_integer()).foreign_key(
-            ForeignKey::create()
-                .name(format!("fk_{name}_replaces_id"))
-                .from(Alias::new(name), Alias::new("replaces_id"))
-                .to(Alias::new(name), Alias::new("id"))
-                .on_delete(ForeignKeyAction::Cascade),
-        );
+        // A part someone can have their own copy of says which it's a copy of. An
+        // item of a part, such as a label, is copied with the part.
+        if copied {
+            table.col(part("replaces_id").big_integer()).foreign_key(
+                ForeignKey::create()
+                    .name(format!("fk_{name}_replaces_id"))
+                    .from(Alias::new(name), Alias::new("replaces_id"))
+                    .to(Alias::new(name), Alias::new("id"))
+                    .on_delete(ForeignKeyAction::Cascade),
+            );
+        }
         table
     };
     let template = [("template_id", "templates", true)];
 
-    let mut discoveries = table("template_discoveries", &template);
+    let mut discoveries = table("template_discoveries", &template, true);
     discoveries
         .col(part("interval_secs").big_integer())
         .col(part("sql").text());
     manager.create_table(discoveries).await?;
 
-    let mut registry = table("template_registry_reads", &template);
+    let mut registry = table("template_registry_reads", &template, true);
     registry.col(key()).col(position());
     manager.create_table(registry).await?;
 
-    let mut notices = table("template_notices", &template);
+    let mut notices = table("template_notices", &template, true);
     notices
         .col(key())
         .col(position())
@@ -214,7 +218,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("text").text().not_null());
     manager.create_table(notices).await?;
 
-    let mut queries = table("template_queries", &template);
+    let mut queries = table("template_queries", &template, true);
     queries
         .col(key())
         .col(position())
@@ -226,13 +230,18 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("enabled_choice").boolean());
     manager.create_table(queries).await?;
 
-    let mut fills = table("template_fills", &[("query_id", "template_queries", true)]);
+    let mut fills = table(
+        "template_fills",
+        &[("query_id", "template_queries", true)],
+        true,
+    );
     fills.col(key()).col(position()).col(part("older").text());
     manager.create_table(fills).await?;
 
     let mut versions = table(
         "template_fill_versions",
         &[("fill_id", "template_fills", true)],
+        true,
     );
     versions
         .col(part("version").string_len(64).not_null())
@@ -240,7 +249,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("sql").text().not_null());
     manager.create_table(versions).await?;
 
-    let mut counters = table("template_counters", &template);
+    let mut counters = table("template_counters", &template, true);
     counters
         .col(key())
         .col(position())
@@ -264,6 +273,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
             ("query_id", "template_queries", false),
             ("counters_id", "template_counters", false),
         ],
+        true,
     );
     metrics
         .col(key())
@@ -336,7 +346,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
             Some("word"),
         ),
     ] {
-        let mut items = table(name, &[(parent, of, true)]);
+        let mut items = table(name, &[(parent, of, true)], false);
         items
             .col(exact_text(backend, Alias::new(item), 255).not_null())
             .col(position());

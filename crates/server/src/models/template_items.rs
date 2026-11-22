@@ -21,8 +21,6 @@ macro_rules! list_table {
                 pub $parent: i64,
                 pub $key: String,
                 pub position: i32,
-                /// The built-in item this is someone's own copy of, if it's one.
-                pub replaces_id: Option<i64>,
             }
 
             #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -37,7 +35,6 @@ macro_rules! list_table {
             ) -> Result<Vec<String>> {
                 let rows = Entity::find()
                     .filter(Column::$Parent.eq(parent))
-                    .filter(Column::ReplacesId.is_null())
                     .order_by_asc(Column::Position)
                     .all(connection)
                     .await
@@ -53,7 +50,6 @@ macro_rules! list_table {
             ) -> Result<()> {
                 let mut left: HashMap<String, Model> = Entity::find()
                     .filter(Column::$Parent.eq(parent))
-                    .filter(Column::ReplacesId.is_null())
                     .all(connection)
                     .await
                     .context(concat!("loading ", $table))?
@@ -120,8 +116,6 @@ macro_rules! map_table {
                 pub $key: String,
                 pub position: i32,
                 pub $value: String,
-                /// The built-in item this is someone's own copy of, if it's one.
-                pub replaces_id: Option<i64>,
             }
 
             #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -136,7 +130,6 @@ macro_rules! map_table {
             ) -> Result<IndexMap<String, String>> {
                 let rows = Entity::find()
                     .filter(Column::$Parent.eq(parent))
-                    .filter(Column::ReplacesId.is_null())
                     .order_by_asc(Column::Position)
                     .all(connection)
                     .await
@@ -152,7 +145,6 @@ macro_rules! map_table {
             ) -> Result<()> {
                 let mut left: HashMap<String, Model> = Entity::find()
                     .filter(Column::$Parent.eq(parent))
-                    .filter(Column::ReplacesId.is_null())
                     .all(connection)
                     .await
                     .context(concat!("loading ", $table))?
