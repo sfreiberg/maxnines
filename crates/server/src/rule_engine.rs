@@ -5,15 +5,15 @@
 //! are merged over the last. Maps merge key by key, and a list is replaced whole.
 
 use std::cell::OnceCell;
-use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result, anyhow, ensure};
-use cel::{Context as CelContext, Env, Program, Value as CelValue};
+use cel::{Context as CelContext, Program, Value as CelValue};
 use maxnines_protocol::AgentConfig;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tracing::debug;
 
+use crate::cel_env::FUNCTIONS;
 use crate::facts::{flatten, unflatten};
 use crate::models::{ConfigRule, RuleInput};
 
@@ -92,10 +92,6 @@ pub fn check_rule(rule: &RuleInput) -> Result<()> {
 fn is_empty_map(value: &Value) -> bool {
     value.as_object().is_some_and(Map::is_empty)
 }
-
-/// The functions and macros every condition can use, made once, as making them takes
-/// far longer than checking a condition.
-static FUNCTIONS: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(Env::stdlib()));
 
 /// A condition ready to check against any number of hosts.
 pub struct Condition(Program);

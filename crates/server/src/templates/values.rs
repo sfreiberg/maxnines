@@ -1,106 +1,94 @@
 //! Metrics a template works out with CEL, `value = "<CEL>"`, from the other columns
 //! of its query's rows, which the server does as an agent's samples arrive, as
-//! agents have no CEL. Each is worked out for each row with the query's labels,
-//! from that row's numbers by their names. `rate(x)` is a running total's change
-//! over the seconds since that row's series was last sent, so the first sample of a
-//! series has none, and nor does a metric naming a column the row doesn't have.
-//! A metric left out where it runs, as its `since` is past the version found there,
-//! isn't worked out.
+//! agents have no CEL.
+//!
+//! Each row an agent sends says which query it's from, which is taken out before
+//! it's stored. Each metric is worked out for the rows of its query, from each
+//! row's numbers by their names. `rate(x)` is a running total's change over the seconds since that query
+//! last sent that series, so its first sample has none, and nor does one sent late,
+//! after a newer one, as an agent sends samples it kept while away. A metric naming
+//! a column the row doesn't have isn't worked out, and nor is one left out where it
+//! runs, as its `since` is past the version found there.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, LazyLock};
+use std::collections::{HashMap, HashSet};
 
-use cel::common::ast::{CallExpr, Expr, IdedExpr, operators};
+use cel::common::ast::IdedExpr;
 use cel::extractors::Arguments;
-use cel::{Context as CelContext, Env, ExecutionError, Program, Value as CelValue};
+use cel::{Context as CelContext, ExecutionError, Program, Value as CelValue};
+use chrono::TimeDelta;
 use serde_json::{Map, Value, json};
 
 use maxnines_protocol::Sample;
-use maxnines_protocol::templates::work::{TemplateWork, collector_of};
-use maxnines_protocol::templates::{Target, Template};
+use maxnines_protocol::templates::Template;
+use maxnines_protocol::templates::work::{QUERY_FIELD, TemplateWork, collector_of};
 
+use crate::cel_env::{FUNCTIONS, NUMBER, fractions, number};
 use crate::metrics::INSTANCE_LABEL;
 use crate::times::Timestamp;
 
-/// CEL's own functions, made once.
-static FUNCTIONS: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(Env::stdlib()));
-
-/// What a template's `value` metrics need besides their own: a running total's
-/// change each second.
+/// A running total's change each second, for a template's `value` metrics.
 pub const RATE: &str = "rate";
 
-/// Makes a whole number one with a fraction, which no one can call by name.
-const NUMBER: &str = "number:";
+/// How long a series no sample has had is remembered, which is longer than any
+/// query's interval can be.
+const FORGET_AFTER: TimeDelta = TimeDelta::days(2);
 
-/// One metric a template works out, compiled.
-pub struct WorkedOut {
+/// The metrics one of a template's queries works out, compiled.
+pub struct QueryValues {
     /// The template's key.
     template: String,
-    /// The query it's a metric of.
     query: String,
-    key: String,
-    /// The labels the query's rows have.
-    labels: BTreeSet<String>,
-    expr: IdedExpr,
+    metrics: Vec<(String, IdedExpr)>,
 }
 
-/// Every `value` metric of a template that's on, compiled. One that doesn't compile
-/// is left out, as saving a template refuses it.
-pub fn worked_out(template: &Template) -> Vec<WorkedOut> {
+/// The metrics a template that's on works out with CEL, by query. One that doesn't
+/// compile is left out, as saving a template refuses it.
+pub fn worked_out(template: &Template) -> Vec<QueryValues> {
     if !template.enabled {
         return Vec::new();
     }
-    let instance = matches!(template.target, Some(Target::Database(_)));
     let mut all = Vec::new();
     for query in template.queries.iter().filter(|query| query.enabled) {
-        let mut labels: BTreeSet<String> = query.labels.iter().cloned().collect();
-        if instance {
-            labels.insert(INSTANCE_LABEL.to_string());
+        let metrics: Vec<(String, IdedExpr)> = query
+            .metrics
+            .iter()
+            .filter_map(|metric| {
+                let program = Program::compile(metric.value.as_deref()?).ok()?;
+                let mut expr = program.expression().clone();
+                fractions(&mut expr);
+                Some((metric.key.clone(), expr))
+            })
+            .collect();
+        if metrics.is_empty() {
+            continue;
         }
-        for metric in &query.metrics {
-            let Some(text) = &metric.value else {
-                continue;
-            };
-            let Ok(program) = Program::compile(text) else {
-                continue;
-            };
-            let mut expr = program.expression().clone();
-            fractions(&mut expr);
-            all.push(WorkedOut {
-                template: template.key.clone(),
-                query: query.key.clone(),
-                key: metric.key.clone(),
-                labels: labels.clone(),
-                expr,
-            });
-        }
+        all.push(QueryValues {
+            template: template.key.clone(),
+            query: query.key.clone(),
+            metrics,
+        });
     }
     all
 }
 
-/// When each row's series was last sent on a connection, to work out rates.
-pub type LastSent = HashMap<String, Timestamp>;
+/// When each query last sent each series on a connection, to work out rates.
+#[derive(Debug, Default)]
+pub struct LastSent(HashMap<(String, String), Timestamp>);
 
-/// Works out each `value` metric for the rows of a sample, adding it to each row it
-/// can be worked out for. `sent` is what the agent was last sent to read.
+/// Works out each `value` metric for the rows of a sample, adding it to each row
+/// of its query. `sent` is what the agent was last sent to read.
 pub fn work_out(
     sample: &mut Sample,
-    metrics: &[WorkedOut],
+    queries: &[QueryValues],
     sent: &[TemplateWork],
     last_sent: &mut LastSent,
 ) {
-    let mut by_template: HashMap<&str, Vec<&WorkedOut>> = HashMap::new();
-    for metric in metrics {
-        by_template
-            .entry(&metric.template)
-            .or_default()
-            .push(metric);
-    }
-    for (template, metrics) in by_template {
-        let collector = collector_of(template);
+    for query in queries {
+        let collector = collector_of(&query.template);
         let Some(Value::Array(rows)) = sample.metrics.get_mut(&collector) else {
             continue;
         };
+        let mut seen: HashSet<String> = HashSet::new();
         for row in rows.iter_mut() {
             let Some(row) = row.as_object_mut() else {
                 continue;
@@ -115,72 +103,85 @@ pub fn work_out(
                 .filter(|(_, value)| value.is_number())
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
-            // A series is the row's labels and what it has, so rows of two queries
-            // with the same labels, or a database's `up`, are told apart.
-            let names: Vec<&String> = numbers.keys().collect();
-            let series = format!("{collector}\n{}\n{names:?}", Value::Object(labels.clone()));
-            let elapsed = last_sent
-                .insert(series, sample.time)
-                .map(|last| (sample.time - last).as_seconds_f64())
-                .filter(|secs| *secs > 0.0);
+            if row.get(QUERY_FIELD).and_then(Value::as_str) != Some(query.query.as_str()) {
+                continue;
+            }
             let database = labels.get(INSTANCE_LABEL).and_then(Value::as_str);
-            let label_names: BTreeSet<String> = labels.keys().cloned().collect();
-            for metric in &metrics {
-                if metric.labels != label_names || row.contains_key(&metric.key) {
+            let Some(omit) = sent
+                .iter()
+                .filter(|work| work.template == query.template)
+                .filter(|work| work.database.as_deref() == database)
+                .flat_map(|work| &work.queries)
+                .find(|sent| sent.key == query.query)
+                .map(|sent| &sent.omit)
+            else {
+                continue;
+            };
+            let series = Value::Object(labels).to_string();
+            seen.insert(series.clone());
+            let elapsed = last_sent.note(&collector, &query.query, series, sample.time);
+            for (key, expr) in &query.metrics {
+                if omit.contains(key) || row.contains_key(key) {
                     continue;
                 }
-                let runs = sent
-                    .iter()
-                    .filter(|work| work.template == metric.template)
-                    .filter(|work| work.database.as_deref() == database)
-                    .flat_map(|work| &work.queries)
-                    .any(|query| query.key == metric.query && !query.omit.contains(&metric.key));
-                if !runs {
-                    continue;
-                }
-                if let Some(value) = evaluate(&metric.expr, &numbers, elapsed) {
-                    row.insert(metric.key.clone(), json!(value));
+                if let Some(value) = evaluate(expr, &numbers, elapsed) {
+                    row.insert(key.clone(), json!(value));
                 }
             }
         }
+        last_sent.forget(&collector, &query.query, &seen, sample.time);
     }
 }
 
-/// Makes the whole numbers in sums ones with fractions as they're worked out, so
-/// `hits * 2` works as it reads, as conditions do.
-fn fractions(expr: &mut IdedExpr) {
-    let Expr::Call(call) = &mut expr.expr else {
-        return;
-    };
-    if let Some(target) = &mut call.target {
-        fractions(target);
-    }
-    call.args.iter_mut().for_each(fractions);
-    let sums = matches!(
-        call.func_name.as_str(),
-        operators::ADD | operators::SUBSTRACT | operators::MULTIPLY | operators::DIVIDE
-    );
-    if sums && call.target.is_none() {
-        for arg in &mut call.args {
-            let inner = std::mem::take(arg);
-            *arg = IdedExpr {
-                id: inner.id,
-                expr: Expr::Call(CallExpr {
-                    func_name: NUMBER.to_string(),
-                    target: None,
-                    args: vec![inner],
-                }),
-            };
+impl LastSent {
+    /// Notes that a query sent a series at `time`, giving the seconds since it last
+    /// did, or nothing for its first, or one older than what's been noted.
+    fn note(
+        &mut self,
+        collector: &str,
+        query: &str,
+        series: String,
+        time: Timestamp,
+    ) -> Option<f64> {
+        let key = (format!("{collector}\n{query}"), series);
+        match self.0.get(&key) {
+            Some(last) if *last >= time => None,
+            last => {
+                let elapsed = last.map(|last| (time - *last).as_seconds_f64());
+                self.0.insert(key, time);
+                elapsed
+            }
         }
     }
+
+    /// Forgets the series a query no longer sends: those not among what it just
+    /// sent, if it sent any, and any not sent for a long while.
+    fn forget(&mut self, collector: &str, query: &str, sent: &HashSet<String>, time: Timestamp) {
+        let of_query = format!("{collector}\n{query}");
+        self.0.retain(|(owner, series), last| {
+            let gone = *owner == of_query && !sent.is_empty() && !sent.contains(series);
+            !gone && time - *last < FORGET_AFTER
+        });
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
-fn number(Arguments(args): Arguments) -> Result<CelValue, ExecutionError> {
-    match args.as_slice() {
-        [CelValue::Int(whole)] => Ok(CelValue::Float(*whole as f64)),
-        [CelValue::UInt(whole)] => Ok(CelValue::Float(*whole as f64)),
-        [other] => Ok(other.clone()),
-        _ => Err(ExecutionError::invalid_argument_count(1, args.len())),
+/// Takes out what each of a template's rows says of its query, once it's been used,
+/// so it isn't stored.
+pub fn strip_queries(sample: &mut Sample) {
+    for (collector, rows) in sample.metrics.iter_mut() {
+        if !collector.starts_with("template.") {
+            continue;
+        }
+        for row in rows.as_array_mut().into_iter().flatten() {
+            if let Some(row) = row.as_object_mut() {
+                row.remove(QUERY_FIELD);
+            }
+        }
     }
 }
 
@@ -197,7 +198,7 @@ fn evaluate(expr: &IdedExpr, numbers: &Map<String, Value>, elapsed: Option<f64>)
             [CelValue::UInt(change)] => *change as f64,
             _ => return Err(ExecutionError::function_error(RATE, "takes one number")),
         };
-        match elapsed {
+        match elapsed.filter(|secs| *secs > 0.0) {
             Some(secs) => Ok(CelValue::Float(change / secs)),
             None => Err(ExecutionError::function_error(
                 RATE,
@@ -231,78 +232,156 @@ mod tests {
           name     = "PG"
           database = "postgres"
           query "throughput" {
-            sql = "SELECT sum(blks_hit) AS hits, sum(blks_read) AS reads, sum(xact_commit) AS commits FROM pg_stat_database"
+            sql = "SELECT sum(numbackends) AS backends, sum(blks_hit) AS hits, sum(blks_read) AS reads, sum(xact_commit) AS commits FROM pg_stat_database"
             metrics = {
               hits      = { total = true }
               reads     = { total = true }
               commits   = { total = true }
               cache_hit = { value = "rate(hits) / (rate(hits) + rate(reads)) * 100", unit = "%" }
               per_sec   = { value = "rate(commits)" }
-              newer     = { value = "hits * 2", since = "15" }
+              newer     = { value = "backends * 2", since = "15" }
+              always    = { value = "1" }
             }
+          }
+          query "sessions" {
+            sql = "SELECT count(*) AS backends FROM pg_stat_activity"
+          }
+          query "slots" {
+            sql     = "SELECT slot_name AS slot, 1 AS held FROM pg_replication_slots"
+            labels  = ["slot"]
+            metrics = { doubled = { value = "held * 2" } }
           }
         }
     "#;
 
     fn sent(omit: &[&str]) -> Vec<TemplateWork> {
+        let query = |key: &str, omit: &[&str]| QueryWork {
+            key: key.to_string(),
+            sql: "SELECT".to_string(),
+            interval: None,
+            labels: Vec::new(),
+            totals: Vec::new(),
+            omit: omit.iter().map(|key| (*key).to_string()).collect(),
+        };
         vec![TemplateWork {
             template: "pg".to_string(),
             database: Some("main".to_string()),
             discover: Vec::new(),
-            queries: vec![QueryWork {
-                key: "throughput".to_string(),
-                sql: "SELECT".to_string(),
-                interval: None,
-                labels: Vec::new(),
-                totals: vec!["hits".into(), "reads".into(), "commits".into()],
-                omit: omit.iter().map(|key| (*key).to_string()).collect(),
-            }],
+            queries: vec![
+                query("throughput", omit),
+                query("sessions", &[]),
+                query("slots", &[]),
+            ],
         }]
     }
 
-    fn sample(at: Timestamp, row: Value) -> Sample {
+    fn sample(at: Timestamp, rows: Value) -> Sample {
         Sample {
             time: at,
-            metrics: BTreeMap::from([(
-                "template.pg".to_string(),
-                json!([row, { "labels": { "instance": "main" }, "up": 1 }]),
-            )]),
+            metrics: BTreeMap::from([("template.pg".to_string(), rows)]),
         }
+    }
+
+    fn worked(at: Timestamp, rows: Value, omit: &[&str], last_sent: &mut LastSent) -> Vec<Value> {
+        let template = maxnines_protocol::templates::parse(PG).unwrap();
+        let mut sample = sample(at, rows);
+        work_out(&mut sample, &worked_out(&template), &sent(omit), last_sent);
+        sample.metrics["template.pg"].as_array().unwrap().clone()
+    }
+
+    fn throughput(backends: u64, totals: Option<(u64, u64, u64)>) -> Value {
+        let mut row = json!({ "labels": { "instance": "main" }, "_query": "throughput", "backends": backends });
+        if let Some((hits, reads, commits)) = totals {
+            row["hits"] = json!(hits);
+            row["reads"] = json!(reads);
+            row["commits"] = json!(commits);
+        }
+        row
     }
 
     #[test]
     fn a_value_is_worked_out_from_its_rows_numbers_and_their_rates() {
-        let template = maxnines_protocol::templates::parse(PG).unwrap();
-        let metrics = worked_out(&template);
-        assert_eq!(metrics.len(), 3);
-        let mut last_sent = LastSent::new();
+        let mut last_sent = LastSent::default();
         let start = crate::times::now();
-        let row = |hits: u64, reads: u64, commits: u64| json!({ "labels": { "instance": "main" }, "hits": hits, "reads": reads, "commits": commits });
+        // The agent's first read has no totals' changes, and no rate is known.
+        let first = worked(start, json!([throughput(3, None)]), &[], &mut last_sent);
+        assert_eq!(first[0]["newer"], 6.0);
+        assert!(first[0].get("per_sec").is_none(), "{}", first[0]);
 
-        // The first has nothing to work a rate out from, but the rest work.
-        let mut first = sample(start, row(90, 10, 20));
-        work_out(&mut first, &metrics, &sent(&[]), &mut last_sent);
-        let read = &first.metrics["template.pg"][0];
-        assert!(read.get("cache_hit").is_none(), "{read}");
-        assert_eq!(read["newer"], 180.0);
-
-        let mut second = sample(start + TimeDelta::seconds(10), row(90, 10, 20));
-        work_out(&mut second, &metrics, &sent(&["newer"]), &mut last_sent);
-        let read = &second.metrics["template.pg"][0];
-        assert_eq!(read["cache_hit"], 90.0);
-        assert_eq!(read["per_sec"], 2.0);
-        // Left out where its since is past the version found.
-        assert!(read.get("newer").is_none(), "{read}");
-        // A database's `up` isn't a row of the query.
-        assert!(second.metrics["template.pg"][1].get("cache_hit").is_none());
-
-        // Not worked out where the query doesn't run.
-        let mut elsewhere = sample(start + TimeDelta::seconds(20), row(1, 1, 1));
-        work_out(&mut elsewhere, &metrics, &[], &mut last_sent);
-        assert!(
-            elsewhere.metrics["template.pg"][0]
-                .get("cache_hit")
-                .is_none()
+        // The next has the changes, and the time since the first.
+        let at = start + TimeDelta::seconds(10);
+        let second = worked(
+            at,
+            json!([throughput(3, Some((90, 10, 20)))]),
+            &["newer"],
+            &mut last_sent,
         );
+        assert_eq!(second[0]["cache_hit"], 90.0);
+        assert_eq!(second[0]["per_sec"], 2.0);
+        // Left out where its since is past the version found.
+        assert!(second[0].get("newer").is_none(), "{}", second[0]);
+    }
+
+    #[test]
+    fn a_value_is_only_worked_out_for_its_own_querys_rows() {
+        let mut last_sent = LastSent::default();
+        let rows = json!([
+            throughput(3, None),
+            { "labels": { "instance": "main" }, "_query": "sessions", "backends": 5 },
+            { "labels": { "instance": "main" }, "up": 1 },
+            { "labels": { "instance": "main", "slot": "a" }, "_query": "slots", "held": 1 },
+        ]);
+        let read = worked(crate::times::now(), rows, &[], &mut last_sent);
+        // Not on another query's row, though it has a column of the same name, nor
+        // on whether the database is up.
+        assert_eq!(read[0]["always"], 1.0);
+        assert!(read[1].get("always").is_none(), "{}", read[1]);
+        assert!(read[2].get("always").is_none(), "{}", read[2]);
+        assert!(read[3].get("always").is_none(), "{}", read[3]);
+        assert_eq!(read[3]["doubled"], 2.0);
+    }
+
+    #[test]
+    fn a_sample_sent_late_has_no_rate_and_moves_nothing_back() {
+        let mut last_sent = LastSent::default();
+        let start = crate::times::now();
+        let row = || json!([throughput(3, Some((10, 10, 10)))]);
+        worked(start, row(), &[], &mut last_sent);
+        worked(start + TimeDelta::seconds(10), row(), &[], &mut last_sent);
+        let late = worked(start + TimeDelta::seconds(5), row(), &[], &mut last_sent);
+        assert!(late[0].get("per_sec").is_none(), "{}", late[0]);
+        let next = worked(start + TimeDelta::seconds(20), row(), &[], &mut last_sent);
+        assert_eq!(next[0]["per_sec"], 1.0);
+    }
+
+    #[test]
+    fn what_a_row_says_of_its_query_is_not_stored() {
+        let mut sample = sample(crate::times::now(), json!([throughput(1, None)]));
+        strip_queries(&mut sample);
+        assert!(sample.metrics["template.pg"][0].get("_query").is_none());
+    }
+
+    #[test]
+    fn series_a_query_no_longer_sends_are_forgotten() {
+        let mut last_sent = LastSent::default();
+        let start = crate::times::now();
+        let slot = |name: &str| json!({ "labels": { "instance": "main", "slot": name }, "_query": "slots", "held": 1 });
+        worked(start, json!([slot("a"), slot("b")]), &[], &mut last_sent);
+        assert_eq!(last_sent.len(), 2);
+        worked(
+            start + TimeDelta::seconds(10),
+            json!([slot("c")]),
+            &[],
+            &mut last_sent,
+        );
+        assert_eq!(last_sent.len(), 1);
+        // And anything not sent for days.
+        worked(
+            start + TimeDelta::days(3),
+            json!([throughput(1, None)]),
+            &[],
+            &mut last_sent,
+        );
+        assert_eq!(last_sent.len(), 1);
     }
 }

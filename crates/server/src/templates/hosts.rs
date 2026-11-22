@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use maxnines_protocol::templates::{Target, Template};
 
-use super::values::{WorkedOut, worked_out};
+use super::values::{QueryValues, worked_out};
 use crate::rule_engine::{Condition, Host};
 
 /// A template as it runs, with which hosts it's for.
@@ -122,7 +122,7 @@ pub fn instances(template: &Template, facts: &Value) -> Vec<Option<String>> {
 pub struct RunningTemplates {
     all: Vec<Assigned>,
     /// The metrics those that are on work out with CEL, compiled.
-    worked_out: Vec<WorkedOut>,
+    worked_out: Vec<QueryValues>,
 }
 
 impl RunningTemplates {
@@ -136,7 +136,7 @@ impl RunningTemplates {
     }
 
     /// The metrics templates that are on work out with CEL as samples arrive.
-    pub fn worked_out(&self) -> &[WorkedOut] {
+    pub fn worked_out(&self) -> &[QueryValues] {
         &self.worked_out
     }
 

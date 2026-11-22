@@ -15,10 +15,11 @@ use std::sync::{Arc, LazyLock};
 use anyhow::{Result, anyhow, bail, ensure};
 use cel::common::ast::{CallExpr, EntryExpr, Expr, IdedExpr, LiteralValue, operators};
 use cel::extractors::Arguments;
-use cel::{Context as CelContext, Env, ExecutionError, Program, Value as CelValue};
+use cel::{Context as CelContext, ExecutionError, Program, Value as CelValue};
 use chrono::TimeDelta;
 
 use crate::catalog::Catalog;
+use crate::cel_env::{FUNCTIONS, NUMBER, fraction_sum, number};
 use crate::metrics::{self, Kind, Metric, Source, Unit};
 
 /// What the database column holds, with room to spare for anyone's condition.
@@ -33,10 +34,6 @@ const SIZES: [(&str, f64); 4] = [
     ("tib", 1024.0 * 1024.0 * 1024.0 * 1024.0),
 ];
 const FORECAST: &str = "forecast";
-/// What every number a sum works on goes through, so whole numbers and metrics'
-/// fractions mix: CEL only adds two numbers of the same kind. Nobody can type it,
-/// as it isn't a name.
-const NUMBER: &str = "number:";
 
 /// What a metric's forecast is bound as, which nobody can type, as it isn't a name.
 fn heading_name(metric: &Metric) -> String {
@@ -427,25 +424,7 @@ impl Reader<'_> {
             self.read(target)?;
         }
         call.args.iter_mut().try_for_each(|arg| self.read(arg))?;
-        // A sum's whole numbers are made numbers with fractions as it's worked out,
-        // so `cpu.usage / 2` works as it reads. Comparisons mix them already.
-        let sums = matches!(
-            call.func_name.as_str(),
-            operators::ADD | operators::SUBSTRACT | operators::MULTIPLY | operators::DIVIDE
-        );
-        if sums && call.target.is_none() {
-            for arg in &mut call.args {
-                let inner = std::mem::take(arg);
-                *arg = IdedExpr {
-                    id: inner.id,
-                    expr: Expr::Call(CallExpr {
-                        func_name: NUMBER.to_string(),
-                        target: None,
-                        args: vec![inner],
-                    }),
-                };
-            }
-        }
+        fraction_sum(call);
         Ok(())
     }
 }
@@ -465,10 +444,6 @@ fn parts_of(fields: &[(&str, metrics::Reading)]) -> String {
     let names: Vec<String> = fields.iter().map(|(name, _)| format!("'{name}'")).collect();
     names.join(", ")
 }
-
-/// The functions and macros conditions can use, made once, as making them takes far
-/// longer than working a condition out.
-static FUNCTIONS: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(Env::stdlib()));
 
 fn number_of(value: &CelValue) -> Option<f64> {
     match value {
@@ -575,16 +550,6 @@ fn size(name: &'static str, factor: f64, args: &[CelValue]) -> Result<CelValue, 
             .map(|count| CelValue::Float(count * factor))
             .ok_or_else(|| ExecutionError::function_error(name, "it takes a number")),
         _ => Err(ExecutionError::function_error(name, "it takes one number")),
-    }
-}
-
-/// A whole number as one with a fraction, and anything else as it is.
-fn number(Arguments(args): Arguments) -> Result<CelValue, ExecutionError> {
-    match args.as_slice() {
-        [CelValue::Int(whole)] => Ok(CelValue::Float(*whole as f64)),
-        [CelValue::UInt(whole)] => Ok(CelValue::Float(*whole as f64)),
-        [other] => Ok(other.clone()),
-        _ => Err(ExecutionError::invalid_argument_count(1, args.len())),
     }
 }
 

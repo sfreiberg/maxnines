@@ -26,6 +26,10 @@ pub const MAX_SQL_LEN: usize = 64 * 1024;
 pub const MAX_COLUMNS: usize = 256;
 /// What a sample calls what discovery found.
 pub const DISCOVERED: &str = "discovered";
+/// What each of a template's rows says it's from: the query's key. It can't be a
+/// metric's, as a key starts with a letter, and the server takes it out before the
+/// rows are stored.
+pub const QUERY_FIELD: &str = "_query";
 /// The collector a template's samples are under, which no collector an agent has
 /// built in can be called, as a key has no dot.
 pub fn collector_of(key: &str) -> String {

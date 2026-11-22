@@ -2162,8 +2162,8 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
     // The agent sends what it found with a sample, with the rows it read.
     let found = |role: &str, database: &str| json!({ "template": "stock", "database": database, "values": { "role": role } });
     let rows = json!([
-        { "labels": { "instance": "a" }, "waiting": 40 },
-        { "labels": { "instance": "b" }, "waiting": 40 },
+        { "labels": { "instance": "a" }, "_query": "orders", "waiting": 40 },
+        { "labels": { "instance": "b" }, "_query": "orders", "waiting": 40 },
     ]);
     let time = crate::times::now() - TimeDelta::seconds(1);
     let sample = AgentMessage::Sample(Sample {

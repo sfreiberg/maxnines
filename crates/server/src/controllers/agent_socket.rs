@@ -30,7 +30,7 @@ use crate::models::ConfigStatus;
 use crate::presence::Presence;
 use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
-use crate::templates::values::{LastSent, work_out};
+use crate::templates::values::{LastSent, strip_queries, work_out};
 use crate::times::{self, Timestamp};
 
 /// Far more than real facts need, so one agent can't fill the database.
@@ -360,7 +360,7 @@ async fn serve(
     // What the agent was last sent to read for its templates, which says which of
     // their metrics worked out with CEL to work out as its samples arrive.
     let sent_work: SentWork = Arc::default();
-    let mut last_sent = LastSent::new();
+    let mut last_sent = LastSent::default();
     let (config_sender, mut configs) = mpsc::channel(1);
     let (ack_sender, mut acks) = mpsc::channel(ACK_QUEUE_SIZE);
     let (action_link, mut action_requests) = state.actions.connected(&agent.id);
@@ -636,6 +636,7 @@ fn receive(
                 let sent = sent_work.lock().unwrap_or_else(PoisonError::into_inner);
                 work_out(&mut sample, templates.worked_out(), &sent, last_sent);
             }
+            strip_queries(&mut sample);
             let command = WriterCommand::SaveAndAck {
                 sample: NewSample {
                     host_id: agent.id.clone(),

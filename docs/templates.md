@@ -174,10 +174,11 @@ query "throughput" {
 }
 ```
 
-A `value` is worked out by the server as each sample arrives, from the numbers in the
-same row of the query, by their columns' names. `rate(x)` is a running total's change
-each second since that row was last sent, so a sample's first row has no rate, and
-nor is anything worked out from a column the row doesn't have. A metric with
+A `value` is worked out by the server as each sample arrives, for each row of its
+query, from that row's numbers by their columns' names. `rate(x)` is a running total's
+change each second since the query last sent that row's series, so a series' first
+row has no rate, and nor does a sample the agent kept while away and sent after newer
+ones. Nothing is worked out from a column the row doesn't have. A metric with
 `since = "15"` is only read, or worked out, where the version discovery found is 15
 or later, and its query waits for discovery.
 

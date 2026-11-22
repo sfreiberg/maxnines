@@ -12,6 +12,7 @@ mod audit;
 mod built_in_rules;
 mod calculations;
 mod catalog;
+mod cel_env;
 mod channels;
 mod check_history;
 mod cli;

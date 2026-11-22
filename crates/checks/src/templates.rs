@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use maxnines_protocol::CheckKind;
-use maxnines_protocol::templates::work::QueryWork;
+use maxnines_protocol::templates::work::{QUERY_FIELD, QueryWork};
 use maxnines_protocol::totals::change;
 use serde_json::{Map, Value, json};
 use tokio::task::JoinHandle;
@@ -381,7 +381,7 @@ pub struct Totals(HashMap<String, f64>);
 /// as 1 or 0 and lengths of time in seconds, labelled by the database and the
 /// query's label columns. Running totals are the change since the last read, so
 /// the first read leaves them out. Text that isn't a label, NULLs and the columns the
-/// query says to leave out give nothing.
+/// query says to leave out give nothing. Each row says which query it's from.
 pub fn metric_rows(
     rows: &[Row],
     query: &QueryWork,
@@ -413,6 +413,7 @@ pub fn metric_rows(
                 || query.omit.contains(name)
                 || name == INSTANCE_LABEL
                 || name == "labels"
+                || name == QUERY_FIELD
             {
                 continue;
             }
@@ -438,6 +439,7 @@ pub fn metric_rows(
         }
         if !numbers.is_empty() {
             numbers.insert("labels".to_string(), Value::Object(labels));
+            numbers.insert(QUERY_FIELD.to_string(), json!(query.key));
             read.push(Value::Object(numbers));
         }
     }
@@ -511,7 +513,12 @@ mod tests {
         // The first read has no change to give, and a row with nothing is left out.
         assert_eq!(
             round(100.0, &mut totals),
-            [json!({ "labels": { "instance": "orders", "slot": "a" }, "active": 1.0, "lag": 2.5 })]
+            [json!({
+                "labels": { "instance": "orders", "slot": "a" },
+                "_query": "q",
+                "active": 1.0,
+                "lag": 2.5,
+            })]
         );
         assert_eq!(round(130.0, &mut totals)[0]["sent"], 30.0);
         // A total that went back started again.
