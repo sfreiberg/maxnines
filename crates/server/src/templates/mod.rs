@@ -9,6 +9,7 @@
 
 pub mod built_in;
 pub mod hosts;
+pub mod values;
 pub mod work;
 
 use anyhow::{Result, bail};

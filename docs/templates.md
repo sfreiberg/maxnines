@@ -168,6 +168,13 @@ query "throughput" {
 }
 ```
 
+A `value` is worked out by the server as each sample arrives, from the numbers in the
+same row of the query, by their columns' names. `rate(x)` is a running total's change
+each second since that row was last sent, so a sample's first row has no rate, and
+nor is anything worked out from a column the row doesn't have. A metric with
+`since = "15"` is only read, or worked out, where the version discovery found is 15
+or later, and its query waits for discovery.
+
 **By version.** `since = "14"` runs a query only from version 14 on. `fill` picks a
 piece of SQL by version, so a query is written once: `{{ name }}` in the SQL is filled
 from the version given that's the highest at or below the one found, or from `older`

@@ -76,6 +76,10 @@ pub struct QueryWork {
     /// The columns that are running totals, sent as the change since the last read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub totals: Vec<String>,
+    /// The columns left out, as they're metrics only from a later version than the
+    /// one found.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub omit: Vec<String>,
 }
 
 /// What one discovery found for one database, as a sample sends it.
@@ -147,7 +151,9 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
         }
         for query in &one.queries {
             ensure!(
-                query.labels.len() <= MAX_COLUMNS && query.totals.len() <= MAX_COLUMNS,
+                query.labels.len() <= MAX_COLUMNS
+                    && query.totals.len() <= MAX_COLUMNS
+                    && query.omit.len() <= MAX_COLUMNS,
                 "query {:?} has too many labels or totals",
                 query.key
             );
@@ -175,6 +181,7 @@ mod tests {
                 interval: None,
                 labels: Vec::new(),
                 totals: Vec::new(),
+                omit: Vec::new(),
             }],
         }
     }

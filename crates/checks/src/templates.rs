@@ -367,7 +367,8 @@ pub struct Totals(HashMap<String, f64>);
 /// A query's rows as a template's sample has them: each row's numbers, yes or no
 /// as 1 or 0 and lengths of time in seconds, labelled by the database and the
 /// query's label columns. Running totals are the change since the last read, so
-/// the first read leaves them out. Text that isn't a label and NULLs give nothing.
+/// the first read leaves them out. Text that isn't a label, NULLs and the columns the
+/// query says to leave out give nothing.
 pub fn metric_rows(
     rows: &[Row],
     query: &QueryWork,
@@ -395,7 +396,11 @@ pub fn metric_rows(
         let series = Value::Object(labels.clone()).to_string();
         let mut numbers = Map::new();
         for (name, cell) in row {
-            if query.labels.contains(name) || name == INSTANCE_LABEL || name == "labels" {
+            if query.labels.contains(name)
+                || query.omit.contains(name)
+                || name == INSTANCE_LABEL
+                || name == "labels"
+            {
                 continue;
             }
             let value = match cell {
@@ -460,6 +465,7 @@ mod tests {
             interval: None,
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
             totals: totals.iter().map(|t| (*t).to_string()).collect(),
+            omit: vec!["later".to_string()],
         }
     }
 
@@ -482,6 +488,7 @@ mod tests {
                     ("lag", Cell::Seconds(2.5)),
                     ("sent", Cell::Number(sent)),
                     ("note", Cell::Text("words".into())),
+                    ("later", Cell::Number(5.0)),
                     ("gone", Cell::Null),
                 ]),
                 row(&[("slot", Cell::Text("b".into())), ("lag", Cell::Null)]),

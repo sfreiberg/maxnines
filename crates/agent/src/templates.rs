@@ -280,6 +280,7 @@ mod tests {
                 interval: None,
                 labels: vec!["name".to_string()],
                 totals: vec!["commits".to_string()],
+                omit: Vec::new(),
             }],
         }
     }

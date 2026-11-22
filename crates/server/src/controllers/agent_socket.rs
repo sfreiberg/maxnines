@@ -1,5 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use axum::body::Bytes;
@@ -9,7 +9,7 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::actions::ActionResult;
-use maxnines_protocol::templates::work::{DISCOVERED, Discovered, MAX_WORK};
+use maxnines_protocol::templates::work::{DISCOVERED, Discovered, MAX_WORK, TemplateWork};
 use maxnines_protocol::{
     AgentMessage, COLLECTORS, ProtocolFit, Protocols, RegistrationStatus, ServerMessage, auth,
 };
@@ -30,6 +30,7 @@ use crate::models::ConfigStatus;
 use crate::presence::Presence;
 use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
+use crate::templates::values::{LastSent, work_out};
 use crate::times::{self, Timestamp};
 
 /// Far more than real facts need, so one agent can't fill the database.
@@ -356,6 +357,10 @@ async fn serve(
     let mut asked = None;
 
     let (jobs, job_queue) = mpsc::channel(JOB_QUEUE_SIZE);
+    // What the agent was last sent to read for its templates, which says which of
+    // their metrics worked out with CEL to work out as its samples arrive.
+    let sent_work: SentWork = Arc::default();
+    let mut last_sent = LastSent::new();
     let (config_sender, mut configs) = mpsc::channel(1);
     let (ack_sender, mut acks) = mpsc::channel(ACK_QUEUE_SIZE);
     let (action_link, mut action_requests) = state.actions.connected(&agent.id);
@@ -367,6 +372,7 @@ async fn serve(
     let mut work = tokio::spawn(do_jobs(
         job_queue,
         config_sender,
+        sent_work.clone(),
         agent.clone(),
         state.clone(),
     ));
@@ -435,6 +441,8 @@ async fn serve(
                             last_boot: &mut last_boot,
                             asked: &mut asked,
                             time_came_late: false,
+                            sent_work: &sent_work,
+                            last_sent: &mut last_sent,
                         };
                         waiting_sample = receive(&text, &agent, state, &mut connection);
                         // Asked for again soon, not a whole turn later.
@@ -458,6 +466,7 @@ async fn serve(
 async fn do_jobs(
     mut jobs: mpsc::Receiver<Job>,
     configs: mpsc::Sender<String>,
+    sent_work: SentWork,
     agent: Arc<Agent>,
     state: AppState,
 ) -> &'static str {
@@ -465,10 +474,13 @@ async fn do_jobs(
     let mut changes = state.registry.subscribe();
     let mut config_changes = state.configs.subscribe();
     let mut template_changes = state.database.template_changes();
-    let mut sent_version = None;
+    let mut sent = SentConfig {
+        version: None,
+        work: sent_work,
+    };
     let mut known_boot = None;
 
-    send_config(&configs, agent, state, &mut sent_version).await;
+    send_config(&configs, agent, state, &mut sent).await;
     loop {
         tokio::select! {
             Ok(()) = changes.changed() => {
@@ -477,15 +489,15 @@ async fn do_jobs(
                 }
             }
             Ok(()) = config_changes.changed() => {
-                send_config(&configs, agent, state, &mut sent_version).await;
+                send_config(&configs, agent, state, &mut sent).await;
             }
             Ok(()) = template_changes.changed() => {
-                send_config(&configs, agent, state, &mut sent_version).await;
+                send_config(&configs, agent, state, &mut sent).await;
             }
             job = jobs.recv() => match job {
                 Some(Job::Facts(facts)) => {
                     if save_facts(facts, agent, state).await {
-                        send_config(&configs, agent, state, &mut sent_version).await;
+                        send_config(&configs, agent, state, &mut sent).await;
                     }
                 }
                 Some(Job::ConfigResult { version, error, skipped_collectors }) => {
@@ -493,7 +505,7 @@ async fn do_jobs(
                 }
                 Some(Job::Discovered(found, at)) => {
                     match state.database.save_discovered(&agent.id, &found, at).await {
-                        Ok(true) => send_config(&configs, agent, state, &mut sent_version).await,
+                        Ok(true) => send_config(&configs, agent, state, &mut sent).await,
                         Ok(false) => {}
                         Err(error) => warn!(
                             id = agent.id,
@@ -524,7 +536,7 @@ async fn send_config(
     configs: &mpsc::Sender<String>,
     agent: &Agent,
     state: &AppState,
-    sent_version: &mut Option<String>,
+    sent: &mut SentConfig,
 ) {
     let resolved = match state.config_for(&agent.id).await {
         Ok(resolved) => resolved,
@@ -538,7 +550,7 @@ async fn send_config(
         }
     };
 
-    if sent_version.as_ref() == Some(&resolved.version) {
+    if sent.version.as_ref() == Some(&resolved.version) {
         return;
     }
     if !resolved.skipped_collectors.is_empty() {
@@ -549,6 +561,7 @@ async fn send_config(
         );
     }
 
+    let work = resolved.config.templates.clone();
     let message = ServerMessage::Config {
         version: resolved.version.clone(),
         config: resolved.config,
@@ -556,7 +569,8 @@ async fn send_config(
     match serde_json::to_string(&message) {
         Ok(text) => {
             if configs.send(text).await.is_ok() {
-                *sent_version = Some(resolved.version);
+                sent.version = Some(resolved.version);
+                *sent.work.lock().unwrap_or_else(PoisonError::into_inner) = work;
             }
         }
         Err(error) => warn!(id = agent.id, %error, "encoding config failed"),
@@ -572,6 +586,18 @@ struct Connection<'a> {
     asked: &'a mut Option<Asked>,
     /// Set when its answer took too long to use.
     time_came_late: bool,
+    sent_work: &'a SentWork,
+    /// When each series of a template's rows was last sent, for rates.
+    last_sent: &'a mut LastSent,
+}
+
+/// What an agent was last sent to read for its templates.
+type SentWork = Arc<std::sync::Mutex<Vec<TemplateWork>>>;
+
+/// What an agent was last sent.
+struct SentConfig {
+    version: Option<String>,
+    work: SentWork,
 }
 
 /// A bad message is logged and skipped rather than ending the connection. Returns a
@@ -588,6 +614,8 @@ fn receive(
         last_boot,
         asked,
         time_came_late,
+        sent_work,
+        last_sent,
     } = connection;
     let job = match serde_json::from_str(text) {
         Ok(AgentMessage::Time { nonce, answered_at }) => {
@@ -603,6 +631,11 @@ fn receive(
         Ok(AgentMessage::Sample(mut sample)) => {
             note_boot(&sample, agent, jobs, last_boot);
             note_discovered(&mut sample, agent, jobs);
+            let templates = state.database.running_templates();
+            if !templates.worked_out().is_empty() {
+                let sent = sent_work.lock().unwrap_or_else(PoisonError::into_inner);
+                work_out(&mut sample, templates.worked_out(), &sent, last_sent);
+            }
             let command = WriterCommand::SaveAndAck {
                 sample: NewSample {
                     host_id: agent.id.clone(),

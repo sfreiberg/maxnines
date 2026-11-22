@@ -2115,7 +2115,10 @@ const STOCK: &str = r#"template "stock" {
   }
   query "orders" {
     sql     = "SELECT count(*) AS waiting FROM orders"
-    metrics = { waiting = { description = "Orders waiting" } }
+    metrics = {
+      waiting = { description = "Orders waiting" }
+      doubled = { value = "waiting * 2" }
+    }
   }
   alert "backlog" {
     name    = "Replica backlog"
@@ -2202,6 +2205,16 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
     assert_eq!(open[0].series.as_deref(), Some("a"));
     // What was found isn't stored as metrics.
     assert!(database.catalog().find("discovered").is_none());
+    // What the template works out with CEL is worked out as the sample arrives.
+    let path = format!("/api/v1/hosts/{}/metrics/stock.doubled", host.id());
+    let read = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    let names: Vec<&str> = read["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|series| series["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a", "b"], "{read}");
 
     // An older sample, sent late, doesn't undo what's newer.
     let old: Vec<maxnines_protocol::templates::work::Discovered> =

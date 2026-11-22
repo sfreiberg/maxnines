@@ -133,6 +133,26 @@ fn needs_discovery(template: &Template, query: &Query) -> bool {
         || query.since.is_some()
         || !query.fills.is_empty()
         || template.min_version.is_some()
+        || query.metrics.iter().any(|metric| metric.since.is_some())
+}
+
+/// A query's metrics that are only from a version later than the one found, or
+/// from one when none was found.
+fn omitted(query: &Query, version: Option<&Version>) -> Vec<String> {
+    query
+        .metrics
+        .iter()
+        .filter(|metric| {
+            metric
+                .since
+                .as_deref()
+                .is_some_and(|since| match (version, Version::parse(since)) {
+                    (Some(at), Some(since)) => *at < since,
+                    _ => true,
+                })
+        })
+        .map(|metric| metric.key.clone())
+        .collect()
 }
 
 fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<QueryWork> {
@@ -162,6 +182,7 @@ fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<Qu
                 .filter(|metric| metric.total)
                 .map(|metric| metric.key.clone())
                 .collect(),
+            omit: omitted(query, version.as_ref()),
         })
         .collect()
 }
@@ -198,7 +219,7 @@ mod tests {
           query "always" {
             interval = "1m"
             sql      = "SELECT 1 AS one"
-            metrics  = { one = { total = true } }
+            metrics  = { one = { total = true }, two = { since = "15" } }
           }
           query "standbys" {
             when   = "role == 'primary'"
@@ -254,6 +275,7 @@ mod tests {
         assert_eq!(keys(&work[0]), ["always", "standbys", "wal"]);
         assert_eq!(work[0].queries[0].interval, Some(Duration::from_secs(60)));
         assert_eq!(work[0].queries[0].totals, ["one"]);
+        assert!(work[0].queries[0].omit.is_empty());
         assert_eq!(work[0].queries[1].labels, ["application"]);
         assert_eq!(
             work[0].queries[2].sql,
@@ -262,6 +284,8 @@ mod tests {
 
         let work = work_for(&templates, &host, &found("14.1", "replica"));
         assert_eq!(keys(&work[0]), ["always", "wal"]);
+        // A metric only from a later version is left out.
+        assert_eq!(work[0].queries[0].omit, ["two"]);
         assert_eq!(work[0].queries[1].sql, "SELECT 0 AS wal_written");
 
         let work = work_for(&templates, &host, &found("13", "primary"));

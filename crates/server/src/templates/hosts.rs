@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use maxnines_protocol::templates::{Target, Template};
 
+use super::values::{WorkedOut, worked_out};
 use crate::rule_engine::{Condition, Host};
 
 /// A template as it runs, with which hosts it's for.
@@ -118,24 +119,38 @@ pub fn instances(template: &Template, facts: &Value) -> Vec<Option<String>> {
 /// Every template there is, each with which hosts it's for, made again whenever
 /// a template changes, or the hosts it's for do.
 #[derive(Default)]
-pub struct RunningTemplates(Vec<Assigned>);
+pub struct RunningTemplates {
+    all: Vec<Assigned>,
+    /// The metrics those that are on work out with CEL, compiled.
+    worked_out: Vec<WorkedOut>,
+}
 
 impl RunningTemplates {
     pub fn new(running: impl IntoIterator<Item = Running>) -> Self {
-        Self(running.into_iter().map(Assigned::new).collect())
+        let all: Vec<Assigned> = running.into_iter().map(Assigned::new).collect();
+        let worked_out = all
+            .iter()
+            .flat_map(|assigned| worked_out(assigned.template()))
+            .collect();
+        Self { all, worked_out }
+    }
+
+    /// The metrics templates that are on work out with CEL as samples arrive.
+    pub fn worked_out(&self) -> &[WorkedOut] {
+        &self.worked_out
     }
 
     pub fn all(&self) -> &[Assigned] {
-        &self.0
+        &self.all
     }
 
     pub fn get(&self, id: i64) -> Option<&Assigned> {
-        self.0.iter().find(|assigned| assigned.id() == id)
+        self.all.iter().find(|assigned| assigned.id() == id)
     }
 
     /// The templates that are on and for this host.
     pub fn for_host<'a>(&'a self, host: &'a Host<'a>) -> impl Iterator<Item = &'a Assigned> + 'a {
-        self.0
+        self.all
             .iter()
             .filter(move |assigned| assigned.template().enabled && assigned.is_for(host))
     }
