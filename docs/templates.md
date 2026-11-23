@@ -249,8 +249,11 @@ transaction, as nothing in it could write, so PostgreSQL's own count of rollback
 isn't one for each statement a template runs; MySQL's is rolled back. On MySQL and
 MariaDB the whole session is read-only too, as MySQL ends a transaction before
 anything that changes a table. ClickHouse is asked over HTTP, where every statement is
-a GET, which it only lets read. A template can still run any `SELECT` its account is
-allowed to, so give MaxNines a [read-only account](#read-only-database-accounts).
+a GET, which it only lets read, and it's sent a 5 second limit too, unless its account
+is set to `readonly = 1`, which can't be sent settings, so its [profile's
+limit](collectors-clickhouse.md#the-account-to-sign-in-as) stands instead. A template
+can still run any `SELECT` its account is allowed to, so give MaxNines a [read-only
+account](#read-only-database-accounts).
 
 #### SHOW statements
 
@@ -260,8 +263,11 @@ is. There's no list of which: what a template can read is up to the account it s
 as, which is why MaxNines warns when that account [can do more than
 read](database-stats.md#what-the-account-may-do). Saving or importing a template checks
 it's one statement, and the agent or server checks again that it's a `SELECT` or `SHOW`
-before it runs one. Each runs as any query does: prepared, in a read-only transaction
-on a read-only session, with a time limit, or on ClickHouse as a GET.
+before it runs one. Each runs as any query does, in a read-only transaction on a
+read-only session, with a time limit, or on ClickHouse as a GET. MySQL and MariaDB
+don't take every `SHOW` as a prepared statement, so theirs are sent as plain text,
+which would run a second statement after a `;`, so one with a `;` anywhere but at its
+end isn't run.
 
 What a `SHOW` statement gives isn't known until it runs, so `columns` names each column
 it reads, as a metric or a label, and no other column is read:

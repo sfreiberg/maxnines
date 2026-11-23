@@ -57,9 +57,10 @@ GRANT SELECT ON system.* TO maxnines;
 ```
 
 Everything it reads is in the `system` tables, and the grant is needed even for those.
-Every request is a GET, which ClickHouse only lets read, and MaxNines sends no settings
-of its own, so the profile is what limits what a read can cost, its time limit
-included. Users are kept on each server unless access control is replicated, so make
+Every request is a GET, which ClickHouse only lets read. An account set to `readonly =
+1`, as this one is, can't be sent settings, so the profile is what limits what a read
+can cost, its time limit included. Any other account is sent a 5 second limit on each
+statement, and has ClickHouse stop one MaxNines has given up on. Users are kept on each server unless access control is replicated, so make
 it on each.
 
 ## What's read, and how often

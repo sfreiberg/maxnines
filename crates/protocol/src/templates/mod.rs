@@ -192,11 +192,12 @@ pub struct Query {
     pub metrics: Vec<Metric>,
 }
 
-/// The first word of a statement, in capitals, after any comments before it.
+/// The first word of a statement, in capitals, after any comments before it,
+/// including MySQL's `#` ones, which no statement starts with otherwise.
 pub fn first_keyword(sql: &str) -> String {
     let mut rest = sql.trim_start();
     loop {
-        if let Some(line) = rest.strip_prefix("--") {
+        if let Some(line) = rest.strip_prefix("--").or_else(|| rest.strip_prefix('#')) {
             rest = line
                 .split_once('\n')
                 .map_or("", |(_, after)| after)

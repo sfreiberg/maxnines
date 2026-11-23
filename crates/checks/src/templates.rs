@@ -2,11 +2,16 @@
 //! databases on hosts with no agent. What to run comes from the server,
 //! already worked out for the database: see [`maxnines_protocol::templates::work`].
 //!
-//! Each statement runs on its own in a read-only transaction that's rolled back
-//! after, with a time limit on the statement and on the whole round. It's run as a
+//! Each statement runs on its own in a read-only transaction, with a time limit on
+//! the statement and on the whole round. On PostgreSQL one that worked commits,
+//! which changes nothing, as nothing could be written, but leaves the server's own
+//! count of rollbacks, which a template reads, as it was. A SELECT is run as a
 //! prepared statement, which a database only takes one statement at a time for, so
-//! SQL with a second statement after a `;` is refused by the database itself. What
-//! the account may read is up to whoever gave it to MaxNines.
+//! SQL with a second statement after a `;` is refused by the database itself.
+//! MySQL and MariaDB only take some SHOW statements prepared, so theirs go as plain
+//! text, which would run a second statement, and so are refused here if they have a
+//! `;` anywhere but at the end. ClickHouse takes one statement at a time anyway.
+//! What the account may read is up to whoever gave it to MaxNines.
 //!
 //! What the account it signs in as may do is read as [`Privileges`], so an account
 //! that can change things can be reported, though it's still used.
@@ -21,6 +26,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use maxnines_protocol::CheckKind;
+use maxnines_protocol::templates::is_show;
 use maxnines_protocol::templates::work::{QUERY_FIELD, QueryWork};
 use maxnines_protocol::totals::change;
 use serde_json::{Map, Value, json};
@@ -197,8 +203,8 @@ impl Session {
             CheckKind::Clickhouse => {
                 let mut clickhouse =
                     crate::databases::clickhouse::Clickhouse::new(check, credentials)?;
-                // Says it can be signed in to and asked anything.
-                clickhouse.version().await?;
+                // Which also says it can be signed in to and asked anything.
+                clickhouse.limit_statements(STATEMENT_LIMIT).await?;
                 Ok(Open::Clickhouse(Box::new(clickhouse)))
             }
             other => bail!("templates can't read {} yet", other.as_str()),
@@ -255,8 +261,12 @@ async fn run_postgres(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<
     } else {
         "ROLLBACK"
     };
-    client.batch_execute(end).await.map_err(pg_short)?;
-    outcome
+    // A statement that failed says why, even if what ends the transaction fails
+    // too, as it does once the connection has gone.
+    let ended = client.batch_execute(end).await.map_err(pg_short);
+    let read = outcome?;
+    ended?;
+    Ok(read)
 }
 
 impl<'a> FromSql<'a> for Cell {
@@ -335,13 +345,28 @@ fn interval(raw: &[u8]) -> Option<f64> {
 
 async fn run_mysql(connection: &mut mysql_async::Conn, sql: &str) -> Result<Vec<Row>> {
     use mysql_async::prelude::Queryable;
+    // MySQL takes only some SHOW statements prepared, such as not SHOW WARNINGS,
+    // and MariaDB before 10.6 fewer, so a SHOW goes as plain text, which runs every
+    // statement it's given: one with a `;` before its end could end the read-only
+    // transaction and run another.
+    let show = is_show(sql);
+    let sql = sql.trim_end().trim_end_matches(';');
+    if show && sql.contains(';') {
+        bail!("a SHOW statement can't have a ; before its end");
+    }
     connection
         .query_drop("START TRANSACTION READ ONLY")
         .await
         .map_err(short)?;
-    let outcome: Result<Vec<mysql_async::Row>> = connection.exec(sql, ()).await.map_err(short);
-    connection.query_drop("ROLLBACK").await.map_err(short)?;
-    Ok(outcome?.into_iter().map(mysql_row).collect())
+    let outcome: Result<Vec<mysql_async::Row>> = match show {
+        true => connection.query(sql).await,
+        false => connection.exec(sql, ()).await,
+    }
+    .map_err(short);
+    let ended = connection.query_drop("ROLLBACK").await.map_err(short);
+    let read = outcome?;
+    ended?;
+    Ok(read.into_iter().map(mysql_row).collect())
 }
 
 fn mysql_row(row: mysql_async::Row) -> Row {
@@ -368,12 +393,23 @@ fn mysql_row(row: mysql_async::Row) -> Row {
                     Cell::Seconds(if negative { -secs } else { secs })
                 }
                 My::Date(..) => Cell::Other,
+                // As a prepared statement gives decimals, and plain text gives
+                // everything.
                 My::Bytes(bytes) => match column.column_type() {
-                    ColumnType::MYSQL_TYPE_DECIMAL | ColumnType::MYSQL_TYPE_NEWDECIMAL => {
-                        String::from_utf8_lossy(&bytes)
-                            .parse()
-                            .map_or(Cell::Other, Cell::Number)
-                    }
+                    ColumnType::MYSQL_TYPE_DECIMAL
+                    | ColumnType::MYSQL_TYPE_NEWDECIMAL
+                    | ColumnType::MYSQL_TYPE_TINY
+                    | ColumnType::MYSQL_TYPE_SHORT
+                    | ColumnType::MYSQL_TYPE_INT24
+                    | ColumnType::MYSQL_TYPE_LONG
+                    | ColumnType::MYSQL_TYPE_LONGLONG
+                    | ColumnType::MYSQL_TYPE_YEAR
+                    | ColumnType::MYSQL_TYPE_FLOAT
+                    | ColumnType::MYSQL_TYPE_DOUBLE => String::from_utf8_lossy(&bytes)
+                        .parse()
+                        .map_or(Cell::Other, Cell::Number),
+                    ColumnType::MYSQL_TYPE_TIME => mysql_time(&String::from_utf8_lossy(&bytes))
+                        .map_or(Cell::Other, Cell::Seconds),
                     ColumnType::MYSQL_TYPE_BIT => Cell::Number(
                         bytes
                             .iter()
@@ -386,6 +422,23 @@ fn mysql_row(row: mysql_async::Row) -> Row {
             (column.name_str().into_owned(), cell)
         })
         .collect()
+}
+
+/// A MySQL time written out, as `[-]838:59:59.000000`, in seconds.
+fn mysql_time(text: &str) -> Option<f64> {
+    let (negative, text) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let mut parts = text.split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let secs = hours * 3_600.0 + minutes * 60.0 + seconds;
+    Some(if negative { -secs } else { secs })
 }
 
 /// A SHOW statement's rows as a template reads them: only the columns it names,
@@ -702,6 +755,14 @@ mod tests {
     }
 
     #[test]
+    fn a_mysql_time_written_out_is_seconds() {
+        assert_eq!(mysql_time("00:01:30"), Some(90.0));
+        assert_eq!(mysql_time("-838:59:59.5"), Some(-3_020_399.5));
+        assert_eq!(mysql_time("01:30"), None);
+        assert_eq!(mysql_time("soon"), None);
+    }
+
+    #[test]
     fn a_show_statements_columns_are_picked_named_and_added_up() {
         let mut query = query(&["channel"], &[]);
         query.columns = [
@@ -777,6 +838,19 @@ mod tests {
         );
         // A replica's status runs too, with no rows on a server that isn't one.
         session.run("SHOW REPLICA STATUS", LIMIT).await.unwrap();
+        // So does one neither takes as a prepared statement, with its numbers as
+        // numbers, and one ending in a `;`.
+        let warnings = session.run("SHOW WARNINGS", LIMIT).await.unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let counted = session.run("SHOW COUNT(*) WARNINGS;", LIMIT).await.unwrap();
+        assert_eq!(counted[0][0].1, Cell::Number(0.0), "{counted:?}");
+        // Plain text runs every statement it's given, so a second is refused.
+        let error = session
+            .run("SHOW WARNINGS; SET SESSION TRANSACTION READ WRITE", LIMIT)
+            .await
+            .unwrap_err();
+        assert!(format!("{error}").contains("can't have a ;"), "{error}");
+        assert_eq!(session.connections(), 1);
     }
 
     #[tokio::test]
@@ -820,6 +894,23 @@ mod tests {
         assert!(session.is_up());
         let shown = session.run("SHOW DATABASES", LIMIT).await.unwrap();
         assert!(!shown.is_empty());
+        // SQL that ends in a `;` or a comment runs as it would anywhere else.
+        session.run("SELECT 1 AS one;", LIMIT).await.unwrap();
+        session
+            .run("SELECT 1 AS one -- a note", LIMIT)
+            .await
+            .unwrap();
+
+        // A statement that runs too long is stopped by ClickHouse, rather than left
+        // running once the round gives up on it.
+        let error = session
+            .run(
+                "SELECT count() AS found FROM numbers(1000000000000) WHERE sipHash64(number) = 0",
+                LIMIT,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error}").contains("Timeout exceeded"), "{error}");
     }
 
     #[tokio::test]

@@ -38,6 +38,9 @@ pub(crate) struct Clickhouse {
     login: Option<Login>,
     /// The connection this round's queries go over, once one is open.
     connection: Option<WebConnection>,
+    /// Settings sent with every query, such as a time limit, as an address's
+    /// parameters, each starting with `&`.
+    settings: String,
 }
 
 /// A query's text, made safe to go in an address.
@@ -60,14 +63,16 @@ fn is_loopback(host: &str) -> bool {
 }
 
 /// A value as a template's cell, by its column's type, which may be wrapped as
-/// `Nullable(…)` or `LowCardinality(…)`. A number that isn't one, such as NaN,
-/// which ClickHouse writes as null, is nothing.
+/// `Nullable(…)` or `LowCardinality(…)`, in either order and as often as it likes,
+/// as in ClickHouse's usual `LowCardinality(Nullable(String))`. A number that isn't
+/// one, such as NaN, which ClickHouse writes as null, is nothing.
 fn cell(kind: &str, value: Option<&Value>) -> Cell {
     let mut kind = kind;
-    for wrapper in ["Nullable(", "LowCardinality("] {
-        while let Some(inner) = kind.strip_prefix(wrapper).and_then(|k| k.strip_suffix(')')) {
-            kind = inner;
-        }
+    while let Some(inner) = ["Nullable(", "LowCardinality("]
+        .iter()
+        .find_map(|wrapper| kind.strip_prefix(wrapper)?.strip_suffix(')'))
+    {
+        kind = inner;
     }
     match value {
         None | Some(Value::Null) => Cell::Null,
@@ -124,7 +129,28 @@ impl Clickhouse {
             timeout: check.timeout,
             login,
             connection: None,
+            settings: String::new(),
         })
+    }
+
+    /// Has ClickHouse stop each statement after `limit`, as the other databases do,
+    /// and when its connection closes, as one the client gave up on does, unless the
+    /// account is set to `readonly = 1`, which can't be sent settings at all. Its
+    /// profile's limits stand for it, as the docs set them.
+    pub(crate) async fn limit_statements(&mut self, limit: Duration) -> Result<()> {
+        let row = self
+            .one("SELECT getSetting('readonly') AS readonly")
+            .await
+            .map_err(|error| anyhow!("{error}"))?;
+        if number(row.get("readonly")) == Some(1.0) {
+            return Ok(());
+        }
+        self.settings = format!(
+            "&max_execution_time={}&timeout_overflow_mode=throw\
+             &cancel_http_readonly_queries_on_client_close=1",
+            limit.as_secs().max(1)
+        );
+        Ok(())
     }
 
     async fn get(&mut self, path: &str) -> Result<(u16, String), Failure> {
@@ -217,9 +243,13 @@ impl Clickhouse {
     /// The whole of what a query gets back, which says its columns' types as well
     /// as its rows.
     async fn answer(&mut self, sql: &str) -> Result<Value, Failure> {
-        // No settings go with it: an account limited to reading, as it should be,
-        // can't change them, and its own profile sets its limits.
-        let path = format!("/?query={}", encoded(&format!("{sql} FORMAT JSON")));
+        // The format is asked for apart from the SQL, which may end in a `;` or a
+        // comment that anything put after it would be part of.
+        let path = format!(
+            "/?default_format=JSON{}&query={}",
+            self.settings,
+            encoded(sql)
+        );
         let (status, body) = self.get(&path).await?;
         if status != 200 {
             // Such as "Code: 497. DB::Exception: maxnines: Not enough privileges…".
@@ -372,6 +402,14 @@ mod tests {
         assert_eq!(
             cell("LowCardinality(String)", Some(&json!("merges"))),
             Cell::Text("merges".to_string())
+        );
+        assert_eq!(
+            cell("LowCardinality(Nullable(String))", Some(&json!("merges"))),
+            Cell::Text("merges".to_string())
+        );
+        assert_eq!(
+            cell("Nullable(LowCardinality(UInt64))", Some(&json!("7"))),
+            Cell::Number(7.0)
         );
         assert_eq!(cell("Date", Some(&json!("2026-11-22"))), Cell::Other);
     }

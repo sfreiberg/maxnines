@@ -471,11 +471,13 @@ fn a_statement_is_a_select_or_a_show() {
     assert!(!is_show("SELECT 1"));
     assert!(is_show("  show   replica status ;"));
     assert!(is_show("-- what's behind\n/* note */ SHOW BINARY LOGS"));
+    assert!(is_show("# MySQL's own comments\n# twice\nSHOW BINARY LOGS"));
     assert_eq!(first_keyword("(SELECT 1) UNION (SELECT 2)"), "SELECT");
     for fine in [
         "SELECT 1",
         "WITH a AS (SELECT 1) SELECT * FROM a",
         "SHOW GRANTS",
+        "# lag\nSELECT 1 AS lag",
     ] {
         assert!(work::check_statement("q", fine).is_ok(), "{fine}");
     }
