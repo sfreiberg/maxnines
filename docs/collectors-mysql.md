@@ -61,9 +61,10 @@ GRANT REPLICA MONITOR ON *.* TO 'maxnines'@'127.0.0.1';
 ```
 
 Use `127.0.0.1` rather than `localhost`, which means the Unix socket to MySQL.
-`PROCESS` shows the oldest transaction and query, `REPLICATION CLIENT`, or `REPLICA
-MONITOR`, a replica's state, and `performance_schema` the server's status and Group
-Replication.
+`PROCESS` shows the oldest transaction and query and InnoDB's own counts, `REPLICATION
+CLIENT`, or `REPLICA MONITOR`, a replica's state, and `performance_schema`, on MySQL,
+its commits and rollbacks, whether it's a replica, and Group Replication. What each
+grant shows is read on its own, so an account without one goes without only that.
 
 Every role the account has been given counts towards [what it may
 do](database-stats.md#what-the-account-may-do), whether or not it's in use, as the
@@ -73,15 +74,16 @@ TABLES` don't count as writing, as MySQL's `sys` schema needs `EXECUTE`.
 ## What's read, and how often
 
 The template finds out about the server first, every hour, with **`server`**: its
-version, whether it's MariaDB, and whether binary logging is on. Then it reads the rest
-every sample:
+version, whether it's MariaDB, whether binary logging is on, and whether MariaDB has
+`information_schema.SLAVE_STATUS`, which says which replicas it has set up. Then it reads
+the rest every sample:
 
 - the server's status, InnoDB, transactions and the longest query;
 - replication, with `SHOW REPLICA STATUS` on MySQL and `SHOW ALL SLAVES STATUS` on
   MariaDB, each channel a series of its own, labelled by its name, which is empty for
   the unnamed one;
-- Group Replication, on MySQL, and Galera, on MariaDB where wsrep is on, as MariaDB
-  reports Galera's status without it too.
+- Group Replication, on MySQL, and Galera, on Percona XtraDB Cluster and MariaDB,
+  where wsrep is on, as MariaDB reports Galera's status without it too.
 
 Two queries ship turned off. Turn either on with **Enable** under **Queries** on the
 template's page:
@@ -126,8 +128,8 @@ from the channel `east` is the series `shop, east`.
 | `mysql.history_length` | Number | Each database | InnoDB undo history length. A long history means purge is held back, usually by a long transaction |
 | `mysql.commits` | A second | Each database | Transactions committed |
 | `mysql.rollbacks` | A second | Each database | Transactions rolled back |
-| `mysql.replica` | 1 or 0 | Each database | Whether it's a replica. On MariaDB, whether its replication threads are running |
-| `mysql.galera_primary` | 1 or 0 | Each database | Whether this Galera node is in the primary component. MariaDB with wsrep on |
+| `mysql.replica` | 1 or 0 | Each database | Whether it's set up as a replica, whether or not it's replicating now. On MariaDB, only where it has `information_schema.SLAVE_STATUS`, as an older one only says so with `SHOW` |
+| `mysql.galera_primary` | 1 or 0 | Each database | Whether this Galera node is in the primary component, where wsrep is on |
 | `mysql.galera_size` | Number | Each database | Nodes in the Galera cluster |
 | `mysql.galera_ready` | 1 or 0 | Each database | Whether the node is ready to take queries |
 | `mysql.galera_connected` | 1 or 0 | Each database | Whether the node is connected to the cluster |

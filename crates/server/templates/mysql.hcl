@@ -2,8 +2,11 @@
 # runs once for each MySQL or MariaDB database: each `database` block of kind mysql in
 # an agent's config, and each MySQL check that reads stats on a host without an agent.
 #
-# Most of it any account can read. Transactions and queries need PROCESS, and
-# replication REPLICATION CLIENT, or REPLICA MONITOR on MariaDB 10.5.9 and later.
+# Most of it any account can read. Transactions, queries and InnoDB's own metrics
+# need PROCESS, and replication REPLICATION CLIENT, or REPLICA MONITOR on MariaDB
+# 10.5.9 and later. On MySQL, commits and rollbacks, whether it's a replica and
+# Group Replication need SELECT on performance_schema. Each grant's are queries of
+# their own, so an account without one only goes without what needs it.
 # MySQL 8.0.22 renamed SLAVE to REPLICA and Master to Source, and MariaDB kept most
 # of the old names, so what differs is read by a query for each, picked by `when`.
 
@@ -13,12 +16,17 @@ template "mysql" {
   database    = "mysql"
   min_version = "8.0.22"
 
+  # Whether MariaDB has a table that says which replicas it has set up, as only a
+  # newer one does.
   discover "server" {
     interval = "1h"
     sql      = <<-SQL
       SELECT VERSION()                   AS version,
              VERSION() LIKE '%MariaDB%'  AS mariadb,
-             @@log_bin                   AS binary_logging
+             @@log_bin                   AS binary_logging,
+             (SELECT COUNT(*) FROM information_schema.TABLES
+              WHERE TABLE_SCHEMA = 'information_schema'
+                AND TABLE_NAME = 'SLAVE_STATUS') AS replica_table
     SQL
   }
 
@@ -86,7 +94,8 @@ template "mysql" {
     }
   }
 
-  # MariaDB's read_only is ON, OFF or a NO_LOCK mode, each read only but OFF.
+  # MariaDB's read_only is ON, OFF or a NO_LOCK mode, each read only but OFF, and
+  # was 1 or 0 before, which reads as text the same either way.
   query "status_mariadb" {
     when = "mariadb == 1"
     sql  = <<-SQL
@@ -96,8 +105,7 @@ template "mysql" {
              tmp_disk_tables, pool_requests, pool_reads,
              pages_dirty * 100 / NULLIF(pages_total, 0)        AS pool_dirty,
              pool_waits, lock_waits, deadlocks, history_length, commits, rollbacks,
-             @@read_only + 0 > 0                               AS read_only,
-             replicas_running > 0                              AS replica,
+             CONCAT(@@read_only) NOT IN ('OFF', '0')           AS read_only,
              semi_sync, semi_sync_clients, semi_sync_misses
       FROM (SELECT
               MAX(CASE WHEN n = 'UPTIME' THEN v + 0 END)                              AS uptime,
@@ -118,7 +126,6 @@ template "mysql" {
               MAX(CASE WHEN n = 'INNODB_HISTORY_LIST_LENGTH' THEN v + 0 END)          AS history_length,
               MAX(CASE WHEN n = 'COM_COMMIT' THEN v + 0 END)                          AS commits,
               MAX(CASE WHEN n = 'COM_ROLLBACK' THEN v + 0 END)                        AS rollbacks,
-              MAX(CASE WHEN n = 'SLAVES_RUNNING' THEN v + 0 END)                      AS replicas_running,
               MAX(CASE WHEN n IN ('RPL_SEMI_SYNC_SOURCE_STATUS', 'RPL_SEMI_SYNC_MASTER_STATUS')
                        THEN v = 'ON' END)                                            AS semi_sync,
               MAX(CASE WHEN n IN ('RPL_SEMI_SYNC_SOURCE_CLIENTS', 'RPL_SEMI_SYNC_MASTER_CLIENTS')
@@ -149,40 +156,88 @@ template "mysql" {
       commits           = { title = "MySQL commits", total = true }
       rollbacks         = { title = "MySQL rollbacks", total = true }
       read_only         = { title = "MySQL read only" }
-      replica           = { title = "MySQL is a replica" }
       semi_sync         = { title = "MySQL semi-synchronous replication on", description = "Off while it's enabled means it fell back to waiting for no replica" }
       semi_sync_clients = { title = "MySQL semi-synchronous replicas" }
       semi_sync_misses  = { title = "MySQL commits not acknowledged by a replica", total = true }
     }
   }
 
-  # MySQL keeps these among InnoDB's own metrics, which take PROCESS, and its
-  # commits and rollbacks in its statement counts.
+  # MySQL keeps these among InnoDB's own metrics, which take PROCESS.
   query "innodb" {
     when = "mariadb == 0"
     sql  = <<-SQL
-      SELECT (SELECT MAX(CASE WHEN NAME = 'lock_deadlocks' THEN COUNT END)
-              FROM information_schema.INNODB_METRICS)                  AS deadlocks,
-             (SELECT MAX(CASE WHEN NAME = 'trx_rseg_history_len' THEN COUNT END)
-              FROM information_schema.INNODB_METRICS)                  AS history_length,
-             (SELECT MAX(CASE WHEN EVENT_NAME = 'statement/sql/commit' THEN COUNT_STAR END)
+      SELECT MAX(CASE WHEN NAME = 'lock_deadlocks' THEN COUNT END)       AS deadlocks,
+             MAX(CASE WHEN NAME = 'trx_rseg_history_len' THEN COUNT END) AS history_length
+      FROM information_schema.INNODB_METRICS
+    SQL
+    metrics = {
+      deadlocks      = { title = "MySQL deadlocks", total = true }
+      history_length = { title = "MySQL undo history length", description = "A long history means purge is held back, usually by a long transaction" }
+    }
+  }
+
+  # MySQL's status leaves out its statement counts, so commits and rollbacks are
+  # among performance_schema's, which take SELECT on it, as does what says whether
+  # a replica is set up, whether or not it's replicating now.
+  query "statements" {
+    when = "mariadb == 0"
+    sql  = <<-SQL
+      SELECT (SELECT MAX(CASE WHEN EVENT_NAME = 'statement/sql/commit' THEN COUNT_STAR END)
               FROM performance_schema.events_statements_summary_global_by_event_name) AS commits,
              (SELECT MAX(CASE WHEN EVENT_NAME = 'statement/sql/rollback' THEN COUNT_STAR END)
               FROM performance_schema.events_statements_summary_global_by_event_name) AS rollbacks,
              (SELECT COUNT(*) > 0 FROM performance_schema.replication_connection_configuration) AS replica
     SQL
     metrics = {
-      deadlocks      = { title = "MySQL deadlocks", total = true }
-      history_length = { title = "MySQL undo history length", description = "A long history means purge is held back, usually by a long transaction" }
-      commits        = { title = "MySQL commits", total = true }
-      rollbacks      = { title = "MySQL rollbacks", total = true }
-      replica        = { title = "MySQL is a replica" }
+      commits   = { title = "MySQL commits", total = true }
+      rollbacks = { title = "MySQL rollbacks", total = true }
+      replica   = { title = "MySQL is a replica" }
     }
   }
 
-  # Galera, as in MariaDB Galera Cluster and Percona XtraDB Cluster, only where
+  # Whether a replica is set up, whether or not it's replicating now, which only a
+  # newer MariaDB says outside SHOW, with REPLICA MONITOR.
+  query "replica_mariadb" {
+    when = "mariadb == 1 && replica_table == 1"
+    sql  = "SELECT COUNT(*) > 0 AS replica FROM information_schema.SLAVE_STATUS"
+    metrics = {
+      replica = { title = "MySQL is a replica" }
+    }
+  }
+
+  # Galera, as in Percona XtraDB Cluster and MariaDB Galera Cluster, only where
   # wsrep is on, as MariaDB reports its status without it too.
   query "galera" {
+    when = "mariadb == 0"
+    sql  = <<-SQL
+      SELECT MAX(CASE WHEN n = 'WSREP_CLUSTER_STATUS' THEN v = 'Primary' END)  AS galera_primary,
+             MAX(CASE WHEN n = 'WSREP_CLUSTER_SIZE' THEN v + 0 END)            AS galera_size,
+             MAX(CASE WHEN n = 'WSREP_READY' THEN v = 'ON' END)                AS galera_ready,
+             MAX(CASE WHEN n = 'WSREP_CONNECTED' THEN v = 'ON' END)            AS galera_connected,
+             MAX(CASE WHEN n = 'WSREP_LOCAL_STATE' THEN v + 0 = 4 END)         AS galera_synced,
+             MAX(CASE WHEN n = 'WSREP_LOCAL_RECV_QUEUE_AVG' THEN v + 0 END)    AS galera_receive_queue,
+             MAX(CASE WHEN n = 'WSREP_LOCAL_SEND_QUEUE_AVG' THEN v + 0 END)    AS galera_send_queue,
+             MAX(CASE WHEN n = 'WSREP_LOCAL_CERT_FAILURES' THEN v + 0 END)     AS galera_cert_failures,
+             MAX(CASE WHEN n = 'WSREP_FLOW_CONTROL_PAUSED_NS' THEN v / 1e7 END) AS galera_flow_paused
+      FROM (SELECT UPPER(VARIABLE_NAME) AS n, VARIABLE_VALUE AS v
+            FROM performance_schema.global_status) AS status
+      HAVING (SELECT COUNT(*) FROM performance_schema.global_variables
+              WHERE UPPER(VARIABLE_NAME) = 'WSREP_ON' AND VARIABLE_VALUE = 'ON') > 0
+    SQL
+    metrics = {
+      galera_primary       = { title = "Galera node in the primary component" }
+      galera_size          = { title = "Galera cluster size" }
+      galera_ready         = { title = "Galera node ready" }
+      galera_connected     = { title = "Galera node connected" }
+      galera_synced        = { title = "Galera node synced" }
+      galera_receive_queue = { title = "Galera receive queue" }
+      galera_send_queue    = { title = "Galera send queue" }
+      galera_cert_failures = { title = "Galera certification failures", total = true }
+      galera_flow_paused   = { title = "Galera time paused for flow control", total = true, unit = "%", description = "The share of the time replication was paused for flow control" }
+    }
+  }
+
+  query "galera_mariadb" {
     when = "mariadb == 1"
     sql  = <<-SQL
       SELECT MAX(CASE WHEN n = 'WSREP_CLUSTER_STATUS' THEN v = 'Primary' END)  AS galera_primary,

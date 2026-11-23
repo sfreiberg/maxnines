@@ -1457,7 +1457,14 @@ async fn a_mysql_check_reads_its_stats_with_the_built_in_template() {
     let mut scheduler = check_scheduler(&server);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut now = crate::times::now();
-    for metric in ["mysql.connections", "mysql.uptime", "mysql.up"] {
+    // Whether it's a replica, from what says one's set up, on MySQL and MariaDB.
+    for metric in [
+        "mysql.connections",
+        "mysql.uptime",
+        "mysql.up",
+        "mysql.read_only",
+        "mysql.replica",
+    ] {
         loop {
             let body = host_metric(&server, &id, metric).await;
             if body["series"]
