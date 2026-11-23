@@ -24,7 +24,7 @@ use crate::models::Database;
 use crate::presence::{Presence, Reached};
 use crate::registration::{HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
-use crate::templates::agentless::AgentlessTemplates;
+use crate::templates::agentless::{AgentlessTemplates, Saving};
 use crate::times::{self, Timestamp};
 
 /// The built-in host the server records its own metrics under. See the migration
@@ -535,8 +535,13 @@ impl Scheduler {
                 read_stats(&check, hostname.clone(), &writer, &reader).await;
             }
             if let Some(templates) = templates {
-                let host_id = check.input.host_id.clone();
-                templates.save(&database, &writer, host_id, hostname).await;
+                let to = Saving {
+                    database: &database,
+                    writer: &writer,
+                    host_id: check.input.host_id.clone(),
+                    hostname,
+                };
+                templates.save(to).await;
             }
         })
     }

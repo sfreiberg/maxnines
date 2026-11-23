@@ -385,7 +385,8 @@ async fn serve(path: &Path) -> Result<()> {
     let config = Config::load(path)?;
     let rules = Rules::compile(&config.registration)?;
 
-    let database = Database::connect(&config.database.resolve_url()?).await?;
+    let database_url = config.database.resolve_url()?;
+    let database = Database::connect(&database_url).await?;
     // The config rules that come with this version, which an upgrade may change.
     let changed = database
         .sync_built_in_rules(&built_in_rules::all(), crate::times::now())
@@ -490,6 +491,7 @@ async fn serve(path: &Path) -> Result<()> {
     )
     .spawn();
     server_stats::spawn_recorder(state.clone());
+    templates::own_database::start(&database_url, state.database.clone(), state.writer.clone());
     // The server is always online to itself, so nothing reads it as missing.
     state
         .presence

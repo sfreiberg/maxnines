@@ -1507,3 +1507,91 @@ async fn a_database_check_reads_what_templates_have_it_read() {
     run_due(&mut scheduler, now + TimeDelta::seconds(11)).await;
     assert!(database.discoveries(&id).await.unwrap().is_empty());
 }
+
+/// Reads the throwaway PostgreSQL, named as `host:port username`, as the server's
+/// own database would be: with the template as the server was built with it, not
+/// as the database has it, and saved on the server's own host.
+#[tokio::test]
+async fn the_servers_own_database_is_read_with_its_templates_as_built() {
+    use crate::remote_checks::LOCAL_HOST_ID;
+    use crate::templates::own_database::{OwnReader, database_of};
+
+    let Ok(real) = std::env::var("MAXNINES_TEST_CHECK_POSTGRES") else {
+        return;
+    };
+    let (target, username) = real.split_once(' ').unwrap();
+    let server = start_with_metrics().await;
+    let database = &server.state.database;
+    let template = |filter: &str| {
+        crate::templates::load(
+            &format!(
+                r#"template "pgt" {{
+                     name     = "PG test"
+                     database = "postgres"
+                     discover "server" {{
+                       sql = "SELECT current_setting('server_version') AS version"
+                     }}
+                     query "activity" {{
+                       since    = "10"
+                       interval = "1s"
+                       sql      = "SELECT count(*) AS sessions FROM pg_stat_activity{filter}"
+                     }}
+                   }}"#
+            ),
+            &json!({}),
+            &crate::catalog::Catalog::built_in(),
+        )
+        .unwrap()
+    };
+    // The database's copy counts nothing; the one built in counts every session.
+    database
+        .import_template(&template(" WHERE false"), crate::times::now())
+        .await
+        .unwrap();
+    let own = database_of(&format!("postgres://{username}@{target}/postgres"))
+        .unwrap()
+        .unwrap();
+    let mut reader = OwnReader::new(
+        vec![template("")],
+        own,
+        database.clone(),
+        server.state.writer.clone(),
+    );
+
+    // On the server's host, which isn't one a person looks up by the API.
+    let series = |name: &'static str| {
+        let state = server.state.clone();
+        async move {
+            let catalog = state.catalog();
+            let metric = catalog.find(name).unwrap().clone();
+            let range = crate::metrics::TimeRange::new(
+                crate::times::now() - TimeDelta::minutes(1),
+                crate::times::now() + TimeDelta::minutes(1),
+            )
+            .unwrap();
+            state
+                .metrics
+                .series(LOCAL_HOST_ID, &metric, range, 8)
+                .await
+                .unwrap()
+                .series
+        }
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let sessions = loop {
+        reader.read_once(Duration::from_millis(200)).await.unwrap();
+        let found = series("pgt.sessions").await;
+        if !found.is_empty() {
+            break found;
+        }
+        assert!(Instant::now() < deadline, "no pgt.sessions");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    assert!(sessions[0].name.contains("maxnines"), "{sessions:?}");
+    assert!(
+        sessions[0].points.iter().all(|point| point.max >= 1.0),
+        "{sessions:?}"
+    );
+    // Its account is the server's, which always could do more than read.
+    assert!(series("database_account.overprivileged").await.is_empty());
+}

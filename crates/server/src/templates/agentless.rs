@@ -19,12 +19,13 @@ use maxnines_checks::databases::{self as stats, is_database};
 use maxnines_checks::templates::reader::{Reader, Results};
 use maxnines_protocol::Sample;
 use maxnines_protocol::templates::work::{DISCOVERED, Discovered, TemplateWork};
+use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use super::hosts::{DatabaseKinds, RunningTemplates};
-use super::values::{LastSent, strip_queries, work_out};
+use super::values::{LastSent, QueryValues, strip_queries, work_out};
 use super::work::{Discoveries, work_for};
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::Database;
@@ -249,66 +250,88 @@ pub struct ReadSoFar {
 impl ReadSoFar {
     /// Saves what's been read as a sample from the check's host, keeping what
     /// discovery found apart, as an agent's sample would be.
-    pub async fn save(
-        self,
-        database: &Database,
-        writer: &mpsc::Sender<WriterCommand>,
-        host_id: String,
-        hostname: String,
-    ) {
+    pub async fn save(self, to: Saving<'_>) {
+        let templates = to.database.running_templates();
         let entries = self.results.take();
-        if entries.is_empty() {
-            return;
-        }
-        let mut sample = Sample {
-            time: times::now(),
-            metrics: entries.into_iter().collect(),
-        };
-        if let Some(found) = sample.metrics.remove(DISCOVERED) {
-            match serde_json::from_value::<Vec<Discovered>>(found) {
-                Ok(mut found) => {
-                    // Only for what's still read, as what's read may have changed.
-                    {
-                        let sent = lock(&self.sent);
-                        found.retain(|one| {
-                            sent.iter().any(|work| {
-                                work.template == one.template
-                                    && work.database.as_deref() == Some(one.database.as_str())
-                            })
-                        });
-                    }
-                    if let Err(error) = database
-                        .save_discovered(&host_id, &found, sample.time)
-                        .await
-                    {
-                        warn!(
-                            host_id,
-                            error = format!("{error:#}"),
-                            "saving what discovery found failed"
-                        );
-                    }
+        save_read(
+            entries,
+            &self.sent,
+            &self.last_sent,
+            templates.worked_out(),
+            to,
+        )
+        .await;
+    }
+}
+
+/// Where what's read is saved: as samples from a host, by its ID and name.
+pub struct Saving<'a> {
+    pub database: &'a Database,
+    pub writer: &'a mpsc::Sender<WriterCommand>,
+    pub host_id: String,
+    pub hostname: String,
+}
+
+/// Saves what's been read, as a sample's `entries`, from a host: what discovery
+/// found for what's still read, by `sent`, is kept with the host, and the rest is
+/// saved as its metrics, with the `value` metrics of `values` worked out.
+pub async fn save_read(
+    entries: Map<String, Value>,
+    sent: &Mutex<Vec<TemplateWork>>,
+    last_sent: &Mutex<LastSent>,
+    values: &[QueryValues],
+    to: Saving<'_>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let Saving {
+        database,
+        writer,
+        host_id,
+        hostname,
+    } = to;
+    let mut sample = Sample {
+        time: times::now(),
+        metrics: entries.into_iter().collect(),
+    };
+    if let Some(found) = sample.metrics.remove(DISCOVERED) {
+        match serde_json::from_value::<Vec<Discovered>>(found) {
+            Ok(mut found) => {
+                // Only for what's still read, as what's read may have changed.
+                {
+                    let sent = lock(sent);
+                    found.retain(|one| {
+                        sent.iter().any(|work| {
+                            work.template == one.template
+                                && work.database.as_deref() == Some(one.database.as_str())
+                        })
+                    });
                 }
-                Err(error) => warn!(host_id, %error, "skipping what discovery found"),
+                if let Err(error) = database
+                    .save_discovered(&host_id, &found, sample.time)
+                    .await
+                {
+                    warn!(
+                        host_id,
+                        error = format!("{error:#}"),
+                        "saving what discovery found failed"
+                    );
+                }
             }
+            Err(error) => warn!(host_id, %error, "skipping what discovery found"),
         }
-        let templates = database.running_templates();
-        if !templates.worked_out().is_empty() {
-            let sent = lock(&self.sent);
-            work_out(
-                &mut sample,
-                templates.worked_out(),
-                &sent,
-                &mut lock(&self.last_sent),
-            );
-        }
-        strip_queries(&mut sample);
-        let command = WriterCommand::Save(NewSample {
-            host_id,
-            hostname,
-            sample,
-        });
-        if writer.send(command).await.is_err() {
-            warn!("the metrics writer has stopped, so what templates read was dropped");
-        }
+    }
+    if !values.is_empty() {
+        work_out(&mut sample, values, &lock(sent), &mut lock(last_sent));
+    }
+    strip_queries(&mut sample);
+    let command = WriterCommand::Save(NewSample {
+        host_id,
+        hostname,
+        sample,
+    });
+    if writer.send(command).await.is_err() {
+        warn!("the metrics writer has stopped, so what templates read was dropped");
     }
 }

@@ -4113,6 +4113,7 @@ dependencies = [
  "maxnines-checks",
  "maxnines-collectors",
  "maxnines-protocol",
+ "percent-encoding",
  "pulldown-cmark",
  "rcgen 0.14.10",
  "resvg",
@@ -4141,6 +4142,7 @@ dependencies = [
  "tracing",
  "two-face",
  "ureq",
+ "url",
  "vergen-gitcl",
  "wildmatch",
 ]

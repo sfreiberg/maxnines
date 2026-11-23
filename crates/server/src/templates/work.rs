@@ -137,12 +137,7 @@ pub fn work_for(
                 let instances = assigned.instances(host.facts, databases);
                 for database in instances.into_iter().flatten() {
                     let found = discoveries.get(&(assigned.id(), database.clone()));
-                    work.push(TemplateWork {
-                        template: template.key.clone(),
-                        discover: discover_work(template),
-                        queries: query_work(template, found),
-                        database: Some(database),
-                    });
+                    work.push(database_work(template, &database, found));
                 }
             }
             // Counters and the registry are for the Windows services' templates,
@@ -176,6 +171,21 @@ pub fn work_for(
         work.truncate(MAX_WORK);
     }
     work
+}
+
+/// What's read of one database for a template for its kind, where discovery found
+/// `found` there, or nothing yet.
+pub fn database_work(
+    template: &Template,
+    database: &str,
+    found: Option<&Map<String, Value>>,
+) -> TemplateWork {
+    TemplateWork {
+        template: template.key.clone(),
+        database: Some(database.to_string()),
+        discover: discover_work(template),
+        queries: query_work(template, found),
+    }
 }
 
 fn discover_work(template: &Template) -> Vec<DiscoverWork> {

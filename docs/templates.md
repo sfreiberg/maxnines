@@ -156,6 +156,17 @@ agent's would be, read as an agent reads it, and saved as a sample from the host
 time the check runs. What's read is worked out again when templates, checks or what
 discovery found change, and at least once a minute.
 
+The server also reads its own database, when it's PostgreSQL or MySQL, but only with
+the templates for that kind that come with MaxNines, exactly as this version of the
+server was built with them: never an imported template, one of your own, or your copy
+of a query, so nothing but SQL that shipped runs over the server's own connection.
+Each statement is read-only, as every template's is, and its series are on the
+**MaxNines server** host, named `maxnines`. Your changes to those templates' alerts
+still apply there. As the server's account has to be able to write, what it may do
+beyond reading isn't reported. To read MaxNines' own database with other templates,
+add a database check for it with an account that can only read. No template for a
+database comes with MaxNines yet, so for now nothing is read.
+
 ### Queries
 
 `query` blocks are SQL whose columns become metrics:
