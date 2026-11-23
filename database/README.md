@@ -365,6 +365,7 @@ erDiagram
         int replaces_id FK
         string key
         int position
+        string title "what charts call it"
         string counter
         string unit
         boolean total

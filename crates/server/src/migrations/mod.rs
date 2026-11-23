@@ -290,6 +290,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
     metrics
         .col(key())
         .col(position())
+        .col(part("title").string_len(255))
         .col(part("counter").string_len(255))
         .col(part("unit").string_len(16))
         .col(part("total").boolean().not_null())

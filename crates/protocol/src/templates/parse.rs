@@ -235,6 +235,7 @@ fn read_notice(key: String, body: Body) -> Result<Notice> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MetricFields {
+    title: Option<String>,
     counter: Option<String>,
     unit: Option<String>,
     #[serde(default)]
@@ -263,6 +264,7 @@ fn read_metrics(metrics: IndexMap<String, Value>) -> Result<Vec<Metric>> {
                         .with_context(|| format!("metrics, {key}"))?;
                     Metric {
                         key: key.clone(),
+                        title: fields.title,
                         counter: fields.counter,
                         unit: fields.unit,
                         total: fields.total,

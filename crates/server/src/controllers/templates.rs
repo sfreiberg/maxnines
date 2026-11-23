@@ -107,6 +107,8 @@ struct OwnMetric {
     /// Its name within the template: `lag` for `postgres.lag`.
     short: String,
     name: String,
+    /// What charts and lists call it.
+    title: String,
     kind: Kind,
     /// The labels its series have besides what the template runs for, which are
     /// what `labels.` gives a summary.
@@ -126,6 +128,7 @@ fn own_metrics(template: &Template) -> Vec<OwnMetric> {
                 .filter(|label| *label != INSTANCE_LABEL)
                 .cloned()
                 .collect(),
+            title: metric.title,
             name: metric.name,
         })
         .collect();
@@ -241,6 +244,7 @@ impl BuiltInValues {
 #[derive(Serialize)]
 struct MetricRow {
     name: String,
+    title: String,
     short: String,
     kind: &'static str,
     labels: String,
@@ -576,6 +580,7 @@ fn metric_rows(template: &Template) -> Vec<MetricRow> {
             let metric_detail = found.map(|(_, m)| m);
             MetricRow {
                 name: metric.name.clone(),
+                title: metric.title.clone(),
                 short: short.clone(),
                 kind: kind_words(metric.kind),
                 labels: metric.labels.join(", "),
@@ -1218,6 +1223,7 @@ struct AlertView {
 #[derive(Serialize)]
 struct MetricView {
     name: String,
+    title: String,
     kind: &'static str,
     labels: Vec<String>,
 }
@@ -1492,6 +1498,7 @@ fn metric_views(template: &Template) -> Vec<MetricView> {
         .into_iter()
         .map(|metric| MetricView {
             name: metric.name,
+            title: metric.title,
             kind: match metric.kind {
                 Kind::Number => "number",
                 Kind::Seconds => "seconds",

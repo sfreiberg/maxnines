@@ -56,12 +56,16 @@ template "postgres" {
       WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()
     SQL
     metrics = {
-      uptime                     = { unit = "s" }
-      replica                    = { description = "Whether it's a replica, replaying another server's WAL" }
-      connections_used           = { unit = "%", description = "Connections in use, out of those not reserved for superusers" }
-      oldest_transaction         = { unit = "s", description = "How long the longest open transaction has been open; a long one holds back vacuum" }
-      oldest_query               = { unit = "s" }
-      oldest_idle_in_transaction = { unit = "s" }
+      uptime                     = { title = "PostgreSQL uptime", unit = "s" }
+      replica                    = { title = "PostgreSQL is a replica", description = "Whether it's a replica, replaying another server's WAL" }
+      connections_used           = { title = "PostgreSQL connections used of the limit", unit = "%", description = "Connections in use, out of those not reserved for superusers" }
+      oldest_transaction         = { title = "PostgreSQL oldest open transaction", unit = "s", description = "How long the longest open transaction has been open; a long one holds back vacuum" }
+      oldest_query               = { title = "PostgreSQL longest-running query", unit = "s" }
+      oldest_idle_in_transaction = { title = "PostgreSQL longest idle in a transaction", unit = "s" }
+      connections                = { title = "PostgreSQL connections" }
+      running_queries            = { title = "PostgreSQL queries running" }
+      idle_in_transaction        = { title = "PostgreSQL sessions idle in a transaction" }
+      lock_waits                 = { title = "PostgreSQL sessions waiting on locks" }
     }
   }
 
@@ -79,16 +83,17 @@ template "postgres" {
       older    = "0"
     }
     metrics = {
-      transactions      = { total = true }
-      rollbacks         = { total = true }
-      temp_written      = { total = true, unit = "bytes", description = "Temporary files written by queries too big for work_mem" }
-      deadlocks         = { total = true }
-      conflicts         = { total = true, description = "Queries on a replica cancelled because of what it was replaying" }
-      checksum_failures = { total = true }
-      blocks_read       = { total = true, description = "Blocks read from disk rather than memory" }
-      blocks_hit        = { total = true, description = "Blocks found in memory" }
+      transactions      = { title = "PostgreSQL transactions", total = true }
+      rollbacks         = { title = "PostgreSQL rollbacks", total = true }
+      temp_written      = { title = "PostgreSQL temporary files written", total = true, unit = "bytes", description = "Temporary files written by queries too big for work_mem" }
+      deadlocks         = { title = "PostgreSQL deadlocks", total = true }
+      conflicts         = { title = "PostgreSQL queries cancelled by replication", total = true, description = "Queries on a replica cancelled because of what it was replaying" }
+      checksum_failures = { title = "PostgreSQL checksum failures", total = true }
+      blocks_read       = { title = "PostgreSQL blocks read from disk", total = true, description = "Blocks read from disk rather than memory" }
+      blocks_hit        = { title = "PostgreSQL blocks found in memory", total = true, description = "Blocks found in memory" }
       # Worked out from the other columns as each sample arrives.
       cache_hit = {
+        title       = "PostgreSQL cache hit rate"
         value       = "rate(blocks_hit) / (rate(blocks_hit) + rate(blocks_read)) * 100"
         unit        = "%"
         description = "Reads served from memory rather than disk"
@@ -104,15 +109,17 @@ template "postgres" {
       older    = "checkpoints_timed, checkpoints_req AS checkpoints_requested FROM pg_stat_bgwriter"
     }
     metrics = {
-      checkpoints_timed     = { total = true }
-      checkpoints_requested = { total = true, description = "Checkpoints forced by WAL filling up; often a sign max_wal_size is too small" }
+      checkpoints_timed     = { title = "PostgreSQL scheduled checkpoints", total = true }
+      checkpoints_requested = { title = "PostgreSQL requested checkpoints", total = true, description = "Checkpoints forced by WAL filling up; often a sign max_wal_size is too small" }
     }
   }
 
   query "wal" {
     since   = "14"
     sql     = "SELECT wal_bytes AS wal_written FROM pg_stat_wal"
-    metrics = { wal_written = { total = true, unit = "bytes" } }
+    metrics = {
+      wal_written = { title = "PostgreSQL WAL written", total = true, unit = "bytes" }
+    }
   }
 
   # What, left alone, ends up stopping the server: transaction IDs running out,
@@ -126,8 +133,10 @@ template "postgres" {
       FROM pg_database WHERE datallowconn
     SQL
     metrics = {
-      xid_age         = { description = "Transactions since the oldest database was last frozen; the server stops near 2.1 billion" }
-      oldest_prepared = { unit = "s" }
+      xid_age         = { title = "PostgreSQL transaction ID age (wraparound)", description = "Transactions since the oldest database was last frozen; the server stops near 2.1 billion" }
+      oldest_prepared = { title = "PostgreSQL oldest prepared transaction", unit = "s" }
+      mxid_age        = { title = "PostgreSQL multixact ID age (wraparound)" }
+      prepared        = { title = "PostgreSQL prepared transactions" }
     }
   }
 
@@ -148,10 +157,11 @@ template "postgres" {
     SQL
     labels = ["application", "address"]
     metrics = {
-      lag_bytes = { unit = "bytes" }
+      lag_bytes = { title = "PostgreSQL standby lag in bytes", unit = "bytes" }
       # Unknown until a standby has replayed something, and again once it's caught
       # up with nothing new, when its bytes behind say it's caught up.
-      lag = { unit = "s", description = "How far behind a replica is, or each standby, as its primary sees it" }
+      lag       = { title = "PostgreSQL replication lag", unit = "s", description = "How far behind a replica is, or each standby, as its primary sees it" }
+      streaming = { title = "PostgreSQL standby streaming" }
     }
   }
 
@@ -164,6 +174,10 @@ template "postgres" {
              count(*) FILTER (WHERE sync_state IN ('sync', 'quorum')) AS synchronous_standbys
       FROM pg_stat_replication
     SQL
+    metrics = {
+      standbys             = { title = "PostgreSQL standbys" }
+      synchronous_standbys = { title = "PostgreSQL synchronous standbys" }
+    }
   }
 
   # ---------------------------------------------------------------------------
@@ -186,8 +200,9 @@ template "postgres" {
       older    = "pg_is_wal_replay_paused()"
     }
     metrics = {
-      lag            = { unit = "s" }
-      replay_backlog = { unit = "bytes", description = "WAL received but not replayed yet" }
+      lag            = { title = "PostgreSQL replication lag", unit = "s" }
+      replay_backlog = { title = "PostgreSQL WAL received but not replayed", unit = "bytes", description = "WAL received but not replayed yet" }
+      replay_paused  = { title = "PostgreSQL replay paused" }
     }
   }
 
@@ -202,8 +217,9 @@ template "postgres" {
       FROM (SELECT 1) AS one LEFT JOIN pg_stat_wal_receiver AS r ON true
     SQL
     metrics = {
-      last_received = { unit = "s", description = "How long since the replica heard from its primary" }
-      timeline      = { description = "Rises after a failover" }
+      last_received = { title = "PostgreSQL time since the replica heard from its primary", unit = "s", description = "How long since the replica heard from its primary" }
+      timeline      = { title = "PostgreSQL timeline", description = "Rises after a failover" }
+      receiving     = { title = "PostgreSQL replica receiving" }
     }
   }
 
@@ -233,8 +249,10 @@ template "postgres" {
     }
     labels = ["slot"]
     metrics = {
-      slot_retained = { unit = "bytes", description = "WAL kept for the slot; an unused slot keeps it until the disk fills" }
-      slot_headroom = { unit = "bytes", description = "WAL left before the slot is lost; none unless max_slot_wal_keep_size is set" }
+      slot_retained = { title = "PostgreSQL WAL kept by a replication slot", unit = "bytes", description = "WAL kept for the slot; an unused slot keeps it until the disk fills" }
+      slot_headroom = { title = "PostgreSQL WAL a slot can still keep", unit = "bytes", description = "WAL left before the slot is lost; none unless max_slot_wal_keep_size is set" }
+      slot_in_use   = { title = "PostgreSQL replication slot in use" }
+      slot_lost     = { title = "PostgreSQL replication slot lost" }
     }
   }
 
@@ -249,8 +267,9 @@ template "postgres" {
       FROM pg_stat_archiver
     SQL
     metrics = {
-      archived         = { total = true }
-      archive_failures = { total = true }
+      archived         = { title = "PostgreSQL WAL files archived", total = true }
+      archive_failures = { title = "PostgreSQL archiving failures", total = true }
+      archive_failing  = { title = "PostgreSQL archiving failing" }
     }
   }
 
@@ -258,7 +277,9 @@ template "postgres" {
     when    = "archiving"
     since   = "12"
     sql     = "SELECT count(*) AS archive_waiting FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'"
-    metrics = { archive_waiting = { description = "WAL files waiting to be archived" } }
+    metrics = {
+      archive_waiting = { title = "PostgreSQL WAL files waiting to be archived", description = "WAL files waiting to be archived" }
+    }
   }
 
   # ---------------------------------------------------------------------------
@@ -278,7 +299,10 @@ template "postgres" {
       older    = "NULL"
     }
     labels  = ["subscription"]
-    metrics = { subscription_errors = { total = true } }
+    metrics = {
+      subscription_errors  = { title = "PostgreSQL subscription errors", total = true }
+      subscription_running = { title = "PostgreSQL subscription running" }
+    }
   }
 
   # ---------------------------------------------------------------------------
@@ -293,14 +317,18 @@ template "postgres" {
       FROM pg_database WHERE datallowconn AND has_database_privilege(oid, 'CONNECT')
     SQL
     labels  = ["database"]
-    metrics = { size = { unit = "bytes", description = "Each database's size on disk" } }
+    metrics = {
+      size = { title = "PostgreSQL database size", unit = "bytes", description = "Each database's size on disk" }
+    }
   }
 
   query "wal_size" {
     enabled  = false
     interval = "5m"
     sql      = "SELECT coalesce(sum(size), 0) AS wal_size FROM pg_ls_waldir()"
-    metrics  = { wal_size = { unit = "bytes", description = "WAL kept on disk" } }
+    metrics = {
+      wal_size = { title = "PostgreSQL WAL on disk", unit = "bytes", description = "WAL kept on disk" }
+    }
   }
 
   # ---------------------------------------------------------------------------

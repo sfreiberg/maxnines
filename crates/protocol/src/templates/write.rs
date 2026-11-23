@@ -173,6 +173,9 @@ fn metrics(metrics: &[Metric]) -> Expression {
                     let mut put = |name: &str, value: Expression| {
                         fields.insert(ObjectKey::from(key_expression(name)), value);
                     };
+                    if let Some(title) = &metric.title {
+                        put("title", text(title));
+                    }
                     if let Some(counter) = &metric.counter {
                         put("counter", text(counter));
                     }

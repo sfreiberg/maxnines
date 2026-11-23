@@ -108,7 +108,10 @@ fn a_template_knows_its_own_metrics_and_what_they_are() {
         postgres["connections_used"].description.as_deref(),
         Some("Connections in use, out of those not reserved for superusers")
     );
-    assert_eq!(postgres["slot_retained"].title, "PG slot retained");
+    assert_eq!(
+        postgres["slot_retained"].title,
+        "PG WAL kept by a replication slot"
+    );
 
     let iis = own(&parse(IIS).unwrap());
     assert_eq!(iis["pool_running"].kind, Kind::Flag);
@@ -151,7 +154,7 @@ fn the_catalog_has_the_metrics_of_templates_that_are_on() {
     let built_in = Catalog::built_in();
     let catalog = Catalog::with_templates([&postgres, &iis]);
     assert!(built_in.find("pg.lag").is_none());
-    assert_eq!(catalog.find("pg.lag").unwrap().title, "PG lag");
+    assert_eq!(catalog.find("pg.lag").unwrap().title, "PG replication lag");
     assert!(catalog.find("iis.requests").is_some());
     // The built-in ones come first, as they did.
     let names = |catalog: &Catalog| -> Vec<String> {

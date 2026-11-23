@@ -194,8 +194,11 @@ alerts with `when` or `since` are checked on the hosts where what was found fits
 
 `metrics = { … }` only says what can't be worked out from the column: `total = true`
 for a running total, which is kept as a rate; a `unit`, which is `%`, `s`, `bytes`,
-`bytes/s`, `/s` or `°C`; a `description`; or `value`, CEL working a metric out from the
-others as each sample arrives.
+`bytes/s`, `/s` or `°C`; a `title`, up to 100 characters, which charts and lists call it,
+such as `PostgreSQL replication lag`, rather than the template's name and the metric's
+key in words; a `description`; or `value`, CEL working a metric out from the others as
+each sample arrives. Whether a database template's database answers, `<key>.up`, is
+titled with the template's name, such as `PostgreSQL up`.
 
 ```hcl
 query "throughput" {

@@ -17,6 +17,10 @@
       {% set e = errors | get(key=mp ~ "unit", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
     </label>
   </div>
+  <label>Title
+    <input type="text" name="{{ mp }}title" value="{{ metric.title }}" maxlength="100" placeholder="What charts call it">
+    {% set e = errors | get(key=mp ~ "title", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
   <label>Worked out as
     <input type="text" name="{{ mp }}value" value="{{ metric.value }}" spellcheck="false" autocomplete="off" data-cel="value" placeholder="value / 1000">
     {% set e = errors | get(key=mp ~ "value", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}

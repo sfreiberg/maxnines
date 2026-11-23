@@ -501,6 +501,7 @@ pub fn collector_of(key: &str) -> String {
 pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
     struct Found {
         key: String,
+        title: Option<String>,
         kind: Kind,
         unit: Unit,
         description: Option<String>,
@@ -517,6 +518,7 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
                 }
             }
             seen.on |= new.on;
+            seen.title = seen.title.take().or(new.title);
         }
         None => found.push(new),
     };
@@ -530,6 +532,7 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
     if instance {
         add(Found {
             key: UP.to_string(),
+            title: Some(format!("{} up", template.name)),
             kind: Kind::Flag,
             unit: Unit::Number,
             description: Some("Whether the database is answering".to_string()),
@@ -557,6 +560,7 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
             let detail = query.metrics.iter().find(|metric| &metric.key == key);
             add(Found {
                 key: key.clone(),
+                title: detail.and_then(|metric| metric.title.clone()),
                 kind: detail.map_or(Kind::Unknown, |metric| kind_of(metric, column)),
                 unit: unit_of(detail),
                 description: detail.and_then(|metric| metric.description.clone()),
@@ -571,6 +575,7 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
         for metric in &counters.metrics {
             add(Found {
                 key: metric.key.clone(),
+                title: metric.title.clone(),
                 kind: kind_of(metric, false),
                 unit: unit_of(Some(metric)),
                 description: metric.description.clone(),
@@ -593,7 +598,9 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
         .map(|metric| {
             let read = Metric {
                 name: format!("{}.{}", template.key, metric.key),
-                title: format!("{} {}", template.name, metric.key.replace('_', " ")),
+                title: metric.title.unwrap_or_else(|| {
+                    format!("{} {}", template.name, metric.key.replace('_', " "))
+                }),
                 unit: metric.unit,
                 collector: collector_of(&template.key),
                 description: metric.description,

@@ -292,6 +292,7 @@ async fn to_metric<C: ConnectionTrait>(
     Ok(Metric {
         states: template_items::metric_states::read(connection, row.id).await?,
         key: row.key,
+        title: row.title,
         counter: row.counter,
         unit: row.unit,
         total: row.total,
@@ -700,6 +701,7 @@ async fn write_metrics<C: ConnectionTrait>(
             counters_id: counters,
             key: metric.key.clone(),
             position: i32::try_from(position)?,
+            title: metric.title.clone(),
             counter: metric.counter.clone(),
             unit: metric.unit.clone(),
             total: metric.total,

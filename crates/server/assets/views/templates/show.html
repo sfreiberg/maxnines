@@ -163,7 +163,7 @@
     <tbody>
       {% for metric in metrics %}
       <tr>
-        <td><code>{{ metric.name }}</code>{% if metric.description %}<span class="under">{{ metric.description }}</span>{% endif %}</td>
+        <td>{{ metric.title }}<span class="under"><code>{{ metric.name }}</code>{% if metric.description %} · {{ metric.description }}{% endif %}</span></td>
         <td>{{ metric.kind }}</td>
         <td>{{ metric.labels }}</td>
         <td>{{ metric.unit }}</td>

@@ -60,7 +60,7 @@ Everything listed, with:
 | --- | --- |
 | `hcl` | The template, written out from its parts |
 | `template` | The template read, field by field, as the HCL has it |
-| `metrics` | Its own metrics, each with its full `name`, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
+| `metrics` | Its own metrics, each with its full `name`, the `title` charts call it, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
 | `alerts` | Each of its alerts, by `key`, with the `rule` in use, as [alert rules](api-alert-rules.md) are given, and where that's your own copy of a built-in template's, the built-in one as `built_in_rule`, `null` otherwise |
 | `choices` | Each discover block, query or counters block you've changed or turned on or off: its `kind`, `discover`, `query` or `counters`, its `key`, whether you have your own copy of it, `copied`, `enabled_choice`, and `original_changed_at`, when a newer version changed the template's own under your copy |
 | `copies` | Your copies, each as `template` has the part, with its `kind` |

@@ -92,6 +92,7 @@ pub struct VersionForm {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct MetricForm {
     pub key: String,
+    pub title: String,
     pub counter: String,
     pub unit: String,
     pub total: bool,
@@ -213,6 +214,7 @@ impl MetricForm {
     fn new(metric: &Metric) -> Self {
         Self {
             key: metric.key.clone(),
+            title: text(&metric.title),
             counter: text(&metric.counter),
             unit: text(&metric.unit),
             total: metric.total,
@@ -230,6 +232,7 @@ impl MetricForm {
         });
         Metric {
             key: self.key.trim().to_string(),
+            title: optional(&self.title),
             counter: optional(&self.counter),
             unit: optional(&self.unit),
             total: self.total,
@@ -555,6 +558,7 @@ impl TemplateForm {
         };
         let metric = |prefix: &str| MetricForm {
             key: get(&format!("{prefix}key")),
+            title: get(&format!("{prefix}title")),
             counter: get(&format!("{prefix}counter")),
             unit: get(&format!("{prefix}unit")),
             total: on(&format!("{prefix}total")),
@@ -834,6 +838,7 @@ impl TemplateForm {
         }
         let metric = |prefix: String, metric: &MetricForm, put: &mut dyn FnMut(String, &str)| {
             put(format!("{prefix}key"), &metric.key);
+            put(format!("{prefix}title"), &metric.title);
             put(format!("{prefix}counter"), &metric.counter);
             put(format!("{prefix}unit"), &metric.unit);
             if metric.total {

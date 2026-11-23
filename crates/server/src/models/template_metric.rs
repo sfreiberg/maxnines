@@ -10,6 +10,7 @@ pub struct Model {
     pub counters_id: Option<i64>,
     pub key: String,
     pub position: i32,
+    pub title: Option<String>,
     pub counter: Option<String>,
     pub unit: Option<String>,
     pub total: bool,

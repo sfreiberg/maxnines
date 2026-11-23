@@ -1595,7 +1595,7 @@ async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
     database.set_query_choice(sessions, Some(false)).await;
     template.queries[0].sql = template.queries[0]
         .sql
-        .replace("AS lock_waits", "AS locks_waiting");
+        .replace("pid <> pg_backend_pid()", "pid != pg_backend_pid()");
     template.queries[0].interval = Some("2m".to_string());
     template.discover[0].interval = Some("5m".to_string());
     let slots = template
@@ -1716,7 +1716,7 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
     database.set_query_choice(sessions, Some(false)).await;
     database
         .sync_templates(
-            &shipped(&[&POSTGRES.replace("AS lock_waits", "AS locks_waiting")]),
+            &shipped(&[&POSTGRES.replace("pid <> pg_backend_pid()", "pid != pg_backend_pid()")]),
             crate::times::now(),
         )
         .await

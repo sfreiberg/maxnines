@@ -103,6 +103,41 @@ mod tests {
         }
     }
 
+    /// What charts and lists call a built-in metric is written for it, not made up
+    /// from its key.
+    #[test]
+    fn every_built_in_metric_has_a_title_of_its_own() {
+        for built_in in all().unwrap() {
+            let template = &built_in.template;
+            let metrics = template.queries.iter().flat_map(|query| {
+                crate::templates::query_columns_of(template, query)
+                    .into_iter()
+                    .filter(|column| !query.labels.contains(column))
+                    .chain(query.metrics.iter().map(|metric| metric.key.clone()))
+                    .map(move |key| (key, query))
+            });
+            for (key, query) in metrics {
+                let titled = query
+                    .metrics
+                    .iter()
+                    .any(|metric| metric.key == key && metric.title.is_some());
+                assert!(titled, "{}.{key} has no title", template.key);
+            }
+        }
+        let catalog = crate::catalog::Catalog::with_templates(
+            all().unwrap().iter().map(|built_in| &built_in.template),
+        );
+        assert_eq!(catalog.find("postgres.up").unwrap().title, "PostgreSQL up");
+        assert_eq!(
+            catalog.find("postgres.xid_age").unwrap().title,
+            "PostgreSQL transaction ID age (wraparound)"
+        );
+        assert_eq!(
+            catalog.find("clickhouse.up").unwrap().title,
+            "ClickHouse up"
+        );
+    }
+
     #[test]
     fn every_built_in_key_is_in_the_released_list() {
         let released = released();

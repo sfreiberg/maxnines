@@ -28,6 +28,8 @@ pub const MAX_KEY_LEN: usize = 64;
 /// What names and descriptions can hold.
 pub const MAX_NAME_LEN: usize = 255;
 pub const MAX_DESCRIPTION_LEN: usize = 1000;
+/// What a metric's title can hold.
+pub const MAX_TITLE_LEN: usize = 100;
 
 /// The operating systems a template can be for, by the `os.family` agents report.
 pub const OPERATING_SYSTEMS: [&str; 4] = ["freebsd", "linux", "macos", "windows"];
@@ -231,6 +233,9 @@ pub struct Join {
 pub struct Metric {
     /// Its name, after the template's key: `lag` for `postgres.lag`.
     pub key: String,
+    /// What charts and lists call it, such as `PostgreSQL replication lag`. Without
+    /// one it's the template's name and the key in words.
+    pub title: Option<String>,
     /// The performance counter it reads, for counters.
     pub counter: Option<String>,
     pub unit: Option<String>,
@@ -922,6 +927,17 @@ fn check_metric(
             "unit",
             format!("{unit:?} isn't a unit: use {}", UNITS.join(", ")),
         );
+    }
+    if let Some(title) = &metric.title {
+        if title.trim().is_empty() {
+            say(place, "title", "can't be empty".to_string());
+        } else if title.chars().count() > MAX_TITLE_LEN {
+            say(
+                place,
+                "title",
+                format!("can be up to {MAX_TITLE_LEN} characters"),
+            );
+        }
     }
     if let Some(description) = &metric.description
         && description.len() > MAX_DESCRIPTION_LEN
