@@ -200,7 +200,7 @@ built-in **Database account can do more than read** alert fires for it. The acco
 still used. The accounts above can do none of these, but a template that reads your own
 tables needs `SELECT` on them and nothing more, such as `GRANT SELECT ON shop.orders TO
 maxnines`. On MySQL and MariaDB, roles count whether or not they're in use, as the
-account could start using one. On PostgreSQL 14 and older, everyone can create tables
+account could start using one, and so do roles given to those roles. On PostgreSQL 14 and older, everyone can create tables
 in the `public` schema unless that's taken away, which counts as writing:
 
 ```sql

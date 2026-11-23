@@ -143,8 +143,9 @@ impl Session {
 }
 
 impl Session {
-    /// What MariaDB's roles give, each put in use in turn, and any role it's given
-    /// in turn too, with the role that was in use put back after, whatever happens.
+    /// What MariaDB's roles give, each the account is given put in use in turn, with
+    /// the role that was in use put back after, whatever happens. MariaDB lists what
+    /// roles given to a role give with it, and won't put one of those in use itself.
     async fn mariadb_role_grants(&mut self, roles: Vec<String>) -> Result<Vec<String>> {
         let rows = self
             .run("SELECT CURRENT_ROLE() AS role", STATEMENT_LIMIT)
@@ -154,19 +155,11 @@ impl Session {
             _ => "NONE".to_string(),
         };
         let mut grants = Vec::new();
-        let mut seen = Vec::new();
-        let mut to_see = roles;
         let outcome = async {
-            while let Some(role) = to_see.pop() {
-                if seen.contains(&role) {
-                    continue;
-                }
+            for role in &roles {
                 self.run(&format!("SET ROLE {role}"), STATEMENT_LIMIT)
                     .await?;
-                let found = lines(&self.run("SHOW GRANTS", STATEMENT_LIMIT).await?);
-                to_see.extend(roles_in(&found));
-                grants.extend(found);
-                seen.push(role);
+                grants.extend(lines(&self.run("SHOW GRANTS", STATEMENT_LIMIT).await?));
             }
             anyhow::Ok(())
         }
@@ -462,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_real_mysql_account_is_found_to_write_through_a_role_it_isnt_using() {
+    async fn a_real_mysql_account_is_found_to_write_through_roles_it_isnt_using() {
         use mysql_async::prelude::Queryable;
         let Some((target, admin)) = server("MAXNINES_TEST_CHECK_MYSQL") else {
             return;
@@ -486,10 +479,15 @@ mod tests {
         let mut reads = session(CheckKind::Mysql, &target, &name);
         assert_eq!(reads.privileges().await.unwrap(), Privileges::default());
 
-        // A role it's been given but isn't using still counts.
+        // A role it's been given but isn't using still counts, and so does one given
+        // to that role, which MariaDB won't put in use on its own.
+        let inner = format!("'{name}_inner'");
         for statement in [
+            format!("DROP ROLE IF EXISTS {inner}"),
             format!("CREATE ROLE {role}"),
-            format!("GRANT INSERT ON maxnines_nowhere.* TO {role}"),
+            format!("CREATE ROLE {inner}"),
+            format!("GRANT INSERT ON maxnines_nowhere.* TO {inner}"),
+            format!("GRANT {inner} TO {role}"),
             format!("GRANT {role} TO {account}"),
         ] {
             connection.query_drop(statement).await.unwrap();
@@ -509,7 +507,11 @@ mod tests {
         );
 
         drop((reads, writes));
-        for statement in [format!("DROP USER {account}"), format!("DROP ROLE {role}")] {
+        for statement in [
+            format!("DROP USER {account}"),
+            format!("DROP ROLE {role}"),
+            format!("DROP ROLE {inner}"),
+        ] {
             connection.query_drop(statement).await.unwrap();
         }
     }
