@@ -1,7 +1,7 @@
 //! The templates that ship inside the server, from its `templates/` folder. They're
 //! written to the database as it starts: see [`crate::models::Database::sync_templates`].
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use ring::digest::{SHA256, digest};
 use rust_embed::RustEmbed;
 use serde_json::{Map, Value};
@@ -32,8 +32,19 @@ pub fn fingerprint(template: &Template) -> String {
 }
 
 /// Every built-in template, by file name, each read and checked as a template
-/// someone added would be.
+/// someone added would be, once, as they're the same for as long as it runs.
 pub fn all() -> Result<Vec<BuiltIn>> {
+    shipped().map(<[BuiltIn]>::to_vec)
+}
+
+fn shipped() -> Result<&'static [BuiltIn]> {
+    static ALL: std::sync::OnceLock<Result<Vec<BuiltIn>, String>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| read_all().map_err(|error| format!("{error:#}")))
+        .as_deref()
+        .map_err(|error| anyhow!(error.clone()))
+}
+
+fn read_all() -> Result<Vec<BuiltIn>> {
     let mut names: Vec<_> = Files::iter().collect();
     names.sort();
     let mut all: Vec<BuiltIn> = Vec::new();
@@ -56,21 +67,16 @@ pub fn all() -> Result<Vec<BuiltIn>> {
 
 /// A built-in template's agent settings, as this server was built with it, which
 /// is the only place a template's settings come from, as only built-in ones have
-/// any.
+/// any. The server doesn't start if the built-in templates can't be read, so
+/// they always can be here.
 pub fn config_of(key: &str) -> Option<serde_json::Map<String, Value>> {
-    static CONFIGS: std::sync::OnceLock<Vec<(String, serde_json::Map<String, Value>)>> =
-        std::sync::OnceLock::new();
-    let configs = CONFIGS.get_or_init(|| {
-        all()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|one| Some((one.template.key, one.template.config?)))
-            .collect()
-    });
-    configs
+    shipped()
+        .ok()?
         .iter()
-        .find(|(of, _)| of == key)
-        .map(|(_, config)| config.clone())
+        .find(|one| one.template.key == key)?
+        .template
+        .config
+        .clone()
 }
 
 /// A built-in template from its file, read and checked.
