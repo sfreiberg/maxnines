@@ -1412,3 +1412,98 @@ async fn a_database_check_reads_its_stats_as_the_hosts() {
         page.body
     );
 }
+
+/// What the API has of a host's metric over the last hour.
+async fn host_metric(server: &TestServer, host_id: &str, metric: &str) -> Value {
+    let path = format!("/api/v1/hosts/{host_id}/metrics/{metric}?range=1h");
+    let (_, body) = api(server, "GET", &path, &Value::Null).await;
+    body
+}
+
+/// Reads the throwaway PostgreSQL the checks crate's tests use, named as
+/// `host:port username`, for a template, as a host with no agent: discovered,
+/// then read for the queries discovery picks, as an agent's would be.
+#[tokio::test]
+async fn a_database_check_reads_what_templates_have_it_read() {
+    let Ok(real) = std::env::var("MAXNINES_TEST_CHECK_POSTGRES") else {
+        return;
+    };
+    let (target, username) = real.split_once(' ').unwrap();
+    let server = start_with_metrics().await;
+    let database = &server.state.database;
+    let template = crate::templates::load(
+        r#"template "pgt" {
+             name     = "PG test"
+             database = "postgres"
+             discover "server" {
+               sql = "SELECT current_setting('server_version') AS version"
+             }
+             query "activity" {
+               since    = "10"
+               interval = "1s"
+               sql      = "SELECT count(*) AS sessions FROM pg_stat_activity"
+             }
+           }"#,
+        &json!({}),
+        &crate::catalog::Catalog::built_in(),
+    )
+    .unwrap();
+    database
+        .import_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    let id = add_host(&server, "orders-db").await;
+    let check = |read_stats: bool| {
+        json!({
+            "host_id": id,
+            "check": { "name": "orders", "kind": "postgres", "target": target },
+            "interval_secs": 10,
+            "username": username,
+            "read_stats": read_stats,
+        })
+    };
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check(true)).await;
+    assert_eq!(status, 201, "{added}");
+    let mut scheduler = check_scheduler(&server);
+
+    // Each run saves what was read since the last, so discovery comes first, then
+    // the query it lets run, the series labelled with the check's name.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = crate::times::now();
+    let sessions = loop {
+        run_due(&mut scheduler, now).await;
+        let body = host_metric(&server, &id, "pgt.sessions").await;
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| !lines.is_empty())
+        {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "no pgt.sessions: {body}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        now += TimeDelta::seconds(11);
+    };
+    assert!(sessions.to_string().contains("orders"), "{sessions}");
+    let found = database.discoveries(&id).await.unwrap();
+    assert_eq!(found.len(), 1, "{found:?}");
+    let (_, values) = found.iter().next().unwrap();
+    assert!(values["version"].is_string(), "{values:?}");
+    // Whether it answered, and what its account may do, as an agent says.
+    for metric in ["pgt.up", "database_account.overprivileged"] {
+        let body = host_metric(&server, &id, metric).await;
+        assert!(
+            body["series"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty()),
+            "no {metric}: {body}"
+        );
+    }
+
+    // A check that doesn't read stats has nothing read, and what discovery found
+    // through it is forgotten.
+    let path = format!("/api/v1/remote-checks/{}", added["id"]);
+    let (status, body) = api(&server, "PUT", &path, &check(false)).await;
+    assert_eq!(status, 204, "{body}");
+    run_due(&mut scheduler, now + TimeDelta::seconds(11)).await;
+    assert!(database.discoveries(&id).await.unwrap().is_empty());
+}

@@ -110,6 +110,12 @@ replication**, with any extras. Its stats are charted on the host's metrics page
 listed under **Latest databases** there, as an agent's are, named after the check.
 The server keeps one connection open between runs, as an agent does.
 
+A check that reads its stats is read for [templates](#templates) too, as a database in
+an agent's config is: the server runs each template for the check's kind that's for
+the host, discovery first and then its queries, on the same schedules, retries and
+limits as an agent, with what the account may do read too. What's read is saved as the
+host's each time the check runs, the series named after the check.
+
 ## The account to sign in as
 
 Give the agent an account of its own, which can read statistics and change nothing.

@@ -24,6 +24,7 @@ use crate::models::Database;
 use crate::presence::{Presence, Reached};
 use crate::registration::{HostState, Registry};
 use crate::store::{NewSample, WriterCommand};
+use crate::templates::agentless::AgentlessTemplates;
 use crate::times::{self, Timestamp};
 
 /// The built-in host the server records its own metrics under. See the migration
@@ -378,6 +379,8 @@ pub struct Scheduler {
     next_run: HashMap<i64, (Timestamp, RemoteCheckInput)>,
     /// For each check that reads a database's stats, by ID.
     readers: HashMap<i64, StatsReader>,
+    /// What templates have read through those checks.
+    templates: AgentlessTemplates,
 }
 
 impl Scheduler {
@@ -397,6 +400,7 @@ impl Scheduler {
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             next_run: HashMap::new(),
             readers: HashMap::new(),
+            templates: AgentlessTemplates::default(),
         }
     }
 
@@ -438,6 +442,17 @@ impl Scheduler {
             .map(|check| (check.id, check.input.host_id.clone()))
             .collect();
         self.presence.keep_checks(&about_hosts);
+        // What templates read is kept apart, so a failure there holds up no checks.
+        if let Err(error) = self
+            .templates
+            .keep(&self.database, &checks, &agentless)
+            .await
+        {
+            warn!(
+                error = format!("{error:#}"),
+                "working out what templates read on hosts with no agent failed"
+            );
+        }
 
         let mut started = Vec::new();
         for check in checks {
@@ -511,11 +526,17 @@ impl Scheduler {
         let writer = self.writer.clone();
         let (results, presence) = (self.results.clone(), self.presence.clone());
         let reader = self.readers.get(&check.id).map(|kept| kept.reader.clone());
+        let templates = self.templates.reads(check.id);
+        let database = self.database.clone();
         tokio::spawn(async move {
             let _slot = slot;
             run(&check, hostname.clone(), &writer, &results, &presence).await;
             if let Some(reader) = reader {
-                read_stats(&check, hostname, &writer, &reader).await;
+                read_stats(&check, hostname.clone(), &writer, &reader).await;
+            }
+            if let Some(templates) = templates {
+                let host_id = check.input.host_id.clone();
+                templates.save(&database, &writer, host_id, hostname).await;
             }
         })
     }

@@ -87,7 +87,7 @@ One field says what a template is for, and it runs once for each match on a host
 
 | Field | Runs |
 | --- | --- |
-| `database = "postgres"` | Once for each database of this kind in the agent's config |
+| `database = "postgres"` | Once for each database of this kind in the agent's config, or on a host without an agent, each database check of this kind that reads its stats |
 | `service = "W3SVC"` | Once on each Windows host with this service |
 | `os = ["linux", "freebsd"]` | Once on each host running one of these: `freebsd`, `linux`, `macos` and `windows`. Its alerts only apply to those hosts |
 | none | Once on every host, agentless ones too |
@@ -101,7 +101,9 @@ host's own **Service stopped** alert should watch.
 
 Databases are found from the `agent.databases` fact, which names each database in the
 agent's config with its kind, such as `{"orders": "postgres"}`, and services from the
-`services` fact, the services Windows has installed.
+`services` fact, the services Windows has installed. On a [host without an
+agent](agentless-hosts.md), a database check that reads its stats is a database,
+named after the check, and of the check's kind.
 
 ### Which hosts it's for
 
@@ -147,6 +149,12 @@ SQL it's sent. A template that isn't for a database is sent once for each host i
 for that runs what it's for, if it reads anything, but performance counters and
 registry values aren't sent or read yet, so agents have nothing to run for one so far.
 Templates for a Windows service aren't sent until then.
+
+On a host without an agent, the server reads its databases itself, the same way and
+with the same limits: what's read through each database check is worked out as an
+agent's would be, read as an agent reads it, and saved as a sample from the host each
+time the check runs. What's read is worked out again when templates, checks or what
+discovery found change, and at least once a minute.
 
 ### Queries
 

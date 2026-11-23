@@ -10,6 +10,7 @@ use tokio::sync::{Mutex, watch};
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::Database;
 use crate::rule_engine::{ConfigRules, Host, ResolvedConfig};
+use crate::templates::hosts::agent_databases;
 use crate::templates::work::work_for;
 
 pub struct AgentConfigs {
@@ -78,7 +79,8 @@ impl AgentConfigs {
         let mut resolved = rules.resolve(&host)?;
         let templates = self.database.running_templates();
         let discoveries = self.database.discoveries(host_id).await?;
-        resolved.config.templates = work_for(&templates, &host, &discoveries);
+        let databases = agent_databases(&facts);
+        resolved.config.templates = work_for(&templates, &host, &databases, &discoveries);
         resolved.version = resolved.config.version()?;
         Ok(resolved)
     }

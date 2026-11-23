@@ -17,14 +17,13 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use maxnines_protocol::is_page_name;
 use maxnines_protocol::templates::work::{DiscoverWork, MAX_WORK, QueryWork, TemplateWork};
 use maxnines_protocol::templates::{
     DEFAULT_DISCOVERY_INTERVAL, Query, Target, Template, Version, fill, parse_duration,
 };
 use tracing::warn;
 
-use super::hosts::RunningTemplates;
+use super::hosts::{DatabaseKinds, RunningTemplates};
 use crate::metrics::{INSTANCE_LABEL, series_values};
 use crate::rule_engine::{Condition, Host};
 
@@ -122,10 +121,12 @@ fn seconds(text: Option<&String>) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// What the agent on this host is sent to read.
+/// What's read for templates on this host, of its `databases`: what its agent is
+/// sent, or what the server reads itself for a host with no agent.
 pub fn work_for(
     templates: &RunningTemplates,
     host: &Host,
+    databases: &DatabaseKinds,
     discoveries: &Discoveries,
 ) -> Vec<TemplateWork> {
     let mut work = Vec::new();
@@ -133,9 +134,8 @@ pub fn work_for(
         let template = assigned.template();
         match &template.target {
             Some(Target::Database(_)) => {
-                // A name an agent's config couldn't have is a fact gone wrong.
-                let databases = assigned.instances(host.facts).into_iter().flatten();
-                for database in databases.filter(|name| is_page_name(name)) {
+                let instances = assigned.instances(host.facts, databases);
+                for database in instances.into_iter().flatten() {
                     let found = discoveries.get(&(assigned.id(), database.clone()));
                     work.push(TemplateWork {
                         template: template.key.clone(),
@@ -154,7 +154,7 @@ pub fn work_for(
             Some(Target::Os(_)) | None => {
                 let reads_something =
                     !template.discover.is_empty() || !template.counters.is_empty();
-                if reads_something && !assigned.instances(host.facts).is_empty() {
+                if reads_something && !assigned.instances(host.facts, databases).is_empty() {
                     work.push(TemplateWork {
                         template: template.key.clone(),
                         database: None,
@@ -260,6 +260,7 @@ mod tests {
 
     use super::*;
     use crate::templates::hosts::Running;
+    use crate::templates::hosts::agent_databases;
 
     fn running(text: &str) -> RunningTemplates {
         RunningTemplates::new([Running {
@@ -302,6 +303,15 @@ mod tests {
         }
     "#;
 
+    /// What the agent on a host is sent, of the databases its facts say it has.
+    fn work_of(
+        templates: &RunningTemplates,
+        host: &Host,
+        discoveries: &Discoveries,
+    ) -> Vec<TemplateWork> {
+        work_for(templates, host, &agent_databases(host.facts), discoveries)
+    }
+
     fn facts() -> Value {
         json!({ "agent": { "databases": { "orders": "postgres", "cache": "mysql" } } })
     }
@@ -321,7 +331,7 @@ mod tests {
 
         // Before discovery, only what needs nothing found runs, for each postgres
         // database, every discover block with it.
-        let work = work_for(&templates, &host, &Discoveries::new());
+        let work = work_of(&templates, &host, &Discoveries::new());
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].database.as_deref(), Some("orders"));
         assert_eq!(work[0].discover.len(), 2);
@@ -336,7 +346,7 @@ mod tests {
                 values.as_object().unwrap().clone(),
             )])
         };
-        let work = work_for(&templates, &host, &found("16.4 (Debian 16.4-1)", "primary"));
+        let work = work_of(&templates, &host, &found("16.4 (Debian 16.4-1)", "primary"));
         assert_eq!(keys(&work[0]), ["always", "standbys", "wal"]);
         assert_eq!(work[0].queries[0].interval, Some(Duration::from_secs(60)));
         assert_eq!(work[0].queries[0].totals, ["one"]);
@@ -347,17 +357,17 @@ mod tests {
             "SELECT wal_bytes FROM pg_stat_wal AS wal_written"
         );
 
-        let work = work_for(&templates, &host, &found("14.1", "replica"));
+        let work = work_of(&templates, &host, &found("14.1", "replica"));
         assert_eq!(keys(&work[0]), ["always", "wal"]);
         // A metric only from a later version is left out.
         assert_eq!(work[0].queries[0].omit, ["two"]);
         assert_eq!(work[0].queries[1].sql, "SELECT 0 AS wal_written");
 
-        let work = work_for(&templates, &host, &found("13", "primary"));
+        let work = work_of(&templates, &host, &found("13", "primary"));
         assert_eq!(keys(&work[0]), ["always", "standbys"]);
 
         // Too old for the template, only discovery runs.
-        let work = work_for(&templates, &host, &found("9.6", "primary"));
+        let work = work_of(&templates, &host, &found("9.6", "primary"));
         assert!(keys(&work[0]).is_empty());
         assert_eq!(work[0].discover.len(), 2);
     }
@@ -379,7 +389,7 @@ mod tests {
                             object  = "Processor"
                             metrics = { busy = "% Processor Time" }
                           }"#;
-        let work = work_for(
+        let work = work_of(
             &os(counters),
             &Host::new(&windows, "a"),
             &Discoveries::new(),
@@ -388,8 +398,8 @@ mod tests {
         assert_eq!(work[0].database, None);
         assert!(work[0].queries.is_empty() && work[0].discover.is_empty());
         // Not on the systems it's for, or with nothing to read.
-        assert!(work_for(&os(counters), &Host::new(&linux, "a"), &Discoveries::new()).is_empty());
-        assert!(work_for(&os(""), &Host::new(&windows, "a"), &Discoveries::new()).is_empty());
+        assert!(work_of(&os(counters), &Host::new(&linux, "a"), &Discoveries::new()).is_empty());
+        assert!(work_of(&os(""), &Host::new(&windows, "a"), &Discoveries::new()).is_empty());
     }
 
     #[test]
@@ -400,7 +410,7 @@ mod tests {
             .chain([("two words".to_string(), json!("postgres"))])
             .collect();
         let facts = json!({ "agent": { "databases": databases } });
-        let work = work_for(&templates, &Host::new(&facts, "a"), &Discoveries::new());
+        let work = work_of(&templates, &Host::new(&facts, "a"), &Discoveries::new());
         assert_eq!(work.len(), MAX_WORK);
         assert!(
             work.iter()
@@ -418,16 +428,16 @@ mod tests {
             host_ids: BTreeSet::new(),
         }]);
         let facts = facts();
-        assert!(work_for(&templates, &Host::new(&facts, "a"), &Discoveries::new()).is_empty());
+        assert!(work_of(&templates, &Host::new(&facts, "a"), &Discoveries::new()).is_empty());
 
         let elsewhere = RunningTemplates::new([Running {
             id: 7,
             template: maxnines_protocol::templates::parse(APP).unwrap(),
             host_ids: BTreeSet::from(["b".to_string()]),
         }]);
-        assert!(work_for(&elsewhere, &Host::new(&facts, "a"), &Discoveries::new()).is_empty());
+        assert!(work_of(&elsewhere, &Host::new(&facts, "a"), &Discoveries::new()).is_empty());
         assert_eq!(
-            work_for(&elsewhere, &Host::new(&facts, "b"), &Discoveries::new()).len(),
+            work_of(&elsewhere, &Host::new(&facts, "b"), &Discoveries::new()).len(),
             1
         );
     }

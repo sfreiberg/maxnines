@@ -2,14 +2,17 @@
 //!
 //! A template is for the hosts given it by hand, and those its `applies_to`
 //! condition picks by their facts. With neither, it's for every host. On a host
-//! it's for, what it runs for is found from the host's facts: each database of its
-//! kind the agent's config has, the service if the host has it, or the host itself.
+//! it's for, what it runs for is found from the host's databases and facts: each
+//! database of its kind, the service if the host has it, or the host itself. A
+//! host's databases are those its agent's config has, or, on a host with no agent,
+//! its database checks that read stats.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use serde_json::Value;
 
+use maxnines_protocol::is_page_name;
 use maxnines_protocol::templates::{Target, Template};
 
 use super::values::{QueryValues, worked_out};
@@ -81,23 +84,41 @@ impl Assigned {
             }
     }
 
-    /// What it runs for on a host it's for, from the host's facts: the names of
-    /// the databases of its kind in the agent's config, or nothing for a template
-    /// that runs once on the host. Empty when it finds nothing to run for.
-    pub fn instances(&self, facts: &Value) -> Vec<Option<String>> {
-        instances(self.template(), facts)
+    /// What it runs for on a host it's for, from the host's databases and facts:
+    /// the names of its databases of the template's kind, or nothing for a
+    /// template that runs once on the host. Empty when it finds nothing to run for.
+    pub fn instances(&self, facts: &Value, databases: &DatabaseKinds) -> Vec<Option<String>> {
+        instances(self.template(), facts, databases)
     }
 }
 
-/// What a template runs for on a host with these facts. See [`Assigned::instances`].
-pub fn instances(template: &Template, facts: &Value) -> Vec<Option<String>> {
+/// The databases on a host that templates can read, by name, with each one's kind.
+pub type DatabaseKinds = BTreeMap<String, String>;
+
+/// The databases an agent's config has, as its facts say. A name its config
+/// couldn't have is a fact gone wrong, so it's left out.
+pub fn agent_databases(facts: &Value) -> DatabaseKinds {
+    facts["agent"]["databases"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(name, _)| is_page_name(name))
+        .filter_map(|(name, kind)| Some((name.clone(), kind.as_str()?.to_string())))
+        .collect()
+}
+
+/// What a template runs for on a host with these facts and databases. See
+/// [`Assigned::instances`].
+pub fn instances(
+    template: &Template,
+    facts: &Value,
+    databases: &DatabaseKinds,
+) -> Vec<Option<String>> {
     match &template.target {
         None => vec![None],
-        Some(Target::Database(kind)) => facts["agent"]["databases"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .filter(|(_, found)| found.as_str() == Some(kind.as_str()))
+        Some(Target::Database(kind)) => databases
+            .iter()
+            .filter(|(_, found)| *found == kind)
             .map(|(name, _)| Some(name.clone()))
             .collect(),
         Some(Target::Service(service)) => {
@@ -237,7 +258,8 @@ mod tests {
             "agent": { "databases": { "orders": "postgres", "cache": "mysql", "stock": "postgres" } },
             "services": ["W3SVC", "Spooler"],
         });
-        let for_target = |target| instances(&template(Some(target), None), &facts);
+        let databases = agent_databases(&facts);
+        let for_target = |target| instances(&template(Some(target), None), &facts, &databases);
 
         assert_eq!(
             for_target(Target::Database("postgres".into())),
@@ -248,6 +270,14 @@ mod tests {
         assert!(for_target(Target::Service("MSSQLSERVER".into())).is_empty());
         assert_eq!(for_target(Target::Os(vec!["windows".into()])), [None]);
         assert!(for_target(Target::Os(vec!["linux".into()])).is_empty());
-        assert_eq!(instances(&template(None, None), &facts), [None]);
+        assert_eq!(instances(&template(None, None), &facts, &databases), [None]);
+
+        // A name no agent's config could have is a fact gone wrong.
+        let odd =
+            json!({ "agent": { "databases": { "two words": "postgres", "ok": "postgres" } } });
+        assert_eq!(
+            agent_databases(&odd),
+            DatabaseKinds::from([("ok".to_string(), "postgres".to_string())])
+        );
     }
 }

@@ -7,6 +7,7 @@
 //! checks as alert rules, with the template's own metrics known by their short and
 //! full names.
 
+pub mod agentless;
 pub mod built_in;
 pub mod hosts;
 pub mod values;
