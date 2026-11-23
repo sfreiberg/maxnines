@@ -98,7 +98,12 @@ connection is opened, the first time or again after the database restarts, disco
 runs at once, and a discover block that fails is tried again within a minute. A
 database that doesn't answer is tried again after 5 seconds, then waits doubling to a
 minute, with nothing else run meanwhile, and one with nothing due is checked each
-sample, so `<key>.up` is as recent as a sample. Templates can read PostgreSQL and MySQL so far.
+sample, so `<key>.up` is as recent as a sample. A statement the database refuses, or a
+database that can't be reached, is shown on the template's and the host's pages until
+it's right again, as [what's going
+wrong](templates.md#where-it-runs-and-whats-going-wrong). Templates can read
+PostgreSQL, MySQL and MariaDB so far, not MongoDB or ClickHouse, whose stats this
+page's readers still read.
 What the account may do beyond reading is read too, as [below](#what-the-account-may-do).
 
 ## Hosts without an agent

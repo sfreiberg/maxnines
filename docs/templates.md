@@ -7,10 +7,11 @@ back as it was.
 
 Templates are under **Settings > Templates**. The ones that come with MaxNines are
 written as the server starts, and an upgrade can bring new versions of them. A built-in
-template can't be edited or deleted. Changing one of its alerts makes a copy of your
-own, used in place of the built-in one, which upgrades never touch. A built-in template
-or alert can be disabled, which stays that way through upgrades. Admins see a notice on
-every page when an upgrade has changed a template, saying which alerts you have your
+template can't be edited or deleted. Changing one of its alerts, discover blocks,
+queries or counters blocks makes a copy of your own, used in place of the built-in
+one, which upgrades never touch. A built-in template, alert, query or counters block
+can be disabled, which stays that way through upgrades. Admins see a notice on every
+page when an upgrade has changed a template, saying which of its parts you have your
 own copies of, until one of them dismisses it.
 
 You can also **import** a template someone else wrote, from **Import** on the Templates
@@ -36,6 +37,22 @@ shown afterwards is written out from the parts.
 | Template | What it watches |
 | --- | --- |
 | **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules) |
+
+## What templates can read so far
+
+- **Databases:** PostgreSQL, and MySQL and MariaDB, with SQL. Templates can't read
+  MongoDB or ClickHouse yet: a template for either says so under **Where it runs**,
+  as `connecting`, and reads nothing. MongoDB isn't SQL, so it needs a way of its own
+  to be written in a template, which isn't decided yet.
+- **Windows:** performance counters and registry values, on hosts with an agent.
+- **What MaxNines reads itself:** MaxNines' own reading of
+  [database stats](database-stats.md) still runs beside templates, under its own
+  metric names, such as `postgres.lag`, so a template can't use those names. No
+  template for a database comes with MaxNines yet. Templates for PostgreSQL, MySQL and
+  then ClickHouse are to take its place, with templates for each operating system.
+
+Where a template is read, and how, is the same on an agent and on the server for a
+[host without an agent](#hosts-without-an-agent-and-maxnines-own-database).
 
 ## The format
 
@@ -158,23 +175,6 @@ for, and its counters blocks picked by `when` and `since` as queries are, each w
 only its metrics for the version found. What it finds is kept for the host, and its
 alerts with `when` or `since` are checked on the hosts where what was found fits.
 
-On a host without an agent, the server reads its databases itself, the same way and
-with the same limits: what's read through each database check is worked out as an
-agent's would be, read as an agent reads it, and saved as a sample from the host each
-time the check runs. What's read is worked out again when templates, checks or what
-discovery found change, and at least once a minute.
-
-The server also reads its own database, when it's PostgreSQL or MySQL, but only with
-the templates for that kind that come with MaxNines, exactly as this version of the
-server was built with them: never an imported template, one of your own, or your copy
-of a query, so nothing but SQL that shipped runs over the server's own connection.
-Each statement is read-only, as every template's is, and its series are on the
-**MaxNines server** host, named `maxnines`. Your changes to those templates' alerts
-still apply there. As the server's account has to be able to write, what it may do
-beyond reading isn't reported. To read MaxNines' own database with other templates,
-add a database check for it with an account that can only read. No template for a
-database comes with MaxNines yet, so for now nothing is read.
-
 ### Queries
 
 `query` blocks are SQL whose columns become metrics:
@@ -233,15 +233,12 @@ query "checkpoints" {
 `interval` runs a query less often than the agent samples, and `enabled = false`
 ships it turned off.
 
-**How SQL runs.** Each query and discover block has to be one `SELECT`. It runs on its
-own, as a prepared statement, in a read-only transaction that's rolled back afterwards,
-and the database stops it after 5 seconds. PostgreSQL and MySQL databases can be read
-so far. A template can run any `SELECT` its account is allowed to, so give MaxNines an
-account that can only read what monitoring needs, such as one in PostgreSQL's
-`pg_monitor` role. MaxNines checks what the account may do whenever it connects and
-every 5 minutes, and an account that can do more than read, such as change data or
-create accounts, fires **Database account can do more than read**. It's still used:
-[what the account may do](database-stats.md#what-the-account-may-do) is up to you.
+**How SQL runs.** Each query and discover block has to be one `SELECT`, which saving
+checks. It runs on its own, as a prepared statement, in a read-only transaction that's
+rolled back afterwards, and the database stops it after 5 seconds. On MySQL and
+MariaDB the whole session is read-only too, as MySQL ends a transaction before
+anything that changes a table. A template can still run any `SELECT` its account is
+allowed to, so give MaxNines a [read-only account](#read-only-database-accounts).
 
 ### Performance counters
 
@@ -350,6 +347,91 @@ notice "cannot_see_sessions" {
   text = "The account can't see other sessions. Grant it pg_monitor."
 }
 ```
+
+## Hosts without an agent, and MaxNines' own database
+
+On a [host without an agent](agentless-hosts.md), the server reads its databases
+itself, through its database checks that have **Read its health and replication**
+ticked: each is a database, named after the check and of its kind, and the templates
+for that kind that are for the host run for it. What's read is worked out as an
+agent's would be, read the same way, with the same schedules, retries and limits,
+and saved as a sample from the host each time the check runs, so it's read no more
+often than the check runs, every 10 seconds at most. A check without that ticked
+runs no template SQL. What's read is worked out again when templates, checks or what
+discovery found change, and at least once a minute. Changing a check starts its
+reading again, running totals too. Templates for Windows aren't read on these hosts,
+and a `value` there has no facts to work from.
+
+The server also reads its own database, when it's PostgreSQL or MySQL, but only with
+the templates for that kind that come with MaxNines, exactly as this version of the
+server was built with them: never an imported template, one of your own, or your copy
+of a part of one, so nothing but SQL that shipped runs over the server's own
+connection, and whether it runs is whether the template ships on, whatever's chosen
+on its page. Each statement is read-only, as every template's is, and its series are
+on the **MaxNines server** host, named `maxnines`. Your changes to those templates'
+alerts still apply there. As the server's account has to be able to write, what it
+may do beyond reading isn't reported. To read MaxNines' own database with other
+templates, add a database check for it with a [read-only
+account](#read-only-database-accounts). No template for a database comes with
+MaxNines yet, so for now nothing is read.
+
+## Read-only database accounts
+
+MaxNines only ever reads, but a template's SQL runs as whatever account the agent or
+the database check signs in as, so what that account may do is what a template could
+do. Give it an account of its own that can read what monitoring needs and change
+nothing. Whenever it connects, and every 5 minutes, MaxNines reads what the account
+may do beyond reading, as the metrics `database_account.overprivileged`,
+`database_account.superuser`, `database_account.writes`,
+`database_account.manages` and `database_account.server_files`, one series for each
+database, and the built-in **Database account can do more than read** alert, in the
+**Host** template, warns about any that may do more. The account is still used, as
+what it may do is up to you: [what each
+counts](database-stats.md#what-the-account-may-do) is with the database stats. It's
+built into MaxNines rather than a template, so it can't be changed by changing a
+template; its alert can be changed or turned off.
+
+**PostgreSQL**
+
+```sql
+CREATE ROLE maxnines WITH LOGIN PASSWORD 'a long random password' CONNECTION LIMIT 3;
+GRANT pg_monitor TO maxnines;
+ALTER ROLE maxnines SET default_transaction_read_only = on;
+```
+
+On PostgreSQL 14 and older, everyone can create tables in the `public` schema until
+that's taken away, which counts as writing, so the alert warns until you run:
+
+```sql
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+```
+
+A role the account is in only after `SET ROLE`, one made `NOINHERIT`, isn't looked at.
+
+**MySQL**
+
+```sql
+CREATE USER 'maxnines'@'127.0.0.1' IDENTIFIED BY 'a long random password'
+  WITH MAX_USER_CONNECTIONS 3;
+GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'maxnines'@'127.0.0.1';
+GRANT SELECT ON performance_schema.* TO 'maxnines'@'127.0.0.1';
+```
+
+**MariaDB**
+
+The same as MySQL, and on 10.5.9 and later also:
+
+```sql
+GRANT REPLICA MONITOR ON *.* TO 'maxnines'@'127.0.0.1';
+```
+
+On both, every role the account has been given counts, whether or not it's in use, as
+the account could start using it, and so do roles given to those roles.
+
+**Your own tables.** A template that reads your application's tables needs `SELECT`
+on them and nothing more, such as `GRANT SELECT ON shop.orders TO maxnines`.
+`EXECUTE` and `LOCK TABLES` don't count as writing, as MySQL's `sys` schema needs
+`EXECUTE`.
 
 ## Examples
 
