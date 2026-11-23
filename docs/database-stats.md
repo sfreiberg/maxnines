@@ -52,14 +52,20 @@ database "events" {
 The name is what the database's series are called, so it can't have spaces. Restart
 the agent after changing these.
 
-The agent tells the server the names of the databases its config allows, and nothing
-else. A [config rule](api-config-rules.md) then picks which to read, under
-**Databases from the agent's config**, one name to a line. A name an agent doesn't
-have reports that it's missing. Nothing is read until a rule asks for it.
+The agent tells the server the names and kinds of the databases its config allows,
+and nothing else.
 
-The host's metrics page lists each database under **Latest databases**: whether it
-answered, whether it's a primary or a replica, its version, and anything that
-couldn't be read, such as for want of a privilege.
+**PostgreSQL** is read by the built-in PostgreSQL [template](templates.md), for every
+PostgreSQL `database` block, with no rule needed. What it found, such as the version and
+whether it's a primary or a replica, and anything that went wrong, are on the
+template's page and the host's **Templates** card.
+
+**MySQL and MariaDB, MongoDB and ClickHouse** are read by MaxNines itself, once a
+[config rule](api-config-rules.md) picks them, under **Databases from the agent's
+config**, one name to a line. A name an agent doesn't have reports that it's missing.
+Nothing of these is read until a rule asks for it. The host's metrics page lists each
+under **Latest databases**: whether it answered, whether it's a primary or a replica,
+its version, and anything that couldn't be read, such as for want of a privilege.
 
 The agent keeps one connection to each database open between samples, and opens a
 new one if that stops working. Each of its reads has a 5 second limit, so a busy
@@ -71,7 +77,7 @@ After a database's name in a rule, list anything else to read, which costs more:
 
 | Extra | What it adds |
 |---|---|
-| `sizes` | Each database's size on disk. PostgreSQL adds the WAL kept, and MySQL the binary logs |
+| `sizes` | Each database's size on disk. MySQL adds the binary logs. For PostgreSQL, turn on the PostgreSQL template's `sizes` and `wal_size` queries on its page instead |
 | `queries` | ClickHouse only: how long queries took over the last five minutes, as the median, 95th and 99th percentiles for each kind of query, and how many failed. It's read from `system.query_log`, which keeps everything unless it's given a time to live, so it can be slow on a busy server |
 
 ClickHouse is read over its HTTP interface, where a password goes with every
@@ -102,8 +108,8 @@ sample, so `<key>.up` is as recent as a sample. A statement the database refuses
 database that can't be reached, is shown on the template's and the host's pages until
 it's right again, as [what's going
 wrong](templates.md#where-it-runs-and-whats-going-wrong). Templates can read
-PostgreSQL, MySQL and MariaDB so far, not MongoDB or ClickHouse, whose stats this
-page's readers still read.
+PostgreSQL, MySQL and MariaDB so far, not MongoDB or ClickHouse. PostgreSQL's stats
+are its built-in template's, and the other kinds' are still this page's readers'.
 What the account may do beyond reading is read too, as [below](#what-the-account-may-do).
 
 ## Hosts without an agent
@@ -111,9 +117,11 @@ What the account may do beyond reading is read too, as [below](#what-the-account
 For a database on a [host without an agent](agentless-hosts.md), such as a managed
 one, the server reads it instead. Add a PostgreSQL, MySQL, MongoDB or ClickHouse check about the
 host on the **Checks** page, with how it signs in, and tick **Read its health and
-replication**, with any extras. Its stats are charted on the host's metrics page and
-listed under **Latest databases** there, as an agent's are, named after the check.
-The server keeps one connection open between runs, as an agent does.
+replication**, with any extras. Its stats are charted on the host's metrics page, as
+an agent's are, named after the check, and for the kinds MaxNines reads itself, listed
+under **Latest databases** there. The server keeps one connection open between runs,
+as an agent does. A PostgreSQL check's stats are the built-in PostgreSQL template's,
+read as below.
 
 A check that reads its stats is read for [templates](#templates) too, as a database in
 an agent's config is: the server runs each template for the check's kind that's for
@@ -217,11 +225,11 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 Each kind of database has metrics of its own, named for it, such as
 `postgres.connections` and `mysql.connections`, so a chart or alert rule is always
 about one kind. Each value is a series named after the database, such as `orders`.
-Things a database has several of are named after both, such as `orders standby
-replica1`, `orders slot backups` or `shop database sales`. A PostgreSQL standby is
-named by its `application_name`, and standbys that share one, as they do when left
-at the default `walreceiver`, by their address too, such as `orders standby
-walreceiver 10.0.0.6`.
+Things a database has several of are named after both, such as `shop database sales`.
+PostgreSQL's, read by its template, are labelled instead, by the database as
+`instance` and by what they're of, so a replication slot is the series `orders,
+backups`, and a standby is labelled by its `application_name` and address, such as
+`orders, walreceiver, 10.0.0.6`.
 
 ### What most kinds have
 
@@ -239,7 +247,7 @@ Each of these is named for its kind, such as **PostgreSQL connections** or
 | **cache hit rate** | How much of what was read was already in memory, for PostgreSQL and MySQL |
 | **is a replica**, **replica receiving** | Its role, and whether a replica is still connected to what it replicates. Lag reads 0 when nothing's arriving, so check this too. Not ClickHouse, whose replicas all take writes |
 | **replication lag** | On a replica, how far behind it is. For PostgreSQL, also each standby, as its primary sees it, and for MongoDB each member, as **MongoDB member lag**. For ClickHouse, the furthest behind of its replicated tables |
-| **database size** | With the `sizes` extra |
+| **database size** | With the `sizes` extra, or for PostgreSQL its template's `sizes` query turned on |
 
 ### PostgreSQL
 
@@ -248,7 +256,8 @@ Each of these is named for its kind, such as **PostgreSQL connections** or
 | **PostgreSQL queries running**, **sessions idle in a transaction**, **sessions waiting on locks**, **longest idle in a transaction** | Sessions by what they're doing |
 | **PostgreSQL transactions**, **temporary files written** | Per second, across every database |
 | **PostgreSQL scheduled checkpoints**, **requested checkpoints** | Many requested ones mean `max_wal_size` is too small |
-| **PostgreSQL WAL written**, **WAL on disk** | Bytes per second on version 14 and later, and with the `sizes` extra |
+| **PostgreSQL WAL written**, **WAL on disk** | Bytes per second on version 14 and later, and with the template's `wal_size` query turned on |
+| **PostgreSQL blocks read**, **blocks hit** | Per second, from disk and from memory, which the cache hit rate is worked out from |
 | **PostgreSQL oldest transaction ID age** | How close it is to wraparound, which stops writes at about 2 billion |
 | **PostgreSQL prepared transactions** | Two-phase transactions never finished hold locks and cleanup back |
 | **PostgreSQL timeline** | Rises after a failover |
@@ -258,8 +267,14 @@ Each of these is named for its kind, such as **PostgreSQL connections** or
 | **PostgreSQL archiving failing**, **WAL files waiting to be archived** | When `archive_mode` is on |
 | **PostgreSQL subscription running**, **subscription errors** | Logical replication into the database signed in to |
 
-Versions 13 and later are what it's built for, and older ones leave out what they
-don't have. On Amazon Aurora, replicas don't report their lag this way.
+These are the built-in PostgreSQL template's, each charted by its name, such as
+**PostgreSQL xid age** for `postgres.xid_age`, and its page has each one's description,
+and it alerts on them itself: down, connections running out, a long transaction,
+transaction IDs running out, checksum failures, replicas and standbys lagging or not
+receiving, replication slots unused, holding WAL or lost, archiving failing and
+subscriptions stopped. Versions 13 and later are what it's built for, back to 10, and
+older ones leave out what they don't have. On Amazon Aurora, replicas don't report
+their lag this way.
 
 ### MySQL and MariaDB
 
@@ -327,13 +342,12 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 
 ## Good things to alert on
 
-- **answering** at 0, for each kind in use, such as **PostgreSQL answering**.
+PostgreSQL's template has its alerts already, as above. For the other kinds:
+
+- **answering** at 0, for each kind in use, such as **MySQL answering**.
 - **connections used** over 80%.
 - **replication lag** over a minute, and **replica receiving** at 0 on a replica.
 - **oldest transaction** over half an hour.
-- **PostgreSQL oldest transaction ID age** over a billion.
-- **PostgreSQL slot lost** at 1, or **WAL kept by replication slots** growing.
-- **PostgreSQL archiving failing** at 1.
 - **MySQL replication error code** above 0, or **replica applying** at 0.
 - **Galera cluster primary** at 0, or **cluster size** below what it should be.
 - **MongoDB replica set has a primary** at 0, or **members healthy** below the

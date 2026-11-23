@@ -9,6 +9,12 @@ use crate::templates::Refused;
 use crate::templates::built_in::{self, BuiltIn, from_source};
 use maxnines_protocol::templates::parse;
 
+/// How many alert rules a new server starts with: every built-in template's alerts.
+fn built_in_rules() -> usize {
+    let all = built_in::all().unwrap();
+    all.iter().map(|one| one.template.alerts.len()).sum()
+}
+
 fn shipped(sources: &[&str]) -> Vec<BuiltIn> {
     sources
         .iter()
@@ -76,11 +82,10 @@ async fn template_id(database: &Database, key: &str) -> i64 {
         .id
 }
 
-/// The PostgreSQL example as the docs have it, which is refused for its metrics'
-/// names: see [`crate::templates::postgres_example`].
-const POSTGRES_AS_WRITTEN: &str = include_str!("../../../../docs/examples/postgres.hcl");
+/// The built-in PostgreSQL template under another key: see
+/// [`crate::templates::postgres_as_pg`].
 static POSTGRES: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(crate::templates::postgres_example);
+    std::sync::LazyLock::new(crate::templates::postgres_as_pg);
 const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 /// The rule in use for a template's alert, and the template's own beside it if
@@ -105,16 +110,27 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
     assert!(database.template_upgrades().await.unwrap().is_empty());
 
     let templates = database.list_templates().await.unwrap();
-    assert_eq!(templates.len(), 1);
-    assert!(templates[0].origin == Origin::BuiltIn && templates[0].enabled);
-    assert_eq!(templates[0].template.key, "host");
+    let keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
+    assert_eq!(keys, ["host", "postgres"]);
+    for template in &templates {
+        assert!(template.origin == Origin::BuiltIn && template.enabled);
+    }
     let rules = database.list_alert_rules().await.unwrap();
-    assert_eq!(rules.len(), 9);
+    let alerts: usize = all.iter().map(|one| one.template.alerts.len()).sum();
+    assert_eq!(rules.len(), alerts);
     for rule in &rules {
         let link = rule.template.as_ref().unwrap();
-        assert_eq!(link.id, templates[0].id);
+        let template = templates.iter().find(|t| t.id == link.id).unwrap();
         assert!(link.replaces_id.is_none() && link.template_enabled);
-        assert!(rule.runs(), "{}", rule.rule.name);
+        // Only what ships turned off doesn't run.
+        let shipped_on = template
+            .template
+            .alerts
+            .iter()
+            .find(|alert| alert.name == rule.rule.name)
+            .unwrap()
+            .enabled;
+        assert_eq!(rule.runs(), shipped_on, "{}", rule.rule.name);
         assert!(rule.conditions.is_some(), "{}", rule.rule.name);
     }
 
@@ -492,7 +508,10 @@ async fn peoples_own_templates_are_changed_directly_with_no_copies() {
             .await
             .unwrap()
     );
-    assert_eq!(database.list_alert_rules().await.unwrap().len(), 9);
+    assert_eq!(
+        database.list_alert_rules().await.unwrap().len(),
+        built_in_rules()
+    );
 
     // The built-in one stays as it ships.
     let host_id = template_id(&database, "host").await;
@@ -548,7 +567,7 @@ async fn a_template_alert_on_its_own_metrics_is_checked_and_knows_what_discovery
     );
     let off = alerts
         .iter()
-        .find(|alert| alert.rule.rule.name == "Too few standbys")
+        .find(|alert| alert.rule.rule.name == "PG too few standbys")
         .unwrap();
     assert!(!off.rule.rule.enabled, "it ships off");
 }
@@ -599,7 +618,7 @@ async fn a_templates_alert_is_changed_through_the_alert_rules_api_by_its_short_n
         .create_template(&template, crate::times::now())
         .await
         .unwrap();
-    let lagging = rule(&server.state.database, "Replica lagging").await;
+    let lagging = rule(&server.state.database, "PG replica lagging").await;
     let path = format!("/api/v1/alert-rules/{}", lagging.id);
 
     let (status, shown) = api(&server, "GET", &path, &Value::Null).await;
@@ -681,7 +700,7 @@ async fn the_templates_pages_show_each_templates_alerts_metrics_and_hcl() {
     let page = browser.get(&server, &format!("/templates/{id}")).await;
     assert_eq!(page.status, 200, "{}", page.body);
     for expected in [
-        "Replica lagging",
+        "PG replica lagging",
         "<code>lag &gt; duration(&#39;30s&#39;)</code>",
         "pg.slot_retained",
         "Only for the databases where what discovery found fits",
@@ -1226,7 +1245,7 @@ async fn an_imported_template_is_replaced_by_a_newer_one_keeping_copies_and_what
             .unwrap()
     );
     let left = database.list_alert_rules().await.unwrap();
-    assert_eq!(left.len(), 10);
+    assert_eq!(left.len(), built_in_rules() + 1);
     let kept = left
         .iter()
         .find(|rule| rule.rule.name == "App slow")
@@ -1271,7 +1290,8 @@ async fn an_import_in_the_way_of_a_built_in_or_own_template_is_refused() {
         assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert!(database.import_outcome(template).await.is_err());
     }
-    assert_eq!(database.list_templates().await.unwrap().len(), 2);
+    // The two built-in ones, and the person's own.
+    assert_eq!(database.list_templates().await.unwrap().len(), 3);
 }
 
 #[tokio::test]
@@ -1291,7 +1311,7 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
     assert_eq!(page.status, 200, "{}", page.body);
     for expected in [
         "This would add a template.",
-        "Replica lagging",
+        "PG replica lagging",
         "pg.slot_retained",
         "FROM pg_stat_replication",
         "invalidation_reason IS NOT NULL",
@@ -1302,7 +1322,7 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
     assert!(page.has_only_our_scripts());
     assert_eq!(
         server.state.database.list_templates().await.unwrap().len(),
-        1
+        built_in::all().unwrap().len()
     );
 
     let broken = POSTGRES.replace("critical         = \"!up\"", "critical         = \"!upp\"");
@@ -1431,7 +1451,7 @@ async fn importing_shows_what_it_would_do_before_it_does_and_exports_read_back()
     let entries = server.state.database.audit_log(None, 200).await.unwrap();
     let postgres: Vec<&str> = entries
         .iter()
-        .filter(|entry| entry.subject.kind == "template" && entry.subject.name == "PostgreSQL")
+        .filter(|entry| entry.subject.kind == "template" && entry.subject.name == "PG")
         .map(|entry| entry.action.as_str())
         .collect();
     assert_eq!(postgres, ["changed", "created"]);
@@ -1565,7 +1585,9 @@ async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
     // A choice someone made of a query stays as its SQL changes, as does every row.
     let sessions = ids["query sessions"];
     database.set_query_choice(sessions, Some(false)).await;
-    template.queries[0].sql = template.queries[0].sql.replace("AS uptime", "AS up_for");
+    template.queries[0].sql = template.queries[0]
+        .sql
+        .replace("AS lock_waits", "AS locks_waiting");
     template.queries[0].interval = Some("2m".to_string());
     template.discover[0].interval = Some("5m".to_string());
     let slots = template
@@ -1573,7 +1595,12 @@ async fn saving_a_template_keeps_the_rows_of_the_parts_it_still_has() {
         .iter_mut()
         .find(|q| q.key == "slots")
         .unwrap();
-    slots.fills[2].versions.insert(
+    let lost = slots
+        .fills
+        .iter_mut()
+        .find(|fill| fill.key == "lost")
+        .unwrap();
+    lost.versions.insert(
         "17".to_string(),
         "invalidation_reason IS NOT NULL".to_string(),
     );
@@ -1681,7 +1708,7 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
     database.set_query_choice(sessions, Some(false)).await;
     database
         .sync_templates(
-            &shipped(&[&POSTGRES.replace("AS uptime", "AS up_for")]),
+            &shipped(&[&POSTGRES.replace("AS lock_waits", "AS locks_waiting")]),
             crate::times::now(),
         )
         .await
@@ -1693,8 +1720,8 @@ async fn importing_syncing_and_the_form_all_keep_the_rows_of_parts_still_there()
     let own = parse(
         &POSTGRES
             .replace("\"pg\" {", "\"mine\" {")
-            .replace("\"PostgreSQL\"", "\"Mine\"")
-            .replace("PostgreSQL down", "Mine down"),
+            .replace("\"PG\"", "\"Mine\"")
+            .replace("PG down", "Mine down"),
     )
     .unwrap();
     let mut own = own;
@@ -1770,7 +1797,7 @@ async fn the_documented_examples_are_served_to_read_and_import() {
     let mut browser = Browser::default();
     let page = browser.get(&server, "/docs/templates").await;
     assert_eq!(page.status, 200);
-    for (file, text) in [("postgres.hcl", POSTGRES_AS_WRITTEN), ("iis.hcl", IIS)] {
+    for (file, text) in [("iis.hcl", IIS)] {
         assert!(
             page.body
                 .contains(&format!(r#"href="/docs/examples/{file}""#)),

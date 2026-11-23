@@ -1,6 +1,6 @@
 use super::*;
 
-const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+const POSTGRES: &str = include_str!("../../../server/templates/postgres.hcl");
 const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 fn problems(text: &str) -> Vec<String> {
@@ -26,7 +26,7 @@ fn the_examples_are_read_and_have_nothing_wrong_with_them() {
 }
 
 #[test]
-fn the_postgres_example_is_read_as_written() {
+fn the_postgres_template_is_read_as_written() {
     let template = parse(POSTGRES).unwrap();
     assert_eq!(template.key, "postgres");
     assert_eq!(template.name, "PostgreSQL");
@@ -61,7 +61,7 @@ fn the_postgres_example_is_read_as_written() {
         throughput.fills[0].versions.get("12").map(String::as_str),
         Some("coalesce(sum(checksum_failures), 0)")
     );
-    assert_eq!(throughput.fills[0].older.as_deref(), Some("NULL"));
+    assert_eq!(throughput.fills[0].older.as_deref(), Some("0"));
     let cache_hit = throughput
         .metrics
         .iter()
@@ -330,7 +330,12 @@ fn every_version_of_a_query_is_filled_in() {
     assert_eq!(filled.len(), 3, "{filled:#?}");
     assert!(filled.iter().all(|sql| !sql.contains("{{")));
     assert!(
-        filled[0].contains("NULL         AS wal_status"),
+        filled[0].contains("NULL            AS slot_headroom"),
+        "{}",
+        filled[0]
+    );
+    assert!(
+        filled[0].contains("false                AS slot_lost"),
         "{}",
         filled[0]
     );

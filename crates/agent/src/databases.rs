@@ -1,6 +1,8 @@
 //! The databases collector: health, load and replication read from databases
 //! the agent's own config defines. How each kind is read is in
-//! [`maxnines_checks::databases`], which the server shares.
+//! [`maxnines_checks::databases`], which the server shares. A kind that's read only
+//! by templates, such as PostgreSQL, is left to them, as [`crate::templates`] reads
+//! every database the config defines whether a rule picks it or not.
 //!
 //! A `database` block holds where a database is and how to sign in, and a config
 //! rule picks which to read by name, and what extras to read from each. So a
@@ -14,7 +16,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, by_kind, is_database};
+use maxnines_checks::databases::{
+    Database, Reader, Settle, TIMEOUT, by_kind, has_reader, is_database,
+};
 use maxnines_protocol::{Check, CheckKind, DatabaseChoice, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -76,7 +80,7 @@ impl DatabaseDefinition {
             .filter(|kind| is_database(*kind))
             .with_context(|| {
                 format!(
-                    "{:?} isn't a kind of database, which are postgres, mysql and mongodb",
+                    "{:?} isn't a kind of database, which are postgres, mysql, mongodb and clickhouse",
                     self.kind
                 )
             })?;
@@ -137,6 +141,14 @@ impl DatabaseCollector {
         let limit = interval.min(TIMEOUT);
         for choice in chosen {
             let name = &choice.name;
+            // Templates read it, and nothing here can.
+            let templates_only = definitions
+                .get(name)
+                .and_then(|definition| CheckKind::parse(&definition.kind))
+                .is_some_and(|kind| is_database(kind) && !has_reader(kind));
+            if templates_only {
+                continue;
+            }
             let found = definitions
                 .get(name)
                 .context("the agent's config has no database by that name")
@@ -259,35 +271,33 @@ mod tests {
 
     #[test]
     fn a_rule_reads_the_databases_the_config_defines_and_only_those() {
-        let definitions =
-            DatabaseDefinitions::from([("orders".to_string(), defined("postgres", "127.0.0.1:0"))]);
-        let chosen = [
-            DatabaseChoice {
-                name: "orders".to_string(),
-                extras: Vec::new(),
-            },
-            DatabaseChoice {
-                name: "nowhere".to_string(),
-                extras: Vec::new(),
-            },
-        ];
+        let definitions = DatabaseDefinitions::from([
+            ("orders".to_string(), defined("mysql", "127.0.0.1:0")),
+            ("ledger".to_string(), defined("postgres", "127.0.0.1:0")),
+        ]);
+        let chosen = ["orders", "ledger", "nowhere"].map(|name| DatabaseChoice {
+            name: name.to_string(),
+            extras: Vec::new(),
+        });
         let mut collector =
             DatabaseCollector::new(&chosen, &definitions, Duration::from_millis(100)).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         let output = loop {
             let output = collector.collect().unwrap();
-            if output["postgres"].is_array() {
+            if output["mysql"].is_array() {
                 break output;
             }
             assert!(Instant::now() < deadline, "no rows");
             thread::sleep(Duration::from_millis(10));
         };
         // Each under its kind, so its values are its kind's own.
-        assert_eq!(output["postgres"][0]["name"], "orders");
-        assert_eq!(output["postgres"][0]["up"], 0, "{output}");
+        assert_eq!(output["mysql"][0]["name"], "orders");
+        assert_eq!(output["mysql"][0]["up"], 0, "{output}");
         assert_eq!(
             output["unknown"][0],
             json!({ "name": "nowhere", "up": 0, "error": "the agent's config has no database by that name" })
         );
+        // PostgreSQL is its template's to read.
+        assert!(output.get("postgres").is_none(), "{output}");
     }
 }

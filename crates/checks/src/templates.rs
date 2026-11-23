@@ -234,8 +234,16 @@ async fn run_postgres(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<
         anyhow::Ok(read)
     }
     .await;
-    // Nothing was written, as nothing could be, so there's nothing to keep.
-    client.batch_execute("ROLLBACK").await.map_err(pg_short)?;
+    // Nothing was written, as nothing could be in a read-only transaction. A read
+    // that worked commits, as one outside a transaction would, so the server's own
+    // count of rollbacks, which a template reads, isn't one for each statement it
+    // runs. One that failed is rolled back either way.
+    let end = if outcome.is_ok() {
+        "COMMIT"
+    } else {
+        "ROLLBACK"
+    };
+    client.batch_execute(end).await.map_err(pg_short)?;
     outcome
 }
 

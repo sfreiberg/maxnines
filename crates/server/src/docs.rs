@@ -669,9 +669,9 @@ mod tests {
         assert_eq!(page.unusable_links, ["../crates/agent/config/agent.hcl"]);
         assert!(page.html.contains(r#"href="https://example.com""#));
         // An example file under docs/examples is served, and one that isn't there isn't.
-        let page = chapter("[one](examples/postgres.hcl) and [none](examples/nope.hcl)");
+        let page = chapter("[one](examples/iis.hcl) and [none](examples/nope.hcl)");
         assert_eq!(page.unusable_links, ["examples/nope.hcl"]);
-        assert!(page.html.contains(r#"href="/docs/examples/postgres.hcl""#));
+        assert!(page.html.contains(r#"href="/docs/examples/iis.hcl""#));
     }
 
     #[test]

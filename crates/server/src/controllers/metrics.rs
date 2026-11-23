@@ -165,7 +165,7 @@ struct DatabaseRow {
     note: Option<String>,
 }
 
-/// Each value is stored under the database's kind, such as `postgres.up`, so the
+/// Each value is stored under the database's kind, such as `mysql.up`, so the
 /// kind comes from whichever says whether it's up. A database the agent doesn't
 /// have is under `unknown`.
 fn database_row(item: &Value) -> Option<DatabaseRow> {

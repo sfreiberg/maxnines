@@ -1218,11 +1218,13 @@ async fn built_in_offline_rule() -> AlertRuleInput {
 
 #[tokio::test]
 async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filling() {
-    let names: Vec<String> = built_in_rules()
+    let mut names: Vec<String> = built_in_rules()
         .await
         .into_iter()
         .map(|rule| rule.name)
         .collect();
+    // As the databases sort names differently.
+    names.sort();
     assert_eq!(
         names,
         [
@@ -1234,6 +1236,20 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Disk will be full soon",
             "Host offline",
             "Host sending no metrics",
+            "PostgreSQL WAL archiving failing",
+            "PostgreSQL connections running out",
+            "PostgreSQL data checksum failures",
+            "PostgreSQL down",
+            "PostgreSQL long-running transaction",
+            "PostgreSQL replica lagging",
+            "PostgreSQL replica not receiving",
+            "PostgreSQL replication slot holding WAL",
+            "PostgreSQL replication slot lost",
+            "PostgreSQL replication slot unused",
+            "PostgreSQL standby falling behind",
+            "PostgreSQL subscription stopped",
+            "PostgreSQL too few standbys",
+            "PostgreSQL transaction IDs running out",
             "Service stopped"
         ]
     );

@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{Result, bail, ensure};
 use chrono::TimeDelta;
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{self as stats, Reader, Settle, by_kind, is_database};
+use maxnines_checks::databases::{self as stats, Reader, Settle, by_kind, has_reader, is_database};
 use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -327,6 +327,11 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
         input.read_stats || input.extras.is_empty(),
         "extras are only read along with a database's stats"
     );
+    ensure!(
+        input.extras.is_empty() || has_reader(input.check.kind),
+        "{} has no extras: turn on its template's queries on the template's page instead",
+        input.check.kind.as_str()
+    );
     for (index, extra) in input.extras.iter().enumerate() {
         ensure!(
             DATABASE_EXTRAS.contains(&extra.as_str()),
@@ -606,12 +611,15 @@ impl Scheduler {
         .await;
     }
 
-    /// A reader for each enabled check that reads stats, made again when its
-    /// check or login changes, and dropped, closing its connection, when it goes.
+    /// A reader for each enabled check that reads stats of a kind read here rather
+    /// than only by templates, made again when its check or login changes, and
+    /// dropped, closing its connection, when it goes.
     fn keep_readers(&mut self, checks: &[RemoteCheck]) {
         let wanted: HashMap<i64, &RemoteCheck> = checks
             .iter()
-            .filter(|check| check.input.enabled && check.input.read_stats)
+            .filter(|check| {
+                check.input.enabled && check.input.read_stats && has_reader(check.input.check.kind)
+            })
             .map(|check| (check.id, check))
             .collect();
         self.readers.retain(|id, _| wanted.contains_key(id));

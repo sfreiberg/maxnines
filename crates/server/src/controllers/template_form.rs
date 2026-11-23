@@ -930,7 +930,7 @@ mod tests {
     use super::*;
     use maxnines_protocol::templates::{parse, to_hcl};
 
-    const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
+    const POSTGRES: &str = include_str!("../../templates/postgres.hcl");
     const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
     #[test]

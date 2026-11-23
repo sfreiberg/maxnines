@@ -37,6 +37,7 @@ shown afterwards is written out from the parts.
 | Template | What it watches |
 | --- | --- |
 | **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules) |
+| **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed under [database stats](database-stats.md#postgresql-1) |
 
 ## What templates can read so far
 
@@ -45,11 +46,11 @@ shown afterwards is written out from the parts.
   as `connecting`, and reads nothing. MongoDB isn't SQL, so it needs a way of its own
   to be written in a template, which isn't decided yet.
 - **Windows:** performance counters and registry values, on hosts with an agent.
-- **What MaxNines reads itself:** MaxNines' own reading of
-  [database stats](database-stats.md) still runs beside templates, under its own
-  metric names, such as `postgres.lag`, so a template can't use those names. No
-  template for a database comes with MaxNines yet. Templates for PostgreSQL, MySQL and
-  then ClickHouse are to take its place, with templates for each operating system.
+- **What MaxNines reads itself:** PostgreSQL is read by its built-in template. MaxNines'
+  own reading of [database stats](database-stats.md) still reads MySQL and MariaDB,
+  MongoDB and ClickHouse, under its own metric names, such as `mysql.connections`, so
+  a template can't use those names. Templates for MySQL and then ClickHouse are to
+  take its place, with templates for each operating system.
 
 Where a template is read, and how, is the same on an agent and on the server for a
 [host without an agent](#hosts-without-an-agent-and-maxnines-own-database).
@@ -85,8 +86,8 @@ The **key**, `myapp`, starts the names of the template's metrics, so the column
 `connections` is the metric `myapp.connections`. It's lowercase letters, digits and
 underscores, starting with a letter, and no two templates share one. So are the keys of
 the blocks inside it, such as `sessions` and `busy`. A template whose metric would
-have the name of one MaxNines has built in, such as `postgres.lag`, is refused: give
-it another key.
+have the name of one MaxNines has built in, such as `mysql.connections`, is refused:
+give it another key.
 
 An agent is sent what it reads all at once, so a template can have up to 64 discover
 blocks and queries together, each SQL statement up to 64 KB with what fills it, each
@@ -372,8 +373,9 @@ on the **MaxNines server** host, named `maxnines`. Your changes to those templat
 alerts still apply there. As the server's account has to be able to write, what it
 may do beyond reading isn't reported. To read MaxNines' own database with other
 templates, add a database check for it with a [read-only
-account](#read-only-database-accounts). No template for a database comes with
-MaxNines yet, so for now nothing is read.
+account](#read-only-database-accounts). So with PostgreSQL, the built-in PostgreSQL
+template reads it. With MySQL nothing is read yet, as no template for MySQL comes with
+MaxNines.
 
 ## Read-only database accounts
 
@@ -435,12 +437,9 @@ on them and nothing more, such as `GRANT SELECT ON shop.orders TO maxnines`.
 
 ## Examples
 
-Two full templates, to read, copy from and import. They're examples of the format,
-not templates that come with MaxNines. The PostgreSQL one can't be imported with its
-key as it is, `postgres`, because MaxNines already reads PostgreSQL itself under the
-same metric names. Change the key, such as to `pg`, to import it.
-
-**[postgres.hcl](examples/postgres.hcl)**, for PostgreSQL, is all SQL:
+The templates that come with MaxNines are examples to read and copy from: open one
+under **Settings > Templates** and choose **Export** for its HCL. The built-in
+**PostgreSQL** template is all SQL:
 
 - `database = "postgres"`, so it's for each PostgreSQL database in an agent's config;
 - `discover` finds the version, whether the server is a primary or a replica, and
@@ -449,9 +448,15 @@ same metric names. Change the key, such as to `pg`, to import it.
   ends, replication slots, archiving and subscriptions. `fill` covers the views that
   moved between versions, such as checkpoints in 17, so each query is written once;
 - `labels` give a series to each standby, slot and subscription;
+- `value` works the cache hit rate out from two running totals with `rate()`;
 - the slow queries, database and WAL sizes, ship with `enabled = false`;
 - its alerts use the short names, such as `lag > duration('30s')` and `!receiving`,
   and `when` keeps the replica's alerts to replicas.
+
+To import it as a template of your own, give it another key and name, as a built-in
+template's are its own.
+
+One more example, which doesn't come with MaxNines, is here to read and import:
 
 **[iis.hcl](examples/iis.hcl)**, for IIS, is Windows performance counters and one
 registry read, with nothing about IIS anywhere else:

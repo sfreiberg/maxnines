@@ -17,6 +17,10 @@ Every server starts with nine alert rules, from the built-in **Host**
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 | **Database account can do more than read** | A [template](templates.md) reads a database with an account that [can do more than read](database-stats.md#what-the-account-may-do) | Warning |
 
+The built-in **PostgreSQL** template brings 14 more, for each PostgreSQL database it
+reads, one of them off until you say how many standbys a primary should have: they're
+listed under [database stats](database-stats.md#postgresql-1).
+
 Each disk alerts on its own. Every alert resolves as soon as its problem is gone,
 without waiting, so a recovery is known at once, and something that keeps failing and
 recovering shows as doing that. A Host offline alert resolves within moments of the

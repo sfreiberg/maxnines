@@ -1,13 +1,15 @@
 //! Reads a database's health, load and replication, for the `databases`
-//! collector on agents and for hosts without an agent on the server.
+//! collector on agents and for hosts without an agent on the server, for the kinds
+//! MaxNines reads itself: [`has_reader`] says which. PostgreSQL is read by its
+//! built-in template instead, through [`crate::templates`].
 //!
 //! A [`Reader`] keeps its connection open between rounds, so each round costs a
 //! few queries rather than a sign-in, and opens a new one when the old one stops
 //! working. ClickHouse, read over HTTP, has one for each round instead. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
 //! replication slots, named after it. A sample groups rows by their database's
-//! kind, as `{"postgres": [...], "mysql": [...]}`, so each kind's values are its
-//! own, such as `postgres.connections`. Running totals in a row go under `totals`,
+//! kind, as `{"mysql": [...], "mongodb": [...]}`, so each kind's values are its
+//! own, such as `mysql.connections`. Running totals in a row go under `totals`,
 //! and a [`Settle`] turns them into the change since the last sample. A total
 //! whose name starts with `_` is only there to work out an average, and goes
 //! once it has.
@@ -15,7 +17,6 @@
 pub(crate) mod clickhouse;
 mod mongodb;
 mod mysql;
-mod postgres;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -35,11 +36,21 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 /// The most notes of what couldn't be read that a round keeps.
 const MAX_MISSING: usize = 4;
 
-/// Whether this kind of check is a database whose stats can be read.
+/// Whether this kind of check is a database whose stats can be read, by a reader
+/// here or by templates.
 pub fn is_database(kind: CheckKind) -> bool {
     matches!(
         kind,
         CheckKind::Postgres | CheckKind::Mysql | CheckKind::Mongodb | CheckKind::Clickhouse
+    )
+}
+
+/// Whether a reader here reads this kind of database. The rest are read only by
+/// templates, such as PostgreSQL by the built-in `postgres` template.
+pub fn has_reader(kind: CheckKind) -> bool {
+    matches!(
+        kind,
+        CheckKind::Mysql | CheckKind::Mongodb | CheckKind::Clickhouse
     )
 }
 
@@ -53,7 +64,6 @@ pub struct Database {
 
 /// A connection that's open.
 enum Open {
-    Postgres(postgres::Postgres),
     Mysql(mysql::Mysql),
     Mongodb(mongodb::Mongodb),
     /// Boxed, as it holds what it's read between rounds, and its connection.
@@ -129,7 +139,6 @@ impl Reader {
         let mut rows = Rows::new(&self.name);
         let extras = &self.extras;
         match self.open.as_mut() {
-            Some(Open::Postgres(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mysql(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mongodb(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Clickhouse(open)) => open.read(&mut rows, extras).await?,
@@ -141,9 +150,6 @@ impl Reader {
     async fn connect(&self) -> Result<Open> {
         let Database { check, credentials } = &self.database;
         match check.kind {
-            CheckKind::Postgres => Ok(Open::Postgres(
-                postgres::Postgres::connect(check, credentials).await?,
-            )),
             CheckKind::Mysql => Ok(Open::Mysql(
                 mysql::Mysql::connect(check, credentials).await?,
             )),
@@ -154,7 +160,7 @@ impl Reader {
                 check,
                 credentials,
             )?))),
-            other => bail!("{} isn't a database", other.as_str()),
+            other => bail!("{} isn't a database read here", other.as_str()),
         }
     }
 }
@@ -397,15 +403,15 @@ mod tests {
     #[test]
     fn rows_are_grouped_by_their_kind() {
         let rows = vec![
-            json!({ "name": "orders", "kind": "postgres", "connections": 3 }),
-            json!({ "name": "orders standby b", "kind": "postgres" }),
+            json!({ "name": "orders", "kind": "mongodb", "connections": 3 }),
+            json!({ "name": "orders member b", "kind": "mongodb" }),
             json!({ "name": "shop", "kind": "mysql", "connections": 5 }),
             json!({ "name": "nowhere", "up": 0 }),
         ];
         assert_eq!(
             by_kind(rows),
             json!({
-                "postgres": [{ "name": "orders", "connections": 3 }, { "name": "orders standby b" }],
+                "mongodb": [{ "name": "orders", "connections": 3 }, { "name": "orders member b" }],
                 "mysql": [{ "name": "shop", "connections": 5 }],
                 "unknown": [{ "name": "nowhere", "up": 0 }],
             })
@@ -430,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_that_isnt_there_says_why() {
-        let mut check = Check::new("orders", CheckKind::Postgres, "127.0.0.1:0");
+        let mut check = Check::new("orders", CheckKind::Mysql, "127.0.0.1:0");
         check.timeout = Some(Duration::from_secs(2));
         let database = Database {
             check,
@@ -443,7 +449,7 @@ mod tests {
         let rows = reader.read(Duration::from_secs(2)).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["up"], 0);
-        assert_eq!(rows[0]["kind"], "postgres");
+        assert_eq!(rows[0]["kind"], "mysql");
         assert!(rows[0]["error"].is_string(), "{rows:?}");
     }
 }

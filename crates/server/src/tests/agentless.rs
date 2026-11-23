@@ -1322,20 +1322,26 @@ async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
         request
     };
     for refused in [
-        request("tcp", "db:5432", json!({ "read_stats": true })),
-        request("postgres", "db:5432", json!({ "extras": ["sizes"] })),
+        request("tcp", "db:3306", json!({ "read_stats": true })),
+        request("mysql", "db:3306", json!({ "extras": ["sizes"] })),
+        request(
+            "mysql",
+            "db:3306",
+            json!({ "read_stats": true, "extras": ["tables"] }),
+        ),
+        // Its template reads PostgreSQL, with queries of its own to turn on.
         request(
             "postgres",
             "db:5432",
-            json!({ "read_stats": true, "extras": ["tables"] }),
+            json!({ "read_stats": true, "extras": ["sizes"] }),
         ),
     ] {
         let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &refused).await;
         assert_eq!(status, 422, "{refused}: {body}");
     }
     let wanted = request(
-        "postgres",
-        "db:5432",
+        "mysql",
+        "db:3306",
         json!({ "read_stats": true, "extras": ["sizes"] }),
     );
     let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &wanted).await;
@@ -1362,55 +1368,61 @@ async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
 }
 
 /// Reads the throwaway PostgreSQL the checks crate's tests use, named as
-/// `host:port username`, as a host with no agent.
+/// `host:port username`, as a host with no agent: by the built-in template, as
+/// nothing else reads PostgreSQL.
 #[tokio::test]
-async fn a_database_check_reads_its_stats_as_the_hosts() {
+async fn a_postgres_check_reads_its_stats_with_the_built_in_template() {
     let Ok(real) = std::env::var("MAXNINES_TEST_CHECK_POSTGRES") else {
         return;
     };
     let (target, username) = real.split_once(' ').unwrap();
     let server = start_with_metrics().await;
+    server
+        .state
+        .database
+        .sync_templates(
+            &crate::templates::built_in::all().unwrap(),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
     let id = add_host(&server, "orders-db").await;
     let check = json!({
         "host_id": id,
         "check": { "name": "orders", "kind": "postgres", "target": target },
-        "interval_secs": 60,
+        "interval_secs": 10,
         "username": username,
         "read_stats": true,
-        "extras": ["sizes"],
     });
     let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
     assert_eq!(status, 201, "{added}");
     let mut scheduler = check_scheduler(&server);
-    assert_eq!(run_due(&mut scheduler, crate::times::now()).await, 1);
 
-    // Saved as the host's, as an agent's would be.
-    // Under its kind, as an agent's would be.
-    for metric in ["postgres.up", "postgres.connections", "postgres.size"] {
-        let path = format!("/api/v1/hosts/{id}/metrics/{metric}?range=1h");
-        let deadline = Instant::now() + Duration::from_secs(5);
+    // Discovery comes first, then the queries it lets run, each saved as the
+    // host's, the series named after the check, as an agent's would be.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = crate::times::now();
+    for metric in ["postgres.connections", "postgres.xid_age", "postgres.up"] {
         loop {
-            let (_, body) = api(&server, "GET", &path, &Value::Null).await;
+            let body = host_metric(&server, &id, metric).await;
             if body["series"]
                 .as_array()
                 .is_some_and(|lines| !lines.is_empty())
             {
+                assert!(body.to_string().contains("orders"), "{body}");
                 break;
             }
             assert!(Instant::now() < deadline, "no {metric}: {body}");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            run_due(&mut scheduler, now).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            now += TimeDelta::seconds(11);
         }
     }
+    // Nothing reads it the old way, so it's not among the latest databases.
     let page = Browser::default()
         .get(&server, &format!("/hosts/{id}/metrics"))
         .await;
-    assert!(page.body.contains("Latest databases"), "{}", page.body);
-    // Its row is found under its kind, and says it's up.
-    assert!(
-        page.body.contains(r#"<span class="badge good">Up</span>"#),
-        "{}",
-        page.body
-    );
+    assert!(!page.body.contains("Latest databases"), "{}", page.body);
 }
 
 /// What the API has of a host's metric over the last hour.

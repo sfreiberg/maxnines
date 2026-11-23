@@ -3,3 +3,4 @@
 # server upgraded past it keeps what people changed. Add a template's key here
 # when adding the template.
 host
+postgres

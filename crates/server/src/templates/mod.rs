@@ -680,17 +680,14 @@ pub fn alert_rule(template: &Template, alert: &Alert) -> Result<AlertRuleInput> 
     })
 }
 
-/// The PostgreSQL example from the docs, under the key `pg`. As written its key is
-/// `postgres`, which would give its metrics the names of the ones MaxNines reads
-/// from PostgreSQL itself, so it's refused: tests that need a template like it use
-/// this.
+/// The built-in PostgreSQL template under the key `pg`, named PG, its alerts too,
+/// for tests that import a template like it beside the built-in one, whose key and
+/// names it would otherwise have.
 #[cfg(test)]
-pub fn postgres_example() -> String {
-    include_str!("../../../../docs/examples/postgres.hcl").replacen(
-        "template \"postgres\"",
-        "template \"pg\"",
-        1,
-    )
+pub fn postgres_as_pg() -> String {
+    include_str!("../../templates/postgres.hcl")
+        .replacen("template \"postgres\"", "template \"pg\"", 1)
+        .replace("= \"PostgreSQL", "= \"PG")
 }
 
 #[cfg(test)]

@@ -3,7 +3,6 @@ use serde_json::json;
 use super::*;
 use maxnines_protocol::templates::parse;
 
-const POSTGRES: &str = include_str!("../../../../docs/examples/postgres.hcl");
 const IIS: &str = include_str!("../../../../docs/examples/iis.hcl");
 
 fn no_facts() -> Value {
@@ -43,8 +42,8 @@ fn with_alerts(alerts: &str) -> String {
 }
 
 #[test]
-fn both_examples_load() {
-    for text in [postgres_example().as_str(), IIS] {
+fn the_postgres_template_and_the_iis_example_load() {
+    for text in [postgres_as_pg().as_str(), IIS] {
         let template = load(text, &no_facts(), &Catalog::built_in())
             .unwrap_or_else(|error| panic!("{error:#}"));
         assert!(!template.alerts.is_empty());
@@ -64,13 +63,14 @@ fn own(template: &Template) -> std::collections::BTreeMap<String, Metric> {
 
 #[test]
 fn a_template_knows_its_own_metrics_and_what_they_are() {
-    let postgres = own(&parse(&postgres_example()).unwrap());
+    let postgres = own(&parse(&postgres_as_pg()).unwrap());
     let kind = |name: &str| postgres[name].kind;
     assert_eq!(postgres["lag"].name, "pg.lag");
     assert_eq!(postgres["lag"].collector, "template.pg");
     assert_eq!(postgres["lag"].template.as_deref(), Some("pg"));
     assert_eq!(kind("up"), Kind::Flag);
-    assert_eq!(kind("lag"), Kind::Unknown);
+    assert_eq!(kind("lag"), Kind::Seconds);
+    assert_eq!(kind("connections"), Kind::Unknown);
     assert_eq!(kind("cache_hit"), Kind::Number);
     assert_eq!(kind("checkpoints_requested"), Kind::Number);
     // A database template runs once for each database, so every series says which.
@@ -108,7 +108,7 @@ fn a_template_knows_its_own_metrics_and_what_they_are() {
         postgres["connections_used"].description.as_deref(),
         Some("Connections in use, out of those not reserved for superusers")
     );
-    assert_eq!(postgres["slot_retained"].title, "PostgreSQL slot retained");
+    assert_eq!(postgres["slot_retained"].title, "PG slot retained");
 
     let iis = own(&parse(IIS).unwrap());
     assert_eq!(iis["pool_running"].kind, Kind::Flag);
@@ -124,7 +124,7 @@ fn a_template_knows_its_own_metrics_and_what_they_are() {
 
 #[test]
 fn a_metric_is_on_while_its_template_and_a_part_that_gives_it_are() {
-    let mut template = parse(&postgres_example()).unwrap();
+    let mut template = parse(&postgres_as_pg()).unwrap();
     let on = |template: &Template, name: &str| {
         let metrics = metrics_of(template);
         let (_, on) = metrics
@@ -146,12 +146,12 @@ fn a_metric_is_on_while_its_template_and_a_part_that_gives_it_are() {
 
 #[test]
 fn the_catalog_has_the_metrics_of_templates_that_are_on() {
-    let postgres = parse(&postgres_example()).unwrap();
+    let postgres = parse(&postgres_as_pg()).unwrap();
     let iis = parse(IIS).unwrap();
     let built_in = Catalog::built_in();
     let catalog = Catalog::with_templates([&postgres, &iis]);
     assert!(built_in.find("pg.lag").is_none());
-    assert_eq!(catalog.find("pg.lag").unwrap().title, "PostgreSQL lag");
+    assert_eq!(catalog.find("pg.lag").unwrap().title, "PG lag");
     assert!(catalog.find("iis.requests").is_some());
     // The built-in ones come first, as they did.
     let names = |catalog: &Catalog| -> Vec<String> {
@@ -186,30 +186,27 @@ fn the_catalog_has_the_metrics_of_templates_that_are_on() {
     assert!(checked.find("pg.size").is_some(), "every part counts");
 }
 
-/// The example is written with the key `postgres`, and MaxNines reads PostgreSQL
-/// itself under those names, so as written it's refused.
+/// MaxNines reads MongoDB itself, under names a template keyed `mongodb` would give
+/// its metrics too, so one is refused.
 #[test]
 fn a_metric_with_a_built_in_metrics_name_is_refused() {
-    let found = problems(POSTGRES);
-    assert!(!found.is_empty());
-    for problem in &found {
-        assert!(
-            problem.contains("MaxNines has built in"),
-            "only its names are wrong: {problem}"
-        );
-    }
-    for expected in [
-        r#"template "postgres": its metric postgres.up would have the name of one MaxNines has built in: give the template another key"#,
-        r#"template "postgres", query "wal": its metric postgres.wal_written would have the name of one MaxNines has built in: give the columns other names, or the template another key"#,
-        r#"template "postgres", query "slots": its metrics postgres.slot_in_use, postgres.slot_headroom, postgres.slot_retained, postgres.slot_lost would have the names of ones MaxNines has built in"#,
-    ] {
-        assert!(
-            found.iter().any(|problem| problem.contains(expected)),
-            "{expected}\n{found:#?}"
-        );
-    }
-    // Under a key of its own there's nothing wrong with it.
-    assert_eq!(problems(&postgres_example()), Vec::<String>::new());
+    let found = problems(
+        r#"template "mongodb" {
+             name     = "MongoDB"
+             database = "mongodb"
+             query "server" { sql = "SELECT 1 AS connections, 2 AS spare, 3 AS uptime" }
+           }"#,
+    );
+    assert_eq!(
+        found,
+        [
+            r#"template "mongodb": its metric mongodb.up would have the name of one MaxNines has built in: give the template another key"#,
+            r#"template "mongodb", query "server": its metrics mongodb.connections, mongodb.uptime would have the names of ones MaxNines has built in: give the columns other names, or the template another key"#,
+        ]
+    );
+    // The built-in PostgreSQL template's are its own, and under another key it
+    // has nothing wrong with it either.
+    assert_eq!(problems(&postgres_as_pg()), Vec::<String>::new());
 
     // One name is enough, and it's the column that says where.
     let found = problems(
