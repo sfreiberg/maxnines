@@ -166,16 +166,21 @@ template "postgres" {
   }
 
   # Counted on their own: with no standbys the query above has no rows, and no
-  # rows means no samples, not zero.
+  # rows means no samples, not zero. A standby is one streaming and replaying what
+  # it's sent, which leaves out one still catching up, pg_basebackup and
+  # pg_receivewal, which replay nothing, and logical replication's subscribers.
   query "standby_count" {
     when = "role == 'primary'"
     sql  = <<-SQL
-      SELECT count(*)                                                 AS standbys,
-             count(*) FILTER (WHERE sync_state IN ('sync', 'quorum')) AS synchronous_standbys
+      SELECT count(*) FILTER (WHERE state = 'streaming' AND replay_lsn IS NOT NULL
+                                AND pid NOT IN (SELECT active_pid FROM pg_replication_slots
+                                                WHERE slot_type = 'logical'
+                                                  AND active_pid IS NOT NULL)) AS standbys,
+             count(*) FILTER (WHERE sync_state IN ('sync', 'quorum'))          AS synchronous_standbys
       FROM pg_stat_replication
     SQL
     metrics = {
-      standbys             = { title = "PostgreSQL standbys" }
+      standbys             = { title = "PostgreSQL standbys streaming" }
       synchronous_standbys = { title = "PostgreSQL synchronous standbys" }
     }
   }

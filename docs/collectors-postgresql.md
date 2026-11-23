@@ -122,7 +122,7 @@ replication slot is the series `orders, backups`, and a standby is labelled by i
 | `postgres.streaming` | 1 or 0 | Each database and standby | On a primary, whether each standby is streaming |
 | `postgres.lag_bytes` | Bytes | Each database and standby | On a primary, how far behind each standby is in WAL |
 | `postgres.lag` | Seconds | Each database, and on a primary each standby | How far behind a replica is, or on a primary each standby, as the primary sees it |
-| `postgres.standbys` | Number | Each database | On a primary, standbys connected |
+| `postgres.standbys` | Number | Each database | On a primary, standbys streaming and replaying what they're sent, leaving out one catching up, `pg_basebackup`, `pg_receivewal` and logical replication |
 | `postgres.synchronous_standbys` | Number | Each database | On a primary, synchronous standbys connected |
 | `postgres.replay_backlog` | Bytes | Each database | On a replica, WAL received but not replayed yet |
 | `postgres.replay_paused` | 1 or 0 | Each database | On a replica, whether replay is paused |
