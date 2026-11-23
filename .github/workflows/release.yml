@@ -104,7 +104,7 @@ jobs:
           workspaces: ". -> ${{ env.TARGET_DIR }}"
       - run: cargo build --release --locked -p maxnines-server --target "$TARGET"
       - run: packaging/archive.sh maxnines-server "${{ needs.check.outputs.version }}" "$TARGET" dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-server-${{ matrix.arch }}
           path: |
@@ -138,7 +138,7 @@ jobs:
         run: |
           file "$TARGET_DIR/$TARGET/release/maxnines-agent" | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
       - run: packaging/archive.sh maxnines-agent "${{ needs.check.outputs.version }}" "$TARGET" dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-agent-${{ matrix.arch }}
           path: |
@@ -172,7 +172,7 @@ jobs:
           for program in maxnines-agent maxnines-server; do
             packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-${{ matrix.arch }}
           path: dist/
@@ -214,7 +214,7 @@ jobs:
           packaging/check-windows-dlls.sh \
             "$TARGET_DIR/$TARGET/release/maxnines-agent.exe" \
             "$TARGET_DIR/$TARGET/release/maxnines-server.exe"
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
       # WiX asks anyone earning US$10,000 a year or more from it to pay its Open
@@ -292,11 +292,11 @@ jobs:
           }
       - name: Keep the installer's logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}-msi-logs
           path: ${{ runner.temp }}/msi-logs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-${{ matrix.arch }}
           path: dist/
@@ -356,7 +356,7 @@ jobs:
             # intermediate files are far bigger than the archives and needed by
             # nothing: copying them took long enough for the VM to drop the connection.
             rm -rf target.nosync
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: freebsd-x86_64
           path: dist/
@@ -373,7 +373,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deb,cargo-generate-rpm
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: linux-*-${{ matrix.arch }}
           merge-multiple: true
@@ -393,7 +393,7 @@ jobs:
           cargo generate-rpm -p crates/server --target "$SERVER" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
           cargo generate-rpm -p crates/agent --target "$AGENT" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
           ls -l packages
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.arch }}
           path: packages/
@@ -411,7 +411,7 @@ jobs:
         image: ["ubuntu:22.04", "debian:12", "ubuntu:24.04", "rockylinux:9"]
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages-${{ matrix.arch }}
           path: packages
@@ -428,11 +428,11 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-server-x86_64
           path: amd64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: linux-server-aarch64
           path: arm64
@@ -442,14 +442,14 @@ jobs:
             mkdir -p "dist/docker/$arch"
             install -m 755 "$arch/$TARGET_DIR"/*/release/maxnines-server "dist/docker/$arch/"
           done
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         if: github.ref_type == 'tag'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         env:
           # Otherwise it uploads a build record as an artifact, which isn't an
           # ordinary one: downloading every artifact to publish then fails.
@@ -478,7 +478,7 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Gather everything to publish
@@ -490,7 +490,7 @@ jobs:
           sha256sum -- * > SHA256SUMS
           ls -l
       # Lets anyone check a download was built here, from this repository.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: release/*
       - name: Create the release
