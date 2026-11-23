@@ -186,12 +186,27 @@ impl RuleForm {
     }
 
     /// A new rule that applies just after `saved`, to the same hosts, to change
-    /// what it sets.
+    /// what it sets. For a built-in rule, hosts given its template by hand are
+    /// named by their IDs, as a rule of someone's own only has a condition.
     fn after(saved: &ConfigRule) -> Self {
+        let given = saved
+            .template
+            .as_ref()
+            .map_or(&[][..], |template| template.host_ids.as_slice());
+        let applies_to = match (given, saved.rule.applies_to.as_deref()) {
+            ([], condition) => condition.map(str::to_string),
+            (ids, condition) => {
+                let picked = format!("trusted.host_id in {}", Value::from(ids.to_vec()));
+                Some(match condition {
+                    Some(condition) => format!("{picked} || ({condition})"),
+                    None => picked,
+                })
+            }
+        };
         Self {
             name: format!("{} changes", saved.rule.name),
             priority: (saved.rule.priority + 1).to_string(),
-            applies_to: ConditionForm::from_condition(saved.rule.applies_to.as_deref()),
+            applies_to: ConditionForm::from_condition(applies_to.as_deref()),
             operating_systems: systems(|key| {
                 saved.rule.operating_systems.iter().any(|os| os == key)
             }),
@@ -582,6 +597,8 @@ struct RuleRow {
     built_in_changed: Option<String>,
     /// Whether it's turned on but not in force, as its template is turned off.
     template_off: bool,
+    /// How many hosts were given its template by hand, for a built-in rule.
+    picked: usize,
 }
 
 /// Describes what a rule sets in a few words.
@@ -669,6 +686,10 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             built_in: rule.built_in.is_some(),
             built_in_changed: rule.built_in_changed_at.map(local_date),
             template_off: rule.rule.enabled && !rule.in_force(),
+            picked: rule
+                .template
+                .as_ref()
+                .map_or(0, |template| template.host_ids.len()),
             description: rule
                 .rule
                 .applies_to

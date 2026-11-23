@@ -207,8 +207,19 @@ impl CompiledRule {
                 return false;
             }
         }
-        let Some(condition) = &self.condition else {
+        // A built-in rule is for the hosts its template is for, as the template
+        // says which: those given it by hand, and those its condition picks, or
+        // only those given it by hand when it has no condition.
+        let given = self
+            .rule
+            .template
+            .as_ref()
+            .map_or(&[][..], |template| template.host_ids.as_slice());
+        if given.iter().any(|id| id == host.id) {
             return true;
+        }
+        let Some(condition) = &self.condition else {
+            return given.is_empty();
         };
         match condition.check(host) {
             Ok(result) => result,

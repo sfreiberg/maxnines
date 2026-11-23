@@ -389,7 +389,7 @@ async fn a_built_in_rule_is_only_in_force_while_its_template_is_enabled() {
     assert_eq!(shown["enabled"], true);
     assert_eq!(
         shown["template"],
-        json!({ "id": template.id, "enabled": false })
+        json!({ "id": template.id, "enabled": false, "host_ids": [] })
     );
 
     // The pages say so, and link to the template.
@@ -406,7 +406,7 @@ async fn a_built_in_rule_is_only_in_force_while_its_template_is_enabled() {
         "{}",
         form.body
     );
-    assert!(form.body.contains("it's disabled now"), "{}", form.body);
+    assert!(form.body.contains("which it isn"), "{}", form.body);
 }
 
 #[tokio::test]
@@ -453,4 +453,147 @@ async fn a_built_in_templates_hcl_leaves_its_settings_to_its_rule_so_it_can_be_c
         "{}",
         page.body
     );
+}
+
+async fn host_id(server: &TestServer, hostname: &str) -> String {
+    let hosts = server.state.registry.list().await;
+    hosts
+        .into_iter()
+        .find(|host| host.hostname == hostname)
+        .unwrap_or_else(|| panic!("no host {hostname}"))
+        .id
+}
+
+/// Whether a host's config, as it is now, has the macOS template's GPU collector.
+async fn watches_gpu(server: &TestServer, id: &str) -> bool {
+    let resolved = server.state.config_for(id).await.unwrap();
+    resolved
+        .config
+        .collectors
+        .get("gpu")
+        .is_some_and(|gpu| gpu.enabled)
+}
+
+#[tokio::test]
+async fn a_built_in_rule_is_for_the_hosts_its_template_is_for_as_chosen_on_its_page() {
+    let server = with_every_built_in_template().await;
+    let mac_rule = rule_named(&server, "macOS").await;
+    let template = mac_rule.template.clone().unwrap();
+    let hosts_path = format!("/api/v1/templates/{}/hosts", template.id);
+    let collectors = maxnines_protocol::COLLECTORS.to_vec();
+
+    let mut first = server.connect_approved(&identity(), "mac-1").await;
+    TestServer::next_config(&mut first).await;
+    send(
+        &mut first,
+        &AgentMessage::Facts {
+            facts: json!({ "os": { "family": "macos" }, "agent": { "collectors": collectors } }),
+        },
+    )
+    .await;
+    TestServer::next_config(&mut first).await;
+    let mut second = server.connect_approved(&identity(), "mac-2").await;
+    TestServer::next_config(&mut second).await;
+    send(
+        &mut second,
+        &AgentMessage::Facts {
+            facts: json!({
+                "os": { "family": "macos" },
+                "agent": { "collectors": collectors },
+                "custom": { "role": "render" },
+            }),
+        },
+    )
+    .await;
+    let (_, config) = TestServer::next_config(&mut second).await;
+    assert!(config.collectors["gpu"].enabled, "{config:?}");
+    let (first_id, second_id) = (
+        host_id(&server, "mac-1").await,
+        host_id(&server, "mac-2").await,
+    );
+    assert!(watches_gpu(&server, &first_id).await);
+
+    // Picked by hand: only the Mac picked keeps the settings, and the one taken off
+    // is sent its config without them.
+    let (status, body) = api(
+        &server,
+        "PUT",
+        &hosts_path,
+        &json!({ "applies_to": null, "host_ids": [first_id] }),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    let (_, config) = TestServer::next_config(&mut second).await;
+    assert!(!config.collectors.contains_key("gpu"), "{config:?}");
+    assert!(
+        config.collectors["cpu"].enabled,
+        "the Host rule still applies"
+    );
+    assert!(watches_gpu(&server, &first_id).await);
+
+    // The API and the pages say so.
+    let (status, body) = api(
+        &server,
+        "GET",
+        &format!("/api/v1/rules/{}", mac_rule.id),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let shown: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(shown["template"]["host_ids"], json!([first_id]));
+    assert_eq!(shown["applies_to"], Value::Null);
+    let mut browser = Browser::default();
+    let list = browser.get(&server, "/rules").await;
+    assert!(
+        list.body.contains("macOS, 1 host picked on its template"),
+        "{}",
+        list.body
+    );
+    let form = browser
+        .get(&server, &format!("/rules/{}/edit", mac_rule.id))
+        .await;
+    assert!(form.body.contains("the host picked there"), "{}", form.body);
+    // A rule of one's own after it names the picked host.
+    let after = browser
+        .get(&server, &format!("/rules/new?from={}", mac_rule.id))
+        .await;
+    assert!(after.body.contains("trusted.host_id in"), "{}", after.body);
+    assert!(after.body.contains(&first_id), "{}", after.body);
+
+    // A condition chosen in place of the template's: the Mac it picks gets them, and
+    // the one it doesn't loses them.
+    let (status, body) = api(
+        &server,
+        "PUT",
+        &hosts_path,
+        &json!({ "applies_to": "facts.custom.role == 'render'", "host_ids": [] }),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    let (_, config) = TestServer::next_config(&mut second).await;
+    assert!(config.collectors["gpu"].enabled, "{config:?}");
+    let (_, config) = TestServer::next_config(&mut first).await;
+    assert!(!config.collectors.contains_key("gpu"), "{config:?}");
+    let shown = rule_named(&server, "macOS").await;
+    assert_eq!(
+        shown.rule.applies_to.as_deref(),
+        Some("facts.custom.role == 'render'")
+    );
+
+    // Going back to what the template says gives every Mac its settings again.
+    let (status, body) = api(
+        &server,
+        "PUT",
+        &hosts_path,
+        &json!({ "applies_to": null, "host_ids": [] }),
+    )
+    .await;
+    assert_eq!(status, 204, "{body}");
+    let (_, config) = TestServer::next_config(&mut first).await;
+    assert!(config.collectors["gpu"].enabled, "{config:?}");
+    assert!(watches_gpu(&server, &second_id).await);
+    let shown = rule_named(&server, "macOS").await;
+    assert_eq!(shown.rule.applies_to, None);
+    assert_eq!(shown.template.unwrap().host_ids, Vec::<String>::new());
 }

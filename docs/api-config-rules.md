@@ -11,8 +11,8 @@ lowest priority first, so higher priorities win.
 | `operating_systems` | The systems it's for, from `freebsd`, `linux`, `macos` and `windows`, which `facts.os.family` has to be one of as well as `applies_to` matching. Empty or left out for every system |
 | `enabled` | Defaults to `true` |
 | `settings` | Required. What to apply, as below |
-| `built_in` | Given back, never set: which built-in rule it is, such as `macos`, or `null` for one of your own |
-| `template` | Given back, never set, only for a built-in rule: the built-in template it's the settings of, as `{"id": 2, "enabled": true}`. The rule is only in force while that template is enabled |
+| `built_in` | Given back, never set: which built-in rule it is, such as `macos`, or `null` for one of your own. A built-in rule's `applies_to` is its template's, as you chose it or as the template comes |
+| `template` | Given back, never set, only for a built-in rule: the built-in template it's the settings of, as `{"id": 2, "enabled": true, "host_ids": []}`. The rule is only in force while that template is enabled, and is for the hosts it's for: those in `host_ids`, given the template by hand, and those `applies_to` picks, or only those in `host_ids` when `applies_to` is `null` and there are some. See [which hosts a template is for](api-templates.md#say-which-hosts-a-template-is-for) |
 
 Built-in rules come with MaxNines, and upgrades change them. See
 [Built-in rules](agents.md#built-in-rules). Only `enabled` can change on one, so an update
@@ -60,7 +60,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/rules/1"
 {
   "id": 1,
   "built_in": "host",
-  "template": { "id": 2, "enabled": true },
+  "template": { "id": 2, "enabled": true, "host_ids": [] },
   "name": "Host",
   "priority": 0,
   "applies_to": null,

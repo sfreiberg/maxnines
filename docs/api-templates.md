@@ -173,7 +173,8 @@ it comes again.
 
 A template is for the hosts in `host_ids` and those `applies_to` picks by their facts.
 With neither, it's for every host, and with only `host_ids`, only those. Its alerts are
-only checked on the hosts it's for. For a built-in or imported template, `applies_to`
+only checked on the hosts it's for, and a built-in template's agent settings, its
+[config rule](agents.md#built-in-rules), only go to them. For a built-in or imported template, `applies_to`
 is your choice, which newer versions leave alone, and giving the one the template
 comes with goes back to following it. `applies_to` has to be CEL and each host has to
 be there, or the answer is `422` saying which. Gives back `204`.

@@ -152,6 +152,10 @@ pub struct RuleTemplate {
     pub id: i64,
     /// Whether it's turned on, which the rule is only in force while it is.
     pub enabled: bool,
+    /// The hosts given the template by hand, which the rule is for too, as well as
+    /// those its condition, the template's, picks. With none, the condition alone
+    /// says which.
+    pub host_ids: Vec<String>,
 }
 
 impl ConfigRule {

@@ -85,17 +85,20 @@ Some rules come with MaxNines, and are marked **Comes with MaxNines**. Each is a
 built-in [template's](templates.md#agent-settings) agent settings, named after it, at
 priority 0, so a rule of your own at a higher priority applies over it:
 
-| Rule | Applies to | Sets |
+| Rule | Applies to, unless you choose others for its template | Sets |
 |---|---|---|
 | **Host** | Every host | A sample every 15 seconds, facts every hour, and the host, CPU, memory, disk, network and system collectors |
 | **macOS** | Macs | The [GPU](collectors-operating-system.md#gpus) collector |
 
 An upgrade can change them, add more or remove one, and the audit log and the Config
-rules page say when it did. Each is only in force while its template is enabled, so
-disabling the template disables its settings too, and the Config rules page says
-**Template disabled**. They can be turned off on their own as well, which lasts through
+rules page say when it did. Each is for the hosts its template is for, so choosing
+which hosts a template is for, on its page, chooses them for its settings too, and the
+rule's page and the Config rules page say how many were picked. Each is only in force
+while its template is enabled, so disabling the template disables its settings too, and
+the Config rules page says **Template disabled**. They can be turned off on their own as well, which lasts through
 upgrades, but not changed or deleted. To change what one sets, open it and follow the link to add a
-rule of your own after it: that rule applies to the same hosts, one priority higher,
+rule of your own after it: that rule applies to the same hosts, naming any picked on
+the template by their IDs, one priority higher,
 and holds only your changes, so upgrades never touch them.
 
 If an upgrade brings a built-in rule with the same name as one of yours, ignoring

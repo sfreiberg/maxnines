@@ -2661,7 +2661,10 @@ impl Database {
 }
 
 /// Gives each built-in config rule the built-in template it's the settings of,
-/// found by the template's key, which is the rule's, saying whether it's turned on.
+/// found by the template's key, which is the rule's: whether it's turned on, and
+/// which hosts it's for, as the rule is for the same ones. Its condition becomes
+/// the template's, whether what the template says or what someone chose in its
+/// place, and the hosts given the template by hand go with it.
 pub(super) async fn with_templates<C: ConnectionTrait>(
     connection: &C,
     rules: &mut [super::ConfigRule],
@@ -2675,17 +2678,29 @@ pub(super) async fn with_templates<C: ConnectionTrait>(
         .all(connection)
         .await
         .context("loading built-in templates")?;
+    let mut given: HashMap<i64, Vec<String>> = HashMap::new();
+    for row in template_host::Entity::find()
+        .filter(template_host::Column::TemplateId.is_in(rows.iter().map(|row| row.id)))
+        .order_by_asc(template_host::Column::HostId)
+        .all(connection)
+        .await
+        .context("loading templates' hosts")?
+    {
+        given.entry(row.template_id).or_default().push(row.host_id);
+    }
     for rule in rules {
         let Some(key) = rule.built_in.as_deref() else {
             continue;
         };
-        rule.template = rows
-            .iter()
-            .find(|row| row.key == key)
-            .map(|row| super::RuleTemplate {
-                id: row.id,
-                enabled: row.enabled_choice.unwrap_or(row.enabled),
-            });
+        let Some(row) = rows.iter().find(|row| row.key == key) else {
+            continue;
+        };
+        rule.rule.applies_to = applies_to_of(row);
+        rule.template = Some(super::RuleTemplate {
+            id: row.id,
+            enabled: row.enabled_choice.unwrap_or(row.enabled),
+            host_ids: given.remove(&row.id).unwrap_or_default(),
+        });
     }
     Ok(())
 }

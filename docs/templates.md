@@ -406,7 +406,10 @@ Each becomes a built-in config rule of its own, named after the template, for th
 the template is for, at priority 0, where it's listed as coming with MaxNines. Your own
 rules apply over it as over any rule: one at a higher priority wins, so a rule of your
 own changes what a template's settings say without touching the template, and upgrades
-leave it alone. The rule is only in force while its template is enabled, and can be
+leave it alone. The rule is for the same hosts as its template, as you choose them on
+the template's page: the hosts you pick and those its condition matches, or every host
+the template says when you've chosen none, so a host taken off the template loses its
+settings too. The rule is only in force while its template is enabled, and can be
 turned off on its own too, which lasts through upgrades. As the settings are that rule,
 the template's HCL, as its page shows it and as it's exported, leaves the `config`
 block out, so it can be copied into a template of your own, and its page links to the
