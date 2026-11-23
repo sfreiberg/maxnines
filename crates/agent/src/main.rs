@@ -320,61 +320,125 @@ fn build(config: &AgentConfig, local: Local<'_>, keeping: &[Made]) -> Result<Bui
 }
 
 /// Builds what a config turns on, apart from the connection, as reading the system
-/// can block, and the agent's one thread also keeps the connection alive. A config
-/// that's built is saved, so monitoring carries on through a server outage.
+/// can block, and the agent's one thread also keeps the connection alive.
 async fn build_apart(
     update: ConfigUpdate,
     config: &Arc<Config>,
-    saving: bool,
     keeping: Vec<Made>,
 ) -> Result<(ConfigUpdate, Built)> {
     let config = config.clone();
     tokio::task::spawn_blocking(move || {
         let built = build(&update.config, config.local(), &keeping)?;
-        if saving && let Err(error) = saved_config::save(&config.saved_config_file(), &update) {
-            warn!(error = format!("{error:#}"), "saving the config failed");
-        }
         Ok((update, built))
     })
     .await
     .context("building collectors stopped")?
 }
 
+/// Saves a config that's running, so monitoring carries on with it through a
+/// server outage.
+async fn save_apart(update: ConfigUpdate, config: &Arc<Config>) {
+    let path = config.saved_config_file();
+    let saved = tokio::task::spawn_blocking(move || saved_config::save(&path, &update)).await;
+    if let Err(error) = saved.map_err(anyhow::Error::from).and_then(|saved| saved) {
+        warn!(error = format!("{error:#}"), "saving the config failed");
+    }
+}
+
+/// The collectors running now, each with what it was made from.
+type Running = Vec<(Made, Box<dyn Collector + Send>)>;
+
 /// Puts a plan's collectors together: those it built, and for the rest, the one
 /// running now made the same, which is taken from `running`. What templates read is
-/// changed in place. None if one the plan keeps isn't running, or can't be changed.
+/// changed in place, once everything else is there. None if one the plan keeps
+/// isn't running, or can't be changed, and then `running` is as it was.
 fn assemble(
     plan: collector::Plan,
-    running: &mut Vec<(Made, Box<dyn Collector + Send>)>,
+    running: &mut Running,
     config: &AgentConfig,
     local: Local<'_>,
 ) -> Option<(Collectors, Vec<Made>)> {
-    let mut collectors = Vec::with_capacity(plan.len());
-    let mut made = Vec::with_capacity(plan.len());
+    // Each collector, and whether it was taken from `running`.
+    let mut parts: Vec<(Made, Box<dyn Collector + Send>, bool)> = Vec::with_capacity(plan.len());
+    let give_back = |parts: Vec<(Made, Box<dyn Collector + Send>, bool)>, running: &mut Running| {
+        running.extend(
+            parts
+                .into_iter()
+                .filter(|(_, _, taken)| *taken)
+                .map(|(made, collector, _)| (made, collector)),
+        );
+    };
     for (what, built) in plan {
-        let collector = match built {
-            Some(built) => built,
-            None => {
-                let at = running.iter().position(|(kept, _)| *kept == what)?;
-                let (_, mut kept) = running.remove(at);
-                if what == Made::Templates {
-                    let templates = kept.as_any_mut()?.downcast_mut::<TemplateCollector>()?;
-                    let work = &config.templates;
-                    if let Err(error) = templates.update(work, local.databases, config.interval) {
-                        warn!(
-                            error = format!("{error:#}"),
-                            "changing what templates read failed"
-                        );
-                        return None;
-                    }
+        match built {
+            Some(built) => parts.push((what, built, false)),
+            None => match running.iter().position(|(kept, _)| *kept == what) {
+                Some(at) => {
+                    let (made, kept) = running.remove(at);
+                    parts.push((made, kept, true));
                 }
-                kept
-            }
-        };
-        collectors.push(collector);
-        made.push(what);
+                None => {
+                    give_back(parts, running);
+                    return None;
+                }
+            },
+        }
     }
-    Some((collectors, made))
+    let kept_templates = parts
+        .iter_mut()
+        .find(|(made, _, taken)| *taken && *made == Made::Templates);
+    if let Some((_, kept, _)) = kept_templates {
+        let changed = match kept
+            .as_any_mut()
+            .and_then(|any| any.downcast_mut::<TemplateCollector>())
+        {
+            Some(templates) => templates
+                .update(&config.templates, local.databases, config.interval)
+                .map_err(|error| format!("{error:#}")),
+            None => Err("it isn't what templates are read with".to_string()),
+        };
+        if let Err(error) = changed {
+            warn!(error, "changing what templates read failed");
+            give_back(parts, running);
+            return None;
+        }
+    }
+    Some(
+        parts
+            .into_iter()
+            .map(|(made, collector, _)| (collector, made))
+            .unzip(),
+    )
+}
+
+/// [`assemble`] apart from the connection, as changing what templates read can
+/// block on Windows' performance counters. `running` comes back as `assemble`
+/// leaves it.
+async fn assemble_apart(
+    plan: collector::Plan,
+    running: Running,
+    update: &ConfigUpdate,
+    config: &Arc<Config>,
+) -> (Option<(Collectors, Vec<Made>)>, Running) {
+    let (agent, config) = (update.config.clone(), config.clone());
+    let assembling = tokio::task::spawn_blocking(move || {
+        let mut running = running;
+        let assembled = catch_unwind(AssertUnwindSafe(|| {
+            assemble(plan, &mut running, &agent, config.local())
+        }))
+        .unwrap_or_else(|_| {
+            error!("putting collectors together panicked");
+            None
+        });
+        (assembled, running)
+    });
+    match assembling.await {
+        Ok(done) => done,
+        // It catches panics, so only a runtime shutting down gets here.
+        Err(error) => {
+            error!(%error, "putting collectors together stopped");
+            (None, Vec::new())
+        }
+    }
 }
 
 /// Where the collectors are.
@@ -382,12 +446,17 @@ enum Collecting {
     Ready(Collectors),
     /// Collecting a sample on a thread of their own, as reading the system can
     /// block, on a hung network drive say, and the agent's one thread also keeps the
-    /// connection to the server alive.
-    Away(JoinHandle<(Collectors, Sample)>),
+    /// connection to the server alive. Since when.
+    Away(JoinHandle<Collected>, Instant),
 }
 
-/// How long a new config waits for the collectors to finish a sample, to keep
-/// what's the same, before building them all again.
+/// What a sample's collection gives back: the collectors, the sample, and which
+/// collectors panicked, by where they are among them.
+type Collected = (Collectors, Sample, Vec<usize>);
+
+/// How long a new config waits, in all, for the collectors to finish a sample, to
+/// keep what's the same, before building them all again. Counted from when the
+/// sample began, so collectors that are stuck hold up only the first config.
 const TAKE_BACK_LIMIT: Duration = Duration::from_secs(5);
 
 /// The monitoring the agent is currently doing.
@@ -396,6 +465,9 @@ struct Monitoring {
     collecting: Collecting,
     /// What each collector was made from, in the same order.
     made: Vec<Made>,
+    /// Collectors that panicked, which a new config builds again rather than keeps,
+    /// as a panic may have left them broken.
+    broken: Vec<Made>,
     period: Duration,
     ticker: Interval,
 }
@@ -414,6 +486,7 @@ impl Monitoring {
             version,
             collecting: Collecting::Ready(collectors),
             made,
+            broken: Vec::new(),
             period,
             ticker,
         }
@@ -422,35 +495,62 @@ impl Monitoring {
     fn collector_count(&self) -> usize {
         match &self.collecting {
             Collecting::Ready(collectors) => collectors.len(),
-            Collecting::Away(_) => 0,
+            Collecting::Away(..) => 0,
+        }
+    }
+
+    /// What the collectors running now were made from, but for those that panicked.
+    fn keeping(&self) -> Vec<Made> {
+        self.made
+            .iter()
+            .filter(|made| !self.broken.contains(made))
+            .cloned()
+            .collect()
+    }
+
+    /// Notes which collectors panicked in a sample.
+    fn note_panicked(&mut self, panicked: &[usize]) {
+        for at in panicked {
+            if let Some(made) = self.made.get(*at)
+                && !self.broken.contains(made)
+            {
+                self.broken.push(made.clone());
+            }
         }
     }
 
     /// The collectors, with what each was made from, once they're back from any
-    /// sample they're taking, which is passed on. None if they don't come back soon.
-    async fn take_back(
-        &mut self,
-        link: &ServerLink,
-    ) -> Option<Vec<(Made, Box<dyn Collector + Send>)>> {
-        let collectors =
-            match std::mem::replace(&mut self.collecting, Collecting::Ready(Vec::new())) {
-                Collecting::Ready(collectors) => collectors,
-                Collecting::Away(task) => match timeout(TAKE_BACK_LIMIT, task).await {
-                    Ok(Ok((collectors, sample))) => {
-                        if let Err(error) = link.send_sample(sample) {
-                            warn!(error = format!("{error:#}"), "keeping a sample failed");
-                        }
-                        collectors
-                    }
-                    _ => return None,
-                },
+    /// sample they're taking, and that sample. None if they don't come back soon,
+    /// and then they carry on with it.
+    async fn take_back(&mut self) -> Option<(Running, Option<Sample>)> {
+        let mut finished = None;
+        if let Collecting::Away(task, since) = &mut self.collecting {
+            let left = TAKE_BACK_LIMIT.saturating_sub(since.elapsed());
+            let Ok(Ok((collectors, sample, panicked))) = timeout(left, &mut *task).await else {
+                return None;
             };
-        Some(
-            std::mem::take(&mut self.made)
-                .into_iter()
-                .zip(collectors)
-                .collect(),
-        )
+            finished = Some(sample);
+            self.note_panicked(&panicked);
+            self.collecting = Collecting::Ready(collectors);
+        }
+        let Collecting::Ready(collectors) =
+            std::mem::replace(&mut self.collecting, Collecting::Ready(Vec::new()))
+        else {
+            return None;
+        };
+        let running = std::mem::take(&mut self.made)
+            .into_iter()
+            .zip(collectors)
+            .collect();
+        Some((running, finished))
+    }
+
+    /// Puts back collectors [`Self::take_back`] took, when a new config couldn't
+    /// use them, so the config that was running carries on.
+    fn put_back(&mut self, running: Running) {
+        let (made, collectors): (Vec<Made>, Collectors) = running.into_iter().unzip();
+        self.made = made;
+        self.collecting = Collecting::Ready(collectors);
     }
 }
 
@@ -477,14 +577,13 @@ async fn run_agent(path: PathBuf, config: Arc<Config>) -> Result<()> {
     // The last good config means monitoring carries on through a server outage.
     let mut monitoring = None;
     if let Some(update) = saved_config::load(&config.saved_config_file()) {
-        match build_apart(update, &config, false, Vec::new()).await {
+        match build_apart(update, &config, Vec::new()).await {
             Ok((update, built)) => {
                 info!(version = update.version, "using the saved config");
                 link.set_facts_interval(update.config.facts_interval);
                 let period = update.config.interval;
-                let mut none = Vec::new();
-                if let Some((collectors, made)) =
-                    assemble(built.plan, &mut none, &update.config, config.local())
+                if let (Some((collectors, made)), _) =
+                    assemble_apart(built.plan, Vec::new(), &update, &config).await
                 {
                     monitoring = Some(Monitoring::new(update.version, collectors, made, period));
                 }
@@ -526,15 +625,17 @@ async fn next_sample(monitoring: &mut Option<Monitoring>) -> Option<Sample> {
                 let Collecting::Ready(mut collectors) = ready else {
                     continue;
                 };
-                active.collecting = Collecting::Away(tokio::task::spawn_blocking(move || {
-                    let sample = collect(&mut collectors);
-                    (collectors, sample)
-                }));
+                let task = tokio::task::spawn_blocking(move || {
+                    let (sample, panicked) = collect(&mut collectors);
+                    (collectors, sample, panicked)
+                });
+                active.collecting = Collecting::Away(task, Instant::now());
             }
-            Collecting::Away(task) => {
+            Collecting::Away(task, _) => {
                 let collected = task.await;
                 match collected {
-                    Ok((collectors, sample)) => {
+                    Ok((collectors, sample, panicked)) => {
+                        active.note_panicked(&panicked);
                         active.collecting = Collecting::Ready(collectors);
                         return Some(sample);
                     }
@@ -554,6 +655,9 @@ async fn next_sample(monitoring: &mut Option<Monitoring>) -> Option<Sample> {
 /// Swaps in a new config, or keeps the current one and tells the server why not.
 /// Collectors whose settings are the same carry on, with whatever they hold, such
 /// as connections and running totals, and templates take their new work in place.
+/// A config that can't be put together that way has everything built again, and
+/// one that can't be built at all leaves the one running as it was. Only a config
+/// that runs is saved.
 async fn apply(
     update: ConfigUpdate,
     config: &Arc<Config>,
@@ -570,30 +674,50 @@ async fn apply(
     }
 
     let version = update.version.clone();
+    let rejected = |error: anyhow::Error| {
+        let error = format!("{error:#}");
+        warn!(version, error, "config rejected");
+        link.report_config(&version, Some(error), Vec::new())
+    };
     let keeping = monitoring
         .as_ref()
-        .map(|active| active.made.clone())
+        .map(Monitoring::keeping)
         .unwrap_or_default();
-    let built = match build_apart(update.clone(), config, true, keeping).await {
+    let (update, built) = match build_apart(update, config, keeping).await {
         Ok(built) => built,
-        Err(error) => {
-            let error = format!("{error:#}");
-            warn!(version, error, "config rejected");
-            return link.report_config(&version, Some(error), Vec::new());
-        }
+        Err(error) => return rejected(error),
     };
-    let (update, built) = built;
     let period = update.config.interval;
     let fresh = built
         .plan
         .iter()
         .any(|(made, built)| built.is_some() && matches!(made, Made::Settings { .. }));
     let skipped_collectors = built.skipped_collectors.clone();
-    let mut running = match monitoring.as_mut() {
-        Some(active) => active.take_back(link).await.unwrap_or_default(),
-        None => Vec::new(),
+    let running = match monitoring.as_mut() {
+        Some(active) => active.take_back().await.map(|(running, finished)| {
+            if let Some(sample) = finished
+                && let Err(error) = link.send_sample(sample)
+            {
+                warn!(error = format!("{error:#}"), "keeping a sample failed");
+            }
+            running
+        }),
+        None => Some(Vec::new()),
     };
-    let assembled = assemble(built.plan, &mut running, &update.config, config.local());
+    let mut assembled = None;
+    if let Some(running) = running {
+        let (done, running) = assemble_apart(built.plan, running, &update, config).await;
+        match done {
+            Some(done) => assembled = Some(done),
+            // What wasn't used goes back, so the old config carries on if the new
+            // one can't be built afresh either.
+            None => {
+                if let Some(active) = monitoring.as_mut() {
+                    active.put_back(running);
+                }
+            }
+        }
+    }
     let started = match assembled {
         Some((collectors, made)) => {
             // Unchanged, the samples keep to their schedule, unless something new
@@ -607,28 +731,24 @@ async fn apply(
                     active.version = update.version.clone();
                     active.collecting = Collecting::Ready(collectors);
                     active.made = made;
+                    active.broken.clear();
                     active
                 }
                 _ => Monitoring::new(update.version.clone(), collectors, made, period),
             }
         }
-        // What was to be kept isn't there any more, so everything's built again.
+        // What was to be kept isn't there, or is still collecting, so everything's
+        // built again.
         None => {
-            drop(running);
-            match build_apart(update.clone(), config, false, Vec::new()).await {
-                Ok((_, built)) => {
-                    let mut none = Vec::new();
-                    let (collectors, made) =
-                        assemble(built.plan, &mut none, &update.config, config.local())
-                            .context("building every collector again")?;
+            let (_, built) = match build_apart(update.clone(), config, Vec::new()).await {
+                Ok(built) => built,
+                Err(error) => return rejected(error),
+            };
+            match assemble_apart(built.plan, Vec::new(), &update, config).await {
+                (Some((collectors, made)), _) => {
                     Monitoring::new(update.version.clone(), collectors, made, period)
                 }
-                Err(error) => {
-                    let error = format!("{error:#}");
-                    warn!(version, error, "config rejected");
-                    *monitoring = None;
-                    return link.report_config(&version, Some(error), Vec::new());
-                }
+                (None, _) => return rejected(anyhow!("putting its collectors together failed")),
             }
         }
     };
@@ -640,15 +760,18 @@ async fn apply(
     );
     *monitoring = Some(started);
     link.set_facts_interval(update.config.facts_interval);
+    save_apart(update.clone(), config).await;
     link.report_config(&update.version, None, skipped_collectors)
 }
 
-/// A collector that fails or panics is logged and skipped so the others still
-/// report, and it gets another chance on the next tick. Rust's panic hook has
-/// already written the panic message and location to stderr.
-fn collect(collectors: &mut [Box<dyn Collector + Send>]) -> Sample {
+/// Collects a sample. A collector that fails or panics is logged and skipped so
+/// the others still report, and it gets another chance on the next tick; which
+/// ones panicked comes back too, by where they are. Rust's panic hook has already
+/// written the panic message and location to stderr.
+fn collect(collectors: &mut [Box<dyn Collector + Send>]) -> (Sample, Vec<usize>) {
     let mut metrics = BTreeMap::new();
-    for collector in collectors {
+    let mut panicked = Vec::new();
+    for (at, collector) in collectors.iter_mut().enumerate() {
         match catch_unwind(AssertUnwindSafe(|| collector.collect())) {
             // Nothing yet, which isn't the same as finding nothing.
             Ok(Ok(Value::Null)) => {}
@@ -657,14 +780,18 @@ fn collect(collectors: &mut [Box<dyn Collector + Send>]) -> Sample {
                 metrics.insert(collector.name().to_string(), value);
             }
             Ok(Err(error)) => warn!(collector = collector.name(), %error, "collection failed"),
-            Err(_) => error!(collector = collector.name(), "collector panicked"),
+            Err(_) => {
+                error!(collector = collector.name(), "collector panicked");
+                panicked.push(at);
+            }
         }
     }
 
-    Sample {
+    let sample = Sample {
         time: maxnines_protocol::time::now(),
         metrics,
-    }
+    };
+    (sample, panicked)
 }
 
 #[cfg(test)]
@@ -787,9 +914,10 @@ mod tests {
 
         // Twice, because the panicking collector must not break later ticks.
         for _ in 0..2 {
-            let sample = collect(&mut collectors);
+            let (sample, panicked) = collect(&mut collectors);
             assert_eq!(sample.metrics.get("working"), Some(&json!(1)));
             assert!(!sample.metrics.contains_key("panicking"));
+            assert_eq!(panicked, [0]);
         }
     }
 
@@ -797,10 +925,11 @@ mod tests {
     fn a_collector_with_no_result_yet_is_left_out() {
         let mut collectors: Collectors = vec![Box::new(NothingYet), Box::new(Working)];
 
-        let sample = collect(&mut collectors);
+        let (sample, panicked) = collect(&mut collectors);
 
         assert_eq!(sample.metrics.get("working"), Some(&json!(1)));
         assert!(!sample.metrics.contains_key("nothing-yet"));
+        assert!(panicked.is_empty());
     }
 
     #[tokio::test]
@@ -904,6 +1033,96 @@ mod tests {
         // One that isn't running any more can't be kept.
         let built = build(&after, Local::none(), &keeping).unwrap();
         assert!(assemble(built.plan, &mut Vec::new(), &after, Local::none()).is_none());
+    }
+
+    /// A config that can't be put together leaves what was running as it was, so the
+    /// config before carries on.
+    #[test]
+    fn a_config_that_cannot_be_put_together_gives_back_what_it_took() {
+        let before = update("v1", json!({ "collectors": { "cpu": {}, "memory": {} } })).config;
+        let keeping: Vec<Made> = build(&before, Local::none(), &[])
+            .unwrap()
+            .plan
+            .into_iter()
+            .map(|(made, _)| made)
+            .collect();
+        let cpu = keeping
+            .iter()
+            .find(|made| matches!(made, Made::Settings { name, .. } if name == "cpu"))
+            .unwrap()
+            .clone();
+        // Only cpu is running, so memory, which the plan keeps, isn't there.
+        let mut running: Running = vec![(cpu.clone(), Box::new(Counting(7)))];
+        let built = build(&before, Local::none(), &keeping).unwrap();
+
+        assert!(assemble(built.plan, &mut running, &before, Local::none()).is_none());
+        assert_eq!(running.len(), 1);
+        assert!(running[0].0 == cpu);
+        assert_eq!(running[0].1.collect().unwrap(), json!(8));
+    }
+
+    /// A collector that panicked is built again by the next config, rather than
+    /// kept, as the panic may have left it broken.
+    #[tokio::test]
+    async fn a_collector_that_panicked_is_not_kept() {
+        let mut monitoring = Monitoring::new(
+            "v1".to_string(),
+            vec![Box::new(Panicking), Box::new(Working)],
+            vec![Made::Templates, Made::OwnUsage],
+            Duration::from_secs(60),
+        );
+        let Collecting::Ready(mut collectors) =
+            std::mem::replace(&mut monitoring.collecting, Collecting::Ready(Vec::new()))
+        else {
+            unreachable!()
+        };
+        let (_, panicked) = collect(&mut collectors);
+        monitoring.note_panicked(&panicked);
+        monitoring.collecting = Collecting::Ready(collectors);
+
+        assert!(monitoring.keeping() == [Made::OwnUsage]);
+    }
+
+    /// Collectors stuck in a sample hold up a new config only so long, counted from
+    /// when the sample began, and carry on with it when they're not taken back.
+    #[tokio::test]
+    async fn collectors_stuck_in_a_sample_are_left_to_it() {
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let mut monitoring = Monitoring::new(
+            "v1".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Duration::from_secs(60),
+        );
+        let task = tokio::task::spawn_blocking(move || {
+            stuck.recv().ok();
+            (
+                Collectors::new(),
+                Sample {
+                    time: maxnines_protocol::time::now(),
+                    metrics: BTreeMap::new(),
+                },
+                Vec::new(),
+            )
+        });
+        // Away for longer than a new config waits, so it doesn't wait at all.
+        let since = Instant::now() - TAKE_BACK_LIMIT;
+        monitoring.collecting = Collecting::Away(task, since);
+
+        let waited = Instant::now();
+        assert!(monitoring.take_back().await.is_none());
+        assert!(waited.elapsed() < TAKE_BACK_LIMIT);
+        assert!(matches!(monitoring.collecting, Collecting::Away(..)));
+
+        release.send(()).unwrap();
+        while let Collecting::Away(task, _) = &monitoring.collecting
+            && !task.is_finished()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let (running, finished) = monitoring.take_back().await.unwrap();
+        assert!(running.is_empty());
+        assert!(finished.is_some());
     }
 
     /// Blocks until it's let go, as reading a hung network drive does.

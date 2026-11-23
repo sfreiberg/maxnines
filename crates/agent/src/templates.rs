@@ -53,16 +53,17 @@ impl TemplateCollector {
     }
 
     /// Changes what's read to `work`: a database's task whose work is the same
-    /// carries on, one whose work changed is told, and the rest stop or start.
+    /// carries on, one whose work changed is told, and the rest stop or start. If
+    /// it fails, nothing has changed.
     pub fn update(
         &mut self,
         work: &[TemplateWork],
         definitions: &DatabaseDefinitions,
         interval: Duration,
     ) -> Result<()> {
+        let runtime = runtime()?;
         self.interval = interval;
         self.host.update(work);
-        let runtime = runtime()?;
         self.reader.update(work, interval, &runtime, |name| {
             definitions
                 .get(name)
