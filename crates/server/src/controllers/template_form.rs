@@ -72,6 +72,8 @@ pub struct QueryForm {
     pub enabled: bool,
     /// Comma separated.
     pub labels: String,
+    /// `name = Column` on each line, for a SHOW statement.
+    pub columns: String,
     pub fills: Vec<FillForm>,
     pub metrics: Vec<MetricForm>,
 }
@@ -312,6 +314,7 @@ impl TemplateForm {
                     when: text(&query.when),
                     enabled: query.enabled,
                     labels: comma_list(&query.labels),
+                    columns: pairs(&query.columns),
                     fills: query
                         .fills
                         .iter()
@@ -438,6 +441,10 @@ impl TemplateForm {
                 when: optional(&query.when),
                 enabled: query.enabled,
                 labels: from_comma_list(&query.labels),
+                columns: from_pairs(&query.columns).unwrap_or_else(|message| {
+                    problems.push(Problem::new(Place::Query(index), "columns", message));
+                    IndexMap::new()
+                }),
                 fills: query
                     .fills
                     .iter()
@@ -619,6 +626,7 @@ impl TemplateForm {
                         when: get(&format!("{prefix}when")),
                         enabled: on(&format!("{prefix}enabled")),
                         labels: get(&format!("{prefix}labels")),
+                        columns: get(&format!("{prefix}columns")),
                         fills: (0..rows(&format!("{prefix}fill.")))
                             .map(|fill| {
                                 let prefix = format!("{prefix}fill.{fill}.");
@@ -860,6 +868,7 @@ impl TemplateForm {
                 put(format!("{prefix}enabled"), "on");
             }
             put(format!("{prefix}labels"), &query.labels);
+            put(format!("{prefix}columns"), &query.columns);
             for (number, fill) in query.fills.iter().enumerate() {
                 let prefix = format!("{prefix}fill.{number}.");
                 put(format!("{prefix}key"), &fill.key);

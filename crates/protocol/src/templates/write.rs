@@ -213,6 +213,7 @@ fn query_block(query: &Query) -> Block {
     attributes.text("since", query.since.as_ref());
     attributes.text("interval", query.interval.as_ref());
     attributes.add("sql", text(&query.sql));
+    attributes.map("columns", &query.columns);
     attributes.list("labels", &query.labels);
     if !query.metrics.is_empty() {
         attributes.add("metrics", metrics(&query.metrics));

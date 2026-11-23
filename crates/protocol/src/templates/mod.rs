@@ -175,11 +175,39 @@ pub struct Query {
     /// Text columns that tell rows apart, one series per row.
     #[serde(default)]
     pub labels: Vec<String>,
+    /// For a SHOW statement, whose columns aren't known until it runs: the name
+    /// each column it reads is given, as a metric or a label, and the column, such
+    /// as `lag = "Seconds_Behind_Source"`. No other column is read.
+    #[serde(default)]
+    pub columns: IndexMap<String, String>,
     #[serde(default)]
     pub fills: Vec<Fill>,
     /// More about some columns, or metrics worked out from them.
     #[serde(default)]
     pub metrics: Vec<Metric>,
+}
+
+/// The only statements a template may run other than a SELECT: MySQL's and
+/// MariaDB's, for what only SHOW says, such as how far behind a replica is.
+pub const SHOW_STATEMENTS: [&str; 5] = [
+    "SHOW REPLICA STATUS",
+    "SHOW SLAVE STATUS",
+    "SHOW ALL REPLICAS STATUS",
+    "SHOW ALL SLAVES STATUS",
+    "SHOW BINARY LOGS",
+];
+
+/// What a template's statement is: a SHOW statement, and whether it's one of
+/// [`SHOW_STATEMENTS`], or `None` for anything else.
+pub fn show_statement(sql: &str) -> Option<bool> {
+    let words: Vec<String> = sql
+        .trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .map(str::to_ascii_uppercase)
+        .collect();
+    (words.first().map(String::as_str) == Some("SHOW"))
+        .then(|| SHOW_STATEMENTS.contains(&words.join(" ").as_str()))
 }
 
 /// A piece of SQL picked by version, filling `{{ key }}` in a query.
@@ -985,6 +1013,25 @@ fn check_query(index: usize, query: &Query, say: &mut dyn FnMut(Place, &str, Str
     }
     if let Some(since) = &query.since {
         check_version(since, &mut |message| say(place, "since", message));
+    }
+    if query.columns.len() > work::MAX_COLUMNS {
+        say(
+            place,
+            "columns",
+            format!("can be up to {}", work::MAX_COLUMNS),
+        );
+    }
+    for (name, column) in &query.columns {
+        if !is_key(name) {
+            say(place, "columns", format!("{name:?} {KEY_RULE}"));
+        }
+        if column.trim().is_empty() {
+            say(
+                place,
+                "columns",
+                format!("{name:?} needs the column it's read from"),
+            );
+        }
     }
     let mut seen = BTreeSet::new();
     for label in &query.labels {

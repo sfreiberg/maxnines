@@ -233,6 +233,14 @@ map_table!(
     counter_set
 );
 map_table!(
+    query_columns,
+    "template_query_columns",
+    query_id,
+    QueryId,
+    name,
+    source
+);
+map_table!(
     registry_values,
     "template_registry_values",
     registry_read_id,

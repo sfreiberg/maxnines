@@ -295,6 +295,8 @@ struct QueryFields {
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default)]
+    columns: IndexMap<String, String>,
+    #[serde(default)]
     metrics: IndexMap<String, Value>,
 }
 
@@ -334,6 +336,7 @@ fn read_query(key: String, body: Body) -> Result<Query> {
         when: fields.when,
         enabled: fields.enabled,
         labels: fields.labels,
+        columns: fields.columns,
         fills,
         metrics: read_metrics(fields.metrics)?,
     })

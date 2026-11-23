@@ -485,6 +485,7 @@ async fn read_template<C: ConnectionTrait>(
             when: query.when_condition,
             enabled: on(original.enabled, original.enabled_choice),
             labels: template_items::query_labels::read(connection, query.id).await?,
+            columns: template_items::query_columns::read(connection, query.id).await?,
             fills,
             metrics: to_metrics(connection, metrics).await?,
         });
@@ -794,6 +795,7 @@ async fn write_query<C: ConnectionTrait>(
     };
     let query_id = put_part!(template_query, connection, expected, existing);
     template_items::query_labels::write(connection, query_id, &query.labels).await?;
+    template_items::query_columns::write(connection, query_id, &query.columns).await?;
 
     let mut fills_left: HashMap<String, template_fill::Model> = template_fill::Entity::find()
         .filter(template_fill::Column::QueryId.eq(query_id))

@@ -565,3 +565,51 @@ fn what_discover_blocks_find_is_found_once() {
         );
     }
 }
+
+#[test]
+fn a_mysql_template_can_run_a_few_show_statements_naming_their_columns() {
+    let template = |database: &str, sql: &str, columns: &str| {
+        format!(
+            r#"template "my" {{
+                 name     = "My"
+                 database = "{database}"
+                 query "replication" {{
+                   sql     = "{sql}"
+                   {columns}
+                   labels  = ["channel"]
+                 }}
+               }}"#
+        )
+    };
+    let columns = r#"columns = { channel = "Channel_Name", behind = "Seconds_Behind_Source" }"#;
+    let fine = template("mysql", "SHOW REPLICA STATUS", columns);
+    assert_eq!(problems(&fine), Vec::<String>::new());
+    let parsed = parse(&fine).unwrap();
+    assert_eq!(
+        query_columns_of(&parsed, &parsed.queries[0]),
+        ["channel", "behind"]
+    );
+    let refused = |text: String, expected: &str| {
+        let found = problems(&text);
+        assert!(
+            found.iter().any(|problem| problem.contains(expected)),
+            "{expected}: {found:#?}"
+        );
+    };
+    refused(
+        template("mysql", "SHOW GRANTS", columns),
+        "SHOW statement templates can't run",
+    );
+    refused(
+        template("postgres", "SHOW REPLICA STATUS", columns),
+        "only a MySQL template can run",
+    );
+    refused(
+        template("mysql", "SHOW REPLICA STATUS", ""),
+        "has to name the columns",
+    );
+    refused(
+        template("mysql", "SELECT 1 AS channel", columns),
+        "only for a SHOW statement",
+    );
+}

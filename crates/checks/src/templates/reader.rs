@@ -27,7 +27,7 @@ use std::time::Duration;
 use anyhow::Result;
 use maxnines_protocol::templates::work::{
     ACCOUNT, ACCOUNTS, CONNECTING, DISCOVERED, Discovered, ERRORS, TemplateErrors, TemplateWork,
-    collector_of, error_text, part_name,
+    check_statement, collector_of, error_text, part_name,
 };
 use serde_json::{Map, Value, json};
 use tokio::runtime::Handle;
@@ -36,7 +36,7 @@ use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
-use super::{INSTANCE_LABEL, Privileges, Session, Totals, discovered, metric_rows};
+use super::{INSTANCE_LABEL, Privileges, Session, Totals, discovered, metric_rows, picked};
 use crate::databases::{Database, TIMEOUT};
 use crate::jitter;
 
@@ -506,8 +506,13 @@ async fn run(
                     continue;
                 }
                 at.at = now + query.interval.unwrap_or(every);
-                match session.run(&query.sql, TIMEOUT).await {
+                let ran = match check_statement(&query.key, &query.sql) {
+                    Ok(()) => session.run(&query.sql, TIMEOUT).await,
+                    Err(refused) => Err(refused),
+                };
+                match ran {
                     Ok(read) => {
+                        let read = picked(read, query);
                         rows.extend(metric_rows(&read, query, &database, &mut at.totals));
                         errors.remove(&part_name("query", &query.key));
                     }
@@ -667,6 +672,7 @@ mod tests {
                     .to_string(),
                 interval: None,
                 labels: vec!["name".to_string()],
+                columns: Default::default(),
                 totals: vec!["commits".to_string()],
                 omit: Vec::new(),
             }],
@@ -909,6 +915,7 @@ mod tests {
             sql: "SELECT count(*) AS sessions FROM pg_stat_activity".to_string(),
             interval: None,
             labels: Vec::new(),
+            columns: Default::default(),
             totals: Vec::new(),
             omit: Vec::new(),
         });

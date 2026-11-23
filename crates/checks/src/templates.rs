@@ -388,6 +388,68 @@ fn mysql_row(row: mysql_async::Row) -> Row {
         .collect()
 }
 
+/// A SHOW statement's rows as a template reads them: only the columns it names,
+/// each under the name it gives it, with yes and no as true and false and numbers
+/// written as text as numbers, and rows with the same labels added up, such as
+/// every binary log's size. Any other statement's rows are as they are.
+pub fn picked(rows: Vec<Row>, query: &QueryWork) -> Vec<Row> {
+    if query.columns.is_empty() {
+        return rows;
+    }
+    let labels = |row: &Row| -> Vec<Cell> {
+        query
+            .labels
+            .iter()
+            .map(|label| {
+                let found = row.iter().find(|(name, _)| name == label);
+                found.map_or(Cell::Null, |(_, cell)| cell.clone())
+            })
+            .collect()
+    };
+    let mut picked: Vec<Row> = Vec::new();
+    for row in rows {
+        let one: Row = query
+            .columns
+            .iter()
+            .map(|(name, column)| {
+                let found = row
+                    .iter()
+                    .find(|(have, _)| have.eq_ignore_ascii_case(column))
+                    .map_or(Cell::Null, |(_, cell)| cell.clone());
+                let cell = match query.labels.contains(name) {
+                    true => found,
+                    false => shown_as_value(found),
+                };
+                (name.clone(), cell)
+            })
+            .collect();
+        match picked.iter_mut().find(|seen| labels(seen) == labels(&one)) {
+            Some(seen) => {
+                for ((_, total), (_, cell)) in seen.iter_mut().zip(one) {
+                    if let (Cell::Number(total), Cell::Number(more)) = (total, cell) {
+                        *total += more;
+                    }
+                }
+            }
+            None => picked.push(one),
+        }
+    }
+    picked
+}
+
+/// What a SHOW statement says in words as a template can read it: yes or no, or a
+/// number. A replica's connection still being made isn't one that's up.
+fn shown_as_value(cell: Cell) -> Cell {
+    let Cell::Text(text) = cell else {
+        return cell;
+    };
+    match text.trim().to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" => Cell::Bool(true),
+        "no" | "off" | "false" | "connecting" => Cell::Bool(false),
+        other => other.parse().map_or(Cell::Text(text), Cell::Number),
+    }
+}
+
 /// What discovery found: the first row's columns, by name.
 pub fn discovered(rows: &[Row]) -> Map<String, Value> {
     let Some(row) = rows.first() else {
@@ -514,6 +576,7 @@ mod tests {
             sql: "SELECT".to_string(),
             interval: None,
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
+            columns: Default::default(),
             totals: totals.iter().map(|t| (*t).to_string()).collect(),
             omit: vec!["later".to_string()],
         }
@@ -632,6 +695,84 @@ mod tests {
         // A statement that runs too long is stopped by the database.
         let error = session.run("SELECT pg_sleep(30)", LIMIT).await.unwrap_err();
         assert!(format!("{error}").contains("statement timeout"), "{error}");
+    }
+
+    #[test]
+    fn a_show_statements_columns_are_picked_named_and_added_up() {
+        let mut query = query(&["channel"], &[]);
+        query.columns = [
+            ("channel", "Channel_Name"),
+            ("receiving", "Replica_IO_Running"),
+            ("behind", "Seconds_Behind_Source"),
+        ]
+        .into_iter()
+        .map(|(name, column)| (name.to_string(), column.to_string()))
+        .collect();
+        let row = |channel: &str, running: &str, behind: Cell| -> Row {
+            vec![
+                ("Channel_Name".to_string(), Cell::Text(channel.to_string())),
+                (
+                    "Replica_IO_Running".to_string(),
+                    Cell::Text(running.to_string()),
+                ),
+                ("Seconds_Behind_Source".to_string(), behind),
+                ("Exec_Source_Log_Pos".to_string(), Cell::Number(1.0)),
+            ]
+        };
+        let rows = picked(
+            vec![
+                row("", "Yes", Cell::Text("3".to_string())),
+                row("east", "Connecting", Cell::Null),
+            ],
+            &query,
+        );
+        assert_eq!(
+            rows,
+            [
+                vec![
+                    ("channel".to_string(), Cell::Text(String::new())),
+                    ("receiving".to_string(), Cell::Bool(true)),
+                    ("behind".to_string(), Cell::Number(3.0)),
+                ],
+                vec![
+                    ("channel".to_string(), Cell::Text("east".to_string())),
+                    ("receiving".to_string(), Cell::Bool(false)),
+                    ("behind".to_string(), Cell::Null),
+                ],
+            ]
+        );
+
+        // Rows with the same labels add up, as every binary log's size does.
+        let mut logs = query.clone();
+        logs.labels.clear();
+        logs.columns = [("binlog_size".to_string(), "File_size".to_string())]
+            .into_iter()
+            .collect();
+        let log = |size: f64| -> Row { vec![("File_size".to_string(), Cell::Number(size))] };
+        assert_eq!(
+            picked(vec![log(100.0), log(23.0)], &logs),
+            [vec![("binlog_size".to_string(), Cell::Number(123.0))]]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_mysql_runs_the_show_statements_templates_may() {
+        let Some(mut session) = real("MAXNINES_TEST_CHECK_MYSQL", CheckKind::Mysql) else {
+            return;
+        };
+        let rows = session.run("SHOW BINARY LOGS", LIMIT).await.unwrap();
+        let mut query = query(&[], &[]);
+        query.columns = [("binlog_size".to_string(), "File_size".to_string())]
+            .into_iter()
+            .collect();
+        let picked = picked(rows, &query);
+        assert_eq!(picked.len(), 1, "{picked:?}");
+        assert!(
+            matches!(picked[0][0].1, Cell::Number(size) if size > 0.0),
+            "{picked:?}"
+        );
+        // A replica's status runs too, with no rows on a server that isn't one.
+        session.run("SHOW REPLICA STATUS", LIMIT).await.unwrap();
     }
 
     #[tokio::test]

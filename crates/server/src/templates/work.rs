@@ -387,6 +387,7 @@ fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<Qu
             sql: fill(query, version.as_ref()),
             interval: seconds(query.interval.as_ref()),
             labels: query.labels.clone(),
+            columns: query.columns.clone(),
             totals: query
                 .metrics
                 .iter()

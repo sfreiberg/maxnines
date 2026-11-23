@@ -465,3 +465,18 @@ fn an_error_is_sent_no_longer_than_an_agent_sends_one() {
     assert_eq!(sent.chars().count(), MAX_ERROR_LEN);
     assert!(sent.ends_with('…'));
 }
+
+#[test]
+fn only_a_few_show_statements_can_be_run() {
+    assert_eq!(show_statement("SELECT 1"), None);
+    assert_eq!(show_statement("  show   replica status ;"), Some(true));
+    assert_eq!(show_statement("SHOW ALL SLAVES STATUS"), Some(true));
+    assert_eq!(show_statement("SHOW BINARY LOGS"), Some(true));
+    assert_eq!(show_statement("SHOW GRANTS"), Some(false));
+    assert_eq!(
+        show_statement("SHOW BINARY LOGS; DROP TABLE x"),
+        Some(false)
+    );
+    assert!(work::check_statement("q", "SHOW PROCESSLIST").is_err());
+    assert!(work::check_statement("q", "SHOW REPLICA STATUS").is_ok());
+}

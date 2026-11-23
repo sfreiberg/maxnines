@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use super::is_key;
@@ -198,6 +199,10 @@ pub struct QueryWork {
     /// The columns that tell rows apart.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// For a SHOW statement, the only columns read, each by the name it's given
+    /// and the column it's from. Rows with the same labels add up.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub columns: IndexMap<String, String>,
     /// The columns that are running totals, sent as the change since the last read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub totals: Vec<String>,
@@ -329,10 +334,15 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
             ensure!(
                 query.labels.len() <= MAX_COLUMNS
                     && query.totals.len() <= MAX_COLUMNS
-                    && query.omit.len() <= MAX_COLUMNS,
-                "query {:?} has too many labels or totals",
+                    && query.omit.len() <= MAX_COLUMNS
+                    && query.columns.len() <= MAX_COLUMNS,
+                "query {:?} has too many labels, totals or columns",
                 query.key
             );
+            check_statement(&query.key, &query.sql)?;
+            for name in query.columns.keys() {
+                check_key(name)?;
+            }
         }
         for counters in &one.counters {
             check_counters(counters)?;
@@ -360,6 +370,17 @@ fn check_sql(key: &str, sql: &str) -> Result<()> {
     ensure!(
         !sql.trim().is_empty() && sql.len() <= MAX_SQL_LEN,
         "{key:?} needs SQL of up to {MAX_SQL_LEN} bytes"
+    );
+    Ok(())
+}
+
+/// A statement is a SELECT, or one of the few SHOW statements templates may run,
+/// which is checked again here, as where it runs is the last place it can be.
+pub fn check_statement(key: &str, sql: &str) -> Result<()> {
+    ensure!(
+        super::show_statement(sql) != Some(false),
+        "query {key:?} is a SHOW statement templates can't run: only {} are",
+        super::SHOW_STATEMENTS.join(", ")
     );
     Ok(())
 }
@@ -421,6 +442,7 @@ mod tests {
                 sql: "SELECT count(*) AS connections FROM pg_stat_activity".to_string(),
                 interval: None,
                 labels: Vec::new(),
+                columns: Default::default(),
                 totals: Vec::new(),
                 omit: Vec::new(),
             }],

@@ -320,6 +320,7 @@ mod tests {
             sql: "SELECT".to_string(),
             interval: None,
             labels: Vec::new(),
+            columns: Default::default(),
             totals: Vec::new(),
             omit: omit.iter().map(|key| (*key).to_string()).collect(),
         };

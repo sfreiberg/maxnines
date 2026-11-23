@@ -14,6 +14,11 @@
     <small>Text columns that tell rows apart, comma separated.</small>
     {% set e = errors | get(key=p ~ "labels", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
+  <label>Columns
+    <textarea name="{{ p }}columns" rows="2" spellcheck="false" placeholder="lag = Seconds_Behind_Source">{{ query.columns }}</textarea>
+    <small>Only for a MySQL template's SHOW statement, whose columns aren't known until it runs: a name for each column read, one to a line.</small>
+    {% set e = errors | get(key=p ~ "columns", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
   <div class="field-row">
     <label>Every
       <input type="text" name="{{ p }}interval" value="{{ query.interval }}" spellcheck="false" placeholder="As the agent's">

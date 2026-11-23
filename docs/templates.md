@@ -240,12 +240,49 @@ query "checkpoints" {
 `interval` runs a query less often than the agent samples, and `enabled = false`
 ships it turned off.
 
-**How SQL runs.** Each query and discover block has to be one `SELECT`, which saving
-checks. It runs on its own, as a prepared statement, in a read-only transaction that's
-rolled back afterwards, and the database stops it after 5 seconds. On MySQL and
+**How SQL runs.** Each query and discover block has to be one `SELECT`, or for a
+query, one of a few [`SHOW` statements](#show-statements), which saving checks. It
+runs on its own, as a prepared statement, in a read-only transaction, and the database
+stops it after 5 seconds. On PostgreSQL a statement that worked commits its
+transaction, as nothing in it could write, so PostgreSQL's own count of rollbacks
+isn't one for each statement a template runs; MySQL's is rolled back. On MySQL and
 MariaDB the whole session is read-only too, as MySQL ends a transaction before
-anything that changes a table. A template can still run any `SELECT` its account is
+anything that changes a table. ClickHouse is asked over HTTP, where every statement is
+a GET, which it only lets read. A template can still run any `SELECT` its account is
 allowed to, so give MaxNines a [read-only account](#read-only-database-accounts).
+
+#### SHOW statements
+
+A query is a single `SELECT`, with one exception: some of what MySQL and MariaDB know is
+only said by a `SHOW` statement, such as how far behind a replica is. So a MySQL
+template's query can be one of these, and nothing else:
+
+- `SHOW REPLICA STATUS` and `SHOW SLAVE STATUS`
+- `SHOW ALL REPLICAS STATUS` and `SHOW ALL SLAVES STATUS`, MariaDB's
+- `SHOW BINARY LOGS`
+
+Which ones is checked as a template is saved or imported, and again by the agent or
+server before it runs one. Each runs as a query does: one statement, in a read-only
+transaction on a read-only session, with a time limit.
+
+What a `SHOW` statement gives isn't known until it runs, so `columns` names each column
+it reads, as a metric or a label, and no other column is read:
+
+```hcl
+query "replication" {
+  sql = "SHOW REPLICA STATUS"
+  columns = {
+    channel   = "Channel_Name"
+    receiving = "Replica_IO_Running"
+    behind    = "Seconds_Behind_Source"
+  }
+  labels = ["channel"]
+}
+```
+
+A column's `Yes` or `No`, `ON` or `OFF`, is read as yes or no, with `Connecting` as no,
+and a number written as text as a number. Rows with the same labels add up, so
+`SHOW BINARY LOGS` with no labels gives the size of every binary log together.
 
 ### Performance counters
 

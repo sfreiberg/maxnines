@@ -338,6 +338,13 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
             None,
         ),
         (
+            "template_query_columns",
+            "query_id",
+            "template_queries",
+            "name",
+            Some("source"),
+        ),
+        (
             "template_counters_excludes",
             "counters_id",
             "template_counters",
