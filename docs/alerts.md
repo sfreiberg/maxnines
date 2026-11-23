@@ -10,10 +10,10 @@ Every server starts with nine alert rules, from the built-in **Host**
 | **Host offline** | An approved host's agent has been gone for a minute | Critical |
 | **Host sending no metrics** | A host's agent has been [connected but sending no metrics](#connected-but-sending-no-metrics) for 5 minutes | Critical |
 | **Disk filling up** | A disk has been over 80% full for 5 minutes, or over 90% | Warning, then critical |
-| **Disk running out of inodes** | A disk has used over 80% of its [inodes](agents.md#disks) for 5 minutes, or over 90% | Warning, then critical |
-| **Container down** | A container has been failing for a minute, on hosts that report [containers](agents.md#containers) | Critical |
-| **Service stopped** | A [watched service](agents.md#watching-services-and-processes) hasn't been running for a minute | Critical |
-| **Clock is wrong** | A host's [clock](agents.md#clock) has been over 5 seconds from the server's for a minute, or over 30 seconds | Warning, then critical |
+| **Disk running out of inodes** | A disk has used over 80% of its [inodes](collectors-operating-system.md#disks) for 5 minutes, or over 90% | Warning, then critical |
+| **Container down** | A container has been failing for a minute, on hosts that report [containers](collectors-containers.md) | Critical |
+| **Service stopped** | A [watched service](collectors-operating-system.md#services) hasn't been running for a minute | Critical |
+| **Clock is wrong** | A host's [clock](collectors-operating-system.md#clock) has been over 5 seconds from the server's for a minute, or over 30 seconds | Warning, then critical |
 | **Disk will be full soon** | A disk has been on course to be full within a day for half an hour, judging by the last 6 hours, or within 4 hours | Warning, then critical |
 | **Database account can do more than read** | A [template](templates.md) reads a database with an account that [can do more than read](database-stats.md#what-the-account-may-do) | Warning |
 
@@ -128,7 +128,7 @@ saying *web-1 is sending metrics again*.
   agent is away, after it reconnects and after the server restarts, until a sample is
   stored, and `!online || !reporting` alerts on either. A host without an agent, or the
   server itself, is always `reporting`.
-- The server's own readings of a host's [clock](agents.md#clock) don't count, as
+- The server's own readings of a host's [clock](collectors-operating-system.md#clock) don't count, as
   they're saved whether or not anything the agent sends is.
 - Nothing starts in the first two minutes after the server starts, while agents
   reconnect and send what they kept meanwhile.

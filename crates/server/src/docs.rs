@@ -862,4 +862,104 @@ mod tests {
             assert!(parse_summary(bad).is_err(), "{bad}");
         }
     }
+
+    /// The pages that list collectors' metrics, each with the collectors whose
+    /// metrics its tables have to list.
+    const COLLECTOR_PAGES: &[(&str, &[&str])] = &[
+        (
+            "collectors-operating-system",
+            &[
+                "cpu",
+                "memory",
+                "disk",
+                "network",
+                "processes",
+                "top_processes",
+                "services",
+                "system",
+                "files",
+                "gpu",
+                "sensors",
+                "host",
+                "agent",
+                crate::clock::COLLECTOR,
+            ],
+        ),
+        ("collectors-containers", &["containers"]),
+        ("collectors-windows-counters", &["counters"]),
+        ("collectors-apache", &["apache"]),
+        ("collectors-nginx", &["nginx"]),
+        ("collectors-php-fpm", &["php_fpm"]),
+    ];
+
+    /// Collectors whose metrics are described elsewhere, without a table of every
+    /// metric yet. Move one to `COLLECTOR_PAGES` once its page has one.
+    const NO_METRIC_TABLE_YET: &[&str] = &[
+        "databases",
+        "database_accounts",
+        "checks",
+        "commands",
+        "custom",
+        "openmetrics",
+        "server",
+    ];
+
+    /// The metric each row of a page's tables starts with, such as `cpu.usage` in
+    /// ``| `cpu.usage` | % | ...``.
+    fn metrics_listed(markdown: &str) -> HashSet<&str> {
+        markdown
+            .lines()
+            .filter_map(|line| line.strip_prefix("| `")?.split_once('`'))
+            .map(|(name, _)| name)
+            .filter(|name| name.contains('.'))
+            .collect()
+    }
+
+    #[test]
+    fn each_collector_page_lists_every_metric_of_its_collectors_and_no_others() {
+        for (page, collectors) in COLLECTOR_PAGES {
+            let markdown = file(&format!("{page}.md")).unwrap();
+            let listed = metrics_listed(&markdown);
+            let expected: HashSet<&str> = crate::metrics::METRICS
+                .iter()
+                .filter(|metric| collectors.contains(&metric.collector))
+                .map(|metric| metric.name)
+                .collect();
+            let mut missing: Vec<_> = expected.difference(&listed).collect();
+            let mut unknown: Vec<_> = listed.difference(&expected).collect();
+            missing.sort();
+            unknown.sort();
+            assert!(missing.is_empty(), "{page}.md doesn't list {missing:?}");
+            assert!(
+                unknown.is_empty(),
+                "{page}.md lists {unknown:?}, which aren't its collectors' metrics"
+            );
+        }
+    }
+
+    #[test]
+    fn every_collector_with_metrics_has_a_page_for_them() {
+        let documented: HashSet<&str> = COLLECTOR_PAGES
+            .iter()
+            .flat_map(|(_, collectors)| collectors.iter().copied())
+            .chain(NO_METRIC_TABLE_YET.iter().copied())
+            .collect();
+        for metric in crate::metrics::METRICS {
+            assert!(
+                documented.contains(metric.collector),
+                "{} is from the {} collector, which no collector page lists",
+                metric.name,
+                metric.collector
+            );
+        }
+    }
+
+    #[test]
+    fn metric_rows_are_found_in_tables() {
+        let rows = "| Metric | Unit |\n| --- | --- |\n| `cpu.usage` | % |\n| `nginx.service` |\n| Linux | systemd |\n";
+        assert_eq!(
+            metrics_listed(rows),
+            HashSet::from(["cpu.usage", "nginx.service"])
+        );
+    }
 }
