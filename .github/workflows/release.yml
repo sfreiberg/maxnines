@@ -1,4 +1,4 @@
-# Builds the agent and server for every supported platform, packages them, and
+# Builds the agent, server and command line for every supported platform, packages them, and
 # publishes a GitHub release when a version tag is pushed.
 #
 # Every MaxNines repo releases the same way. A tag v1.2.3 is a production release,
@@ -111,9 +111,10 @@ jobs:
             dist/
             ${{ env.TARGET_DIR }}/${{ env.TARGET }}/release/maxnines-server
 
-  # Fully static, so it runs on any Linux, Alpine and older distributions included.
+  # The agent and command line, fully static, so they run on any Linux, Alpine and
+  # older distributions included.
   linux-agent:
-    name: Agent for Linux ${{ matrix.arch }}
+    name: Agent and command line for Linux ${{ matrix.arch }}
     needs: check
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -133,17 +134,26 @@ jobs:
         with:
           key: ${{ env.TARGET }}
           workspaces: ". -> ${{ env.TARGET_DIR }}"
-      - run: cargo build --release --locked -p maxnines-agent --target "$TARGET"
-      - name: Check it needs nothing else
+      - run: cargo build --release --locked -p maxnines-agent -p maxnines-cli --target "$TARGET"
+      - name: Check they need nothing else
         run: |
-          file "$TARGET_DIR/$TARGET/release/maxnines-agent" | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
-      - run: packaging/archive.sh maxnines-agent "${{ needs.check.outputs.version }}" "$TARGET" dist
+          for program in maxnines-agent maxnines; do
+            file "$TARGET_DIR/$TARGET/release/$program" | tee /dev/stderr | grep -qE "static(ally|-pie) linked"
+          done
+      - run: |
+          for program in maxnines-agent maxnines-cli; do
+            packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
+          done
+      # The command line's man pages and completions, for its packages.
+      - run: packaging/cli-files.sh "$TARGET_DIR/$TARGET/release"
       - uses: actions/upload-artifact@v7
         with:
           name: linux-agent-${{ matrix.arch }}
           path: |
             dist/
             ${{ env.TARGET_DIR }}/${{ env.TARGET }}/release/maxnines-agent
+            ${{ env.TARGET_DIR }}/${{ env.TARGET }}/release/maxnines
+            ${{ env.TARGET_DIR }}/${{ env.TARGET }}/release/cli-files/
 
   macos:
     name: macOS ${{ matrix.arch }}
@@ -167,9 +177,10 @@ jobs:
         with:
           key: ${{ env.TARGET }}
           workspaces: ". -> ${{ env.TARGET_DIR }}"
-      - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+      - run: cargo build --release --locked -p maxnines-agent -p maxnines-server -p maxnines-cli --target "$TARGET"
+      # The x86_64 command line writes its man pages through Rosetta.
       - run: |
-          for program in maxnines-agent maxnines-server; do
+          for program in maxnines-agent maxnines-server maxnines-cli; do
             packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
           done
       - uses: actions/upload-artifact@v7
@@ -209,11 +220,12 @@ jobs:
             choco install -y llvm
             printf '%s\n' 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
           fi
-      - run: cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+      - run: cargo build --release --locked -p maxnines-agent -p maxnines-server -p maxnines-cli --target "$TARGET"
       - run: |
           packaging/check-windows-dlls.sh \
             "$TARGET_DIR/$TARGET/release/maxnines-agent.exe" \
-            "$TARGET_DIR/$TARGET/release/maxnines-server.exe"
+            "$TARGET_DIR/$TARGET/release/maxnines-server.exe" \
+            "$TARGET_DIR/$TARGET/release/maxnines.exe"
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
@@ -240,11 +252,14 @@ jobs:
           esac
           IFS=. read -r major minor patch _ <<< "$base"
           mkdir -p msi/upgrade msi/x64 dist
-          for program in agent server; do
+          for program in agent server cli; do
+            # The command line is maxnines.exe.
+            exe=maxnines-$program.exe
+            [ "$program" = cli ] && exe=maxnines.exe
             build() {
               wix build -arch "${3:-${{ matrix.wix_arch }}}" \
                 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext \
-                -d Version="$1" -d Program="$TARGET_DIR/$TARGET/release/maxnines-$program.exe" -d License=LICENSE \
+                -d Version="$1" -d Program="$TARGET_DIR/$TARGET/release/$exe" -d License=LICENSE \
                 -o "$2" "packaging/windows/$program.wxs"
             }
             build "$msi_version" "msi/maxnines-$program-$VERSION-$TARGET.msi"
@@ -271,6 +286,13 @@ jobs:
           packaging/windows/test-server-install.ps1 `
             -Msi "msi/maxnines-server-$env:VERSION-$env:TARGET.msi" `
             -Upgrade msi/upgrade/maxnines-server.msi @x64
+      - name: Test the command line's installer
+        shell: pwsh
+        run: |
+          $x64 = if (Test-Path msi/x64/maxnines-cli.msi) { @{ X64OnArm = 'msi/x64/maxnines-cli.msi' } } else { @{} }
+          packaging/windows/test-cli-install.ps1 `
+            -Msi "msi/maxnines-cli-$env:VERSION-$env:TARGET.msi" `
+            -Upgrade msi/upgrade/maxnines-cli.msi -Version $env:VERSION @x64
       # Windows on Arm runs x64 programs by translating them, and tells them the
       # processor is an x64 one. An x64 agent installed there before its installer
       # refused still has to report the real processor.
@@ -325,7 +347,7 @@ jobs:
             set -e
             . "$HOME/.cargo/env"
             git config --global --add safe.directory "$PWD"
-            cargo build --release --locked -p maxnines-agent -p maxnines-server --target "$TARGET"
+            cargo build --release --locked -p maxnines-agent -p maxnines-server -p maxnines-cli --target "$TARGET"
             # Nothing else runs the agent on FreeBSD, so its tests for giving up
             # root and for reading who holds sockets run here, and then the real thing: started as root, it becomes
             # maxnines, and its helper reads what only root can.
@@ -349,7 +371,7 @@ jobs:
             "$agent" --config /tmp/agent.hcl action disk_space disk=/tmp/only-root | grep -q "/tmp/only-root"
             test -f /var/db/maxnines-agent-helper/disk_space.json
             "$agent" --config /tmp/agent.hcl action connections | grep -q "hold sockets"
-            for program in maxnines-agent maxnines-server; do
+            for program in maxnines-agent maxnines-server maxnines-cli; do
               packaging/archive.sh "$program" "${{ needs.check.outputs.version }}" "$TARGET" dist
             done
             # Copyback brings the whole folder out of the VM, and the build's
@@ -383,15 +405,17 @@ jobs:
           AGENT: ${{ matrix.arch }}-unknown-linux-musl
           VERSION: ${{ needs.check.outputs.version }}
         run: |
-          chmod 755 "$TARGET_DIR"/*/release/maxnines-*
+          chmod 755 "$TARGET_DIR"/*/release/maxnines-* "$TARGET_DIR"/*/release/maxnines
           mkdir -p packages
           cargo deb -p maxnines-server --no-build --no-strip --target "$SERVER" -o packages/
           cargo deb -p maxnines-agent --no-build --no-strip --target "$AGENT" -o packages/
+          cargo deb -p maxnines-cli --no-build --no-strip --target "$AGENT" -o packages/
           # RPM versions can't contain "-". A "~" sorts a pre-release before the
           # release, as cargo deb does for Debian.
           rpm_metadata="version = \"$(echo "$VERSION" | tr - '~')\""
           cargo generate-rpm -p crates/server --target "$SERVER" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
           cargo generate-rpm -p crates/agent --target "$AGENT" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
+          cargo generate-rpm -p crates/cli --target "$AGENT" --target-dir "$TARGET_DIR" -s "$rpm_metadata" -o packages/
           ls -l packages
       - uses: actions/upload-artifact@v7
         with:

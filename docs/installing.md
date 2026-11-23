@@ -1,8 +1,9 @@
 # Installing
 
-Each [release](https://github.com/sfreiberg/maxnines/releases) has the agent and
-server for Linux, macOS and Windows on both x86_64 and Arm, and for FreeBSD on x86_64.
-Set up the server first, as agents report to it.
+Each [release](https://github.com/sfreiberg/maxnines/releases) has the agent,
+server and [command line](cli.md#installing) for Linux, macOS and Windows on both
+x86_64 and Arm, and for FreeBSD on x86_64. Set up the server first, as agents report
+to it.
 
 ## Linux packages
 
@@ -177,4 +178,5 @@ maxnines-agent version
 maxnines-server version
 ```
 
-`--version` prints just the version.
+`--version` prints just the version, and is all the command line has:
+`maxnines --version`.

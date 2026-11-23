@@ -7,6 +7,7 @@ mod config;
 mod failure;
 mod http;
 mod kinds;
+mod man_pages;
 mod output;
 mod server;
 mod signin;
@@ -245,6 +246,9 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
 }
 
 fn main() -> ExitCode {
+    if let Some(code) = man_pages::asked_for() {
+        return code;
+    }
     let cli = Cli::parse();
     match run(cli) {
         Ok(code) => ExitCode::from(code),

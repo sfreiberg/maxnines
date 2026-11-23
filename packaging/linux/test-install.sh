@@ -1,6 +1,7 @@
 #!/bin/sh
-# Installs the built packages on whatever system this runs on, then runs both
-# programs as their services would, to show they work there. The release
+# Installs the built packages on whatever system this runs on, then runs the
+# agent and server as their services would, and the command line, to show they
+# work there. The release
 # workflow runs it in a container for each system the packages are meant for.
 set -eu
 
@@ -75,6 +76,28 @@ chown maxnines /var/lib/maxnines-agent
 # one that runs actions is maxnines and the helper is root.
 test "$(agent_action top_cpu | awk '$NF == "maxnines-agent" { print $2 }' | sort -u | tr '\n' ' ')" = "maxnines root "
 
+# The command line runs, and its man pages and completions are where each system
+# looks for them. Container images of Debian and Ubuntu may leave man pages out
+# when installing, so for those the package is checked for them instead.
+maxnines --version | grep -Eq '^maxnines [0-9]+\.[0-9]+\.[0-9]+'
+test -f /usr/share/bash-completion/completions/maxnines
+test -f /usr/share/fish/vendor_completions.d/maxnines.fish
+if command -v apt-get >/dev/null; then
+  test -f /usr/share/zsh/vendor-completions/_maxnines
+  pages=$(dpkg-deb -c ./packages/maxnines-cli_*.deb)
+else
+  test -f /usr/share/zsh/site-functions/_maxnines
+  test -f /usr/share/man/man1/maxnines.1.gz
+  pages=$(rpm -qlp ./packages/maxnines-cli-*.rpm)
+fi
+for page in maxnines maxnines-get maxnines-silence maxnines-config-use; do
+  echo "$pages" | grep -q "/usr/share/man/man1/$page.1.gz"
+done
+# With nobody signed in, it says so and exits as documented.
+status=0
+MAXNINES_CONFIG_DIR=$(mktemp -d) maxnines get hosts || status=$?
+test "$status" = 4
+
 # Upgrading keeps an edited config without asking: Debian doesn't track it at all,
 # and RPM keeps it as noreplace.
 for config in server agent; do
@@ -93,7 +116,8 @@ done
 
 # Purging deletes the configs and their folder.
 if command -v apt-get >/dev/null; then
-  apt-get purge -y -qq maxnines-server maxnines-agent </dev/null
+  apt-get purge -y -qq maxnines-server maxnines-agent maxnines-cli </dev/null
   test ! -e /etc/maxnines
+  test ! -e /usr/bin/maxnines
 fi
 echo "Installed and ran on $(. /etc/os-release && echo "$PRETTY_NAME")"

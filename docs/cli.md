@@ -10,6 +10,45 @@ maxnines get alerts
 maxnines silence host web-1 --for 30m --reason "Rebooting"
 ```
 
+## Installing
+
+Each [release](https://github.com/sfreiberg/maxnines/releases) has `maxnines` for
+Linux, macOS and Windows on both x86_64 and Arm, and for FreeBSD on x86_64. It's one
+program that needs nothing else, and needn't be on the same machine as the server.
+
+**Linux packages** put it in `/usr/bin` with its man pages and its completions for
+bash, zsh and fish, which work in a new shell:
+
+```sh
+sudo apt install ./maxnines-cli_0.1.0-1_amd64.deb    # Debian and Ubuntu
+sudo dnf install ./maxnines-cli-0.1.0-1.x86_64.rpm   # RHEL, Rocky, Alma and Fedora
+```
+
+**Windows** has an installer for x64 and Arm, such as
+`maxnines-cli-<version>-x86_64-pc-windows-msvc.msi`. It puts `maxnines.exe` in
+`C:\Program Files\MaxNines\Command Line` and on the `PATH` for everyone, so it works
+in any command prompt opened after it. It asks nothing, so it installs silently
+with `msiexec /i maxnines-cli-<version>-x86_64-pc-windows-msvc.msi /qn`.
+Uninstalling it leaves everyone's sign-ins.
+
+**Other systems** have an archive, such as
+`maxnines-cli-<version>-aarch64-apple-darwin.tar.gz`, holding `maxnines` and its man
+pages in `man`. Put the program somewhere on your `PATH`, and the man pages where
+`man` looks:
+
+```sh
+tar -xzf maxnines-cli-0.1.0-aarch64-apple-darwin.tar.gz
+cd maxnines-cli-0.1.0-aarch64-apple-darwin
+sudo install -m 755 maxnines /usr/local/bin/
+sudo install -d /usr/local/share/man/man1
+sudo install -m 644 man/*.1 /usr/local/share/man/man1/
+xattr -d com.apple.quarantine /usr/local/bin/maxnines   # macOS, until it's signed
+```
+
+`man maxnines` then lists every command, and each has a page of its own, such as
+`man maxnines-silence`. They hold what `--help` says; this page has the rest.
+Completions are [below](#shell-completions).
+
 ## Signing in
 
 `maxnines login` opens your browser at the server. Sign in there if you aren't already,
@@ -182,9 +221,20 @@ answer in CI. Use an API key there, which never touches the Keychain.
 | 6 | Couldn't reach the server, or nobody allowed the sign-in in time |
 | 7 | Anything else, such as the server failing |
 
-Shell completions:
+## Shell completions
+
+The Linux packages install completions for bash, zsh and fish. Otherwise,
+`maxnines completion` writes them for bash, zsh, fish, PowerShell or Elvish, to save
+where your shell looks for them:
 
 ```sh
+maxnines completion bash > ~/.local/share/bash-completion/completions/maxnines
 maxnines completion zsh > "${fpath[1]}/_maxnines"
-maxnines completion bash > /etc/bash_completion.d/maxnines
+maxnines completion fish > ~/.config/fish/completions/maxnines.fish
+```
+
+PowerShell runs them from your profile:
+
+```powershell
+maxnines completion powershell >> $PROFILE
 ```
