@@ -23,6 +23,7 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **SSH** (`ssh`) | `host:port` | Its host key and the ways it offers to sign in, or that an account can sign in |
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
+| **FTP or FTPS** (`ftp`) | `host:port` | That it greets as FTP, and its certificate where it offers TLS, or that an account can sign in |
 
 An agent older than a kind of check doesn't know it. It runs the rest of its checks,
 and reports that one as down, saying the agent needs upgrading.
@@ -38,7 +39,7 @@ named after what the check reaches, in lower case:
 | Kind | Named after | Example target | Host's name |
 |---|---|---|---|
 | `http` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
-| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3` | What's before the port | `db1.internal:5432` | `db1.internal` |
+| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp` | What's before the port | `db1.internal:5432` | `db1.internal` |
 | `dns` | The name it looks up | `example.com` | `example.com` |
 | `ping` | The host it pings | `192.0.2.7` | `192.0.2.7` |
 
@@ -62,7 +63,7 @@ check doesn't go through is left out.
 |---|---|---|
 | `dns_secs` | **DNS lookup time** | Looking up the target's name, or asking the DNS server, for a DNS check |
 | `connect_secs` | **Connection time** | Opening the TCP connection, once the address is known, and nothing after it: no TLS, greeting or signing in |
-| `tls_secs` | **TLS handshake time** | The TLS handshake, for a website, a certificate, and mail over TLS |
+| `tls_secs` | **TLS handshake time** | The TLS handshake, for a website, a certificate, and mail, FTP and the rest over TLS |
 | `first_byte_secs` | **Time to first byte** | A website: from sending the request to the answer starting |
 | `download_secs` | **Download time** | A website: reading the rest of the page |
 | `response_secs` | **Check response time** | The whole check, when it worked, signing in included |
@@ -101,6 +102,21 @@ the check doesn't speak, so a Memcached that needs it doesn't answer `stats` and
 counts as down. Tick **Use TLS from the start** for a Memcached started with TLS
 (`-Z`), and its certificate is read as a website's is.
 
+## FTP and FTPS
+
+An FTP check reads the server's greeting, then asks to upgrade to TLS with `AUTH TLS`,
+which is explicit FTPS. Where the server agrees, the check upgrades and reads its
+certificate as a website check does, with its days left on **Certificate days left**,
+and a certificate that fails counts as down unless **Don't count a bad certificate as
+down** is ticked. `tls_offered` says whether it agreed. For implicit FTPS, usually on
+port 990, tick **Use TLS from the start**.
+
+Given a username and password, it signs in after upgrading and then leaves. Like a
+mail check, it never sends a password without TLS, so signing in to a server that
+doesn't offer it counts as down without the password being sent. To check a plain
+FTP server, don't sign in. No data connection is ever opened, so nothing is listed,
+fetched or sent.
+
 ## Domain expiry
 
 A website check also finds out when the site's domain registration runs out, from the
@@ -126,7 +142,7 @@ To be warned in good time, add an alert rule on **Domain days left** below 30.
 
 ## Signing in
 
-A database, Redis, SSH or mail check that isn't given a way to sign in checks only
+A database, Redis, SSH, mail or FTP check that isn't given a way to sign in checks only
 what it can without one: that the server answers, and as what. Given a username and
 password, or for SSH a private key, it signs in, and counts as down if it can't.
 Nothing else is done once it has: no queries are run, no commands, and no mail is

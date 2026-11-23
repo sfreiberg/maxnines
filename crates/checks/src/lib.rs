@@ -6,6 +6,7 @@
 //! Errors only ever say what kind of failure it was, as a URL can hold a password.
 
 pub mod databases;
+mod ftp;
 mod mail;
 mod memcached;
 pub mod openmetrics;
@@ -102,7 +103,8 @@ pub fn host_reached(check: &Check) -> String {
         | CheckKind::Ssh
         | CheckKind::Smtp
         | CheckKind::Imap
-        | CheckKind::Pop3 => target
+        | CheckKind::Pop3
+        | CheckKind::Ftp => target
             .rsplit_once(':')
             .map_or(target, |(host, _port)| host)
             .to_string(),
@@ -150,7 +152,7 @@ struct Findings {
     cert_valid_until: Option<DateTime<Utc>>,
     cert_days_left: Option<i64>,
     records: Option<usize>,
-    /// postgres: whether it offers TLS, asked without signing in.
+    /// postgres, mail and ftp: whether it offers TLS, asked without signing in.
     tls_offered: Option<bool>,
     /// What the server says it is, such as 16.4 or 8.4.3.
     server_version: Option<String>,
@@ -240,6 +242,7 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Smtp => mail::check_smtp(check, credentials, &mut findings).await,
             CheckKind::Imap => mail::check_imap(check, credentials, &mut findings).await,
             CheckKind::Pop3 => mail::check_pop3(check, credentials, &mut findings).await,
+            CheckKind::Ftp => ftp::check_ftp(check, credentials, &mut findings).await,
             CheckKind::Unknown => Err(anyhow!(CheckKind::UNKNOWN_MESSAGE)),
         }
     };

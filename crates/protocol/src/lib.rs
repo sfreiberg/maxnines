@@ -559,7 +559,8 @@ pub struct Check {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
     /// mysql, redis, memcached, mongodb and clickhouse: connect over TLS, which
-    /// they don't offer on their own. For ClickHouse, that's HTTPS.
+    /// they don't offer on their own. For ClickHouse, that's HTTPS. Mail and ftp:
+    /// from the start, rather than upgrading to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
     /// ssh: the host key's SHA-256 fingerprint, as `ssh-keygen -l` prints it, such
@@ -590,6 +591,7 @@ pub enum CheckKind {
     Smtp,
     Imap,
     Pop3,
+    Ftp,
     /// A kind this build doesn't know, from a newer server. The server never saves
     /// one, and an agent reports that it can't run it rather than turning down the
     /// whole of its config.
@@ -605,7 +607,7 @@ impl CheckKind {
     /// Every kind this build can run.
     /// In the order people are offered them. `Unknown` stays the last variant, which
     /// a test relies on to check that nothing's missing here.
-    pub const KNOWN: [Self; 15] = [
+    pub const KNOWN: [Self; 16] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -621,6 +623,7 @@ impl CheckKind {
         Self::Smtp,
         Self::Imap,
         Self::Pop3,
+        Self::Ftp,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -640,6 +643,7 @@ impl CheckKind {
             Self::Smtp => "smtp",
             Self::Imap => "imap",
             Self::Pop3 => "pop3",
+            Self::Ftp => "ftp",
             Self::Unknown => "unknown",
         }
     }
@@ -657,6 +661,7 @@ impl CheckKind {
                 | Self::Smtp
                 | Self::Imap
                 | Self::Pop3
+                | Self::Ftp
         )
     }
 
@@ -755,7 +760,8 @@ impl Check {
             | CheckKind::Ssh
             | CheckKind::Smtp
             | CheckKind::Imap
-            | CheckKind::Pop3 => ensure!(
+            | CheckKind::Pop3
+            | CheckKind::Ftp => ensure!(
                 has_port(target),
                 "check {name:?} needs a target like host:port"
             ),
@@ -798,6 +804,7 @@ impl Check {
                 CheckKind::Smtp,
                 CheckKind::Imap,
                 CheckKind::Pop3,
+                CheckKind::Ftp,
             ],
         )?;
         only_for(
@@ -818,6 +825,7 @@ impl Check {
                 CheckKind::Smtp,
                 CheckKind::Imap,
                 CheckKind::Pop3,
+                CheckKind::Ftp,
             ],
         )?;
         only_for(self.host_key.is_some(), "host_key", &[CheckKind::Ssh])?;
@@ -1699,7 +1707,8 @@ mod tests {
             | CheckKind::Ssh
             | CheckKind::Smtp
             | CheckKind::Imap
-            | CheckKind::Pop3 => true,
+            | CheckKind::Pop3
+            | CheckKind::Ftp => true,
             CheckKind::Unknown => false,
         };
         assert!(CheckKind::KNOWN.into_iter().all(runs));

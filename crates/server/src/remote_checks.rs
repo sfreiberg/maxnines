@@ -193,7 +193,7 @@ impl SignIn {
         }
         ensure!(
             kind.signs_in(),
-            "only database, Redis, SSH and mail checks sign in"
+            "only database, Redis, SSH, mail and FTP checks sign in"
         );
         if let Some(username) = &self.username {
             ensure!(
