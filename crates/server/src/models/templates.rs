@@ -9,7 +9,7 @@
 //! built-in template or one of its alerts is on is a flag on its own row, which
 //! starting never writes. People's own templates are the same rows, changed directly.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result, bail};
 use sea_orm::sea_query::Expr;
@@ -112,6 +112,136 @@ pub struct StoredTemplate {
     pub updated_at: Timestamp,
     /// When an upgrade last changed it, for a built-in one.
     pub upgraded_at: Option<Timestamp>,
+    /// What's been made of each of its discover blocks, queries and counters
+    /// blocks that someone has changed or turned on or off.
+    pub choices: Vec<PartChoice>,
+    /// Someone's copies of its parts, for a built-in or imported one, each used in
+    /// place of the part with its key.
+    pub copies: Vec<Part>,
+}
+
+/// A kind of a template's part that can be someone's own copy, or, but for a
+/// discover block, turned off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartKind {
+    Discover,
+    Query,
+    Counters,
+}
+
+impl PartKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Discover => "discover",
+            Self::Query => "query",
+            Self::Counters => "counters",
+        }
+    }
+
+    /// Whether it can be turned off. A discover block can't, as what it finds is
+    /// waited on.
+    pub fn turns_off(self) -> bool {
+        self != Self::Discover
+    }
+}
+
+/// One of a template's discover blocks, queries or counters blocks.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Part {
+    Discover(Discover),
+    Query(Query),
+    Counters(Counters),
+}
+
+impl Part {
+    pub fn kind(&self) -> PartKind {
+        match self {
+            Self::Discover(_) => PartKind::Discover,
+            Self::Query(_) => PartKind::Query,
+            Self::Counters(_) => PartKind::Counters,
+        }
+    }
+
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Discover(part) => &part.key,
+            Self::Query(part) => &part.key,
+            Self::Counters(part) => &part.key,
+        }
+    }
+
+    /// The part of `kind` with `key` in `template`, and where it comes.
+    pub fn of(template: &Template, kind: PartKind, key: &str) -> Option<(usize, Self)> {
+        match kind {
+            PartKind::Discover => template
+                .discover
+                .iter()
+                .position(|part| part.key == key)
+                .map(|at| (at, Self::Discover(template.discover[at].clone()))),
+            PartKind::Query => template
+                .queries
+                .iter()
+                .position(|part| part.key == key)
+                .map(|at| (at, Self::Query(template.queries[at].clone()))),
+            PartKind::Counters => template
+                .counters
+                .iter()
+                .position(|part| part.key == key)
+                .map(|at| (at, Self::Counters(template.counters[at].clone()))),
+        }
+    }
+
+    /// Puts this part in `template` in place of the one with its key, if it has
+    /// one. Returns whether it did.
+    pub fn put_in(self, template: &mut Template) -> bool {
+        match self {
+            Self::Discover(part) => put(&mut template.discover, part, |p| &p.key),
+            Self::Query(part) => put(&mut template.queries, part, |p| &p.key),
+            Self::Counters(part) => put(&mut template.counters, part, |p| &p.key),
+        }
+    }
+
+    /// Whether it's on: a discover block always is.
+    fn enabled(&self) -> bool {
+        match self {
+            Self::Discover(_) => true,
+            Self::Query(part) => part.enabled,
+            Self::Counters(part) => part.enabled,
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        match self {
+            Self::Discover(_) => {}
+            Self::Query(part) => part.enabled = enabled,
+            Self::Counters(part) => part.enabled = enabled,
+        }
+    }
+}
+
+fn put<T>(parts: &mut [T], part: T, key: impl Fn(&T) -> &String) -> bool {
+    match parts.iter().position(|one| key(one) == key(&part)) {
+        Some(at) => {
+            parts[at] = part;
+            true
+        }
+        None => false,
+    }
+}
+
+/// What someone has made of one of a template's parts.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PartChoice {
+    pub kind: PartKind,
+    pub key: String,
+    /// Whether they have their own copy of it, used in its place.
+    pub copied: bool,
+    /// Whether they chose it on or off, for a built-in or imported template.
+    pub enabled_choice: Option<bool>,
+    /// When a newer version of the template changed what their copy is a copy of.
+    pub original_changed_at: Option<Timestamp>,
 }
 
 impl StoredTemplate {
@@ -213,6 +343,40 @@ macro_rules! parts {
     }};
 }
 
+/// A template's own rows of a kind of part that can be copied, in its order, each
+/// with the row read in its place: someone's copy of it, for a template as it runs,
+/// or the row itself. Whether it's on is always the template's own row's say.
+macro_rules! chosen_parts {
+    ($entity:ident, $reading:expr, $connection:expr, $id:expr, $what:literal) => {{
+        let rows = $entity::Entity::find()
+            .filter($entity::Column::TemplateId.eq($id))
+            .order_by_asc($entity::Column::Position)
+            .all($connection)
+            .await
+            .context(concat!("loading ", $what))?;
+        let mut copies: HashMap<i64, $entity::Model> = HashMap::new();
+        let mut originals = Vec::new();
+        for row in rows {
+            match row.replaces_id {
+                Some(of) => {
+                    copies.insert(of, row);
+                }
+                None => originals.push(row),
+            }
+        }
+        originals
+            .into_iter()
+            .map(|original| {
+                let read = match $reading {
+                    Reading::AsRun => copies.remove(&original.id),
+                    Reading::AsWritten => None,
+                };
+                (read.unwrap_or_else(|| original.clone()), original)
+            })
+            .collect::<Vec<($entity::Model, $entity::Model)>>()
+    }};
+}
+
 /// The template a row and its parts' rows say.
 async fn read_template<C: ConnectionTrait>(
     connection: &C,
@@ -224,15 +388,14 @@ async fn read_template<C: ConnectionTrait>(
         Reading::AsWritten => enabled,
         Reading::AsRun => choice.unwrap_or(enabled),
     };
-    let discoveries = template_discovery::Entity::find()
-        .filter(template_discovery::Column::TemplateId.eq(id))
-        .filter(template_discovery::Column::ReplacesId.is_null())
-        .order_by_asc(template_discovery::Column::Position)
-        .all(connection)
-        .await
-        .context("loading a template's discovery")?;
-    let mut discover = Vec::with_capacity(discoveries.len());
-    for found in discoveries {
+    let mut discover = Vec::new();
+    for (found, _) in chosen_parts!(
+        template_discovery,
+        reading,
+        connection,
+        id,
+        "a template's discovery"
+    ) {
         let registry = template_registry_read::Entity::find()
             .filter(template_registry_read::Column::DiscoveryId.eq(found.id))
             .filter(template_registry_read::Column::ReplacesId.is_null())
@@ -272,11 +435,10 @@ async fn read_template<C: ConnectionTrait>(
         .collect();
 
     let mut queries = Vec::new();
-    for query in parts!(
+    for (query, original) in chosen_parts!(
         template_query,
         reading,
         connection,
-        TemplateId,
         id,
         "a template's queries"
     ) {
@@ -320,7 +482,7 @@ async fn read_template<C: ConnectionTrait>(
             interval: length(query.interval_secs),
             since: query.since,
             when: query.when_condition,
-            enabled: on(query.enabled, query.enabled_choice),
+            enabled: on(original.enabled, original.enabled_choice),
             labels: template_items::query_labels::read(connection, query.id).await?,
             fills,
             metrics: to_metrics(connection, metrics).await?,
@@ -328,11 +490,10 @@ async fn read_template<C: ConnectionTrait>(
     }
 
     let mut counters = Vec::new();
-    for block in parts!(
+    for (block, original) in chosen_parts!(
         template_counters,
         reading,
         connection,
-        TemplateId,
         id,
         "a template's counters"
     ) {
@@ -362,7 +523,7 @@ async fn read_template<C: ConnectionTrait>(
             when: block.when_condition,
             since: block.since,
             interval: length(block.interval_secs),
-            enabled: on(block.enabled, block.enabled_choice),
+            enabled: on(original.enabled, original.enabled_choice),
             metrics: to_metrics(connection, metrics).await?,
         });
     }
@@ -439,6 +600,16 @@ async fn to_stored<C: ConnectionTrait>(
     connection: &C,
     row: template::Model,
 ) -> Result<StoredTemplate> {
+    let choices = part_choices(connection, row.id).await?;
+    let mut copies = Vec::new();
+    if choices.iter().any(|choice| choice.copied) {
+        let as_run = read_template(connection, &row, Reading::AsRun).await?;
+        for choice in choices.iter().filter(|choice| choice.copied) {
+            if let Some((_, part)) = Part::of(&as_run, choice.kind, &choice.key) {
+                copies.push(part);
+            }
+        }
+    }
     Ok(StoredTemplate {
         template: read_template(connection, &row, Reading::AsWritten).await?,
         id: row.id,
@@ -451,6 +622,8 @@ async fn to_stored<C: ConnectionTrait>(
         created_at: row.created_at,
         updated_at: row.updated_at,
         upgraded_at: row.upgraded_at,
+        choices,
+        copies,
     })
 }
 
@@ -542,11 +715,192 @@ async fn write_metrics<C: ConnectionTrait>(
     Ok(())
 }
 
+/// Writes one discover block, over `existing` if it has a row, or as a new row: for
+/// a template, or with `replaces` for someone's copy of the template's block. Gives
+/// the row's ID.
+async fn write_discover<C: ConnectionTrait>(
+    connection: &C,
+    template_id: i64,
+    position: usize,
+    discover: &Discover,
+    existing: Option<template_discovery::Model>,
+    replaces: Option<i64>,
+) -> Result<i64> {
+    let expected = template_discovery::Model {
+        id: existing.as_ref().map_or(0, |row| row.id),
+        template_id,
+        key: discover.key.clone(),
+        position: i32::try_from(position)?,
+        interval_secs: secs(&discover.interval)?,
+        sql: discover.sql.clone(),
+        replaces_id: replaces,
+        original_changed_at: existing.as_ref().and_then(|row| row.original_changed_at),
+    };
+    let discovery = put_part!(template_discovery, connection, expected, existing);
+    template_items::counter_sets::write(connection, discovery, &discover.counter_sets).await?;
+
+    let mut reads: HashMap<String, template_registry_read::Model> =
+        template_registry_read::Entity::find()
+            .filter(template_registry_read::Column::DiscoveryId.eq(discovery))
+            .filter(template_registry_read::Column::ReplacesId.is_null())
+            .all(connection)
+            .await
+            .context("loading a template's registry reads")?
+            .into_iter()
+            .map(|row| (row.key.clone(), row))
+            .collect();
+    for (position, read) in discover.registry.iter().enumerate() {
+        let existing = reads.remove(&read.key);
+        let expected = template_registry_read::Model {
+            id: existing.as_ref().map_or(0, |row| row.id),
+            discovery_id: discovery,
+            key: read.key.clone(),
+            position: i32::try_from(position)?,
+            replaces_id: None,
+        };
+        let read_id = put_part!(template_registry_read, connection, expected, existing);
+        template_items::registry_values::write(connection, read_id, &read.values).await?;
+    }
+    drop_parts!(template_registry_read, connection, reads);
+    Ok(discovery)
+}
+
+/// Writes one query, with its fills and metrics, as [`write_discover`] does a
+/// discover block. Whether someone chose it on or off is only ever kept on the
+/// template's own row, so it stays as it is.
+async fn write_query<C: ConnectionTrait>(
+    connection: &C,
+    template_id: i64,
+    position: usize,
+    query: &Query,
+    existing: Option<template_query::Model>,
+    replaces: Option<i64>,
+) -> Result<i64> {
+    let expected = template_query::Model {
+        id: existing.as_ref().map_or(0, |row| row.id),
+        template_id,
+        key: query.key.clone(),
+        position: i32::try_from(position)?,
+        sql: query.sql.clone(),
+        interval_secs: secs(&query.interval)?,
+        since: query.since.clone(),
+        when_condition: query.when.clone(),
+        enabled: query.enabled,
+        enabled_choice: existing.as_ref().and_then(|row| row.enabled_choice),
+        replaces_id: replaces,
+        original_changed_at: existing.as_ref().and_then(|row| row.original_changed_at),
+    };
+    let query_id = put_part!(template_query, connection, expected, existing);
+    template_items::query_labels::write(connection, query_id, &query.labels).await?;
+
+    let mut fills_left: HashMap<String, template_fill::Model> = template_fill::Entity::find()
+        .filter(template_fill::Column::QueryId.eq(query_id))
+        .filter(template_fill::Column::ReplacesId.is_null())
+        .all(connection)
+        .await
+        .context("loading a query's fills")?
+        .into_iter()
+        .map(|row| (row.key.clone(), row))
+        .collect();
+    for (position, fill) in query.fills.iter().enumerate() {
+        let existing = fills_left.remove(&fill.key);
+        let expected = template_fill::Model {
+            id: existing.as_ref().map_or(0, |row| row.id),
+            query_id,
+            key: fill.key.clone(),
+            position: i32::try_from(position)?,
+            older: fill.older.clone(),
+            replaces_id: None,
+        };
+        let fill_id = put_part!(template_fill, connection, expected, existing);
+
+        let mut versions_left: HashMap<String, template_fill_version::Model> =
+            template_fill_version::Entity::find()
+                .filter(template_fill_version::Column::FillId.eq(fill_id))
+                .filter(template_fill_version::Column::ReplacesId.is_null())
+                .all(connection)
+                .await
+                .context("loading a fill's versions")?
+                .into_iter()
+                .map(|row| (row.version.clone(), row))
+                .collect();
+        for (position, (version, sql)) in fill.versions.iter().enumerate() {
+            let existing = versions_left.remove(version);
+            let expected = template_fill_version::Model {
+                id: existing.as_ref().map_or(0, |row| row.id),
+                fill_id,
+                version: version.clone(),
+                position: i32::try_from(position)?,
+                sql: sql.clone(),
+                replaces_id: None,
+            };
+            put_part!(template_fill_version, connection, expected, existing);
+        }
+        drop_parts!(template_fill_version, connection, versions_left);
+    }
+    drop_parts!(template_fill, connection, fills_left);
+    write_metrics(connection, &query.metrics, Some(query_id), None).await?;
+    Ok(query_id)
+}
+
+/// Writes one counters block, with its metrics, as [`write_query`] does a query.
+async fn write_counters<C: ConnectionTrait>(
+    connection: &C,
+    template_id: i64,
+    position: usize,
+    counters: &Counters,
+    existing: Option<template_counters::Model>,
+    replaces: Option<i64>,
+) -> Result<i64> {
+    let expected = template_counters::Model {
+        id: existing.as_ref().map_or(0, |row| row.id),
+        template_id,
+        key: counters.key.clone(),
+        position: i32::try_from(position)?,
+        object: counters.object.clone(),
+        label: counters.label.clone(),
+        pattern: counters.pattern.clone(),
+        instance: counters.instance.clone(),
+        join_object: counters.join.as_ref().map(|join| join.object.clone()),
+        join_pattern: counters.join.as_ref().map(|join| join.pattern.clone()),
+        when_condition: counters.when.clone(),
+        since: counters.since.clone(),
+        interval_secs: secs(&counters.interval)?,
+        enabled: counters.enabled,
+        enabled_choice: existing.as_ref().and_then(|row| row.enabled_choice),
+        replaces_id: replaces,
+        original_changed_at: existing.as_ref().and_then(|row| row.original_changed_at),
+    };
+    let counters_id = put_part!(template_counters, connection, expected, existing);
+    template_items::counters_excludes::write(connection, counters_id, &counters.exclude).await?;
+    template_items::counters_groups::write(connection, counters_id, &counters.groups).await?;
+    write_metrics(connection, &counters.metrics, None, Some(counters_id)).await?;
+    Ok(counters_id)
+}
+
+/// The rows of a template's own parts of one kind, but not anyone's copies of
+/// them, by key.
+macro_rules! own_parts {
+    ($entity:ident, $connection:expr, $id:expr, $what:literal) => {{
+        let rows: HashMap<String, $entity::Model> = $entity::Entity::find()
+            .filter($entity::Column::TemplateId.eq($id))
+            .filter($entity::Column::ReplacesId.is_null())
+            .all($connection)
+            .await
+            .context(concat!("loading ", $what))?
+            .into_iter()
+            .map(|row| (row.key.clone(), row))
+            .collect();
+        rows
+    }};
+}
+
 /// Writes a template's parts, but for its alerts, over the ones it has. Each is
 /// matched by its key within what it's part of: a row that's still there keeps its
-/// ID, so what points at it and whether someone chose it on or off stay, and is only
-/// written if something of it changed; new parts are added, and only those the
-/// template no longer has are deleted. A part given another key is a new part.
+/// ID, so what points at it, whether someone chose it on or off and their copy of
+/// it stay, and is only written if something of it changed; new parts are added,
+/// and only those the template no longer has are deleted, with any copy of them.
+/// A part given another key is a new part.
 async fn write_parts<C: ConnectionTrait>(
     connection: &C,
     id: i64,
@@ -554,64 +908,14 @@ async fn write_parts<C: ConnectionTrait>(
 ) -> Result<()> {
     template_items::renames::write(connection, id, &template.renamed_from).await?;
     template_items::services::write(connection, id, &template.services).await?;
-    let mut left: HashMap<String, template_discovery::Model> = template_discovery::Entity::find()
-        .filter(template_discovery::Column::TemplateId.eq(id))
-        .filter(template_discovery::Column::ReplacesId.is_null())
-        .all(connection)
-        .await
-        .context("loading a template's discovery")?
-        .into_iter()
-        .map(|row| (row.key.clone(), row))
-        .collect();
+    let mut left = own_parts!(template_discovery, connection, id, "a template's discovery");
     for (position, discover) in template.discover.iter().enumerate() {
         let existing = left.remove(&discover.key);
-        let expected = template_discovery::Model {
-            id: existing.as_ref().map_or(0, |row| row.id),
-            template_id: id,
-            key: discover.key.clone(),
-            position: i32::try_from(position)?,
-            interval_secs: secs(&discover.interval)?,
-            sql: discover.sql.clone(),
-            replaces_id: None,
-        };
-        let discovery = put_part!(template_discovery, connection, expected, existing);
-        template_items::counter_sets::write(connection, discovery, &discover.counter_sets).await?;
-
-        let mut reads: HashMap<String, template_registry_read::Model> =
-            template_registry_read::Entity::find()
-                .filter(template_registry_read::Column::DiscoveryId.eq(discovery))
-                .filter(template_registry_read::Column::ReplacesId.is_null())
-                .all(connection)
-                .await
-                .context("loading a template's registry reads")?
-                .into_iter()
-                .map(|row| (row.key.clone(), row))
-                .collect();
-        for (position, read) in discover.registry.iter().enumerate() {
-            let existing = reads.remove(&read.key);
-            let expected = template_registry_read::Model {
-                id: existing.as_ref().map_or(0, |row| row.id),
-                discovery_id: discovery,
-                key: read.key.clone(),
-                position: i32::try_from(position)?,
-                replaces_id: None,
-            };
-            let read_id = put_part!(template_registry_read, connection, expected, existing);
-            template_items::registry_values::write(connection, read_id, &read.values).await?;
-        }
-        drop_parts!(template_registry_read, connection, reads);
+        write_discover(connection, id, position, discover, existing, None).await?;
     }
     drop_parts!(template_discovery, connection, left);
 
-    let mut left: HashMap<String, template_notice::Model> = template_notice::Entity::find()
-        .filter(template_notice::Column::TemplateId.eq(id))
-        .filter(template_notice::Column::ReplacesId.is_null())
-        .all(connection)
-        .await
-        .context("loading a template's notices")?
-        .into_iter()
-        .map(|row| (row.key.clone(), row))
-        .collect();
+    let mut left = own_parts!(template_notice, connection, id, "a template's notices");
     for (position, notice) in template.notices.iter().enumerate() {
         let existing = left.remove(&notice.key);
         let expected = template_notice::Model {
@@ -627,117 +931,17 @@ async fn write_parts<C: ConnectionTrait>(
     }
     drop_parts!(template_notice, connection, left);
 
-    let mut left: HashMap<String, template_query::Model> = template_query::Entity::find()
-        .filter(template_query::Column::TemplateId.eq(id))
-        .filter(template_query::Column::ReplacesId.is_null())
-        .all(connection)
-        .await
-        .context("loading a template's queries")?
-        .into_iter()
-        .map(|row| (row.key.clone(), row))
-        .collect();
+    let mut left = own_parts!(template_query, connection, id, "a template's queries");
     for (position, query) in template.queries.iter().enumerate() {
         let existing = left.remove(&query.key);
-        let expected = template_query::Model {
-            id: existing.as_ref().map_or(0, |row| row.id),
-            template_id: id,
-            key: query.key.clone(),
-            position: i32::try_from(position)?,
-            sql: query.sql.clone(),
-            interval_secs: secs(&query.interval)?,
-            since: query.since.clone(),
-            when_condition: query.when.clone(),
-            enabled: query.enabled,
-            enabled_choice: existing.as_ref().and_then(|row| row.enabled_choice),
-            replaces_id: None,
-        };
-        let query_id = put_part!(template_query, connection, expected, existing);
-        template_items::query_labels::write(connection, query_id, &query.labels).await?;
-
-        let mut fills_left: HashMap<String, template_fill::Model> = template_fill::Entity::find()
-            .filter(template_fill::Column::QueryId.eq(query_id))
-            .filter(template_fill::Column::ReplacesId.is_null())
-            .all(connection)
-            .await
-            .context("loading a query's fills")?
-            .into_iter()
-            .map(|row| (row.key.clone(), row))
-            .collect();
-        for (position, fill) in query.fills.iter().enumerate() {
-            let existing = fills_left.remove(&fill.key);
-            let expected = template_fill::Model {
-                id: existing.as_ref().map_or(0, |row| row.id),
-                query_id,
-                key: fill.key.clone(),
-                position: i32::try_from(position)?,
-                older: fill.older.clone(),
-                replaces_id: None,
-            };
-            let fill_id = put_part!(template_fill, connection, expected, existing);
-
-            let mut versions_left: HashMap<String, template_fill_version::Model> =
-                template_fill_version::Entity::find()
-                    .filter(template_fill_version::Column::FillId.eq(fill_id))
-                    .filter(template_fill_version::Column::ReplacesId.is_null())
-                    .all(connection)
-                    .await
-                    .context("loading a fill's versions")?
-                    .into_iter()
-                    .map(|row| (row.version.clone(), row))
-                    .collect();
-            for (position, (version, sql)) in fill.versions.iter().enumerate() {
-                let existing = versions_left.remove(version);
-                let expected = template_fill_version::Model {
-                    id: existing.as_ref().map_or(0, |row| row.id),
-                    fill_id,
-                    version: version.clone(),
-                    position: i32::try_from(position)?,
-                    sql: sql.clone(),
-                    replaces_id: None,
-                };
-                put_part!(template_fill_version, connection, expected, existing);
-            }
-            drop_parts!(template_fill_version, connection, versions_left);
-        }
-        drop_parts!(template_fill, connection, fills_left);
-        write_metrics(connection, &query.metrics, Some(query_id), None).await?;
+        write_query(connection, id, position, query, existing, None).await?;
     }
     drop_parts!(template_query, connection, left);
 
-    let mut left: HashMap<String, template_counters::Model> = template_counters::Entity::find()
-        .filter(template_counters::Column::TemplateId.eq(id))
-        .filter(template_counters::Column::ReplacesId.is_null())
-        .all(connection)
-        .await
-        .context("loading a template's counters")?
-        .into_iter()
-        .map(|row| (row.key.clone(), row))
-        .collect();
+    let mut left = own_parts!(template_counters, connection, id, "a template's counters");
     for (position, counters) in template.counters.iter().enumerate() {
         let existing = left.remove(&counters.key);
-        let expected = template_counters::Model {
-            id: existing.as_ref().map_or(0, |row| row.id),
-            template_id: id,
-            key: counters.key.clone(),
-            position: i32::try_from(position)?,
-            object: counters.object.clone(),
-            label: counters.label.clone(),
-            pattern: counters.pattern.clone(),
-            instance: counters.instance.clone(),
-            join_object: counters.join.as_ref().map(|join| join.object.clone()),
-            join_pattern: counters.join.as_ref().map(|join| join.pattern.clone()),
-            when_condition: counters.when.clone(),
-            since: counters.since.clone(),
-            interval_secs: secs(&counters.interval)?,
-            enabled: counters.enabled,
-            enabled_choice: existing.as_ref().and_then(|row| row.enabled_choice),
-            replaces_id: None,
-        };
-        let counters_id = put_part!(template_counters, connection, expected, existing);
-        template_items::counters_excludes::write(connection, counters_id, &counters.exclude)
-            .await?;
-        template_items::counters_groups::write(connection, counters_id, &counters.groups).await?;
-        write_metrics(connection, &counters.metrics, None, Some(counters_id)).await?;
+        write_counters(connection, id, position, counters, existing, None).await?;
     }
     drop_parts!(template_counters, connection, left);
     Ok(())
@@ -867,7 +1071,109 @@ fn template_snapshot(stored: &StoredTemplate) -> Result<Snapshot> {
     fields["origin"] = json!(stored.origin.as_str());
     fields["applies_to"] = json!(stored.applies_to);
     fields["host_ids"] = json!(stored.host_ids);
+    if !stored.choices.is_empty() {
+        let choices: BTreeMap<String, Option<bool>> = stored
+            .choices
+            .iter()
+            .filter(|choice| choice.enabled_choice.is_some())
+            .map(|choice| {
+                let name = format!("{} {}", choice.kind.as_str(), choice.key);
+                (name, choice.enabled_choice)
+            })
+            .collect();
+        fields["enabled_choices"] = json!(choices);
+        fields["copies"] = json!(stored.copies);
+    }
     Ok(Snapshot::new(stored.template.name.clone(), fields))
+}
+
+/// What someone has made of a template's parts: each that has a copy, or that
+/// they chose on or off.
+async fn part_choices<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Vec<PartChoice>> {
+    let mut choices = Vec::new();
+    macro_rules! choices_of {
+        ($entity:ident, $kind:expr, $choice:expr) => {{
+            let rows = $entity::Entity::find()
+                .filter($entity::Column::TemplateId.eq(id))
+                .order_by_asc($entity::Column::Position)
+                .all(connection)
+                .await
+                .context("loading a template's parts")?;
+            let copies: HashMap<i64, &$entity::Model> = rows
+                .iter()
+                .filter_map(|row| Some((row.replaces_id?, row)))
+                .collect();
+            for row in rows.iter().filter(|row| row.replaces_id.is_none()) {
+                let copy = copies.get(&row.id);
+                let enabled_choice: Option<bool> = $choice(row);
+                if copy.is_some() || enabled_choice.is_some() {
+                    choices.push(PartChoice {
+                        kind: $kind,
+                        key: row.key.clone(),
+                        copied: copy.is_some(),
+                        enabled_choice,
+                        original_changed_at: copy.and_then(|copy| copy.original_changed_at),
+                    });
+                }
+            }
+        }};
+    }
+    choices_of!(template_discovery, PartKind::Discover, |_| None);
+    choices_of!(
+        template_query,
+        PartKind::Query,
+        |row: &template_query::Model| row.enabled_choice
+    );
+    choices_of!(
+        template_counters,
+        PartKind::Counters,
+        |row: &template_counters::Model| row.enabled_choice
+    );
+    Ok(choices)
+}
+
+/// Someone's copies of a template's parts that the latest upgrade changed the
+/// part of, as `query "sessions"`.
+async fn changed_part_copies<C: ConnectionTrait>(
+    connection: &C,
+    row: &template::Model,
+) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    let Some(upgraded_at) = row.upgraded_at else {
+        return Ok(changed);
+    };
+    macro_rules! changed_of {
+        ($entity:ident, $kind:expr) => {{
+            let copies = $entity::Entity::find()
+                .filter($entity::Column::TemplateId.eq(row.id))
+                .filter($entity::Column::ReplacesId.is_not_null())
+                .filter($entity::Column::OriginalChangedAt.gte(upgraded_at))
+                .order_by_asc($entity::Column::Position)
+                .all(connection)
+                .await
+                .context("loading a template's parts")?;
+            changed.extend(
+                copies
+                    .into_iter()
+                    .map(|copy| format!("{} {:?}", $kind.as_str(), copy.key)),
+            );
+        }};
+    }
+    changed_of!(template_discovery, PartKind::Discover);
+    changed_of!(template_query, PartKind::Query);
+    changed_of!(template_counters, PartKind::Counters);
+    Ok(changed)
+}
+
+/// Notes that a template changed now.
+async fn touch<C: ConnectionTrait>(connection: &C, id: i64, now: Timestamp) -> Result<()> {
+    template::Entity::update_many()
+        .col_expr(template::Column::UpdatedAt, Expr::value(now))
+        .filter(template::Column::Id.eq(id))
+        .exec(connection)
+        .await
+        .context("saving template")?;
+    Ok(())
 }
 
 /// Which hosts a template is for by their facts: what someone chose, or what the
@@ -1274,7 +1580,16 @@ async fn rewrite_original<C: ConnectionTrait>(
     now: Timestamp,
 ) -> Result<()> {
     let origin = Origin::parse(&row.origin)?;
-    let before = template_snapshot(&to_stored(connection, row.clone()).await?)?;
+    let stored = to_stored(connection, row.clone()).await?;
+    let before = template_snapshot(&stored)?;
+    // Someone's copy of a part this version no longer has goes with it.
+    let gone: Vec<String> = stored
+        .choices
+        .iter()
+        .filter(|choice| choice.copied)
+        .filter(|choice| Part::of(template, choice.kind, &choice.key).is_none())
+        .map(|choice| format!("{} {:?}", choice.kind.as_str(), choice.key))
+        .collect();
     let mut active = template::ActiveModel {
         id: Set(row.id),
         fingerprint: Set(Some(fingerprint.to_string())),
@@ -1291,14 +1606,24 @@ async fn rewrite_original<C: ConnectionTrait>(
         .await
         .map_err(|error| taken(error, template))?;
     write_parts(connection, row.id, template).await?;
+    note_changed_copies(connection, &stored, template, now).await?;
     let kept = write_rules(connection, row.id, template, origin, now).await?;
-    // What the notice of this version adds: copies that are people's own rules now.
-    let note = (!kept.is_empty()).then(|| {
-        format!(
+    // What the notice of this version adds: copies that are people's own rules now,
+    // and copies of parts that went.
+    let mut said = Vec::new();
+    if !kept.is_empty() {
+        said.push(format!(
             "it no longer has {}, so your own copy is now a rule of yours",
             kept.join(", ")
-        )
-    });
+        ));
+    }
+    if !gone.is_empty() {
+        said.push(format!(
+            "it no longer has {}, so your own copy went with it",
+            gone.join(", ")
+        ));
+    }
+    let note = (!said.is_empty()).then(|| said.join("; "));
     template::Entity::update_many()
         .col_expr(template::Column::UpgradeNote, Expr::value(note))
         .filter(template::Column::Id.eq(row.id))
@@ -1306,6 +1631,55 @@ async fn rewrite_original<C: ConnectionTrait>(
         .await
         .context("noting what a newer template changed")?;
     record_template(connection, row.id, Some(&before)).await
+}
+
+/// Notes on each of someone's copies of a template's parts whose part a newer
+/// version, `template`, changed, that it did, as their copy is left as it is.
+async fn note_changed_copies<C: ConnectionTrait>(
+    connection: &C,
+    before: &StoredTemplate,
+    template: &Template,
+    now: Timestamp,
+) -> Result<()> {
+    for choice in before.choices.iter().filter(|choice| choice.copied) {
+        let (Some((_, mut was)), Some((_, mut now_says))) = (
+            Part::of(&before.template, choice.kind, &choice.key),
+            Part::of(template, choice.kind, &choice.key),
+        ) else {
+            continue;
+        };
+        // Whether it ships on isn't what a copy says.
+        was.set_enabled(true);
+        now_says.set_enabled(true);
+        if was == now_says {
+            continue;
+        }
+        macro_rules! note {
+            ($entity:ident) => {{
+                let own = $entity::Entity::find()
+                    .filter($entity::Column::TemplateId.eq(before.id))
+                    .filter($entity::Column::ReplacesId.is_null())
+                    .filter($entity::Column::Key.eq(choice.key.clone()))
+                    .one(connection)
+                    .await
+                    .context("loading a template's part")?;
+                if let Some(own) = own {
+                    $entity::Entity::update_many()
+                        .col_expr($entity::Column::OriginalChangedAt, Expr::value(now))
+                        .filter($entity::Column::ReplacesId.eq(own.id))
+                        .exec(connection)
+                        .await
+                        .context("noting a part's copy")?;
+                }
+            }};
+        }
+        match choice.kind {
+            PartKind::Discover => note!(template_discovery),
+            PartKind::Query => note!(template_query),
+            PartKind::Counters => note!(template_counters),
+        }
+    }
+    Ok(())
 }
 
 /// Adds a built-in or imported template, with a notice of it if `noticed`.
@@ -1986,6 +2360,221 @@ impl Database {
         Ok(true)
     }
 
+    /// A template as it runs: someone's copies of its parts in their place, and
+    /// each part on or off as they chose.
+    pub async fn template_as_run(&self, id: i64) -> Result<Option<Template>> {
+        let row = template::Entity::find_by_id(id)
+            .filter(template::Column::DeletedAt.is_null())
+            .one(&self.connection)
+            .await
+            .context("loading template")?;
+        match row {
+            Some(row) => Ok(Some(
+                read_template(&self.connection, &row, Reading::AsRun).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// Saves one of a template's discover blocks, queries or counters blocks as
+    /// `part` says, found by its kind and key, checked in the template already.
+    /// Someone's own template has it changed in place. A built-in or imported one
+    /// isn't theirs to change, so the first change makes a copy of their own, used
+    /// in its place from then on, and later ones change the copy; saving what the
+    /// template's own part says deletes the copy. Whether it's on stays as it is.
+    /// Returns false if there's no such template or part.
+    pub async fn save_template_part(&self, id: i64, part: Part, now: Timestamp) -> Result<bool> {
+        let Some(stored) = self.get_template(id).await? else {
+            return Ok(false);
+        };
+        let Some((_, original)) = Part::of(&stored.template, part.kind(), part.key()) else {
+            return Ok(false);
+        };
+        let mut part = part;
+        part.set_enabled(original.enabled());
+        if !stored.origin.is_original() {
+            let mut template = stored.template.clone();
+            part.put_in(&mut template);
+            return self.update_template(id, &template, now).await;
+        }
+        let transaction = self.connection.begin().await.context("saving template")?;
+        let before = template_snapshot(&stored)?;
+        let same = part == original;
+        macro_rules! copy_of_part {
+            ($entity:ident, $write:ident, $value:expr) => {{
+                let own = $entity::Entity::find()
+                    .filter($entity::Column::TemplateId.eq(id))
+                    .filter($entity::Column::ReplacesId.is_null())
+                    .filter($entity::Column::Key.eq(part.key()))
+                    .one(&transaction)
+                    .await
+                    .context("loading a template's part")?
+                    .context("a template's part went missing")?;
+                let copy = $entity::Entity::find()
+                    .filter($entity::Column::ReplacesId.eq(own.id))
+                    .one(&transaction)
+                    .await
+                    .context("loading a template's part")?;
+                match (same, copy) {
+                    (true, Some(copy)) => {
+                        $entity::Entity::delete_by_id(copy.id)
+                            .exec(&transaction)
+                            .await
+                            .context("deleting a copy of a template's part")?;
+                    }
+                    (true, None) => {}
+                    (false, copy) => {
+                        let position = usize::try_from(own.position)?;
+                        $write(&transaction, id, position, $value, copy, Some(own.id)).await?;
+                    }
+                }
+            }};
+        }
+        match &part {
+            Part::Discover(discover) => {
+                copy_of_part!(template_discovery, write_discover, discover);
+            }
+            Part::Query(query) => copy_of_part!(template_query, write_query, query),
+            Part::Counters(counters) => {
+                copy_of_part!(template_counters, write_counters, counters);
+            }
+        }
+        touch(&transaction, id, now).await?;
+        record_template(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
+        Ok(true)
+    }
+
+    /// Turns one of a template's queries or counters blocks on or off: for a
+    /// built-in or imported template it's someone's choice, kept beside what the
+    /// template says, which upgrades leave alone; their own is simply changed.
+    /// Returns false if there's no such template or part.
+    pub async fn set_template_part_enabled(
+        &self,
+        id: i64,
+        kind: PartKind,
+        key: &str,
+        enabled: bool,
+        now: Timestamp,
+    ) -> Result<bool> {
+        if !kind.turns_off() {
+            bail!(Refused(
+                "a discover block can't be turned off, as what it finds is waited on: change it instead"
+                    .to_string()
+            ));
+        }
+        let transaction = self.connection.begin().await.context("saving template")?;
+        let Some(stored) = load_template(&transaction, id).await? else {
+            return Ok(false);
+        };
+        if Part::of(&stored.template, kind, key).is_none() {
+            return Ok(false);
+        }
+        let before = template_snapshot(&stored)?;
+        let original = stored.origin.is_original();
+        macro_rules! turn {
+            ($entity:ident) => {{
+                let update = $entity::Entity::update_many();
+                let update = match original {
+                    true => {
+                        update.col_expr($entity::Column::EnabledChoice, Expr::value(Some(enabled)))
+                    }
+                    false => update.col_expr($entity::Column::Enabled, Expr::value(enabled)),
+                };
+                update
+                    .filter($entity::Column::TemplateId.eq(id))
+                    .filter($entity::Column::ReplacesId.is_null())
+                    .filter($entity::Column::Key.eq(key))
+                    .exec(&transaction)
+                    .await
+                    .context("saving a template's part")?;
+            }};
+        }
+        match kind {
+            PartKind::Query => turn!(template_query),
+            PartKind::Counters => turn!(template_counters),
+            PartKind::Discover => unreachable!("refused above"),
+        }
+        touch(&transaction, id, now).await?;
+        record_template(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
+        Ok(true)
+    }
+
+    /// Puts one of a built-in or imported template's parts back to the template's
+    /// own: deletes someone's copy of it, and forgets whether they chose it on or
+    /// off. Returns false if there's no such part, or nothing of theirs to put back.
+    pub async fn reset_template_part(
+        &self,
+        id: i64,
+        kind: PartKind,
+        key: &str,
+        now: Timestamp,
+    ) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("saving template")?;
+        let Some(stored) = load_template(&transaction, id).await? else {
+            return Ok(false);
+        };
+        let Some(choice) = stored
+            .choices
+            .iter()
+            .find(|choice| choice.kind == kind && choice.key == key)
+        else {
+            return Ok(false);
+        };
+        let copied = choice.copied;
+        let before = template_snapshot(&stored)?;
+        macro_rules! reset {
+            ($entity:ident, $clear:expr) => {{
+                let own = $entity::Entity::find()
+                    .filter($entity::Column::TemplateId.eq(id))
+                    .filter($entity::Column::ReplacesId.is_null())
+                    .filter($entity::Column::Key.eq(key))
+                    .one(&transaction)
+                    .await
+                    .context("loading a template's part")?
+                    .context("a template's part went missing")?;
+                if copied {
+                    $entity::Entity::delete_many()
+                        .filter($entity::Column::ReplacesId.eq(own.id))
+                        .exec(&transaction)
+                        .await
+                        .context("deleting a copy of a template's part")?;
+                }
+                $clear(own.id).await?;
+            }};
+        }
+        let none = |_: i64| async { anyhow::Ok(()) };
+        match kind {
+            PartKind::Discover => reset!(template_discovery, none),
+            PartKind::Query => reset!(template_query, |own: i64| {
+                template_query::Entity::update_many()
+                    .col_expr(
+                        template_query::Column::EnabledChoice,
+                        Expr::value(None::<bool>),
+                    )
+                    .filter(template_query::Column::Id.eq(own))
+                    .exec(&transaction)
+            }),
+            PartKind::Counters => reset!(template_counters, |own: i64| {
+                template_counters::Entity::update_many()
+                    .col_expr(
+                        template_counters::Column::EnabledChoice,
+                        Expr::value(None::<bool>),
+                    )
+                    .filter(template_counters::Column::Id.eq(own))
+                    .exec(&transaction)
+            }),
+        }
+        touch(&transaction, id, now).await?;
+        record_template(&transaction, id, Some(&before)).await?;
+        transaction.commit().await.context("saving template")?;
+        self.refresh_catalog().await?;
+        Ok(true)
+    }
+
     /// What admins haven't dismissed of what an upgrade changed in the built-in
     /// templates: each one's name, with the alerts people have copies of that it
     /// changed under them.
@@ -2018,6 +2607,8 @@ impl Database {
                 .into_iter()
                 .map(|copy| copy.name)
                 .collect();
+            let mut copies = copies;
+            copies.extend(changed_part_copies(&self.connection, &row).await?);
             let mut said = Vec::new();
             if !copies.is_empty() {
                 said.push(format!(

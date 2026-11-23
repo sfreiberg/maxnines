@@ -18,6 +18,8 @@ pub struct Model {
     pub enabled_choice: Option<bool>,
     /// The built-in part this is someone's own copy of, if it's one.
     pub replaces_id: Option<i64>,
+    /// On someone's copy: when a newer version changed what it's a copy of.
+    pub original_changed_at: Option<DateTimeUtc>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

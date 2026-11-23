@@ -3,8 +3,8 @@
 [Templates](templates.md) are sent and given back as HCL. The server keeps a template as
 its parts, not as text, so comments and layout in HCL you send aren't kept, and the HCL
 given back is written out from the parts. The built-in ones can be turned on and off,
-and their alerts changed by making your own copy of one, but not changed or deleted
-themselves, which gives `422`.
+and their alerts, discover blocks, queries and counters blocks changed by making your
+own copy of one, but not changed or deleted themselves, which gives `422`.
 
 | Field | Description |
 | --- | --- |
@@ -60,6 +60,8 @@ Everything listed, with:
 | `template` | The template read, field by field, as the HCL has it |
 | `metrics` | Its own metrics, each with its full `name`, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
 | `alerts` | Each of its alerts, by `key`, with the `rule` in use, as [alert rules](api-alert-rules.md) are given, and where that's your own copy of a built-in template's, the built-in one as `built_in_rule`, `null` otherwise |
+| `choices` | Each discover block, query or counters block you've changed or turned on or off: its `kind`, `discover`, `query` or `counters`, its `key`, whether you have your own copy of it, `copied`, `enabled_choice`, and `original_changed_at`, when a newer version changed the template's own under your copy |
+| `copies` | Your copies, each as `template` has the part, with its `kind` |
 
 A template's rule has a `template` field saying so: the template's `id` and `key`, the
 `alert`'s key, `replaces_id`, which for your own copy is the built-in rule it's used in place of,
@@ -213,11 +215,44 @@ Deletes your copy of a built-in or imported template's alert, as deleting the co
 is checked again, taking the copy's open alerts, silences and maintenance windows with
 it. It also forgets whether you chose the alert on or off. `404` if there's neither.
 
+## Change a template's discover block, query or counters block
+
+`GET`, `PUT` and `DELETE /api/v1/templates/{id}/discover/{key}`, `/queries/{key}` and `/counters/{key}`
+
+`GET` gives the part as it runs, field by field as `template` has it, with `copied`,
+`enabled_choice` and `original_changed_at` as in `choices`, and for your own copy, the
+template's own as `template_part`.
+
+`PUT` changes it. The body is the part as `GET` gives it; its key is the address's,
+whatever the body says, and whether it's on isn't changed here. It's checked in the
+template, in place of what it changes, so a column one of the template's alerts uses
+can't go, and everything wrong is in the `error`. For a built-in or imported
+template, the first change makes your own copy, used in place of the template's own
+from then on, which newer versions leave alone; later changes update the copy, and a
+body that says what the template's own does deletes it. For a template of your own,
+the template itself is changed. Gives back `204`.
+
+```sh
+curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT count(*) AS tills FROM tills WHERE open", "interval": "1m", "enabled": true}' \
+  "$MAXNINES_URL/api/v1/templates/4/queries/tills"
+```
+
+`DELETE`, or `POST …/reset`, puts a built-in or imported template's part back: it
+deletes your copy and forgets whether you chose it on or off. `404` if there's
+neither.
+
+`POST /api/v1/templates/{id}/queries/{key}/enable` and `…/disable`, and the same for
+`counters`, turn a query or counters block on or off: your choice for a built-in or
+imported template, which newer versions leave alone, or the template itself for one of
+your own. A discover block can't be turned off, as what it finds is waited on.
+
 ## What an upgrade changed
 
 `GET /api/v1/templates/upgrades` gives the names of the built-in templates an upgrade
-changed whose notice admins haven't dismissed, each saying which alerts you have copies
-of that it changed, and
+changed whose notice admins haven't dismissed, each saying which alerts and parts you
+have copies of that it changed, and any copy that went with a part it dropped, and
 `POST /api/v1/templates/upgrades/dismiss` dismisses it. Both need an admin.
 
 ```json

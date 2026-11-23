@@ -410,6 +410,28 @@ changes the template itself, as editing the template does.
 
 A template's alerts can be turned off but not deleted.
 
+## Changing a template's discover blocks, queries and counters
+
+The template's page lists its discover blocks, queries and performance counters as
+they run. **Change** opens one on its own, with the same fields as the template's form;
+its key stays as it is. It's checked in the template, so a column one of its alerts
+uses can't go, and the form says which alert.
+
+For a **built-in** or imported template, saving makes a copy of your own, used in place
+of the template's own from then on, as a changed alert is. Upgrades and newer imports
+leave your copy alone; when one changes the part you copied, the page and the notice
+say so, and you can compare it with what the template now says under **As the
+template comes**. If a newer version drops the part, your copy goes with it, and the
+notice says that too. Saving what the template says deletes your copy, as **Reset to
+template** does.
+
+**Disable** turns a query or counters block off without a copy, as your choice, which
+newer versions leave alone; **Reset to template** forgets it. A discover block can be
+changed but not turned off, as what it finds is what the rest waits on.
+
+For a template of **your own**, changing a part changes the template itself, and
+**Disable** clears its **Enabled** box.
+
 ## Names, keys and upgrades
 
 A built-in template is known by its key, so an upgrade can rename it or change

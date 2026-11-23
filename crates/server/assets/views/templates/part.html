@@ -1,0 +1,38 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ kind_words | capitalize }} {{ key }} · {{ template.name }} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a> / <a href="/templates/{{ id }}">{{ template.name }}</a></p>
+<h1>Change {{ kind_words }} <code>{{ key }}</code></h1>
+{% if original %}<p class="hint">{% if copied %}This is your own copy, used in place of the template's. Saving what the template says deletes it.{% else %}Saving makes a copy of your own, used in place of the template's. Upgrades leave your copy alone, and say when the template's changed under it.{% endif %}</p>{% endif %}
+<form method="post" action="{{ action }}" class="stacked template-form" id="template-form" data-cel-local="{{ local_metrics }}">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {# Pressing Enter uses the first button in a form, so it has to be Save. #}
+  {% if can_edit %}<button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save</button>{% endif %}
+  {% if problem_count > 0 %}<p class="error" role="alert">{% if problem_count == 1 %}One thing needs{% else %}{{ problem_count }} things need{% endif %} changing before this can be saved: see below.</p>{% endif %}
+  {% set e = errors | get(key="", default="") %}{% if e %}<p class="error">{{ e }}</p>{% endif %}
+  {% if kind == "discover" %}
+  {% for discover in form.discover %}
+  {% set d = "discover." ~ loop.index0 ~ "." %}
+  {% set di = loop.index0 %}
+  {% include "templates/_discover.html" %}
+  {% endfor %}
+  {% elif kind == "query" %}
+  {% for query in form.queries %}
+  {% set q = loop.index0 %}
+  {% set p = "query." ~ q ~ "." %}
+  {% include "templates/_query.html" %}
+  {% endfor %}
+  {% else %}
+  {% for counters in form.counters %}
+  {% set c = loop.index0 %}
+  {% set p = "counters." ~ c ~ "." %}
+  {% include "templates/_counters.html" %}
+  {% endfor %}
+  {% endif %}
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="/templates/{{ id }}">Cancel</a>
+  </div>
+</form>
+{% endblock content %}

@@ -11,6 +11,7 @@ mod events;
 mod proxies;
 mod roles;
 mod sign_ins;
+mod template_parts;
 mod templates;
 mod two_factor;
 mod users;

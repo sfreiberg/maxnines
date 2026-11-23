@@ -230,6 +230,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             get(two_factor_requirement).put(require_two_factor),
         )
         .merge(super::templates::api_routes())
+        .merge(super::template_parts::api_routes())
         .merge(super::suggestions::api_routes())
         .route_layer(middleware::from_fn_with_state(state, require_token))
         .fallback(no_such_route)

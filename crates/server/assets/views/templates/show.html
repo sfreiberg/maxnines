@@ -26,7 +26,7 @@
   {% endif %}
 </div>
 {% if template.description %}<p>{{ template.description }}</p>{% endif %}
-{% if original %}<p class="hint">{% if origin == "imported" %}Importing a newer version replaces{% else %}Upgrades replace{% endif %} what this template says. Changing one of its alerts makes a copy of your own, used in its place, which that leaves alone, and turning it or an alert off lasts through it.</p>{% endif %}
+{% if original %}<p class="hint">{% if origin == "imported" %}Importing a newer version replaces{% else %}Upgrades replace{% endif %} what this template says. Changing one of its alerts, queries, discover or counters blocks makes a copy of your own, used in its place, which that leaves alone, and turning it or a part of it off lasts through it.</p>{% endif %}
 
 <section class="card">
   <h2>Hosts</h2>
@@ -52,6 +52,54 @@
   <p>{% if applies_to %}Hosts where <code>{{ applies_to }}</code>{% if given_hosts %}, and {{ given_hosts | join(sep=", ") }}{% endif %}{% elif given_hosts %}{{ given_hosts | join(sep=", ") }}{% else %}Every host{% endif %}</p>
   {% endif %}
 </section>
+
+{% for section in part_sections %}
+{% set rows = section.rows %}
+{% if rows %}
+<section class="card">
+  <h2>{{ section.title }}</h2>
+  <p class="hint">{{ section.hint }}{% if original %} Changing one makes a copy of your own, used in its place, which upgrades leave alone.{% endif %}</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Key</th><th>Reads</th><th>Every</th><th></th><th></th></tr></thead>
+    <tbody>
+      {% for part in rows %}
+      <tr{% if not part.enabled %} class="disabled"{% endif %}>
+        <td><code>{{ part.key }}</code>{% if part.metrics %}<span class="under">Says more about {{ part.metrics | join(sep=", ") }}</span>{% endif %}</td>
+        <td>
+          <details><summary>{% if part.kind == "counters" %}{{ part.reads }}{% else %}{{ part.reads | truncate(length=60) }}{% endif %}</summary><pre class="table-scroll"><code>{{ part.reads }}</code></pre></details>
+          {% if part.when %}<div class="condition">Only when <code>{{ part.when }}</code></div>{% endif %}
+          {% if part.since %}<div class="condition">Since version <code>{{ part.since }}</code></div>{% endif %}
+          {% if part.copied %}<div class="hint">Your own copy.{% if part.changed %} A newer version changed the template's on {{ part.changed }}.{% endif %}</div>
+          <details><summary>As the template comes</summary><pre class="table-scroll"><code>{{ part.comes_as }}</code></pre></details>{% endif %}
+        </td>
+        <td class="nowrap">{{ part.every }}</td>
+        <td>{% if not part.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if part.copied %} <span class="badge hollow">Yours</span>{% endif %}{% if part.enabled_chosen %}<span class="under">{% if part.enabled %}On{% else %}Off{% endif %} by your choice</span>{% endif %}</td>
+        <td>
+          {% if can_edit %}
+          <div class="actions row-actions">
+            {% if part.turns_off %}
+            <form method="post" action="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/{% if part.enabled %}disable{% else %}enable{% endif %}" hx-post="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/{% if part.enabled %}disable{% else %}enable{% endif %}" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">{% if part.enabled %}Disable{% else %}Enable{% endif %}</button>
+            </form>
+            {% endif %}
+            <a class="button secondary" href="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/edit">Change</a>
+            {% if original and (part.copied or part.enabled_chosen) %}
+            <form method="post" action="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/reset" hx-post="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/reset" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">Reset to template</button>
+            </form>
+            {% endif %}
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+{% endfor %}
 
 <section class="card">
   <h2>Alerts</h2>

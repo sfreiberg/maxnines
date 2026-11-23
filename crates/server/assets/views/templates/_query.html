@@ -1,0 +1,71 @@
+<div class="repeat">
+  {% set e = errors | get(key=p, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+  <label>Key
+    <input type="text" name="{{ p }}key" value="{{ query.key }}"{% if part_only %} readonly{% endif %} spellcheck="false">
+    {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>SQL
+    <textarea name="{{ p }}sql" rows="5" spellcheck="false">{{ query.sql }}</textarea>
+    <small>Name every column, with <code>AS</code> where it isn't a column of its own. <code>{{ '{{' }} name }}</code> is filled in by version, from a fill below.</small>
+    {% set e = errors | get(key=p ~ "sql", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Labels
+    <input type="text" name="{{ p }}labels" value="{{ query.labels }}" spellcheck="false" placeholder="slot">
+    <small>Text columns that tell rows apart, comma separated.</small>
+    {% set e = errors | get(key=p ~ "labels", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <div class="field-row">
+    <label>Every
+      <input type="text" name="{{ p }}interval" value="{{ query.interval }}" spellcheck="false" placeholder="As the agent's">
+      {% set e = errors | get(key=p ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Since version
+      <input type="text" name="{{ p }}since" value="{{ query.since }}" spellcheck="false">
+      {% set e = errors | get(key=p ~ "since", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </div>
+  <label>Only when
+    <input type="text" name="{{ p }}when" value="{{ query.when }}" spellcheck="false" autocomplete="off" data-cel="when" placeholder="role == 'primary'">
+    {% set e = errors | get(key=p ~ "when", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  {% if not part_only %}<label class="checkbox"><input type="checkbox" name="{{ p }}enabled"{% if query.enabled %} checked{% endif %}> Enabled</label>{% endif %}
+
+  {% for fill in query.fills %}
+  {% set fp = p ~ "fill." ~ loop.index0 ~ "." %}
+  {% set f = loop.index0 %}
+  <div class="repeat">
+    {% set e = errors | get(key=fp, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+    <label>Fill
+      <input type="text" name="{{ fp }}key" value="{{ fill.key }}" spellcheck="false">
+      {% set e = errors | get(key=fp ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    {% for version in fill.versions %}
+    <div class="field-row">
+      <label>From version
+        <input type="text" name="{{ fp }}version.{{ loop.index0 }}.from" value="{{ version.from }}" spellcheck="false">
+      </label>
+      <label>SQL
+        <textarea name="{{ fp }}version.{{ loop.index0 }}.sql" rows="1" spellcheck="false">{{ version.sql }}</textarea>
+      </label>
+      <button type="submit" name="form_action" value="remove:query.{{ q }}.fill.{{ f }}.version.{{ loop.index0 }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove version</button>
+    </div>
+    {% endfor %}
+    {% set e = errors | get(key=fp ~ "versions", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    <button type="submit" name="form_action" value="add:query.{{ q }}.fill.{{ f }}.version" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add version</button>
+    <label>SQL for older versions
+      <textarea name="{{ fp }}older" rows="1" spellcheck="false">{{ fill.older }}</textarea>
+      {% set e = errors | get(key=fp ~ "older", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <button type="submit" name="form_action" value="remove:query.{{ q }}.fill.{{ f }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove fill</button>
+  </div>
+  {% endfor %}
+  <button type="submit" name="form_action" value="add:query.{{ q }}.fill" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add fill</button>
+
+  {% for metric in query.metrics %}
+  {% set mp = p ~ "metric." ~ loop.index0 ~ "." %}
+  {% set remove = "query." ~ q ~ ".metric." ~ loop.index0 %}
+  {% include "templates/_metric.html" %}
+  {% endfor %}
+  <button type="submit" name="form_action" value="add:query.{{ q }}.metric" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Say more about a column</button>
+  {% if not part_only %}<button type="submit" name="form_action" value="remove:query.{{ q }}" class="danger" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove query</button>{% endif %}
+</div>

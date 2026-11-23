@@ -82,45 +82,7 @@
     {% for discover in form.discover %}
     {% set d = "discover." ~ loop.index0 ~ "." %}
     {% set di = loop.index0 %}
-    <div class="repeat">
-      {% set e = errors | get(key=d, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
-      <label>Key
-        <input type="text" name="{{ d }}key" value="{{ discover.key }}" spellcheck="false" autocomplete="off" placeholder="role">
-        {% set e = errors | get(key=d ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>Every
-        <input type="text" name="{{ d }}interval" value="{{ discover.interval }}" spellcheck="false" placeholder="1h">
-        {% set e = errors | get(key=d ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>SQL
-        <textarea name="{{ d }}sql" rows="4" spellcheck="false">{{ discover.sql }}</textarea>
-        <small>Each column becomes something <code>when</code> can look at by its name. A <code>version</code> column is read as a version.</small>
-        {% set e = errors | get(key=d ~ "sql", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>Counter sets
-        <textarea name="{{ d }}counter_sets" rows="2" spellcheck="false" placeholder="asp_net = ASP.NET">{{ discover.counter_sets }}</textarea>
-        <small>One <code>name = Counter set</code> to a line, each true or false for whether the host has it.</small>
-        {% set e = errors | get(key=d ~ "counter_sets", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      {% for read in discover.registry %}
-      {% set p = d ~ "registry." ~ loop.index0 ~ "." %}
-      <div class="repeat">
-        <label>Registry key
-          <input type="text" name="{{ p }}key" value="{{ read.key }}" spellcheck="false" placeholder="HKLM\SOFTWARE\Microsoft\InetStp">
-        </label>
-        <label>Values
-          <textarea name="{{ p }}values" rows="2" spellcheck="false" placeholder="version = VersionString">{{ read.values }}</textarea>
-          <small>One <code>name = Value name</code> to a line.</small>
-        </label>
-        <button type="submit" name="form_action" value="remove:discover.{{ di }}.registry.{{ loop.index0 }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove registry key</button>
-      </div>
-      {% endfor %}
-      {% set e = errors | get(key=d ~ "registry", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      <div class="actions">
-        <button type="submit" name="form_action" value="add:discover.{{ di }}.registry" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add registry key</button>
-        <button type="submit" name="form_action" value="remove:discover.{{ di }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove discover block</button>
-      </div>
-    </div>
+    {% include "templates/_discover.html" %}
     {% endfor %}
     <button type="submit" name="form_action" value="add:discover" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add discover block</button>
   </fieldset>
@@ -155,77 +117,7 @@
     {% for query in form.queries %}
     {% set q = loop.index0 %}
     {% set p = "query." ~ q ~ "." %}
-    <div class="repeat">
-      {% set e = errors | get(key=p, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
-      <label>Key
-        <input type="text" name="{{ p }}key" value="{{ query.key }}" spellcheck="false">
-        {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>SQL
-        <textarea name="{{ p }}sql" rows="5" spellcheck="false">{{ query.sql }}</textarea>
-        <small>Name every column, with <code>AS</code> where it isn't a column of its own. <code>{{ '{{' }} name }}</code> is filled in by version, from a fill below.</small>
-        {% set e = errors | get(key=p ~ "sql", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>Labels
-        <input type="text" name="{{ p }}labels" value="{{ query.labels }}" spellcheck="false" placeholder="slot">
-        <small>Text columns that tell rows apart, comma separated.</small>
-        {% set e = errors | get(key=p ~ "labels", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <div class="field-row">
-        <label>Every
-          <input type="text" name="{{ p }}interval" value="{{ query.interval }}" spellcheck="false" placeholder="As the agent's">
-          {% set e = errors | get(key=p ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-        <label>Since version
-          <input type="text" name="{{ p }}since" value="{{ query.since }}" spellcheck="false">
-          {% set e = errors | get(key=p ~ "since", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-      </div>
-      <label>Only when
-        <input type="text" name="{{ p }}when" value="{{ query.when }}" spellcheck="false" autocomplete="off" data-cel="when" placeholder="role == 'primary'">
-        {% set e = errors | get(key=p ~ "when", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label class="checkbox"><input type="checkbox" name="{{ p }}enabled"{% if query.enabled %} checked{% endif %}> Enabled</label>
-
-      {% for fill in query.fills %}
-      {% set fp = p ~ "fill." ~ loop.index0 ~ "." %}
-      {% set f = loop.index0 %}
-      <div class="repeat">
-        {% set e = errors | get(key=fp, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
-        <label>Fill
-          <input type="text" name="{{ fp }}key" value="{{ fill.key }}" spellcheck="false">
-          {% set e = errors | get(key=fp ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-        {% for version in fill.versions %}
-        <div class="field-row">
-          <label>From version
-            <input type="text" name="{{ fp }}version.{{ loop.index0 }}.from" value="{{ version.from }}" spellcheck="false">
-          </label>
-          <label>SQL
-            <textarea name="{{ fp }}version.{{ loop.index0 }}.sql" rows="1" spellcheck="false">{{ version.sql }}</textarea>
-          </label>
-          <button type="submit" name="form_action" value="remove:query.{{ q }}.fill.{{ f }}.version.{{ loop.index0 }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove version</button>
-        </div>
-        {% endfor %}
-        {% set e = errors | get(key=fp ~ "versions", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        <button type="submit" name="form_action" value="add:query.{{ q }}.fill.{{ f }}.version" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add version</button>
-        <label>SQL for older versions
-          <textarea name="{{ fp }}older" rows="1" spellcheck="false">{{ fill.older }}</textarea>
-          {% set e = errors | get(key=fp ~ "older", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-        <button type="submit" name="form_action" value="remove:query.{{ q }}.fill.{{ f }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove fill</button>
-      </div>
-      {% endfor %}
-      <button type="submit" name="form_action" value="add:query.{{ q }}.fill" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add fill</button>
-
-      {% for metric in query.metrics %}
-      {% set mp = p ~ "metric." ~ loop.index0 ~ "." %}
-      {% set remove = "query." ~ q ~ ".metric." ~ loop.index0 %}
-      {% include "templates/_metric.html" %}
-      {% endfor %}
-      <button type="submit" name="form_action" value="add:query.{{ q }}.metric" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Say more about a column</button>
-      <button type="submit" name="form_action" value="remove:query.{{ q }}" class="danger" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove query</button>
-    </div>
+    {% include "templates/_query.html" %}
     {% endfor %}
     <button type="submit" name="form_action" value="add:query" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add query</button>
   </fieldset>
@@ -235,74 +127,7 @@
     {% for counters in form.counters %}
     {% set c = loop.index0 %}
     {% set p = "counters." ~ c ~ "." %}
-    <div class="repeat">
-      {% set e = errors | get(key=p, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
-      <label>Key
-        <input type="text" name="{{ p }}key" value="{{ counters.key }}" spellcheck="false">
-        {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>Counter set
-        <input type="text" name="{{ p }}object" value="{{ counters.object }}" spellcheck="false" placeholder="Web Service">
-        {% set e = errors | get(key=p ~ "object", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <div class="field-row">
-        <label>Label instances as
-          <input type="text" name="{{ p }}label" value="{{ counters.label }}" spellcheck="false" placeholder="site">
-          {% set e = errors | get(key=p ~ "label", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-        <label>Only the instance
-          <input type="text" name="{{ p }}instance" value="{{ counters.instance }}" spellcheck="false">
-          {% set e = errors | get(key=p ~ "instance", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-      </div>
-      <label>Instances matching
-        <input type="text" name="{{ p }}pattern" value="{{ counters.pattern }}" spellcheck="false" placeholder="^\d+_(?<pool>.+)$">
-        <small>A regular expression whose named groups become labels.</small>
-        {% set e = errors | get(key=p ~ "pattern", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label>Leave out
-        <textarea name="{{ p }}exclude" rows="1" spellcheck="false">{{ counters.exclude }}</textarea>
-        <small>Instances, one to a line.</small>
-      </label>
-      <label>Groups from counters
-        <textarea name="{{ p }}groups" rows="1" spellcheck="false" placeholder="pid = ID Process">{{ counters.groups }}</textarea>
-        {% set e = errors | get(key=p ~ "groups", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <div class="field-row">
-        <label>Join counter set
-          <input type="text" name="{{ p }}join.object" value="{{ counters.join_object }}" spellcheck="false">
-          {% set e = errors | get(key=p ~ "join.object", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-        <label>Join pattern
-          <input type="text" name="{{ p }}join.pattern" value="{{ counters.join_pattern }}" spellcheck="false">
-          {% set e = errors | get(key=p ~ "join.pattern", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-      </div>
-      {% set e = errors | get(key=p ~ "join.", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      <div class="field-row">
-        <label>Every
-          <input type="text" name="{{ p }}interval" value="{{ counters.interval }}" spellcheck="false" placeholder="As the agent's">
-          {% set e = errors | get(key=p ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-        <label>Since version
-          <input type="text" name="{{ p }}since" value="{{ counters.since }}" spellcheck="false">
-          {% set e = errors | get(key=p ~ "since", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-        </label>
-      </div>
-      <label>Only when
-        <input type="text" name="{{ p }}when" value="{{ counters.when }}" spellcheck="false" autocomplete="off" data-cel="when">
-        {% set e = errors | get(key=p ~ "when", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
-      </label>
-      <label class="checkbox"><input type="checkbox" name="{{ p }}enabled"{% if counters.enabled %} checked{% endif %}> Enabled</label>
-      {% set e = errors | get(key=p ~ "metrics", default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
-      {% for metric in counters.metrics %}
-      {% set mp = p ~ "metric." ~ loop.index0 ~ "." %}
-      {% set remove = "counters." ~ c ~ ".metric." ~ loop.index0 %}
-      {% include "templates/_metric.html" %}
-      {% endfor %}
-      <button type="submit" name="form_action" value="add:counters.{{ c }}.metric" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add metric</button>
-      <button type="submit" name="form_action" value="remove:counters.{{ c }}" class="danger" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove counters</button>
-    </div>
+    {% include "templates/_counters.html" %}
     {% endfor %}
     <button type="submit" name="form_action" value="add:counters" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add counters</button>
   </fieldset>

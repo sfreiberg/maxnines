@@ -20,7 +20,7 @@ use super::{CsrfForm, Page, local_date, server_error};
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
 use crate::metrics::{INSTANCE_LABEL, Kind};
-use crate::models::{Imported, Origin, StoredTemplate, TemplateAlert};
+use crate::models::{Imported, Origin, Part, PartKind, StoredTemplate, TemplateAlert};
 use crate::templates::{Refused, metrics_of};
 
 pub fn routes() -> Router<AppState> {
@@ -280,6 +280,166 @@ fn alert_rows(alerts: &[TemplateAlert]) -> Vec<AlertRow> {
         .collect()
 }
 
+/// One of a template's discover blocks, queries or counters blocks, as its page
+/// lists it: as it runs, with what someone made of it.
+#[derive(Serialize)]
+struct PartRow {
+    /// `discover`, `query` or `counters`.
+    kind: &'static str,
+    /// What its address calls its kind: `discover`, `queries` or `counters`.
+    segment: &'static str,
+    key: String,
+    /// The SQL it runs, the counter set it reads, or what it looks for.
+    reads: String,
+    every: String,
+    when: String,
+    since: String,
+    /// The metrics it says more about, by their short names.
+    metrics: Vec<String>,
+    enabled: bool,
+    turns_off: bool,
+    /// Whether someone has their own copy of it, used in its place.
+    copied: bool,
+    /// Whether someone chose it on or off, rather than the template.
+    enabled_chosen: bool,
+    /// When a newer version changed the template's own, under someone's copy.
+    changed: Option<String>,
+    /// What the template's own says it reads, when someone has a copy.
+    comes_as: String,
+}
+
+/// What a part reads, in short.
+fn reads(part: &Part) -> String {
+    match part {
+        Part::Discover(discover) => {
+            let mut said = Vec::new();
+            said.extend(discover.sql.clone());
+            said.extend(discover.registry.iter().map(|read| {
+                let names: Vec<&str> = read.values.values().map(String::as_str).collect();
+                format!("{}: {}", read.key, names.join(", "))
+            }));
+            said.extend(
+                discover
+                    .counter_sets
+                    .values()
+                    .map(|set| format!("whether there's a {set} counter set")),
+            );
+            said.join("\n")
+        }
+        Part::Query(query) => query.sql.clone(),
+        Part::Counters(counters) => counters.object.clone(),
+    }
+}
+
+/// A card of a template's page listing one kind of its parts.
+#[derive(Serialize)]
+struct PartSection {
+    title: &'static str,
+    hint: &'static str,
+    rows: Vec<PartRow>,
+}
+
+fn part_sections(stored: &StoredTemplate, as_run: &Template) -> Vec<PartSection> {
+    let mut rows = part_rows(stored, as_run);
+    let mut take = |kind: PartKind| {
+        let (these, rest) = rows.drain(..).partition(|row| row.kind == kind.as_str());
+        rows = rest;
+        these
+    };
+    vec![
+        PartSection {
+            title: "Discovery",
+            hint: "Each discover block runs first, then every interval. What they find is what \
+                queries' and alerts' conditions look at. A discover block can be changed but \
+                not turned off, as what it finds is waited on.",
+            rows: take(PartKind::Discover),
+        },
+        PartSection {
+            title: "Queries",
+            hint: "Each column becomes a metric.",
+            rows: take(PartKind::Query),
+        },
+        PartSection {
+            title: "Performance counters",
+            hint: "Read on Windows hosts.",
+            rows: take(PartKind::Counters),
+        },
+    ]
+}
+
+fn part_rows(stored: &StoredTemplate, as_run: &Template) -> Vec<PartRow> {
+    let text = |value: &Option<String>| value.clone().unwrap_or_default();
+    let mut parts: Vec<Part> = Vec::new();
+    parts.extend(as_run.discover.iter().cloned().map(Part::Discover));
+    parts.extend(as_run.queries.iter().cloned().map(Part::Query));
+    parts.extend(as_run.counters.iter().cloned().map(Part::Counters));
+    parts
+        .into_iter()
+        .map(|part| {
+            let kind = part.kind();
+            let choice = stored
+                .choices
+                .iter()
+                .find(|choice| choice.kind == kind && choice.key == part.key());
+            let copied = choice.is_some_and(|choice| choice.copied);
+            let comes_as = match copied {
+                true => Part::of(&stored.template, kind, part.key())
+                    .map(|(_, own)| reads(&own))
+                    .unwrap_or_default(),
+                false => String::new(),
+            };
+            let (every, when, since, metrics, enabled) = match &part {
+                Part::Discover(discover) => (
+                    discover
+                        .interval
+                        .clone()
+                        .unwrap_or_else(|| "1h".to_string()),
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                    true,
+                ),
+                Part::Query(query) => (
+                    text(&query.interval),
+                    text(&query.when),
+                    text(&query.since),
+                    query.metrics.iter().map(|m| m.key.clone()).collect(),
+                    query.enabled,
+                ),
+                Part::Counters(counters) => (
+                    text(&counters.interval),
+                    text(&counters.when),
+                    text(&counters.since),
+                    counters.metrics.iter().map(|m| m.key.clone()).collect(),
+                    counters.enabled,
+                ),
+            };
+            PartRow {
+                kind: kind.as_str(),
+                segment: match kind {
+                    PartKind::Discover => "discover",
+                    PartKind::Query => "queries",
+                    PartKind::Counters => "counters",
+                },
+                key: part.key().to_string(),
+                reads: reads(&part),
+                every,
+                when,
+                since,
+                metrics,
+                enabled,
+                turns_off: kind.turns_off(),
+                copied,
+                enabled_chosen: choice.is_some_and(|choice| choice.enabled_choice.is_some()),
+                changed: choice
+                    .and_then(|choice| choice.original_changed_at)
+                    .map(local_date),
+                comes_as,
+            }
+        })
+        .collect()
+}
+
 fn metric_rows(template: &Template) -> Vec<MetricRow> {
     let detail = |short: &str| {
         template
@@ -356,9 +516,14 @@ async fn show_page(
             return Ok(None);
         };
         let alerts = state.database.template_alerts(stored.id).await?;
-        anyhow::Ok(Some((stored, alerts)))
+        let as_run = state
+            .database
+            .template_as_run(stored.id)
+            .await?
+            .unwrap_or_else(|| stored.template.clone());
+        anyhow::Ok(Some((stored, alerts, as_run)))
     };
-    let (stored, alerts) = match loaded.await {
+    let (stored, alerts, as_run) = match loaded.await {
         Ok(Some(found)) => found,
         Ok(None) => return not_found(state, token),
         Err(error) => return server_error(&error),
@@ -397,7 +562,8 @@ async fn show_page(
         .with("upgraded", &stored.upgraded_at.map(local_date))
         .with("source", &stored.hcl())
         .with("alerts", &alert_rows(&alerts))
-        .with("metrics", &metric_rows(&stored.template));
+        .with("part_sections", &part_sections(&stored, &as_run))
+        .with("metrics", &metric_rows(&as_run));
     match typed {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
         None => page.render(),
@@ -532,6 +698,7 @@ async fn form_page(
         .with("problem_count", &problems.len())
         .with("operating_systems", &crate::rule_engine::OPERATING_SYSTEMS)
         .with("units", &maxnines_protocol::templates::UNITS)
+        .with("part_only", &false)
         .with("local_metrics", &local_suggestions(&template));
     match problems.is_empty() {
         true => page.render(),
@@ -978,6 +1145,8 @@ async fn api_show(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
         view["template"] = serde_json::to_value(&stored.template)?;
         view["metrics"] = serde_json::to_value(metrics)?;
         view["alerts"] = serde_json::to_value(alerts)?;
+        view["choices"] = serde_json::to_value(&stored.choices)?;
+        view["copies"] = serde_json::to_value(&stored.copies)?;
         anyhow::Ok(Some(view))
     };
     match loaded.await {

@@ -166,6 +166,9 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
             .to_owned()
     };
     let position = || part("position").integer().not_null().to_owned();
+    // On someone's copy of a discover block, query or counters block: when a newer
+    // version of the template changed what it's a copy of.
+    let changed = || moment(backend, Alias::new("original_changed_at"));
     // What every part has, and the template, query, counters or fill it's part of.
     let table = |name: &str, parents: &[(&str, &str, bool)], copied: bool| {
         let mut table = Table::create()
@@ -205,7 +208,8 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(key())
         .col(position())
         .col(part("interval_secs").big_integer())
-        .col(part("sql").text());
+        .col(part("sql").text())
+        .col(changed());
     manager.create_table(discoveries).await?;
 
     let mut registry = table(
@@ -233,7 +237,8 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("since").string_len(64))
         .col(part("when_condition").text())
         .col(part("enabled").boolean().not_null())
-        .col(part("enabled_choice").boolean());
+        .col(part("enabled_choice").boolean())
+        .col(changed());
     manager.create_table(queries).await?;
 
     let mut fills = table(
@@ -269,7 +274,8 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(part("since").string_len(64))
         .col(part("interval_secs").big_integer())
         .col(part("enabled").boolean().not_null())
-        .col(part("enabled_choice").boolean());
+        .col(part("enabled_choice").boolean())
+        .col(changed());
     manager.create_table(counters).await?;
 
     // A metric is a query's or a counters block's.

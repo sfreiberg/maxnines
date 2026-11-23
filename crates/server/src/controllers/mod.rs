@@ -38,6 +38,7 @@ mod sign_ins;
 mod silences;
 mod suggestions;
 pub(crate) mod template_form;
+mod template_parts;
 mod templates;
 mod update_notice;
 mod users;
@@ -246,6 +247,7 @@ pub fn app(state: AppState) -> Router {
         .merge(compressed(metrics::routes()))
         .merge(rules::routes())
         .merge(templates::routes())
+        .merge(template_parts::routes())
         .merge(suggestions::routes())
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
