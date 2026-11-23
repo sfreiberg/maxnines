@@ -1,5 +1,5 @@
-//! Runs a template's SQL against a database, for agents and, later, for the server
-//! reading databases on hosts with no agent. What to run comes from the server,
+//! Runs a template's SQL against a database, for agents and for the server reading
+//! databases on hosts with no agent. What to run comes from the server,
 //! already worked out for the database: see [`maxnines_protocol::templates::work`].
 //!
 //! Each statement runs on its own in a read-only transaction that's rolled back
@@ -32,6 +32,7 @@ use crate::databases::Database;
 use crate::sign_in::{mysql_connection, pg_short, postgres_client, short};
 
 mod privileges;
+pub mod reader;
 pub use privileges::Privileges;
 
 /// How long one statement gets before the database stops it.

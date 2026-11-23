@@ -35,11 +35,9 @@ const BLOCKING_THREAD_KEEP_ALIVE: Duration = Duration::from_secs(1);
 /// The runtime every background collector shares, once one has started.
 static RUNTIME: Mutex<Option<Handle>> = Mutex::new(None);
 
-/// A random time up to `limit`, which keeps work on the same schedule from all
-/// starting at once, whether that's in one agent or across a fleet.
-pub fn jitter(limit: Duration) -> Duration {
-    limit.mul_f64(rand::random())
-}
+/// Keeps work on the same schedule from all starting at once, whether that's in one
+/// agent or across a fleet.
+pub use maxnines_checks::jitter;
 
 /// Every `every`, first at a random point in the first one. After running late, the
 /// next goes at once, and the ones after it keep to the same schedule.
@@ -413,16 +411,6 @@ mod tests {
         assert_eq!(started.elapsed(), late);
         schedule.tick().await;
         assert_eq!(started.elapsed(), first + every * 2);
-    }
-
-    #[test]
-    fn jitter_varies_and_stays_within_its_limit() {
-        let limit = Duration::from_secs(10);
-        let times: Vec<Duration> = (0..100).map(|_| jitter(limit)).collect();
-
-        assert!(times.iter().all(|time| *time < limit));
-        assert!(times.iter().any(|time| *time != times[0]));
-        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

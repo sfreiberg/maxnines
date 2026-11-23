@@ -109,6 +109,12 @@ pub fn host_reached(check: &Check) -> String {
         .to_lowercase()
 }
 
+/// A random length of time up to `limit`, to start something at a random point in
+/// its first interval, so things started together don't all run at once.
+pub fn jitter(limit: Duration) -> Duration {
+    limit.mul_f64(rand::random())
+}
+
 /// How long a check gets. A slower answer counts as down.
 pub fn limit(check: &Check) -> Duration {
     check.timeout.unwrap_or(DEFAULT_CHECK_TIMEOUT)
@@ -1117,6 +1123,16 @@ mod tests {
 
     fn check(kind: CheckKind, target: &str) -> Check {
         Check::new("a", kind, target)
+    }
+
+    #[test]
+    fn jitter_varies_and_stays_within_its_limit() {
+        let limit = Duration::from_secs(10);
+        let times: Vec<Duration> = (0..100).map(|_| jitter(limit)).collect();
+
+        assert!(times.iter().all(|time| *time < limit));
+        assert!(times.iter().any(|time| *time != times[0]));
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
     }
 
     #[test]

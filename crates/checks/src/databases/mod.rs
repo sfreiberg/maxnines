@@ -44,7 +44,7 @@ pub fn is_database(kind: CheckKind) -> bool {
 }
 
 /// Where a database is and how to sign in to it.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Database {
     /// The kind, where to reach it, and its options, as a check would have them.
     pub check: Check,
