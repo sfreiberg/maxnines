@@ -72,13 +72,15 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn new(name: &str, database: Database, extras: &[String]) -> Self {
-        Self {
+    /// A reader for a kind of database read here, or none for one only templates
+    /// read, which is the one place that's decided for whoever reads databases.
+    pub fn new(name: &str, database: Database, extras: &[String]) -> Option<Self> {
+        has_reader(database.check.kind).then(|| Self {
             name: name.to_string(),
             database,
             extras: extras.to_vec(),
             open: None,
-        }
+        })
     }
 
     pub fn name(&self) -> &str {
@@ -430,11 +432,16 @@ mod tests {
                 ..Credentials::default()
             },
         };
-        let mut reader = Reader::new("orders", database, &[]);
+        let mut reader = Reader::new("orders", database.clone(), &[]).unwrap();
         let rows = reader.read(Duration::from_secs(2)).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["up"], 0);
         assert_eq!(rows[0]["kind"], "mongodb");
         assert!(rows[0]["error"].is_string(), "{rows:?}");
+
+        // A kind only templates read has no reader here.
+        let mut postgres = database;
+        postgres.check.kind = CheckKind::Postgres;
+        assert!(Reader::new("orders", postgres, &[]).is_none());
     }
 }

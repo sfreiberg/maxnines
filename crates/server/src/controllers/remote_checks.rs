@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use chrono::TimeDelta;
-use maxnines_checks::databases::{has_reader, is_database};
+use maxnines_checks::databases::is_database;
 use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -273,9 +273,9 @@ impl CheckForm {
             grace: None,
             enabled: self.enabled,
             read_stats,
-            // A kind only templates read has none: its template's queries are
-            // turned on instead.
-            extras: if read_stats && has_reader(kind) {
+            // Ticked for a kind only templates read, they're refused as the API
+            // refuses them, saying to turn on its template's queries instead.
+            extras: if read_stats {
                 self.extras.clone()
             } else {
                 Vec::new()

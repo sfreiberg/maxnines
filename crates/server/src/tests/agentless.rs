@@ -1365,6 +1365,28 @@ async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
         form.body
             .contains(r#"<input type="checkbox" name="extra_sizes" checked>"#)
     );
+
+    // And the form refuses what the API does, rather than saving without it.
+    let fields = [
+        ("name", "orders"),
+        ("kind", "postgres"),
+        ("target", "db:5432"),
+        ("interval_secs", "60"),
+        ("enabled", "on"),
+        ("sign_in", "password"),
+        ("username", "maxnines"),
+        ("read_stats", "on"),
+        ("extra_sizes", "on"),
+    ];
+    let refused = Browser::default()
+        .submit(&server, "/checks/new", "/checks", &fields)
+        .await;
+    assert_ne!(refused.status, 303, "{}", refused.body);
+    assert!(
+        refused.body.contains("postgres has no extras"),
+        "{}",
+        refused.body
+    );
 }
 
 /// Reads the throwaway PostgreSQL the checks crate's tests use, named as

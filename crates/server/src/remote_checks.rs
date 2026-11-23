@@ -617,9 +617,7 @@ impl Scheduler {
     fn keep_readers(&mut self, checks: &[RemoteCheck]) {
         let wanted: HashMap<i64, &RemoteCheck> = checks
             .iter()
-            .filter(|check| {
-                check.input.enabled && check.input.read_stats && has_reader(check.input.check.kind)
-            })
+            .filter(|check| check.input.enabled && check.input.read_stats)
             .map(|check| (check.id, check))
             .collect();
         self.readers.retain(|id, _| wanted.contains_key(id));
@@ -637,7 +635,11 @@ impl Scheduler {
                 check: check.input.check.clone(),
                 credentials: credentials.clone().unwrap_or_default(),
             };
-            let reader = Reader::new(&check.input.check.name, database, &check.input.extras);
+            // Templates read it, and nothing here can.
+            let Some(reader) = Reader::new(&check.input.check.name, database, &check.input.extras)
+            else {
+                continue;
+            };
             self.readers.insert(
                 id,
                 StatsReader {

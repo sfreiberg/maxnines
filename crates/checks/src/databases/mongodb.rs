@@ -404,7 +404,7 @@ mod tests {
             return;
         };
         let extras = vec!["sizes".to_string()];
-        let mut reader = Reader::new("main", database, &extras);
+        let mut reader = Reader::new("main", database, &extras).unwrap();
         let mut settle = Settle::default();
         let first = settle.settle(reader.read(Duration::from_secs(10)).await);
         let main = row(&first, "main");

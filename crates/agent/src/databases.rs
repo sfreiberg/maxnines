@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{
-    Database, Reader, Settle, TIMEOUT, by_kind, has_reader, is_database,
-};
+use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, by_kind, is_database};
 use maxnines_protocol::{Check, CheckKind, DatabaseChoice, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -141,22 +139,18 @@ impl DatabaseCollector {
         let limit = interval.min(TIMEOUT);
         for choice in chosen {
             let name = &choice.name;
-            // Templates read it, and nothing here can.
-            let templates_only = definitions
-                .get(name)
-                .and_then(|definition| CheckKind::parse(&definition.kind))
-                .is_some_and(|kind| is_database(kind) && !has_reader(kind));
-            if templates_only {
-                continue;
-            }
             let found = definitions
                 .get(name)
                 .context("the agent's config has no database by that name")
                 .and_then(|definition| definition.database(name));
             match found {
                 Ok(database) => {
+                    // Templates read it, and nothing here can.
+                    let Some(reader) = Reader::new(name, database, &choice.extras) else {
+                        continue;
+                    };
                     // Rounds never overlap, so it keeps its connection between them.
-                    let reader = Arc::new(Mutex::new(Reader::new(name, database, &choice.extras)));
+                    let reader = Arc::new(Mutex::new(reader));
                     // Its running totals become changes as it's read.
                     let mut settle = Settle::default();
                     background.repeat(
@@ -273,8 +267,9 @@ mod tests {
     fn a_rule_reads_the_databases_the_config_defines_and_only_those() {
         let definitions = DatabaseDefinitions::from([
             ("orders".to_string(), defined("mongodb", "127.0.0.1:0")),
-            ("ledger".to_string(), defined("postgres", "127.0.0.1:0")),
-            ("shop".to_string(), defined("mysql", "127.0.0.1:0")),
+            // Never connected to here, as only their templates read them.
+            ("ledger".to_string(), defined("postgres", "127.0.0.1:1")),
+            ("shop".to_string(), defined("mysql", "127.0.0.1:1")),
         ]);
         let chosen = ["orders", "ledger", "shop", "nowhere"].map(|name| DatabaseChoice {
             name: name.to_string(),
