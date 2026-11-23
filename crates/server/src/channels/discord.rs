@@ -42,12 +42,21 @@ fn circle(tone: Tone) -> &'static str {
     }
 }
 
-fn headline(notice: &Notice) -> String {
+/// A link to the alert's own page, with its chart, as a line of its own. The
+/// address is in angle brackets so Discord doesn't add a preview of the page.
+fn link_line(notice: &Notice, web_url: Option<&str>) -> String {
+    web_url.map_or_else(String::new, |url| {
+        format!("\n[{}](<{}>)", notice.link_label(), notice.link(url))
+    })
+}
+
+/// The first line, short enough to leave room for the link after it.
+fn headline(notice: &Notice, link: &str) -> String {
     let circle = circle(notice.tone());
     let max = if notice.action.is_some() {
         MAX_HEADLINE_CHARS
     } else {
-        MAX_CHARS
+        MAX_CHARS.saturating_sub(link.chars().count())
     };
     format!("{circle}**{}** {}", notice.label(), notice.summary())
         .chars()
@@ -55,18 +64,19 @@ fn headline(notice: &Notice) -> String {
         .collect()
 }
 
-/// What an action printed, as much as fits under the headline.
-fn printed(notice: &Notice, headline: &str) -> Option<Printed> {
+/// What an action printed, as much as fits between the headline and the link.
+fn printed(notice: &Notice, headline: &str, link: &str) -> Option<Printed> {
     let around = FENCE_START.len() + FENCE_END.len() + CUT_NOTE.len();
-    let room = MAX_CHARS.saturating_sub(headline.chars().count() + around);
-    notice.printed(room)
+    let used = headline.chars().count() + link.chars().count() + around;
+    notice.printed(MAX_CHARS.saturating_sub(used))
 }
 
 /// Mentions are turned off, as agents choose their own names and one called
 /// `@everyone` would otherwise ping a whole server.
-fn body(notice: &Notice) -> Value {
-    let mut content = headline(notice);
-    if let Some(printed) = printed(notice, &content) {
+fn body(notice: &Notice, web_url: Option<&str>) -> Value {
+    let link = link_line(notice, web_url);
+    let mut content = headline(notice, &link);
+    if let Some(printed) = printed(notice, &content, &link) {
         // Three backticks would end the block early.
         let text = printed.text.replace("```", "'''");
         content.push_str(&format!("{FENCE_START}{text}{FENCE_END}"));
@@ -74,13 +84,15 @@ fn body(notice: &Notice) -> Value {
             content.push_str(CUT_NOTE);
         }
     }
+    content.push_str(&link);
     json!({ "content": content, "allowed_mentions": { "parse": [] } })
 }
 
 /// All of what an action printed, as a file, when the message had to cut it.
-fn whole_output(notice: &Notice) -> Option<(String, String)> {
+fn whole_output(notice: &Notice, web_url: Option<&str>) -> Option<(String, String)> {
     let run = notice.action.as_ref()?;
-    let cut = printed(notice, &headline(notice))?.cut;
+    let link = link_line(notice, web_url);
+    let cut = printed(notice, &headline(notice, &link), &link)?.cut;
     cut.then(|| (format!("{}.txt", run.action), run.output.clone()))
 }
 
@@ -155,12 +167,13 @@ impl ChannelType for Discord {
         channel: &Channel,
         notice: &Notice,
         _reply_to: Option<&str>,
-        _senders: &Senders,
+        senders: &Senders,
     ) -> Result<Option<String>> {
         let target = channel.channel.target.clone();
-        let body = body(notice);
+        let web_url = senders.web_url.as_deref();
+        let body = body(notice, web_url);
         let chart = notice.chart.clone();
-        let output = whole_output(notice);
+        let output = whole_output(notice, web_url);
         blocking(move || {
             let chart = chart.as_deref().map(Vec::as_slice);
             post(&target, &body, chart, output.as_ref()).map(|()| None)
@@ -178,15 +191,15 @@ mod tests {
     #[test]
     fn what_an_action_printed_is_shown_so_it_lines_up() {
         let notice = action_notice("FOLDER  SIZE\n/var/log  9 GiB\n```@everyone\n");
-        let body = body(&notice);
+        let body = body(&notice, None);
         assert_eq!(
             body["content"],
             "**ACTION** disk_space ran on web-1\n```\nFOLDER  SIZE\n/var/log  9 GiB\n'''@everyone\n```"
         );
-        assert_eq!(whole_output(&notice), None);
+        assert_eq!(whole_output(&notice, None), None);
         // One that printed nothing still says how it went.
         assert_eq!(
-            super::body(&action_notice(""))["content"],
+            super::body(&action_notice(""), None)["content"],
             "**ACTION** disk_space ran on web-1"
         );
     }
@@ -195,14 +208,14 @@ mod tests {
     fn output_too_long_for_a_message_is_cut_at_a_line_and_sent_whole_as_a_file() {
         let line = "/var/lib/something  1 GiB\n";
         let notice = action_notice(&line.repeat(200));
-        let body = body(&notice);
+        let body = body(&notice, None);
         let content = body["content"].as_str().unwrap();
         assert!(content.chars().count() <= MAX_CHARS, "{content}");
         assert!(
             content.ends_with("1 GiB\n```\nCut short. All of it is in the file."),
             "{content}"
         );
-        let (name, whole) = whole_output(&notice).unwrap();
+        let (name, whole) = whole_output(&notice, None).unwrap();
         assert_eq!(name, "disk_space.txt");
         assert_eq!(whole, line.repeat(200));
     }
@@ -210,15 +223,15 @@ mod tests {
     #[test]
     fn discord_messages_lead_with_what_happened() {
         assert_eq!(
-            body(&notice(Event::Firing, alert()))["content"],
+            body(&notice(Event::Firing, alert()), None)["content"],
             "🔴 **CRITICAL** CPU usage on web-1 is 97%, above 90%"
         );
         assert_eq!(
-            body(&notice(Event::Resolved, alert()))["content"],
+            body(&notice(Event::Resolved, alert()), None)["content"],
             "🟢 **RESOLVED** CPU usage on web-1 is 97%, above 90%"
         );
         assert_eq!(
-            body(&notice(Event::Escalated, alert()))["content"],
+            body(&notice(Event::Escalated, alert()), None)["content"],
             "🔴 **NOW CRITICAL** CPU usage on web-1 is 97%, above 90%"
         );
     }
@@ -230,7 +243,7 @@ mod tests {
             ..alert()
         };
         let starts = |notice: Notice| {
-            body(&notice)["content"]
+            body(&notice, None)["content"]
                 .as_str()
                 .unwrap()
                 .chars()
@@ -250,7 +263,7 @@ mod tests {
             summary: "@everyone is offline".to_string(),
             ..alert()
         };
-        let body = body(&notice(Event::Firing, alert));
+        let body = body(&notice(Event::Firing, alert), None);
         assert_eq!(body["allowed_mentions"]["parse"], json!([]));
     }
 
@@ -260,8 +273,51 @@ mod tests {
             summary: "é".repeat(3000),
             ..alert()
         };
-        let body = body(&notice(Event::Firing, alert));
-        let content = body["content"].as_str().unwrap();
+        let plain = body(&notice(Event::Firing, alert.clone()), None);
+        let content = plain["content"].as_str().unwrap();
         assert_eq!(content.chars().count(), MAX_CHARS);
+
+        // The link to the alert is never what's cut.
+        let linked = body(&notice(Event::Firing, alert), Some(URL));
+        let content = linked["content"].as_str().unwrap();
+        assert_eq!(content.chars().count(), MAX_CHARS);
+        assert!(
+            content.ends_with("\n[View alert](<https://m.example.com/alerts/7>)"),
+            "{content}"
+        );
+    }
+
+    const URL: &str = "https://m.example.com";
+
+    #[test]
+    fn a_discord_message_links_to_its_alert_and_its_chart() {
+        assert_eq!(
+            body(&notice(Event::Firing, alert()), Some(URL))["content"],
+            "🔴 **CRITICAL** CPU usage on web-1 is 97%, above 90%\n\
+             [View alert](<https://m.example.com/alerts/7>)"
+        );
+        // One about no alert links to them all.
+        assert!(
+            body(&Notice::test(), Some(URL))["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("\n[View alerts](<https://m.example.com/alerts>)")
+        );
+    }
+
+    #[test]
+    fn what_an_action_printed_leaves_room_for_the_link() {
+        let line = "/var/lib/something  1 GiB\n";
+        let notice = action_notice(&line.repeat(200));
+        let sent = body(&notice, Some(URL));
+        let content = sent["content"].as_str().unwrap();
+        assert!(content.chars().count() <= MAX_CHARS, "{content}");
+        assert!(
+            content.ends_with(
+                "Cut short. All of it is in the file.\n[View alert](<https://m.example.com/alerts/7>)"
+            ),
+            "{content}"
+        );
+        assert!(whole_output(&notice, Some(URL)).is_some());
     }
 }

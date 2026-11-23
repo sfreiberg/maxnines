@@ -197,6 +197,23 @@ impl Notice {
     }
 
     /// Where all of what the action printed is, for a message that had to cut it.
+    /// Where to look: the alert's own page, with its chart, for a notice about one,
+    /// and the alerts page for one about none, such as a test.
+    pub(crate) fn link(&self, web_url: &str) -> String {
+        match &self.alert {
+            Some(alert) => format!("{web_url}/alerts/{}", alert.id),
+            None => crate::channels::alerts_link(web_url),
+        }
+    }
+
+    /// What the link to [`Self::link`] says.
+    pub(crate) fn link_label(&self) -> &'static str {
+        match &self.alert {
+            Some(_) => "View alert",
+            None => "View alerts",
+        }
+    }
+
     pub(crate) fn actions_link(&self, web_url: &str) -> Option<String> {
         let alert = self.alert.as_ref()?;
         self.action

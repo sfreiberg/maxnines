@@ -119,7 +119,7 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     // A resolved alert updates the message it fired with, which keeps saying what
     // was wrong, while the reply in its thread says where things stand now.
     let mut lines = vec![format!("*{}* {}", notice.label(), escape(&alert.summary))];
-    let mut details = vec![
+    let details = [
         format!("Rule: {}", escape(&alert.rule_name)),
         if alert.host_id == FLEET_HOST_ID {
             format!("Hosts: {}", escape(&alert.hostname))
@@ -132,11 +132,14 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
         },
         format!("Started: {}", format_utc(alert.started_at)),
     ];
-    if let Some(url) = web_url {
-        details.push(format!("<{url}/alerts|View alerts>"));
-    }
+    // The link to the alert's own page, with its chart, which a long summary
+    // never pushes out.
+    let link = web_url.map_or_else(String::new, |url| {
+        format!(" · <{}|{}>", notice.link(url), notice.link_label())
+    });
     lines.push(details.join(" · "));
-    lines.join("\n")
+    let room = SECTION_MAX_CHARS.saturating_sub(link.chars().count());
+    clip_escaped(lines.join("\n"), room) + &link
 }
 
 /// How an action went, with what it printed in a block that lines up.
@@ -646,7 +649,7 @@ mod tests {
         assert!(text.contains("Rule: High CPU"), "{text}");
         assert!(text.contains("Host: web-1"), "{text}");
         assert!(
-            text.contains("<https://m.example.com/alerts|View alerts>"),
+            text.ends_with(" · <https://m.example.com/alerts/7|View alert>"),
             "{text}"
         );
     }
@@ -759,6 +762,24 @@ mod tests {
             .unwrap();
         assert!(text.chars().count() <= SECTION_MAX_CHARS);
         assert!(text.ends_with("&lt;"), "{}", &text[text.len() - 10..]);
+
+        // The link to the alert is what's kept.
+        let long = Alert {
+            summary: "<".repeat(5000),
+            ..crate::channels::testing::alert()
+        };
+        let shown = content(
+            &notice(Event::Firing, long),
+            Some("https://m.example.com"),
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&shown).unwrap();
+        let text = value["attachments"][0]["blocks"][0]["text"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(text.chars().count() <= SECTION_MAX_CHARS);
+        assert!(text.ends_with(" · <https://m.example.com/alerts/7|View alert>"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow, ensure};
 use axum::http::Uri;
 use serde_json::{Value, json};
 
-use super::{ChannelType, alerts_link, blocking, post_json, url_preview};
+use super::{ChannelType, blocking, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput, Event, Severity};
 use crate::notifier::{Notice, Senders, format_utc};
 use crate::registration::short_id;
@@ -86,7 +86,7 @@ fn body(notice: &Notice, web_url: Option<&str>) -> Value {
                 { "type": "Action.OpenUrl", "title": "All of what it printed", "url": link }
             ]),
             None => json!([
-                { "type": "Action.OpenUrl", "title": "View alerts", "url": alerts_link(url) }
+                { "type": "Action.OpenUrl", "title": notice.link_label(), "url": notice.link(url) }
             ]),
         };
     }
@@ -176,7 +176,7 @@ mod tests {
         let facts = card["body"][2]["facts"].as_array().unwrap();
         assert_eq!(facts[0], json!({ "title": "Rule", "value": "High CPU" }));
         assert_eq!(facts[1]["title"], "Host");
-        assert_eq!(card["actions"][0]["url"], "https://m.example.com/alerts");
+        assert_eq!(card["actions"][0]["url"], "https://m.example.com/alerts/7");
 
         let warning = Alert {
             severity: Severity::Warning,

@@ -5,7 +5,7 @@ use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
 use super::on_call::{self, Incident};
-use super::{ChannelType, alerts_link, blocking, post_json};
+use super::{ChannelType, blocking, post_json};
 use crate::alerting::{Channel, ChannelInput};
 use crate::notifier::{Notice, Senders};
 
@@ -54,7 +54,7 @@ fn event(notice: &Notice, step: Incident, key: &str, web_url: Option<&str>) -> V
         },
     });
     if let Some(url) = web_url {
-        event["client_url"] = json!(alerts_link(url));
+        event["client_url"] = json!(notice.link(url));
     }
     event
 }
@@ -129,6 +129,17 @@ mod tests {
         assert_eq!(event["event_action"], "trigger");
         assert_eq!(event["payload"]["severity"], "warning");
         assert_eq!(event["dedup_key"], "maxnines-alert-7");
+    }
+
+    #[test]
+    fn an_incident_links_to_its_alert() {
+        let opened = event(
+            &notice(Event::Firing, alert()),
+            Incident::Open,
+            "key",
+            Some("https://m.example.com"),
+        );
+        assert_eq!(opened["client_url"], "https://m.example.com/alerts/7");
     }
 
     #[test]

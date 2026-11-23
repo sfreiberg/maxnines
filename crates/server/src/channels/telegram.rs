@@ -4,9 +4,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use serde_json::{Value, json};
 use ureq::unversioned::multipart::Form;
 
-use super::{
-    ChannelType, Response, alerts_link, blocking, chart_part, explain_http, post, post_form,
-};
+use super::{ChannelType, Response, blocking, chart_part, explain_http, post, post_form};
 use crate::alerting::{Channel, ChannelInput, Event};
 use crate::notifier::{Notice, Senders, format_utc};
 use crate::registration::short_id;
@@ -109,8 +107,9 @@ fn text(notice: &Notice, web_url: Option<&str>) -> String {
     }
     if let Some(url) = web_url {
         lines.push(format!(
-            "<a href=\"{}\">View alerts</a>",
-            escape(&alerts_link(url))
+            "<a href=\"{}\">{}</a>",
+            escape(&notice.link(url)),
+            notice.link_label()
         ));
     }
     lines.join("\n")
@@ -342,7 +341,7 @@ mod tests {
             text,
             "<b>CRITICAL</b> CPU usage on web-1 is 97%, above 90%\n\
              Rule: High CPU · Host: web-1 (abc) · Started: 1970-01-01 00:00:01 UTC\n\
-             <a href=\"https://m.example.com/alerts\">View alerts</a>"
+             <a href=\"https://m.example.com/alerts/7\">View alert</a>"
         );
         assert_eq!(
             super::text(&Notice::test(), None),

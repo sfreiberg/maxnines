@@ -3329,7 +3329,7 @@ async fn an_alert_opens_and_closes_in_alertops() {
     assert_eq!(events[0]["message"], "High CPU on web-1: CPU usage is 95%");
     assert_eq!(events[0]["severity"], "critical");
     assert_eq!(events[0]["hostname"], "web-1");
-    assert_eq!(events[0]["link"], "https://monitor.example.com/alerts");
+    assert!(is_alert_link(&events[0]["link"]), "{}", events[0]);
     assert_eq!(events[1]["status"], "closed");
     assert_eq!(events[1]["alert_id"], events[0]["alert_id"]);
 }
@@ -3351,7 +3351,7 @@ async fn an_alert_opens_and_closes_in_signl4() {
     assert_eq!(events[0]["Title"], "High CPU");
     assert_eq!(events[0]["Message"], "High CPU on web-1: CPU usage is 95%");
     assert_eq!(events[0]["Severity"], "critical");
-    assert_eq!(events[0]["Link"], "https://monitor.example.com/alerts");
+    assert!(is_alert_link(&events[0]["Link"]), "{}", events[0]);
     assert_eq!(events[1]["X-S4-Status"], "resolved");
     assert_eq!(events[1]["X-S4-ExternalID"], events[0]["X-S4-ExternalID"]);
 }
@@ -3499,7 +3499,7 @@ async fn an_alert_opens_a_pagerduty_incident() {
     );
     assert_eq!(event["payload"]["source"], "web-1");
     assert_eq!(event["payload"]["severity"], "critical");
-    assert_eq!(event["client_url"], "https://monitor.example.com/alerts");
+    assert!(is_alert_link(&event["client_url"]), "{event}");
     assert!(
         event["dedup_key"]
             .as_str()
@@ -4309,7 +4309,7 @@ async fn an_alert_posts_to_slack_with_the_bot_token() {
         .unwrap();
     assert!(body["attachments"][0]["blocks"][1].is_null(), "{body}");
     assert!(
-        text.contains("<https://monitor.example.com/alerts|View alerts>"),
+        text.contains("<https://monitor.example.com/alerts/") && text.ends_with("|View alert>"),
         "{text}"
     );
     assert!(
@@ -11292,4 +11292,11 @@ async fn an_open_alert_carries_on_as_a_templates_rule_is_copied_and_put_back() {
 
     // And it ends when the problem does, as any alert.
     assert!(disk_at(&mut test, 8, 10.0).await.is_empty());
+}
+
+/// Whether a notification's link is to one alert's own page.
+fn is_alert_link(link: &Value) -> bool {
+    link.as_str()
+        .and_then(|link| link.strip_prefix("https://monitor.example.com/alerts/"))
+        .is_some_and(|id| id.parse::<i64>().is_ok())
 }

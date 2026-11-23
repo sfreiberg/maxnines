@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 
 use super::on_call::{self, Incident};
-use super::{ChannelType, alerts_link, blocking, post_json, url_preview};
+use super::{ChannelType, blocking, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput};
 use crate::notifier::{Notice, Senders};
 
@@ -22,7 +22,7 @@ fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
         "hostname": on_call::hostname(notice),
     });
     if let Some(url) = web_url {
-        event["link"] = json!(alerts_link(url));
+        event["link"] = json!(notice.link(url));
     }
     event
 }

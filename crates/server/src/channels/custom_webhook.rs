@@ -161,7 +161,7 @@ fn context(notice: &Notice, web_url: Option<&str>) -> Result<Context> {
         "id": notice.id,
         "event": notice.event,
         "text": notice.text,
-        "link": web_url.map(super::alerts_link),
+        "link": web_url.map(|url| notice.link(url)),
         "alert": fields,
         "action": notice.action_fields(),
     });
@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(body["severity"], "critical");
         assert_eq!(body["status"], "firing");
         assert_eq!(body["value"], 97.0);
-        assert_eq!(body["link"], "https://maxnines.example.com/alerts");
+        assert_eq!(body["link"], "https://maxnines.example.com/alerts/7");
     }
 
     #[test]

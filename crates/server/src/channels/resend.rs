@@ -21,7 +21,7 @@ pub struct Resend;
 
 /// What Resend is asked to send. With a chart, or what an action printed, there's
 /// HTML showing it beside the plain text.
-fn body(channel: &ChannelInput, notice: &Notice) -> Result<Value> {
+fn body(channel: &ChannelInput, notice: &Notice, web_url: Option<&str>) -> Result<Value> {
     let mail = channel
         .mail
         .as_ref()
@@ -34,9 +34,9 @@ fn body(channel: &ChannelInput, notice: &Notice) -> Result<Value> {
         "from": sender(mail)?.to_string(),
         "to": to,
         "subject": subject(notice),
-        "text": text(notice),
+        "text": text(notice, web_url),
     });
-    if let Some(html) = html(notice) {
+    if let Some(html) = html(notice, web_url) {
         body["html"] = json!(html);
     }
     if let Some(chart) = &notice.chart {
@@ -153,7 +153,7 @@ impl ChannelType for Resend {
         _reply_to: Option<&str>,
         senders: &Senders,
     ) -> Result<Option<String>> {
-        let body = body(&channel.channel, notice)?;
+        let body = body(&channel.channel, notice, senders.web_url.as_deref())?;
         let key = channel
             .channel
             .credential
@@ -197,7 +197,7 @@ mod tests {
             ..notice(Event::Firing, alert())
         };
 
-        let body = body(&channel(), &charted).unwrap();
+        let body = body(&channel(), &charted, None).unwrap();
 
         assert_eq!(body["from"], "MaxNines <alerts@example.com>");
         assert_eq!(body["to"], json!(["a@example.com", "b@example.com"]));
@@ -211,7 +211,7 @@ mod tests {
             body["attachments"][0]["content"],
             STANDARD.encode(b"\x89PNG")
         );
-        let plain = super::body(&channel(), &notice(Event::Firing, alert())).unwrap();
+        let plain = super::body(&channel(), &notice(Event::Firing, alert()), None).unwrap();
         assert!(plain.get("html").is_none() && plain.get("attachments").is_none());
     }
 

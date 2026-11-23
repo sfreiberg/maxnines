@@ -38,9 +38,9 @@ fn transport(server: &MailServer, password: Option<&str>) -> Result<SmtpTranspor
 
 /// Sends through the channel's own mail server. Errors only say how it failed, as
 /// a mail server's reply can repeat what it was sent.
-fn send_through(channel: &ChannelInput, notice: &Notice) -> Result<()> {
+fn send_through(channel: &ChannelInput, notice: &Notice, web_url: Option<&str>) -> Result<()> {
     let (from, server) = settings(channel)?;
-    let message = message(&from, &channel.target, notice)?;
+    let message = message(&from, &channel.target, notice, web_url)?;
     transport(server, channel.credential.as_deref())?
         .send(&message)
         .map_err(|error| match error.status() {
@@ -174,8 +174,16 @@ fn printed(notice: &Notice) -> Option<String> {
     Some(format!("{}{cut}\n", printed.text))
 }
 
-pub(super) fn text(notice: &Notice) -> String {
+/// Where to see the alert, with its chart, as a line of its own.
+fn link_line(notice: &Notice, web_url: Option<&str>) -> Option<String> {
+    web_url.map(|url| format!("{}: {}\n", notice.link_label(), notice.link(url)))
+}
+
+pub(super) fn text(notice: &Notice, web_url: Option<&str>) -> String {
     let mut text = details(notice);
+    if let Some(link) = link_line(notice, web_url) {
+        text.push_str(&link);
+    }
     if let Some(printed) = printed(notice) {
         text.push('\n');
         text.push_str(&printed);
@@ -193,7 +201,7 @@ fn escape_html(text: &str) -> String {
 
 /// The HTML part, for an email that needs one: the plain text with the chart
 /// under it, or with what an action printed in a font that keeps it lined up.
-pub(super) fn html(notice: &Notice) -> Option<String> {
+pub(super) fn html(notice: &Notice, web_url: Option<&str>) -> Option<String> {
     let printed = printed(notice);
     if notice.chart.is_none() && printed.is_none() {
         return None;
@@ -203,6 +211,13 @@ pub(super) fn html(notice: &Notice) -> Option<String> {
          <pre style=\"font-family: sans-serif; white-space: pre-wrap\">{}</pre>",
         escape_html(&details(notice))
     );
+    if let Some(url) = web_url {
+        html.push_str(&format!(
+            "<p><a href=\"{}\">{}</a></p>",
+            escape_html(&notice.link(url)),
+            notice.link_label()
+        ));
+    }
     if let Some(printed) = printed {
         html.push_str(&format!(
             "<pre style=\"font-family: monospace\">{}</pre>",
@@ -220,18 +235,20 @@ pub(super) fn html(notice: &Notice) -> Option<String> {
 }
 
 /// Plain text, or with a chart, plain text beside HTML that shows it.
-fn message(from: &Mailbox, to: &str, notice: &Notice) -> Result<Message> {
+fn message(from: &Mailbox, to: &str, notice: &Notice, web_url: Option<&str>) -> Result<Message> {
     let mut message = Message::builder()
         .from(from.clone())
         .subject(subject(notice));
     for address in recipients(to)? {
         message = message.to(Mailbox::new(None, address));
     }
-    let message = match (html(notice), &notice.chart) {
-        (None, _) => message.header(ContentType::TEXT_PLAIN).body(text(notice)),
+    let message = match (html(notice, web_url), &notice.chart) {
+        (None, _) => message
+            .header(ContentType::TEXT_PLAIN)
+            .body(text(notice, web_url)),
         (Some(html), None) => message.multipart(
             MultiPart::alternative()
-                .singlepart(SinglePart::plain(text(notice)))
+                .singlepart(SinglePart::plain(text(notice, web_url)))
                 .singlepart(SinglePart::html(html)),
         ),
         (Some(html), Some(chart)) => {
@@ -241,7 +258,7 @@ fn message(from: &Mailbox, to: &str, notice: &Notice) -> Result<Message> {
                 .singlepart(Attachment::new_inline("chart".to_string()).body(chart.to_vec(), png));
             message.multipart(
                 MultiPart::alternative()
-                    .singlepart(SinglePart::plain(text(notice)))
+                    .singlepart(SinglePart::plain(text(notice, web_url)))
                     .multipart(shown),
             )
         }
@@ -288,11 +305,12 @@ impl ChannelType for Email {
         channel: &Channel,
         notice: &Notice,
         _reply_to: Option<&str>,
-        _senders: &Senders,
+        senders: &Senders,
     ) -> Result<Option<String>> {
         let channel = channel.channel.clone();
         let notice = notice.clone();
-        blocking(move || send_through(&channel, &notice).map(|()| None)).await
+        let web_url = senders.web_url.clone();
+        blocking(move || send_through(&channel, &notice, web_url.as_deref()).map(|()| None)).await
     }
 }
 
@@ -308,7 +326,7 @@ mod tests {
     fn what_an_action_printed_is_in_the_email_in_a_font_that_lines_up() {
         let ran = action_notice("FOLDER  SIZE\n<b>/var</b>  9 GiB\n");
         assert_eq!(subject(&ran), "[MaxNines ACTION] disk_space ran on web-1");
-        let text = text(&ran);
+        let text = text(&ran, None);
         assert!(
             text.starts_with(
                 "disk_space ran on web-1\n\nAlert: CPU usage on web-1 is 97%, above 90%\n\
@@ -320,7 +338,7 @@ mod tests {
             text.ends_with("\n\nFOLDER  SIZE\n<b>/var</b>  9 GiB\n"),
             "{text}"
         );
-        let html = html(&ran).unwrap();
+        let html = html(&ran, None).unwrap();
         assert!(
             html.contains(
                 "<pre style=\"font-family: monospace\">FOLDER  SIZE\n\
@@ -330,7 +348,7 @@ mod tests {
         );
         assert!(!html.contains("cid:chart"), "{html}");
         // An alert without a chart is still plain text alone.
-        assert_eq!(super::html(&notice(Event::Firing, alert())), None);
+        assert_eq!(super::html(&notice(Event::Firing, alert()), None), None);
     }
 
     #[test]
@@ -344,7 +362,7 @@ mod tests {
             chart: Some(Arc::new(b"\x89PNG chart".to_vec())),
             ..notice(Event::Firing, odd_host)
         };
-        let email = message(&from, "ops@example.com", &charted).unwrap();
+        let email = message(&from, "ops@example.com", &charted, None).unwrap();
         let text = String::from_utf8_lossy(&email.formatted()).to_string();
 
         assert!(text.contains("multipart/alternative"), "{text}");
@@ -354,7 +372,13 @@ mod tests {
         assert!(text.contains("src=3D\"cid:chart\"") || text.contains("src=\"cid:chart\""));
         assert!(text.contains("web-&lt;1&gt;"), "{text}");
 
-        let plain = message(&from, "ops@example.com", &notice(Event::Firing, alert())).unwrap();
+        let plain = message(
+            &from,
+            "ops@example.com",
+            &notice(Event::Firing, alert()),
+            None,
+        )
+        .unwrap();
         let text = String::from_utf8_lossy(&plain.formatted()).to_string();
         assert!(!text.contains("multipart"));
     }
@@ -399,7 +423,7 @@ mod tests {
             subject(&notice),
             "[MaxNines RESOLVED] CPU usage on web-1 is now 12%, no longer above 90%"
         );
-        let body = text(&notice);
+        let body = text(&notice, None);
         assert!(
             body.contains("When it fired: CPU usage on web-1 is 97%, above 90%"),
             "{body}"
@@ -415,7 +439,7 @@ mod tests {
             resolved_summary: None,
             ..alert()
         };
-        let body = text(&notice(Event::Resolved, alert));
+        let body = text(&notice(Event::Resolved, alert), None);
         assert!(body.contains("Rule: High CPU"), "{body}");
         assert!(body.contains("Host: web-1 (abc)"), "{body}");
         assert!(body.contains("Resolved: 1970-01-01 00:01:01 UTC"), "{body}");
@@ -424,7 +448,7 @@ mod tests {
 
     #[test]
     fn a_firing_email_has_no_end_yet() {
-        let body = text(&notice(Event::Firing, alert()));
+        let body = text(&notice(Event::Firing, alert()), None);
         assert!(!body.contains("Resolved:"), "{body}");
         assert!(!body.contains("Reason:"), "{body}");
     }

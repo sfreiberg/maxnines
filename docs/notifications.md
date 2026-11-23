@@ -1,5 +1,25 @@
 # Notification channels
 
+## Links back to the alert
+
+Every channel's notification about an alert links to that alert's own page, which has
+its chart, who acknowledged it and what its actions printed, when the server knows the
+address people reach it at, from its `public_url`. A test, which is about no alert,
+links to the Alerts page instead.
+
+| Channel | Where the link is |
+| --- | --- |
+| Discord | **View alert** on the message's last line, which a long message never cuts |
+| Slack | **View alert** at the end of the rule, host and start time, which a long message never cuts |
+| Telegram | **View alert** on the message's last line |
+| Microsoft Teams | A **View alert** button, or **All of what it printed** for what an action printed |
+| Email and Resend | A **View alert** line with the address, and a link in the HTML part |
+| Webhook | `link` in the body |
+| Custom webhook | `link`, for the body to use |
+| PagerDuty | The incident's client link |
+| AlertOps | `link` |
+| SIGNL4 | `Link` |
+
 ## Charts
 
 When an alert starts, a warning becomes critical, or an alert resolves, Discord,
@@ -119,7 +139,7 @@ What a template can use:
 | `event` | `firing`, `escalated`, `eased`, `reminder`, `resolved`, `action` or `test` |
 | `text` | The notification in one line, like `Resolved: CPU usage on web-1 is now 42%, no longer above 90%` |
 | `id` | The same for every attempt at one notification, so a receiver can spot a repeat |
-| `link` | The alerts page, when the server knows the address people reach it at |
+| `link` | The alert's own page, when the server knows the address people reach it at, or the Alerts page for a test |
 | `alert.id`, `alert.rule_id`, `alert.rule_name` | The alert, and the rule that started it, by the name it has now |
 | `alert.severity` | `warning` or `critical` |
 | `alert.hostname`, `alert.host_id` | The host, by the name it has now |
@@ -175,7 +195,8 @@ Alerts go to a Teams channel through a workflow that posts whatever is sent to i
    Teams webhook request is received** step.
 
 Each notification is a card with the alert, its rule, the host and when it started,
-and a **View alerts** link when the server knows its own address. Teams messages have
+and a **View alert** button for the alert's own page when the server knows its own
+address. Teams messages have
 no chart and no buttons, as a workflow can only post. The URL works like a password,
 so it's never shown again once saved.
 
