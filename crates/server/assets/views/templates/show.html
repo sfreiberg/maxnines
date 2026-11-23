@@ -72,7 +72,7 @@
     <tbody>
       {% for part in rows %}
       <tr{% if not part.enabled %} class="disabled"{% endif %}>
-        <td><code>{{ part.key }}</code>{% if part.metrics %}<span class="under">Says more about {{ part.metrics | join(sep=", ") }}</span>{% endif %}</td>
+        <td><code class="nowrap">{{ part.key }}</code>{% if part.metrics %}<span class="under">Says more about {{ part.metrics | join(sep=", ") }}</span>{% endif %}</td>
         <td>
           <details><summary>{% if part.kind == "counters" %}{{ part.reads }}{% else %}{{ part.reads | truncate(length=60) }}{% endif %}</summary><pre class="table-scroll"><code>{{ part.reads }}</code></pre></details>
           {% if part.when %}<div class="condition">Only when <code>{{ part.when }}</code></div>{% endif %}

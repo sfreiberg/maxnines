@@ -3,7 +3,7 @@
 {% block main_class %} class="narrow"{% endblock main_class %}
 {% block content %}
 <p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a> / <a href="/templates/{{ id }}">{{ template.name }}</a></p>
-<h1>Change {{ kind_words }} <code>{{ key }}</code></h1>
+<h1>Change {{ kind_words }} {{ key }}</h1>
 {% if original %}<p class="hint">{% if copied %}This is your own copy, used in place of the template's. Saving what the template says deletes it.{% else %}Saving makes a copy of your own, used in place of the template's. Upgrades leave your copy alone, and say when the template's changed under it.{% endif %}</p>{% endif %}
 <form method="post" action="{{ action }}" class="stacked template-form" id="template-form" data-cel-local="{{ local_metrics }}">
   <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">

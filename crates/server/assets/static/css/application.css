@@ -242,6 +242,8 @@ td.nowrap { white-space: nowrap; }
 /* A second, quieter line in a cell, for a detail that goes with the first. */
 td .under { display: block; margin-top: 3px; font-size: 12px; color: var(--muted); }
 td .under.nowrap { white-space: nowrap; }
+/* A key, which reads wrongly broken in two. */
+td code.nowrap { white-space: nowrap; }
 td details.agent { margin-top: 3px; font-size: 12px; color: var(--muted); }
 td details.agent summary { cursor: pointer; }
 td details.agent code { display: block; max-width: 48ch; margin-top: 3px; white-space: normal; overflow-wrap: anywhere; }
