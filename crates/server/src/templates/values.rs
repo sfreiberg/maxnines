@@ -104,6 +104,10 @@ pub fn work_out(
     facts: &Value,
     last_sent: &mut LastSent,
 ) {
+    // Once a sample, however many rows and metrics use it.
+    let Ok(facts) = cel::to_value(facts) else {
+        return;
+    };
     for query in queries {
         let collector = collector_of(&query.template);
         let Some(Value::Array(rows)) = sample.metrics.get_mut(&collector) else {
@@ -167,11 +171,11 @@ pub fn work_out(
                     };
                     let mut numbers = numbers.clone();
                     numbers.insert(VALUE.to_string(), reading);
-                    if let Some(value) = evaluate(expr, &numbers, facts, elapsed) {
+                    if let Some(value) = evaluate(expr, &numbers, &facts, elapsed) {
                         row.insert(key.clone(), json!(value));
                     }
                 } else if !row.contains_key(key)
-                    && let Some(value) = evaluate(expr, &numbers, facts, elapsed)
+                    && let Some(value) = evaluate(expr, &numbers, &facts, elapsed)
                 {
                     row.insert(key.clone(), json!(value));
                 }
@@ -233,19 +237,20 @@ pub fn strip_queries(sample: &mut Sample) {
     }
 }
 
-/// A metric's value from a row's numbers and the host's facts, or nothing if it
-/// can't be worked out.
+/// A metric's value from a row's numbers and the host's facts, as CEL, or nothing if
+/// it can't be worked out.
 fn evaluate(
     expr: &IdedExpr,
     numbers: &Map<String, Value>,
-    facts: &Value,
+    facts: &CelValue,
     elapsed: Option<f64>,
 ) -> Option<f64> {
     let mut context = CelContext::with_env(FUNCTIONS.clone());
     for (name, value) in numbers {
         context.add_variable_from_value(name.as_str(), CelValue::Float(value.as_f64()?));
     }
-    context.add_variable(FACTS, facts).ok()?;
+    // A map is shared, not copied, so this costs the same however many facts.
+    context.add_variable_from_value(FACTS, facts.clone());
     let rate = move |Arguments(args): Arguments| -> Result<CelValue, ExecutionError> {
         let change = match args.as_slice() {
             [CelValue::Float(change)] => *change,

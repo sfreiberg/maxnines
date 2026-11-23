@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde_json::{Map, Value};
 
 use maxnines_protocol::templates::work::{
-    CounterWork, CountersWork, DiscoverWork, Instances, JoinWork, MAX_WORK, QueryWork,
+    CounterWork, CountersWork, DiscoverWork, Discovered, Instances, JoinWork, MAX_WORK, QueryWork,
     RegistryWork, TemplateWork,
 };
 use maxnines_protocol::templates::{
@@ -28,6 +28,7 @@ use tracing::warn;
 
 use super::hosts::{DatabaseKinds, RunningTemplates};
 use crate::metrics::{INSTANCE_LABEL, series_values};
+use crate::models::Database;
 use crate::rule_engine::{Condition, Host};
 
 /// What discovery found on one host, by template ID and database, or [`ON_HOST`]
@@ -41,6 +42,31 @@ pub const ON_HOST: &str = "";
 /// Where what's found is kept for a template run for `database`, or on the host.
 pub fn instance_of(database: Option<&str>) -> String {
     database.unwrap_or(ON_HOST).to_string()
+}
+
+/// Keeps only what discovery found for what's read, by `work`, as a sample can come
+/// after what's read changed.
+pub fn keep_read(found: &mut Vec<Discovered>, work: &[TemplateWork]) {
+    found.retain(|one| {
+        work.iter()
+            .any(|read| read.template == one.template && read.database == one.database)
+    });
+}
+
+/// Forgets what discovery found on a host for anything not in `work`, what the
+/// host reads now.
+pub async fn forget_unread(database: &Database, host_id: &str, work: &[TemplateWork]) {
+    let reads: Vec<(String, String)> = work
+        .iter()
+        .map(|one| (one.template.clone(), instance_of(one.database.as_deref())))
+        .collect();
+    if let Err(error) = database.forget_discovered(host_id, &reads).await {
+        warn!(
+            host_id,
+            error = format!("{error:#}"),
+            "forgetting what discovery found failed"
+        );
+    }
 }
 
 /// The column discovery finds a version in.
@@ -110,26 +136,35 @@ pub fn picked_databases(
     picked
 }
 
-/// Keeps only the series of the databases picked on a host, for a rule whose series
-/// have a label for the database, or, for a template that runs on the host, all of
-/// them or none, as the host is picked. `labels` are the series' labels, in order.
+/// Keeps only the series of what's picked on a host. For a template that runs for
+/// each database, `per_database`, that's the series of the databases picked, for a
+/// rule whose series have a label for the database, or all of them if any database
+/// on the host is picked, for one whose don't. For a template that runs on the host,
+/// it's all of them or none, as the host is picked. `labels` are the series' labels,
+/// in order.
 pub fn keep_picked(
     series: &mut Vec<String>,
     labels: &[String],
     host_id: &str,
     picked: &HashSet<(String, String)>,
+    per_database: bool,
 ) {
-    let Some(at) = labels.iter().position(|label| label == INSTANCE_LABEL) else {
-        if !picked.contains(&(host_id.to_string(), ON_HOST.to_string())) {
-            series.clear();
+    let at = labels.iter().position(|label| label == INSTANCE_LABEL);
+    let host_picked = match (per_database, at) {
+        (true, Some(at)) => {
+            series.retain(|series| {
+                series_values(series).get(at).is_some_and(|database| {
+                    picked.contains(&(host_id.to_string(), database.clone()))
+                })
+            });
+            return;
         }
-        return;
+        (true, None) => picked.iter().any(|(host, _)| host == host_id),
+        (false, _) => picked.contains(&(host_id.to_string(), ON_HOST.to_string())),
     };
-    series.retain(|series| {
-        series_values(series)
-            .get(at)
-            .is_some_and(|database| picked.contains(&(host_id.to_string(), database.clone())))
-    });
+    if !host_picked {
+        series.clear();
+    }
 }
 
 fn seconds(text: Option<&String>) -> Option<Duration> {
@@ -684,9 +719,21 @@ mod tests {
         let picked = HashSet::from([("a".to_string(), ON_HOST.to_string())]);
         let labels = vec!["pool".to_string()];
         let mut series = vec!["x".to_string(), "y".to_string()];
-        keep_picked(&mut series, &labels, "a", &picked);
+        keep_picked(&mut series, &labels, "a", &picked, false);
         assert_eq!(series.len(), 2);
-        keep_picked(&mut series, &labels, "b", &picked);
+        keep_picked(&mut series, &labels, "b", &picked, false);
+        assert!(series.is_empty());
+    }
+
+    /// A database template's rule whose series aren't each a database's is checked on
+    /// a host if any of its databases is picked.
+    #[test]
+    fn a_rule_for_a_database_template_without_a_series_per_database_keeps_its_host() {
+        let picked = HashSet::from([("a".to_string(), "orders".to_string())]);
+        let mut series = vec![String::new()];
+        keep_picked(&mut series, &[], "a", &picked, true);
+        assert_eq!(series, [""]);
+        keep_picked(&mut series, &[], "b", &picked, true);
         assert!(series.is_empty());
     }
 

@@ -98,6 +98,8 @@ pub struct TemplateLink {
     pub enabled_choice: Option<bool>,
     /// Whether the template is on. Its alerts aren't checked while it's off.
     pub template_enabled: bool,
+    /// Whether the template runs for each database, rather than once on a host.
+    pub per_database: bool,
     /// CEL over what the template's discovery found, picking the databases the
     /// alert is for.
     pub when: Option<String>,

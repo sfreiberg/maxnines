@@ -480,6 +480,44 @@ fn an_os_template_alerts_only_on_those_systems() {
     cel::Program::compile(&applies_to(&template).unwrap()).unwrap();
 }
 
+/// `instance` is the database a series is from, in every template, so none can give
+/// a label that name.
+#[test]
+fn no_template_labels_a_series_instance() {
+    let found = problems(
+        r#"template "app" {
+             name = "App"
+             os   = ["windows"]
+             counters "named" {
+               object  = "Web Service"
+               label   = "instance"
+               metrics = { requests = "Total Method Requests/sec" }
+             }
+             counters "patterned" {
+               object  = "W3SVC_W3WP"
+               pattern = "^\\d+_(?<instance>.+)$"
+               metrics = { active = "Active Requests" }
+             }
+             counters "fine" {
+               object  = "Web Service"
+               label   = "site"
+               metrics = { connections = "Current Connections" }
+             }
+           }"#,
+    );
+    for block in ["named", "patterned"] {
+        let expected = format!(r#"counters "{block}": a label can't be called instance"#);
+        assert!(
+            found.iter().any(|problem| problem.contains(&expected)),
+            "{expected}\n{found:#?}"
+        );
+    }
+    assert!(
+        !found.iter().any(|problem| problem.contains("\"fine\"")),
+        "{found:#?}"
+    );
+}
+
 #[test]
 fn sql_needs_a_template_for_a_database() {
     let found = problems(

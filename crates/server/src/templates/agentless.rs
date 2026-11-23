@@ -26,7 +26,7 @@ use tracing::warn;
 
 use super::hosts::{DatabaseKinds, RunningTemplates};
 use super::values::{LastSent, QueryValues, strip_queries, work_out};
-use super::work::{Discoveries, instance_of, work_for};
+use super::work::{Discoveries, forget_unread, keep_read, work_for};
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::Database;
 use crate::remote_checks::RemoteCheck;
@@ -64,7 +64,9 @@ struct ReadCheck {
 /// What was worked out, and what from.
 struct Worked {
     templates: Arc<RunningTemplates>,
-    discoveries: Arc<BTreeMap<String, Discoveries>>,
+    /// What discovery found on the hosts read, so a change on another host doesn't
+    /// have it all worked out again.
+    discoveries: BTreeMap<String, Discoveries>,
     checks: Vec<ReadCheck>,
     at: Instant,
     /// By check ID.
@@ -110,9 +112,16 @@ impl AgentlessTemplates {
         read.sort();
         let templates = database.running_templates();
         let discoveries = database.all_discoveries().await?;
+        let here: BTreeMap<String, Discoveries> = read
+            .iter()
+            .filter_map(|check| {
+                let found = discoveries.get(&check.host_id)?;
+                Some((check.host_id.clone(), found.clone()))
+            })
+            .collect();
         let current = self.worked.as_ref().is_some_and(|worked| {
             Arc::ptr_eq(&worked.templates, &templates)
-                && Arc::ptr_eq(&worked.discoveries, &discoveries)
+                && worked.discoveries == here
                 && worked.checks == read
                 && worked.at.elapsed() < REWORK_EVERY
         });
@@ -125,7 +134,7 @@ impl AgentlessTemplates {
             let work = work_out_all(database, &templates, &discoveries, &read, before).await?;
             self.worked = Some(Worked {
                 templates,
-                discoveries,
+                discoveries: here,
                 checks: read,
                 at: Instant::now(),
                 work,
@@ -206,7 +215,7 @@ async fn work_out_all(
             .collect();
         let found = discoveries.get(*host_id).unwrap_or(&empty);
         let all = work_for(templates, &host, &databases, found);
-        forget_others(database, host_id, &all).await;
+        forget_unread(database, host_id, &all).await;
         for check in checks {
             let mine: Vec<TemplateWork> = all
                 .iter()
@@ -219,25 +228,10 @@ async fn work_out_all(
     // A host read before and not now has nothing read.
     for host_id in before {
         if !by_host.contains_key(host_id.as_str()) {
-            forget_others(database, &host_id, &[]).await;
+            forget_unread(database, &host_id, &[]).await;
         }
     }
     Ok(work)
-}
-
-/// Forgets what discovery found on a host for anything not in `work`.
-async fn forget_others(database: &Database, host_id: &str, work: &[TemplateWork]) {
-    let reads: Vec<(String, String)> = work
-        .iter()
-        .map(|one| (one.template.clone(), instance_of(one.database.as_deref())))
-        .collect();
-    if let Err(error) = database.forget_discovered(host_id, &reads).await {
-        warn!(
-            host_id,
-            error = format!("{error:#}"),
-            "forgetting what discovery found failed"
-        );
-    }
 }
 
 /// What one check has read for templates since it last ran.
@@ -299,14 +293,7 @@ pub async fn save_read(
         match serde_json::from_value::<Vec<Discovered>>(found) {
             Ok(mut found) => {
                 // Only for what's still read, as what's read may have changed.
-                {
-                    let sent = lock(sent);
-                    found.retain(|one| {
-                        sent.iter().any(|work| {
-                            work.template == one.template && work.database == one.database
-                        })
-                    });
-                }
+                keep_read(&mut found, &lock(sent));
                 if let Err(error) = database
                     .save_discovered(&host_id, &found, sample.time)
                     .await

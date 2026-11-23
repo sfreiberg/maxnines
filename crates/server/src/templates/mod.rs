@@ -160,7 +160,6 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
                 continue;
             }
         };
-        let runs_for_each = matches!(template.target, Some(Target::Database(_)));
         for label in &query.labels {
             if !columns.contains(label) {
                 problems.push(Problem::new(
@@ -168,14 +167,8 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
                     "labels",
                     format!("{label:?} isn't one of the query's columns"),
                 ));
-            } else if runs_for_each && label == INSTANCE_LABEL {
-                problems.push(Problem::new(
-                    place,
-                    "labels",
-                    format!(
-                        "a label can't be called {INSTANCE_LABEL}, which every series already has for the database it's from"
-                    ),
-                ));
+            } else if label == INSTANCE_LABEL {
+                problems.push(Problem::new(place, "labels", instance_taken()));
             }
         }
         for (number, metric) in query.metrics.iter().enumerate() {
@@ -189,6 +182,16 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
                     ),
                 ));
             }
+        }
+    }
+
+    for (index, counters) in template.counters.iter().enumerate() {
+        if counters
+            .labels()
+            .iter()
+            .any(|label| label == INSTANCE_LABEL)
+        {
+            problems.push(Problem::new(Place::Counters(index), "", instance_taken()));
         }
     }
 
@@ -258,6 +261,13 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
         }
     }
     problems
+}
+
+/// Why no label can be called `instance`, in any template.
+fn instance_taken() -> String {
+    format!(
+        "a label can't be called {INSTANCE_LABEL}, which MaxNines keeps for the database a series is from"
+    )
 }
 
 /// The alert field a rule's check means, from how its message starts, and the rest

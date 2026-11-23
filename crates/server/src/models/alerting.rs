@@ -42,20 +42,21 @@ fn to_alert_rule(
     row: alert_rule::Model,
     channels: Vec<i64>,
     actions: Vec<RuleAction>,
-    templates: &BTreeMap<i64, (String, bool)>,
+    templates: &BTreeMap<i64, TemplateOf>,
 ) -> Result<AlertRule> {
     let template = match (row.template_id, &row.template_alert) {
         (Some(id), Some(alert)) => {
-            let (key, on) = templates
+            let of = templates
                 .get(&id)
                 .cloned()
                 .context("a rule's template is missing")?;
             Some(TemplateLink {
                 id,
-                key,
+                key: of.key,
                 alert: alert.clone(),
                 replaces_id: row.replaces_id,
-                template_enabled: on,
+                template_enabled: of.on,
+                per_database: of.per_database,
                 enabled_choice: row.enabled_choice,
                 when: row.when_condition.clone(),
                 since: row.since.clone(),
@@ -911,24 +912,43 @@ pub(super) async fn load_alert_rule<C: ConnectionTrait>(
     to_alert_rule(row, channels, actions, &templates).map(Some)
 }
 
-/// Each template's key and whether it's on, by its ID. The alerts of one that's
-/// off don't run.
-async fn template_links<C: ConnectionTrait>(
-    connection: &C,
-) -> Result<BTreeMap<i64, (String, bool)>> {
-    let rows: Vec<(i64, String, bool, Option<bool>)> = template::Entity::find()
+/// What a rule needs of its template.
+#[derive(Clone)]
+struct TemplateOf {
+    key: String,
+    /// Whether it's on. The alerts of one that's off don't run.
+    on: bool,
+    /// Whether it runs for each database.
+    per_database: bool,
+}
+
+/// What each template's rules need of it, by its ID.
+async fn template_links<C: ConnectionTrait>(connection: &C) -> Result<BTreeMap<i64, TemplateOf>> {
+    // Its ID, key, whether it ships on, whether someone turned it on or off, and the
+    // kind of what it runs for.
+    type Row = (i64, String, bool, Option<bool>, Option<String>);
+    let rows: Vec<Row> = template::Entity::find()
         .select_only()
         .column(template::Column::Id)
         .column(template::Column::Key)
         .column(template::Column::Enabled)
         .column(template::Column::EnabledChoice)
+        .column(template::Column::TargetKind)
         .into_tuple()
         .all(connection)
         .await
         .context("loading templates")?;
     Ok(rows
         .into_iter()
-        .map(|(id, key, enabled, choice)| (id, (key, choice.unwrap_or(enabled))))
+        .map(|(id, key, enabled, choice, target)| {
+            let of = TemplateOf {
+                key,
+                on: choice.unwrap_or(enabled),
+                // As `Target::kind` writes a database's.
+                per_database: target.as_deref() == Some("database"),
+            };
+            (id, of)
+        })
         .collect())
 }
 

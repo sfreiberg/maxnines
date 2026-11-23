@@ -52,6 +52,15 @@ pub const MAX_INSTANCES: usize = 256;
 /// The most registry values or counter sets one discover block looks for.
 pub const MAX_LOOKED_FOR: usize = 64;
 
+/// Whether a discover block looks for more than an agent takes, from how many values
+/// it reads from each registry key and how many counter sets it looks for.
+pub fn looks_for_too_much(
+    registry_values: impl IntoIterator<Item = usize>,
+    counter_sets: usize,
+) -> bool {
+    registry_values.into_iter().sum::<usize>() + counter_sets > MAX_LOOKED_FOR
+}
+
 /// One template, run for one database in the agent's own config, or once on the
 /// host for a template that isn't for a database.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,14 +264,12 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
                 "{:?} looks at the host for a database",
                 discover.key
             );
-            let looked_for = discover
-                .registry
-                .iter()
-                .map(|read| read.values.len())
-                .sum::<usize>()
-                + discover.counter_sets.len();
+            let too_much = looks_for_too_much(
+                discover.registry.iter().map(|read| read.values.len()),
+                discover.counter_sets.len(),
+            );
             ensure!(
-                looked_for <= MAX_LOOKED_FOR,
+                !too_much,
                 "{:?} looks for more than {MAX_LOOKED_FOR} things",
                 discover.key
             );

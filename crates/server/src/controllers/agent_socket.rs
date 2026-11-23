@@ -31,7 +31,7 @@ use crate::presence::Presence;
 use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
 use crate::templates::values::{LastSent, strip_queries, work_out};
-use crate::templates::work::instance_of;
+use crate::templates::work::{forget_unread, keep_read};
 use crate::times::{self, Timestamp};
 
 /// Far more than real facts need, so one agent can't fill the database.
@@ -507,15 +507,10 @@ async fn do_jobs(
                 Some(Job::Discovered(mut found, at)) => {
                     // Only for what the agent's still sent to read, as a sample can
                     // come after what it reads changed.
-                    {
-                        let sent = sent.work.lock().unwrap_or_else(PoisonError::into_inner);
-                        found.retain(|one| {
-                            sent.work.iter().any(|work| {
-                                work.template == one.template
-                                    && work.database == one.database
-                            })
-                        });
-                    }
+                    keep_read(
+                        &mut found,
+                        &sent.work.lock().unwrap_or_else(PoisonError::into_inner).work,
+                    );
                     match state.database.save_discovered(&agent.id, &found, at).await {
                         Ok(true) => send_config(&configs, agent, state, &mut sent).await,
                         Ok(false) => {}
@@ -563,19 +558,7 @@ async fn send_config(
     };
 
     // What discovery found for anything the agent isn't sent to read is forgotten.
-    let reads: Vec<(String, String)> = resolved
-        .config
-        .templates
-        .iter()
-        .map(|work| (work.template.clone(), instance_of(work.database.as_deref())))
-        .collect();
-    if let Err(error) = state.database.forget_discovered(&agent.id, &reads).await {
-        warn!(
-            id = agent.id,
-            error = format!("{error:#}"),
-            "forgetting what discovery found failed"
-        );
-    }
+    forget_unread(&state.database, &agent.id, &resolved.config.templates).await;
     if sent.version.as_ref() == Some(&resolved.version) {
         return;
     }

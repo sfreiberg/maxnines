@@ -183,7 +183,9 @@ database comes with MaxNines yet, so for now nothing is read.
   yes or no, and intervals become lengths of time;
 - every column needs a name: give anything that isn't a column of its own one with
   `AS`;
-- `labels = ["slot"]` names the text columns that tell rows apart, one series per row;
+- `labels = ["slot"]` names the text columns that tell rows apart, one series per row.
+  No label can be called `instance`, in any template, as that's the database a series
+  is from;
 - a NULL gives no sample, rather than zero.
 
 `metrics = { … }` only says what can't be worked out from the column: `total = true`
@@ -265,7 +267,7 @@ counters "sites" {
   yes or no, or `value / 1000`;
 - `states = { "3" = "Running" }` gives a word for each number;
 - `label = "site"` gives each instance its own series, labelled `site`. `_Total` is
-  always left out;
+  always left out, and no label can be called `instance`;
 - `pattern` does the same with a regular expression whose named groups become labels,
   leaving out instances it doesn't match. `instance` reads one instance only, and
   `exclude` lists instances to leave out;

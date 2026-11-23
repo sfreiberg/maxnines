@@ -675,13 +675,11 @@ impl Template {
             {
                 say(place, "sql", "can't be empty".to_string());
             }
-            let looked_for = discover
-                .registry
-                .iter()
-                .map(|read| read.values.len())
-                .sum::<usize>()
-                + discover.counter_sets.len();
-            if looked_for > work::MAX_LOOKED_FOR {
+            let too_much = work::looks_for_too_much(
+                discover.registry.iter().map(|read| read.values.len()),
+                discover.counter_sets.len(),
+            );
+            if too_much {
                 say(
                     place,
                     "",

@@ -1146,7 +1146,14 @@ impl Evaluator {
         }
         // Only the databases discovery picks, for a rule that's for some of them.
         if let Some(picked) = snapshot.picked.get(&rule.id) {
-            template_work::keep_picked(&mut series, conditions.series_labels(), &host.id, picked);
+            let per_database = rule.template.as_ref().is_some_and(|link| link.per_database);
+            template_work::keep_picked(
+                &mut series,
+                conditions.series_labels(),
+                &host.id,
+                picked,
+                per_database,
+            );
         }
         series.truncate(MAX_SERIES_PER_HOST);
 

@@ -303,7 +303,7 @@ async fn replay_hosts(
                 "It's tried on the databases where what discovery last found fits its when or since."
                     .to_string(),
             );
-            picked = Some(databases);
+            picked = Some((databases, link.per_database));
         }
     }
     if hosts.len() > MAX_HOSTS {
@@ -370,7 +370,9 @@ async fn replay_hosts(
                     window,
                     since,
                 };
-                let picked = picked.as_ref().map(|picked| (host_id.as_str(), picked));
+                let picked = picked
+                    .as_ref()
+                    .map(|(picked, per_database)| (host_id.as_str(), picked, *per_database));
                 let (warned, critical, tried) =
                     replay_host(&conditions, hold, &past, facts, hostname, picked);
                 let replayed = Replayed {
@@ -431,6 +433,10 @@ impl Past<'_> {
     }
 }
 
+/// The host a rule is tried on, the hosts and databases discovery picks for it, and
+/// whether its template runs for each database.
+type PickedOn<'a> = (&'a str, &'a HashSet<(String, String)>, bool);
+
 /// How often a rule would have alerted on one host, each of its series counted, and
 /// whether there was anything to try it on.
 fn replay_host(
@@ -439,7 +445,7 @@ fn replay_host(
     past: &Past,
     facts: &CelValue,
     hostname: &str,
-    picked: Option<(&str, &HashSet<(String, String)>)>,
+    picked: Option<PickedOn<'_>>,
 ) -> (usize, usize, bool) {
     let readings = past.readings;
     let fanned = conditions.series_sources();
@@ -458,8 +464,14 @@ fn replay_host(
     if fanned.is_empty() {
         series.push(String::new());
     }
-    if let Some((host_id, picked)) = picked {
-        keep_picked(&mut series, conditions.series_labels(), host_id, picked);
+    if let Some((host_id, picked, per_database)) = picked {
+        keep_picked(
+            &mut series,
+            conditions.series_labels(),
+            host_id,
+            picked,
+            per_database,
+        );
     }
     series.truncate(MAX_SERIES_PER_HOST);
     let times: BTreeSet<Timestamp> = readings
