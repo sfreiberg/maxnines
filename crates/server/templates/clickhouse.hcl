@@ -564,10 +564,19 @@ template "clickhouse" {
     summary  = "{{ hostname }}: {{ instance }} lost data that no other replica had"
   }
 
+  # Apart, as each is read by a query of its own, and a server with no replicated
+  # tables has no replication queue to read.
   alert "replication_stuck" {
-    name    = "ClickHouse replication or mutations stuck"
-    warning = "queue_stuck > 0 || mutations_failing > 0"
+    name    = "ClickHouse replication stuck"
+    warning = "queue_stuck > 0"
     for     = "15m"
-    summary = "{{ hostname }}: {{ instance }} has replication queue entries or mutations that keep failing"
+    summary = "{{ hostname }}: {{ instance }} has replication queue entries that keep failing"
+  }
+
+  alert "mutations_failing" {
+    name    = "ClickHouse mutations failing"
+    warning = "mutations_failing > 0"
+    for     = "15m"
+    summary = "{{ hostname }}: {{ instance }} has mutations that keep failing"
   }
 }

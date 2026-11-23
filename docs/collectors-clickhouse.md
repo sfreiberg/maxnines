@@ -224,7 +224,8 @@ any of them on the template's page.
 | **ClickHouse memory running out** | Over 90% of its memory limit for 5 minutes | Warning |
 | **ClickHouse replicated tables read only** | A replicated table read only, or one that lost Keeper, for a minute | Critical |
 | **ClickHouse data lost on a replica** | A replica found data lost | Critical |
-| **ClickHouse replication or mutations stuck** | A replication queue entry stuck, or a mutation failing, for a quarter of an hour | Warning |
+| **ClickHouse replication stuck** | A replication queue entry stuck for a quarter of an hour | Warning |
+| **ClickHouse mutations failing** | A mutation failing for a quarter of an hour | Warning |
 
 Beyond these, two are worth adding yourself: `clickhouse.pool_used` for merges and
 mutations over 90% for a quarter of an hour, and `clickhouse.errors` above 0 for the
