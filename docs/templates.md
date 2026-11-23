@@ -287,9 +287,10 @@ share of the whole host. What it works out takes the reading's place.
 `when`, `since` and `interval` work as a query's do, and a metric's `since` leaves it
 out below that version. Counters are read through Windows' English names, so a
 template works whatever language Windows is in. Counter sets a `join` reads and that
-`counter_sets` looks for are found by the names Windows lists them by, which are the
-same in every language for most applications' own, such as IIS's `W3SVC_W3WP`, but not
-for Windows' own, such as `Process`. To see which counters a host has, run
+`counter_sets` looks for are given by their English names too, such as `Process`, and
+found by the name Windows has for them in its own language; an application's own
+counter sets that Windows has no English name for, such as IIS's `W3SVC_W3WP`, have one
+name in every language. To see which counters a host has, run
 `typeperf -qx "<Counter set>"` there.
 
 ### Alerts

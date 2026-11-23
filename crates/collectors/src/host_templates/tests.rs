@@ -116,6 +116,45 @@ fn a_running_total_is_sent_as_its_change_from_the_second_read() {
     );
 }
 
+/// A read that misses a running total, as a counter can, loses nothing of it: its
+/// change is worked out from its last reading when it's back. One gone for longer
+/// starts again from nothing.
+#[test]
+fn a_running_total_that_misses_a_read_keeps_its_last_reading() {
+    let mut failures = metric("worker_failures", "Total Worker Process Failures");
+    failures.total = true;
+    let work = block(Instances::Labelled("pool".to_string()), vec![failures]);
+    let mut totals = Totals::default();
+    let read = |value: f64| readings(&[("Total Worker Process Failures", &[("shop", value)])]);
+    let missed = readings(&[("Total Worker Process Failures", &[])]);
+    rows(&work, &read(4.0), &mut totals);
+    assert!(rows(&work, &missed, &mut totals).is_empty());
+    assert_eq!(
+        rows(&work, &read(9.0), &mut totals)[0]["worker_failures"],
+        5.0
+    );
+
+    for _ in 0..=TOTAL_MISSES {
+        rows(&work, &missed, &mut totals);
+    }
+    assert!(rows(&work, &read(12.0), &mut totals).is_empty());
+}
+
+/// Windows lists each English name after its number, and a name can be there twice.
+#[test]
+fn english_names_are_read_from_windows_list_of_numbers_and_names() {
+    let list: Vec<String> = [
+        "1", "1847", "2", "System", "230", "Process", "232", "Process",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let names = english_pairs(&list);
+    assert_eq!(names["process"], 230);
+    assert_eq!(names["system"], 2);
+    assert_eq!(names.len(), 3);
+}
+
 #[test]
 fn one_instance_or_a_set_with_none_is_one_unlabelled_series() {
     let work = block(
@@ -319,9 +358,10 @@ fn this_host_reads_counters_counter_sets_and_the_registry() {
         ],
     };
     let mut templates = HostTemplates::default();
-    templates.update(&[work]);
+    templates.update(std::slice::from_ref(&work));
     std::thread::sleep(Duration::from_millis(250));
-    let read = templates.collect(Duration::from_secs(10));
+    // Counters every sample, with no wait between them.
+    let read = templates.collect(Duration::ZERO);
 
     let found = &read.discovered[0];
     assert_eq!(found.template, "win");
@@ -353,7 +393,16 @@ fn this_host_reads_counters_counter_sets_and_the_registry() {
     assert!(idle["threads"].as_f64().unwrap() > 0.0, "{rows:?}");
 
     // Discovery waits for its interval, and counters read again.
-    let again = templates.collect(Duration::from_secs(10));
+    let again = templates.collect(Duration::ZERO);
     assert!(again.discovered.is_empty());
     assert!(!again.rows["win"].is_empty());
+
+    // A discover block that changed runs at once, and what it found before goes.
+    let mut changed = work.clone();
+    changed.discover[0].counter_sets.clear();
+    templates.update(&[changed]);
+    let after = templates.collect(Duration::ZERO);
+    let found = &after.discovered[0];
+    assert!(found.values.contains_key("build"), "{found:?}");
+    assert!(!found.values.contains_key("processor"), "{found:?}");
 }

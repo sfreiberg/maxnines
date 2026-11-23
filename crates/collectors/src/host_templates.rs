@@ -17,7 +17,7 @@
 //!
 //! Other systems have none of this, so an agent on one reads nothing for them.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use maxnines_protocol::templates::work::{
@@ -43,9 +43,14 @@ pub struct Readings {
 }
 
 /// Each running total's last reading, by series and metric, which turns the next
-/// into the change since.
+/// into the change since, and how many reads in a row have missed it since.
 #[derive(Debug, Default)]
-pub struct Totals(HashMap<String, f64>);
+pub struct Totals(HashMap<String, (f64, u32)>);
+
+/// How many reads in a row a running total can miss and still have its change
+/// worked out from its last reading when it's back. One that's missed more has
+/// gone, and starts again from nothing if it comes back.
+const TOTAL_MISSES: u32 = 5;
 
 /// One counters block's rows: each series' metrics, labelled, with which block
 /// they're from. Instances it doesn't read or can't label give nothing.
@@ -131,8 +136,8 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
         }
     }
 
-    let mut seen = HashMap::new();
     let mut read = Vec::with_capacity(series.len());
+    let mut seen = HashSet::new();
     for (labels, metrics) in series {
         let key = serde_json::to_string(&labels).unwrap_or_default();
         let mut row = Map::new();
@@ -142,8 +147,11 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
             };
             if metric.total {
                 let total = format!("{key}\n{}", metric.key);
-                let last = totals.0.get(&total).copied();
-                seen.insert(total, value);
+                let last = totals
+                    .0
+                    .insert(total.clone(), (value, 0))
+                    .map(|(last, _)| last);
+                seen.insert(total);
                 match last {
                     // A total that went down started again from nothing.
                     Some(last) => row.insert(
@@ -162,8 +170,14 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
             read.push(Value::Object(row));
         }
     }
-    // A series that's gone starts again from nothing if it comes back.
-    totals.0 = seen;
+    // One that missed a read, as a counter can, keeps its last reading for a while,
+    // so what happened meanwhile isn't lost when it's back.
+    totals.0.retain(|total, (_, misses)| {
+        if !seen.contains(total) {
+            *misses += 1;
+        }
+        *misses <= TOTAL_MISSES
+    });
     read
 }
 
@@ -250,10 +264,28 @@ pub struct HostTemplates {
 
 struct HostTemplate {
     work: TemplateWork,
-    /// When each discover block runs next.
-    discover_at: Vec<Instant>,
-    found: Map<String, Value>,
+    /// When each discover block runs next, and what it found last, if it's run.
+    discover_at: Vec<(Instant, Option<Map<String, Value>>)>,
+    /// What was last sent of what discovery found.
+    said: Option<Map<String, Value>>,
     counters: Vec<CountersAt>,
+}
+
+impl HostTemplate {
+    /// What every discover block found, together, or nothing if none has run yet.
+    fn found(&self) -> Option<Map<String, Value>> {
+        let mut all: Option<Map<String, Value>> = None;
+        for (_, found) in &self.discover_at {
+            if let Some(found) = found {
+                all.get_or_insert_with(Map::new).extend(
+                    found
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+            }
+        }
+        all
+    }
 }
 
 struct CountersAt {
@@ -274,7 +306,9 @@ pub struct HostRead {
 impl HostTemplates {
     /// Changes what's read to the templates in `work` that run on the host. One whose
     /// work is the same carries on; one whose counters block is the same keeps its
-    /// counters and running totals, and what its discovery found.
+    /// counters and running totals, and one whose discover block is the same keeps
+    /// what it found, while what a block that's gone or changed found goes. Opening
+    /// counters can block, so this is called apart from the agent's connection.
     pub fn update(&mut self, work: &[TemplateWork]) {
         let wanted: Vec<&TemplateWork> = work.iter().filter(|one| one.database.is_none()).collect();
         if !wanted.is_empty() && !platform::READS {
@@ -303,13 +337,18 @@ impl HostTemplates {
                         })
                         .collect();
                     // A discover block that's new, or changed, runs at once.
+                    let mut before = std::mem::take(&mut running.discover_at);
                     running.discover_at = one
                         .discover
                         .iter()
                         .map(|discover| {
                             let same = running.work.discover.iter().position(|was| was == discover);
-                            same.and_then(|at| running.discover_at.get(at).copied())
-                                .unwrap_or(now)
+                            same.and_then(|at| {
+                                before
+                                    .get_mut(at)
+                                    .map(|kept| std::mem::replace(kept, (now, None)))
+                            })
+                            .unwrap_or((now, None))
                         })
                         .collect();
                     running.work = one.clone();
@@ -319,8 +358,8 @@ impl HostTemplates {
                         one.template.clone(),
                         HostTemplate {
                             work: one.clone(),
-                            discover_at: vec![now; one.discover.len()],
-                            found: Map::new(),
+                            discover_at: vec![(now, None); one.discover.len()],
+                            said: None,
                             counters: one
                                 .counters
                                 .iter()
@@ -341,7 +380,9 @@ impl HostTemplates {
         for (key, running) in &mut self.templates {
             let mut discovered = false;
             let mut refreshed = false;
-            for (at, discover) in running.discover_at.iter_mut().zip(&running.work.discover) {
+            for ((at, found), discover) in
+                running.discover_at.iter_mut().zip(&running.work.discover)
+            {
                 if *at > now {
                     continue;
                 }
@@ -350,28 +391,36 @@ impl HostTemplates {
                     platform::refresh_counter_sets();
                     refreshed = true;
                 }
+                // What it finds now, so a value that's gone, or can't be read, isn't
+                // found any more.
+                let mut now_found = Map::new();
                 for registry in &discover.registry {
                     for (name, value) in &registry.values {
-                        match platform::registry_value(&registry.key, value) {
-                            Some(found) => running.found.insert(name.clone(), found),
-                            None => running.found.remove(name),
-                        };
+                        if let Some(value) = platform::registry_value(&registry.key, value) {
+                            now_found.insert(name.clone(), value);
+                        }
                     }
                 }
                 for (name, object) in &discover.counter_sets {
-                    match platform::counter_set_exists(object) {
-                        Some(there) => running.found.insert(name.clone(), json!(there)),
-                        None => running.found.remove(name),
-                    };
+                    if let Some(there) = platform::counter_set_exists(object) {
+                        now_found.insert(name.clone(), json!(there));
+                    }
                 }
+                *found = Some(now_found);
                 discovered = true;
             }
-            if discovered {
+            // Sent whenever discovery ran, and when what was found changes as what
+            // it's told to discover does.
+            let found = running.found();
+            if let Some(values) = &found
+                && (discovered || found != running.said)
+            {
                 read.discovered.push(Discovered {
                     template: key.clone(),
                     database: None,
-                    values: running.found.clone(),
+                    values: values.clone(),
                 });
+                running.said = found;
             }
             let mut read_now = Vec::new();
             for counters in &mut running.counters {
@@ -402,6 +451,20 @@ impl CountersAt {
     }
 }
 
+/// The English names Windows numbers, by name in lowercase, from its list of each
+/// number followed by its name. The first number a name has is kept, as a name can
+/// be listed twice.
+#[cfg(any(windows, test))]
+pub fn english_pairs(list: &[String]) -> HashMap<String, u32> {
+    let mut names = HashMap::new();
+    for [index, name] in list.as_chunks::<2>().0 {
+        if let Ok(index) = index.trim().parse::<u32>() {
+            names.entry(name.to_lowercase()).or_insert(index);
+        }
+    }
+    names
+}
+
 /// The English path of a counters block's counter, for every instance it reads.
 pub fn path(work: &CountersWork, counter: &str) -> String {
     let object = &work.object;
@@ -430,17 +493,24 @@ pub fn counters_read(work: &CountersWork) -> Vec<String> {
 
 #[cfg(windows)]
 mod platform {
+    use std::collections::HashMap;
     use std::ptr::{null, null_mut};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
+    use windows_sys::Win32::Foundation::{ERROR_MORE_DATA, ERROR_SUCCESS};
     use windows_sys::Win32::System::Performance::{
         PDH_CSTATUS_NO_OBJECT, PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PDH_RAW_COUNTER_ITEM_W,
         PERF_DETAIL_WIZARD, PdhAddCounterW, PdhCloseQuery, PdhCollectQueryData,
-        PdhEnumObjectItemsW, PdhEnumObjectsW, PdhGetRawCounterArrayW, PdhOpenQueryW,
+        PdhEnumObjectItemsW, PdhEnumObjectsW, PdhGetRawCounterArrayW, PdhLookupPerfNameByIndexW,
+        PdhOpenQueryW,
+    };
+    use windows_sys::Win32::System::Registry::{
+        HKEY_PERFORMANCE_DATA, RegCloseKey, RegQueryValueExW,
     };
 
-    use super::{CountersWork, ONLY, Readings, counters_read, path};
+    use super::{CountersWork, ONLY, Readings, counters_read, english_pairs, path};
     use crate::counters::numbered;
     use crate::counters::pdh::{Formatted, added, formatted};
     use crate::windows_text::{from_wide, wide};
@@ -617,9 +687,10 @@ mod platform {
 
     /// A counter of a counter set whose instances are that set's instances, to read
     /// their names from at each collection. Windows names counters in its own
-    /// language here, so the counter set has to be found by the name it has there.
+    /// language here, so the counter set is found by the name it has there.
     fn instances_of(query: PDH_HQUERY, object: &str) -> Option<PDH_HCOUNTER> {
-        let (counters, _) = object_items(object).ok()?;
+        let object = local_name(object);
+        let (counters, _) = object_items(&object).ok()?;
         let first = counters.first()?;
         let path = wide(&format!(r"\{object}(*)\{first}"));
         let mut counter: PDH_HCOUNTER = null_mut();
@@ -656,20 +727,98 @@ mod platform {
     }
 
     /// Has Windows look again at which counter sets there are, as one whose software
-    /// was installed since isn't otherwise found.
+    /// was installed since isn't otherwise found, and reads their English names again.
     pub fn refresh_counter_sets() {
         let mut size = 0u32;
         // SAFETY: asking for the size of the list, refreshing it on the way, with
         // nowhere to put it.
         unsafe { PdhEnumObjectsW(null(), null(), null_mut(), &mut size, PERF_DETAIL_WIZARD, 1) };
+        *english_names() = read_english_names();
     }
 
-    /// Whether the host has a counter set, or nothing if that can't be told.
+    /// Whether the host has a counter set, by its English name, or nothing if that
+    /// can't be told.
     pub fn counter_set_exists(object: &str) -> Option<bool> {
-        match object_items(object) {
+        match object_items(&local_name(object)) {
             Ok(_) => Some(true),
             Err(PDH_CSTATUS_NO_OBJECT) => Some(false),
             Err(_) => None,
+        }
+    }
+
+    /// The English names of counters and counter sets, each with the number Windows
+    /// knows it by, read when first needed and again when counter sets are looked
+    /// at again.
+    fn english_names() -> MutexGuard<'static, HashMap<String, u32>> {
+        static NAMES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
+        NAMES
+            .get_or_init(|| Mutex::new(read_english_names()))
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What Windows has as `Counter 009`: each English name after its number, each
+    /// ending with a zero. Lowercase names, as Windows matches names in any case.
+    fn read_english_names() -> HashMap<String, u32> {
+        let value = wide("Counter 009");
+        let mut buffer = vec![0u8; 256 * 1024];
+        loop {
+            let mut size = buffer.len() as u32;
+            // SAFETY: the name ends with a zero, and the buffer is `size` long.
+            let status = unsafe {
+                RegQueryValueExW(
+                    HKEY_PERFORMANCE_DATA,
+                    value.as_ptr(),
+                    null(),
+                    null_mut(),
+                    buffer.as_mut_ptr(),
+                    &mut size,
+                )
+            };
+            match status {
+                ERROR_SUCCESS => {
+                    buffer.truncate(size as usize);
+                    break;
+                }
+                // It doesn't say how much it needs, so more is tried, up to a limit.
+                ERROR_MORE_DATA if buffer.len() < 64 * 1024 * 1024 => {
+                    let more = buffer.len() * 2;
+                    buffer.resize(more, 0);
+                }
+                _ => {
+                    // SAFETY: closing what reading performance data opened.
+                    unsafe { RegCloseKey(HKEY_PERFORMANCE_DATA) };
+                    return HashMap::new();
+                }
+            }
+        }
+        // SAFETY: closing what reading performance data opened.
+        unsafe { RegCloseKey(HKEY_PERFORMANCE_DATA) };
+        let units: Vec<u16> = buffer
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect();
+        english_pairs(&names(&units))
+    }
+
+    /// The name a counter set has in Windows' own language, from its English name:
+    /// the English name itself if Windows doesn't number it, as an app's own counter
+    /// sets, such as IIS's `W3SVC_W3WP`, have one name in every language.
+    pub fn local_name(english: &str) -> String {
+        let Some(index) = english_names().get(&english.to_lowercase()).copied() else {
+            return english.to_string();
+        };
+        let mut name = vec![0u16; 1024];
+        let mut size = name.len() as u32;
+        // SAFETY: this host, and the buffer is `size` long.
+        let status =
+            unsafe { PdhLookupPerfNameByIndexW(null(), index, name.as_mut_ptr(), &mut size) };
+        match status {
+            // SAFETY: Windows wrote a name ending with a zero.
+            0 => unsafe { from_wide(name.as_ptr()) },
+            _ => english.to_string(),
         }
     }
 
