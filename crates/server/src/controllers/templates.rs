@@ -624,9 +624,20 @@ async fn show_page(
             .template_as_run(stored.id)
             .await?
             .unwrap_or_else(|| stored.template.clone());
-        anyhow::Ok(Some((stored, alerts, as_run, runs)))
+        // A built-in template's agent settings are a config rule of their own.
+        let config_rule = match stored.origin == Origin::BuiltIn {
+            true => state
+                .database
+                .list_rules()
+                .await?
+                .into_iter()
+                .find(|rule| rule.built_in.as_deref() == Some(stored.template.key.as_str()))
+                .map(|rule| json!({ "id": rule.id, "name": rule.rule.name })),
+            false => None,
+        };
+        anyhow::Ok(Some((stored, alerts, as_run, runs, config_rule)))
     };
-    let (stored, alerts, as_run, (runs, more_runs)) = match loaded.await {
+    let (stored, alerts, as_run, (runs, more_runs), config_rule) = match loaded.await {
         Ok(Some(found)) => found,
         Ok(None) => return not_found(state, token),
         Err(error) => return server_error(&error),
@@ -663,6 +674,7 @@ async fn show_page(
                 .collect::<Vec<_>>(),
         )
         .with("upgraded", &stored.upgraded_at.map(local_date))
+        .with("config_rule", &config_rule)
         .with("source", &stored.hcl())
         .with("alerts", &alert_rows(&alerts))
         .with("part_sections", &part_sections(&stored, &as_run))

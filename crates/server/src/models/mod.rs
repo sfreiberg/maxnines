@@ -138,8 +138,32 @@ pub struct ConfigRule {
     /// When an upgrade last changed a built-in rule.
     #[serde(skip)]
     pub built_in_changed_at: Option<Timestamp>,
+    /// For a built-in rule, the template it's the settings of, as it's only in
+    /// force while that template is turned on.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub template: Option<RuleTemplate>,
     #[serde(flatten)]
     pub rule: RuleInput,
+}
+
+/// The built-in template a built-in rule is the settings of.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleTemplate {
+    pub id: i64,
+    /// Whether it's turned on, which the rule is only in force while it is.
+    pub enabled: bool,
+}
+
+impl ConfigRule {
+    /// Whether it applies to the hosts it's for: turned on, and for a built-in
+    /// rule, its template turned on too.
+    pub fn in_force(&self) -> bool {
+        self.rule.enabled
+            && self
+                .template
+                .as_ref()
+                .is_none_or(|template| template.enabled)
+    }
 }
 
 /// What can be set on a rule. Validated by [`crate::rule_engine::check_rule`].
@@ -988,6 +1012,7 @@ impl Database {
                 to_rule(row.clone(), mine)
             })
             .collect::<Result<Vec<_>>>()?;
+        templates::with_templates(&self.connection, &mut rules).await?;
         // Built-in rules apply before people's own of the same priority, so theirs win.
         rules.sort_by_key(|rule| (rule.rule.priority, rule.built_in.is_none(), rule.id));
         Ok(rules)
@@ -1013,7 +1038,9 @@ impl Database {
     }
 
     pub async fn get_rule(&self, id: i64) -> Result<Option<ConfigRule>> {
-        load_rule(&self.connection, id).await
+        let mut rule = load_rule(&self.connection, id).await?;
+        templates::with_templates(&self.connection, rule.as_mut_slice()).await?;
+        Ok(rule)
     }
 
     pub async fn create_rule(&self, input: &RuleInput) -> Result<i64> {
@@ -1226,6 +1253,7 @@ fn to_rule<'a>(
         id: row.id,
         built_in: row.built_in,
         built_in_changed_at: row.built_in_changed_at,
+        template: None,
         rule: RuleInput {
             name: row.name,
             priority: row.priority,

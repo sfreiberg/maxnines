@@ -26,6 +26,7 @@
   {% endif %}
 </div>
 {% if template.description %}<p>{{ template.description }}</p>{% endif %}
+{% if config_rule %}<p class="hint">Its agent settings are the <a href="/rules/{{ config_rule.id }}/edit">{{ config_rule.name }} config rule</a>, in force while it's enabled, rather than part of its HCL.</p>{% endif %}
 {% if original %}<p class="hint">{% if origin == "imported" %}Importing a newer version replaces{% else %}Upgrades replace{% endif %} what this template says. Changing one of its alerts, queries, discover or counters blocks makes a copy of your own, used in its place, which that leaves alone, and turning it or a part of it off lasts through it.</p>{% endif %}
 
 <section class="card">

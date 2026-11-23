@@ -203,7 +203,7 @@ async fn a_built_in_rule_can_only_be_turned_on_or_off_through_the_api() {
 
 #[tokio::test]
 async fn a_built_in_rule_is_locked_on_its_page_and_can_be_customized() {
-    let server = with_every_built_in_rule().await;
+    let server = with_every_built_in_template().await;
     let mac = rule_named(&server, "macOS").await;
     let mut browser = Browser::default();
 
@@ -329,4 +329,128 @@ async fn a_rule_named_like_another_whatever_the_case_is_refused() {
     let id = rule_named(&server, "Mine").await.id;
     let (status, body) = api(&server, "PUT", &format!("/api/v1/rules/{id}"), &rule).await;
     assert_eq!(status, 422, "{body}");
+}
+
+/// Every built-in rule and template, as a real start writes them.
+async fn with_every_built_in_template() -> TestServer {
+    let server = with_every_built_in_rule().await;
+    server
+        .state
+        .database
+        .sync_templates(
+            &crate::templates::built_in::all().unwrap(),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    server
+}
+
+#[tokio::test]
+async fn a_built_in_rule_is_only_in_force_while_its_template_is_enabled() {
+    let server = with_every_built_in_template().await;
+    let mac_rule = rule_named(&server, "macOS").await;
+    let template = mac_rule.template.clone().expect("the rule's template");
+    assert!(template.enabled);
+
+    let mut mac = server.connect_approved(&identity(), "mac-1").await;
+    TestServer::next_config(&mut mac).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({
+            "os": { "family": "macos" },
+            "agent": { "collectors": maxnines_protocol::COLLECTORS.to_vec() },
+        }),
+    };
+    send(&mut mac, &facts).await;
+    let (_, config) = TestServer::next_config(&mut mac).await;
+    assert!(config.collectors["gpu"].enabled, "{config:?}");
+
+    // Turning the template off takes its settings with it, though the rule itself
+    // is still turned on, and the Mac is sent its config without them.
+    server
+        .state
+        .database
+        .set_template_enabled(template.id, false, crate::times::now())
+        .await
+        .unwrap();
+    let (_, config) = TestServer::next_config(&mut mac).await;
+    assert!(!config.collectors.contains_key("gpu"), "{config:?}");
+    assert!(config.collectors["cpu"].enabled);
+
+    let (status, body) = api(
+        &server,
+        "GET",
+        &format!("/api/v1/rules/{}", mac_rule.id),
+        &Value::Null,
+    )
+    .await;
+    assert_eq!(status, 200);
+    let shown: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(shown["enabled"], true);
+    assert_eq!(
+        shown["template"],
+        json!({ "id": template.id, "enabled": false })
+    );
+
+    // The pages say so, and link to the template.
+    let list = Browser::default().get(&server, "/rules").await;
+    assert!(list.body.contains("Template disabled"), "{}", list.body);
+    let form = Browser::default()
+        .get(&server, &format!("/rules/{}/edit", mac_rule.id))
+        .await;
+    assert!(
+        form.body.contains(&format!(
+            r#"<a href="/templates/{}">macOS template</a>"#,
+            template.id
+        )),
+        "{}",
+        form.body
+    );
+    assert!(form.body.contains("it's disabled now"), "{}", form.body);
+}
+
+#[tokio::test]
+async fn a_built_in_templates_hcl_leaves_its_settings_to_its_rule_so_it_can_be_copied() {
+    let server = with_every_built_in_template().await;
+    let host_rule = rule_named(&server, "Host").await;
+    let template = host_rule.template.clone().unwrap();
+    let path = format!("/api/v1/templates/{}", template.id);
+    let (status, body) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(status, 200);
+    let shown: Value = serde_json::from_str(&body).unwrap();
+    let hcl = shown["hcl"].as_str().unwrap();
+    assert!(!hcl.contains("config {"), "{hcl}");
+    assert!(hcl.contains("template \"host\""), "{hcl}");
+
+    // So it can be saved as someone's own, under a key and names of their own, as
+    // no two templates or alert rules share a name.
+    let copied: String = hcl
+        .replace("template \"host\"", "template \"my_host\"")
+        .lines()
+        .map(|line| match line.trim_start().starts_with("name ") {
+            true => format!("{}\n", line.replacen("= \"", "= \"My ", 1)),
+            false => format!("{line}\n"),
+        })
+        .collect();
+    let (status, body) = api(
+        &server,
+        "POST",
+        "/api/v1/templates",
+        &json!({ "hcl": copied }),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    // Its page says where its settings are instead.
+    let page = Browser::default()
+        .get(&server, &format!("/templates/{}", template.id))
+        .await;
+    assert!(
+        page.body.contains(&format!(
+            r#"<a href="/rules/{}/edit">Host config rule</a>"#,
+            host_rule.id
+        )),
+        "{}",
+        page.body
+    );
 }

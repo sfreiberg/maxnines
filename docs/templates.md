@@ -406,7 +406,11 @@ Each becomes a built-in config rule of its own, named after the template, for th
 the template is for, at priority 0, where it's listed as coming with MaxNines. Your own
 rules apply over it as over any rule: one at a higher priority wins, so a rule of your
 own changes what a template's settings say without touching the template, and upgrades
-leave it alone. The rule can be turned off, which lasts through upgrades.
+leave it alone. The rule is only in force while its template is enabled, and can be
+turned off on its own too, which lasts through upgrades. As the settings are that rule,
+the template's HCL, as its page shows it and as it's exported, leaves the `config`
+block out, so it can be copied into a template of your own, and its page links to the
+rule instead.
 
 Templates you import or write can't have a `config` block, and one that does is refused:
 give agents' settings in a config rule, which says plainly what it changes on which

@@ -20,7 +20,7 @@ use crate::alerting::NameTaken;
 use crate::app_state::AppState;
 use crate::condition_builder::Builder;
 use crate::facts::unflatten;
-use crate::models::{ConfigRule, RuleInput};
+use crate::models::{ConfigRule, RuleInput, RuleTemplate};
 use crate::registration::HostState;
 use crate::rule_engine::{self, CompiledRule, Host, OPERATING_SYSTEMS};
 use crate::rule_preview::Preview;
@@ -66,6 +66,8 @@ struct RuleForm {
     built_in: bool,
     /// When an upgrade last changed it, for a built-in rule.
     built_in_changed: Option<String>,
+    /// For a built-in rule, the template it's the settings of.
+    template: Option<RuleTemplate>,
 }
 
 /// Whether a rule is for one operating system.
@@ -169,6 +171,7 @@ impl RuleForm {
             operating_systems: systems(|key| rule.operating_systems.iter().any(|os| os == key)),
             built_in: false,
             built_in_changed: None,
+            template: None,
         }
     }
 
@@ -177,6 +180,7 @@ impl RuleForm {
         Self {
             built_in: saved.built_in.is_some(),
             built_in_changed: saved.built_in_changed_at.map(local_date),
+            template: saved.template.clone(),
             ..Self::from_rule(&saved.rule)
         }
     }
@@ -224,6 +228,7 @@ impl RuleForm {
             operating_systems: systems(|key| fields.contains_key(&format!("os_{key}"))),
             built_in: false,
             built_in_changed: None,
+            template: None,
         }
     }
 
@@ -575,6 +580,8 @@ struct RuleRow {
     systems: Option<String>,
     built_in: bool,
     built_in_changed: Option<String>,
+    /// Whether it's turned on but not in force, as its template is turned off.
+    template_off: bool,
 }
 
 /// Describes what a rule sets in a few words.
@@ -661,6 +668,7 @@ async fn index(State(state): State<AppState>, token: CsrfToken) -> Response {
             systems: systems_label(&rule.rule.operating_systems),
             built_in: rule.built_in.is_some(),
             built_in_changed: rule.built_in_changed_at.map(local_date),
+            template_off: rule.rule.enabled && !rule.in_force(),
             description: rule
                 .rule
                 .applies_to

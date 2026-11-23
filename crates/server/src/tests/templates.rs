@@ -2547,5 +2547,6 @@ async fn only_a_built_in_template_has_agent_settings() {
         stored.template.config.as_ref().unwrap()["interval_secs"],
         15
     );
-    assert!(stored.hcl().contains("config {"), "{}", stored.hcl());
+    // Its HCL leaves them to its config rule, so it can be copied into one's own.
+    assert!(!stored.hcl().contains("config {"), "{}", stored.hcl());
 }

@@ -245,9 +245,15 @@ pub struct PartChoice {
 }
 
 impl StoredTemplate {
-    /// The template as HCL, written from its rows.
+    /// The template as HCL, written from its rows, as it's shown and exported. A
+    /// built-in template's agent settings are left out, as they're a config rule of
+    /// their own, and only a template that comes with MaxNines can have any, so what
+    /// it's copied into can be saved as someone's own.
     pub fn hcl(&self) -> String {
-        to_hcl(&self.template)
+        to_hcl(&Template {
+            config: None,
+            ..self.template.clone()
+        })
     }
 }
 
@@ -2245,6 +2251,11 @@ impl Database {
         self.template_changes.subscribe()
     }
 
+    /// How many times templates have changed since the server started.
+    pub fn template_revision(&self) -> u64 {
+        *self.template_changes.borrow()
+    }
+
     /// The template a rule is one of the alerts of, whether it's the template's own
     /// rule or someone's copy. None for a rule that isn't a template's.
     pub async fn template_rule(&self, rule_id: i64) -> Result<Option<TemplateRule>> {
@@ -2647,6 +2658,36 @@ impl Database {
             .context("saving templates")?;
         Ok(())
     }
+}
+
+/// Gives each built-in config rule the built-in template it's the settings of,
+/// found by the template's key, which is the rule's, saying whether it's turned on.
+pub(super) async fn with_templates<C: ConnectionTrait>(
+    connection: &C,
+    rules: &mut [super::ConfigRule],
+) -> Result<()> {
+    if rules.iter().all(|rule| rule.built_in.is_none()) {
+        return Ok(());
+    }
+    let rows = template::Entity::find()
+        .filter(template::Column::Origin.eq(Origin::BuiltIn.as_str()))
+        .filter(template::Column::DeletedAt.is_null())
+        .all(connection)
+        .await
+        .context("loading built-in templates")?;
+    for rule in rules {
+        let Some(key) = rule.built_in.as_deref() else {
+            continue;
+        };
+        rule.template = rows
+            .iter()
+            .find(|row| row.key == key)
+            .map(|row| super::RuleTemplate {
+                id: row.id,
+                enabled: row.enabled_choice.unwrap_or(row.enabled),
+            });
+    }
+    Ok(())
 }
 
 /// Agent settings are only for the templates that come with MaxNines: anyone else's

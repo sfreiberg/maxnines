@@ -91,8 +91,10 @@ priority 0, so a rule of your own at a higher priority applies over it:
 | **macOS** | Macs | The [GPU](collectors-operating-system.md#gpus) collector |
 
 An upgrade can change them, add more or remove one, and the audit log and the Config
-rules page say when it did. They can be turned off, which lasts through upgrades, but
-not changed or deleted. To change what one sets, open it and follow the link to add a
+rules page say when it did. Each is only in force while its template is enabled, so
+disabling the template disables its settings too, and the Config rules page says
+**Template disabled**. They can be turned off on their own as well, which lasts through
+upgrades, but not changed or deleted. To change what one sets, open it and follow the link to add a
 rule of your own after it: that rule applies to the same hosts, one priority higher,
 and holds only your changes, so upgrades never touch them.
 

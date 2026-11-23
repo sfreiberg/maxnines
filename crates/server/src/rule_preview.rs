@@ -103,6 +103,7 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
         id: id.unwrap_or(NEW_RULE_ID),
         built_in: replaced.and_then(|saved| saved.built_in.clone()),
         built_in_changed_at: None,
+        template: replaced.and_then(|saved| saved.template.clone()),
         rule: rule.clone(),
     });
     proposed.sort_by_key(|saved| (saved.rule.priority, saved.built_in.is_none(), saved.id));
@@ -363,6 +364,7 @@ mod tests {
             id,
             built_in: None,
             built_in_changed_at: None,
+            template: None,
             rule: input(name, priority, condition, settings),
         }
     }

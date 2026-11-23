@@ -13,13 +13,18 @@ use crate::rule_engine::{ConfigRules, Host, ResolvedConfig};
 use crate::templates::hosts::agent_databases;
 use crate::templates::work::work_for;
 
+/// How many times the rules, then the templates, have changed.
+type Revision = (u64, u64);
+
 pub struct AgentConfigs {
     database: Database,
     /// Bumped when rules change, so live connections work out their config again.
     changes: watch::Sender<u64>,
-    /// The rules as they were at a revision. Whoever finds them out of date loads them,
-    /// while everyone else waits for that rather than loading them too.
-    rules: Mutex<Option<(u64, Arc<ConfigRules>)>>,
+    /// The rules as they were at a revision of them and of the templates, as a
+    /// built-in rule is only in force while its template is turned on. Whoever finds
+    /// them out of date loads them, while everyone else waits for that rather than
+    /// loading them too.
+    rules: Mutex<Option<(Revision, Arc<ConfigRules>)>>,
 }
 
 impl AgentConfigs {
@@ -51,7 +56,7 @@ impl AgentConfigs {
     pub async fn rules(&self) -> Result<Arc<ConfigRules>> {
         // Read before loading, so rules saved while they load are loaded again next
         // time, as they may have been missed.
-        let revision = *self.changes.borrow();
+        let revision = (*self.changes.borrow(), self.database.template_revision());
         let mut kept = self.rules.lock().await;
         if let Some((loaded_at, rules)) = kept.as_ref()
             && *loaded_at == revision

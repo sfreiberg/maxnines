@@ -12,6 +12,7 @@ lowest priority first, so higher priorities win.
 | `enabled` | Defaults to `true` |
 | `settings` | Required. What to apply, as below |
 | `built_in` | Given back, never set: which built-in rule it is, such as `macos`, or `null` for one of your own |
+| `template` | Given back, never set, only for a built-in rule: the built-in template it's the settings of, as `{"id": 2, "enabled": true}`. The rule is only in force while that template is enabled |
 
 Built-in rules come with MaxNines, and upgrades change them. See
 [Built-in rules](agents.md#built-in-rules). Only `enabled` can change on one, so an update
@@ -59,6 +60,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/rules/1"
 {
   "id": 1,
   "built_in": "host",
+  "template": { "id": 2, "enabled": true },
   "name": "Host",
   "priority": 0,
   "applies_to": null,

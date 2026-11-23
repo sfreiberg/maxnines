@@ -195,10 +195,10 @@ impl CompiledRule {
     /// A condition that can't be evaluated doesn't match. That's the normal case
     /// for a rule about a fact this agent doesn't have.
     pub fn matches(&self, host: &Host) -> bool {
-        let rule = &self.rule.rule;
-        if !rule.enabled {
+        if !self.rule.in_force() {
             return false;
         }
+        let rule = &self.rule.rule;
         if !rule.operating_systems.is_empty() {
             let family = host.facts["os"]["family"].as_str();
             let listed =
@@ -306,6 +306,7 @@ mod tests {
             id: 1,
             built_in: None,
             built_in_changed_at: None,
+            template: None,
             rule: RuleInput {
                 name: name.to_string(),
                 priority: 0,

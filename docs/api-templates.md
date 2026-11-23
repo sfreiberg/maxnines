@@ -58,7 +58,7 @@ Everything listed, with:
 
 | Field | Description |
 | --- | --- |
-| `hcl` | The template, written out from its parts |
+| `hcl` | The template, written out from its parts, leaving out a built-in template's `config` block, whose settings are its [built-in config rule](agents.md#built-in-rules), and which `template` still has |
 | `template` | The template read, field by field, as the HCL has it |
 | `metrics` | Its own metrics, each with its full `name`, the `title` charts call it, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
 | `alerts` | Each of its alerts, by `key`, with the `rule` in use, as [alert rules](api-alert-rules.md) are given, and where that's your own copy of a built-in template's, the built-in one as `built_in_rule`, `null` otherwise |
@@ -133,7 +133,7 @@ An imported template is deleted as one of your own is.
 `GET /api/v1/templates/{id}/export`
 
 Any template as HCL, written out from its parts, as text rather than JSON, ready to
-import somewhere else.
+import somewhere else, as `hcl` is, with no `config` block.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
