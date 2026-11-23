@@ -111,7 +111,7 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
 
     let templates = database.list_templates().await.unwrap();
     let keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
-    assert_eq!(keys, ["clickhouse", "host", "postgres"]);
+    assert_eq!(keys, ["clickhouse", "host", "mysql", "postgres"]);
     for template in &templates {
         assert!(template.origin == Origin::BuiltIn && template.enabled);
     }

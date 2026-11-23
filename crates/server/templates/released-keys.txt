@@ -5,3 +5,4 @@
 host
 postgres
 clickhouse
+mysql

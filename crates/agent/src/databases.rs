@@ -272,10 +272,11 @@ mod tests {
     #[test]
     fn a_rule_reads_the_databases_the_config_defines_and_only_those() {
         let definitions = DatabaseDefinitions::from([
-            ("orders".to_string(), defined("mysql", "127.0.0.1:0")),
+            ("orders".to_string(), defined("mongodb", "127.0.0.1:0")),
             ("ledger".to_string(), defined("postgres", "127.0.0.1:0")),
+            ("shop".to_string(), defined("mysql", "127.0.0.1:0")),
         ]);
-        let chosen = ["orders", "ledger", "nowhere"].map(|name| DatabaseChoice {
+        let chosen = ["orders", "ledger", "shop", "nowhere"].map(|name| DatabaseChoice {
             name: name.to_string(),
             extras: Vec::new(),
         });
@@ -284,20 +285,21 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         let output = loop {
             let output = collector.collect().unwrap();
-            if output["mysql"].is_array() {
+            if output["mongodb"].is_array() {
                 break output;
             }
             assert!(Instant::now() < deadline, "no rows");
             thread::sleep(Duration::from_millis(10));
         };
         // Each under its kind, so its values are its kind's own.
-        assert_eq!(output["mysql"][0]["name"], "orders");
-        assert_eq!(output["mysql"][0]["up"], 0, "{output}");
+        assert_eq!(output["mongodb"][0]["name"], "orders");
+        assert_eq!(output["mongodb"][0]["up"], 0, "{output}");
         assert_eq!(
             output["unknown"][0],
             json!({ "name": "nowhere", "up": 0, "error": "the agent's config has no database by that name" })
         );
-        // PostgreSQL is its template's to read.
+        // PostgreSQL and MySQL are their templates' to read.
         assert!(output.get("postgres").is_none(), "{output}");
+        assert!(output.get("mysql").is_none(), "{output}");
     }
 }

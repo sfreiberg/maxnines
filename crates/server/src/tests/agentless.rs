@@ -1322,11 +1322,11 @@ async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
         request
     };
     for refused in [
-        request("tcp", "db:3306", json!({ "read_stats": true })),
-        request("mysql", "db:3306", json!({ "extras": ["sizes"] })),
+        request("tcp", "db:27017", json!({ "read_stats": true })),
+        request("mongodb", "db:27017", json!({ "extras": ["sizes"] })),
         request(
-            "mysql",
-            "db:3306",
+            "mongodb",
+            "db:27017",
             json!({ "read_stats": true, "extras": ["tables"] }),
         ),
         // Its template reads PostgreSQL, with queries of its own to turn on.
@@ -1340,9 +1340,9 @@ async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
         assert_eq!(status, 422, "{refused}: {body}");
     }
     let wanted = request(
-        "mysql",
-        "db:3306",
-        json!({ "read_stats": true, "extras": ["sizes"] }),
+        "mongodb",
+        "db:27017",
+        json!({ "read_stats": true, "extras": ["sizes"], "password": "s3cret" }),
     );
     let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &wanted).await;
     assert_eq!(status, 201, "{added}");
@@ -1423,6 +1423,64 @@ async fn a_postgres_check_reads_its_stats_with_the_built_in_template() {
         .get(&server, &format!("/hosts/{id}/metrics"))
         .await;
     assert!(!page.body.contains("Latest databases"), "{}", page.body);
+}
+
+/// Reads the throwaway MySQL the checks crate's tests use, named as
+/// `host:port username`, as a host with no agent: by the built-in template, as
+/// nothing else reads MySQL, its replication through SHOW as well as SELECTs.
+#[tokio::test]
+async fn a_mysql_check_reads_its_stats_with_the_built_in_template() {
+    let Ok(real) = std::env::var("MAXNINES_TEST_CHECK_MYSQL") else {
+        return;
+    };
+    let (target, username) = real.split_once(' ').unwrap();
+    let server = start_with_metrics().await;
+    server
+        .state
+        .database
+        .sync_templates(
+            &crate::templates::built_in::all().unwrap(),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    let id = add_host(&server, "shop-db").await;
+    let check = json!({
+        "host_id": id,
+        "check": { "name": "shop", "kind": "mysql", "target": target },
+        "interval_secs": 10,
+        "username": username,
+        "read_stats": true,
+    });
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+    assert_eq!(status, 201, "{added}");
+    let mut scheduler = check_scheduler(&server);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = crate::times::now();
+    for metric in ["mysql.connections", "mysql.uptime", "mysql.up"] {
+        loop {
+            let body = host_metric(&server, &id, metric).await;
+            if body["series"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty())
+            {
+                assert!(body.to_string().contains("shop"), "{body}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no {metric}: {body}");
+            run_due(&mut scheduler, now).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            now += TimeDelta::seconds(11);
+        }
+    }
+    // Nothing went wrong reading it.
+    let errors = server
+        .state
+        .database
+        .template_errors(Some(&id), None)
+        .await
+        .unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
 }
 
 /// What the API has of a host's metric over the last hour.

@@ -1,22 +1,22 @@
 //! Reads a database's health, load and replication, for the `databases`
 //! collector on agents and for hosts without an agent on the server, for the kinds
-//! MaxNines reads itself: [`has_reader`] says which. PostgreSQL and ClickHouse are
-//! read by their built-in templates instead, through [`crate::templates`].
+//! MaxNines reads itself: [`has_reader`] says which, which is MongoDB, as it isn't
+//! SQL. PostgreSQL, MySQL and ClickHouse are read by their built-in templates
+//! instead, through [`crate::templates`].
 //!
 //! A [`Reader`] keeps its connection open between rounds, so each round costs a
 //! few queries rather than a sign-in, and opens a new one when the old one stops
 //! working. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
 //! replication slots, named after it. A sample groups rows by their database's
-//! kind, as `{"mysql": [...], "mongodb": [...]}`, so each kind's values are its
-//! own, such as `mysql.connections`. Running totals in a row go under `totals`,
+//! kind, as `{"mongodb": [...]}`, so each kind's values are its own, such as
+//! `mongodb.connections`. Running totals in a row go under `totals`,
 //! and a [`Settle`] turns them into the change since the last sample. A total
 //! whose name starts with `_` is only there to work out an average, and goes
 //! once it has.
 
 pub(crate) mod clickhouse;
 mod mongodb;
-mod mysql;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -46,9 +46,9 @@ pub fn is_database(kind: CheckKind) -> bool {
 }
 
 /// Whether a reader here reads this kind of database. The rest are read only by
-/// templates, such as PostgreSQL and ClickHouse by their built-in templates.
+/// templates, such as PostgreSQL, MySQL and ClickHouse by their built-in templates.
 pub fn has_reader(kind: CheckKind) -> bool {
-    matches!(kind, CheckKind::Mysql | CheckKind::Mongodb)
+    kind == CheckKind::Mongodb
 }
 
 /// Where a database is and how to sign in to it.
@@ -61,7 +61,6 @@ pub struct Database {
 
 /// A connection that's open.
 enum Open {
-    Mysql(mysql::Mysql),
     Mongodb(mongodb::Mongodb),
 }
 
@@ -134,7 +133,6 @@ impl Reader {
         let mut rows = Rows::new(&self.name);
         let extras = &self.extras;
         match self.open.as_mut() {
-            Some(Open::Mysql(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mongodb(open)) => open.read(&mut rows, extras).await?,
             None => bail!("not connected"),
         }
@@ -144,9 +142,6 @@ impl Reader {
     async fn connect(&self) -> Result<Open> {
         let Database { check, credentials } = &self.database;
         match check.kind {
-            CheckKind::Mysql => Ok(Open::Mysql(
-                mysql::Mysql::connect(check, credentials).await?,
-            )),
             CheckKind::Mongodb => Ok(Open::Mongodb(
                 mongodb::Mongodb::connect(check, credentials).await?,
             )),
@@ -426,7 +421,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_that_isnt_there_says_why() {
-        let mut check = Check::new("orders", CheckKind::Mysql, "127.0.0.1:0");
+        let mut check = Check::new("orders", CheckKind::Mongodb, "127.0.0.1:0");
         check.timeout = Some(Duration::from_secs(2));
         let database = Database {
             check,
@@ -439,7 +434,7 @@ mod tests {
         let rows = reader.read(Duration::from_secs(2)).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["up"], 0);
-        assert_eq!(rows[0]["kind"], "mysql");
+        assert_eq!(rows[0]["kind"], "mongodb");
         assert!(rows[0]["error"].is_string(), "{rows:?}");
     }
 }

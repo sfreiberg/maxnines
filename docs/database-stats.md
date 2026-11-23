@@ -60,14 +60,15 @@ PostgreSQL `database` block, with no rule needed. What it found, such as the ver
 whether it's a primary or a replica, and anything that went wrong, are on the
 template's page and the host's **Templates** card.
 
-**ClickHouse** is read by the built-in ClickHouse template the same way.
+**MySQL and MariaDB**, and **ClickHouse**, are read by their built-in templates the
+same way.
 
-**MySQL and MariaDB, and MongoDB** are read by MaxNines itself, once a
-[config rule](api-config-rules.md) picks them, under **Databases from the agent's
-config**, one name to a line. A name an agent doesn't have reports that it's missing.
-Nothing of these is read until a rule asks for it. The host's metrics page lists each
-under **Latest databases**: whether it answered, whether it's a primary or a replica,
-its version, and anything that couldn't be read, such as for want of a privilege.
+**MongoDB** is read by MaxNines itself, once a [config rule](api-config-rules.md)
+picks it, under **Databases from the agent's config**, one name to a line. A name an
+agent doesn't have reports that it's missing. Nothing of it is read until a rule asks
+for it. The host's metrics page lists each under **Latest databases**: whether it
+answered, whether it's a primary or a replica, its version, and anything that
+couldn't be read, such as for want of a privilege.
 
 The agent keeps one connection to each database open between samples, and opens a
 new one if that stops working. Each of its reads has a 5 second limit, so a busy
@@ -79,7 +80,7 @@ After a database's name in a rule, list anything else to read, which costs more:
 
 | Extra | What it adds |
 |---|---|
-| `sizes` | Each database's size on disk. MySQL adds the binary logs. For PostgreSQL and ClickHouse, turn on their templates' `sizes` queries on their pages instead, and PostgreSQL's `wal_size` |
+| `sizes` | MongoDB only: each database's size on disk. For PostgreSQL, MySQL and ClickHouse, turn on their templates' `sizes` queries on their pages instead, and PostgreSQL's `wal_size` or MySQL's `binary_logs` |
 
 ClickHouse is read over its HTTP interface, where a password goes with every
 request as basic authentication, not as a challenge as the others sign in. So
@@ -112,9 +113,8 @@ sample, so `<key>.up` is as recent as a sample. A statement the database refuses
 database that can't be reached, is shown on the template's and the host's pages until
 it's right again, as [what's going
 wrong](templates.md#where-it-runs-and-whats-going-wrong). Templates can read
-PostgreSQL, MySQL and MariaDB, and ClickHouse so far, not MongoDB. PostgreSQL's and
-ClickHouse's stats are their built-in templates', and the other kinds' are still this
-page's readers'.
+PostgreSQL, MySQL and MariaDB, and ClickHouse so far, not MongoDB. Their stats are
+their built-in templates', and MongoDB's are still read by MaxNines itself.
 What the account may do beyond reading is read too, as [below](#what-the-account-may-do).
 
 ## Hosts without an agent
@@ -125,8 +125,8 @@ host on the **Checks** page, with how it signs in, and tick **Read its health an
 replication**, with any extras. Its stats are charted on the host's metrics page, as
 an agent's are, named after the check, and for the kinds MaxNines reads itself, listed
 under **Latest databases** there. The server keeps one connection open between runs,
-as an agent does. A PostgreSQL or ClickHouse check's stats are its built-in template's,
-read as below.
+as an agent does. A PostgreSQL, MySQL or ClickHouse check's stats are its built-in
+template's, read as below.
 
 A check that reads its stats is read for [templates](#templates) too, as a database in
 an agent's config is: the server runs each template for the check's kind that's for
@@ -294,12 +294,19 @@ their lag this way.
 | **MySQL replica applying**, **relay log size**, **replication error code** | For each channel a replica replicates from. The unnamed one is the database's own row |
 | **MySQL semi-synchronous replication on**, **semi-synchronous replicas**, **commits not acknowledged by a replica** | When semi-synchronous replication is installed. Off while enabled means it fell back to waiting for no one |
 | **MySQL group members**, **group members online**, **group member online**, **group applier queue**, **group certifier queue**, **group conflicts** | Group Replication, as in InnoDB Cluster |
-| **Galera cluster primary**, **cluster size**, **node ready**, **node connected**, **node synced**, **receive queue**, **send queue**, **certification failures**, **paused for flow control** | Galera, as in MariaDB Galera Cluster and Percona XtraDB Cluster |
-| **MySQL binary logs on disk** | With the `sizes` extra |
+| **Galera node in the primary component**, **cluster size**, **node ready**, **node connected**, **node synced**, **receive queue**, **send queue**, **certification failures**, **paused for flow control** | Galera, as in MariaDB Galera Cluster and Percona XtraDB Cluster |
+| **MySQL binary logs on disk** | With the template's `binary_logs` query turned on, where binary logging is |
+| **MySQL seconds behind, as the replica says**, **replica's set delay**, **replication receiver error code**, **applier error code** | What replication lag and the replication error code are worked out from |
+| **MySQL buffer pool read requests**, **reads from disk** | Running totals the buffer pool hit rate is worked out from |
 
-Replication's statements and fields were renamed in MySQL 8.0.22, from `SLAVE` to
-`REPLICA` and `Master` to `Source`, and MariaDB kept most of the old names. Either
-works. A delayed replica's lag leaves out its delay.
+These are the built-in MySQL template's, and it alerts on them itself: down,
+connections running out, a long transaction, replication stopped or failing, a replica
+lagging, a Galera node outside the primary component, and a group member offline.
+Replication is read with `SHOW REPLICA STATUS` on MySQL and `SHOW ALL SLAVES STATUS` on
+MariaDB, each channel a series of its own, labelled by its name, which is empty for the
+unnamed one. A delayed replica's lag leaves out its delay. It's for MySQL 8.0.22 and
+later, which renamed `SLAVE` to `REPLICA` and `Master` to `Source`, and any MariaDB.
+Galera is only read where wsrep is on, as MariaDB reports its status without it too.
 
 ### MongoDB
 
@@ -353,15 +360,11 @@ its name, such as **ClickHouse parts used** for `clickhouse.parts_used`.
 
 ## Good things to alert on
 
-PostgreSQL's and ClickHouse's templates have their alerts already, as their sections
-say. For the other kinds:
+PostgreSQL's, MySQL's and ClickHouse's templates have their alerts already, as their
+sections say. Beyond them:
 
-- **answering** at 0, for each kind in use, such as **MySQL answering**.
-- **connections used** over 80%.
-- **replication lag** over a minute, and **replica receiving** at 0 on a replica.
-- **oldest transaction** over half an hour.
-- **MySQL replication error code** above 0, or **replica applying** at 0.
-- **Galera cluster primary** at 0, or **cluster size** below what it should be.
+- **MongoDB answering** at 0, and **connections used** over 80%.
+- **Galera cluster size** below what it should be.
 - **MongoDB replica set has a primary** at 0, or **members healthy** below the
   set's size.
 - **MongoDB oplog window** under a day.

@@ -613,3 +613,37 @@ fn a_query_can_be_one_show_statement_naming_its_columns() {
         "only for a SHOW statement",
     );
 }
+
+/// Binary logs are only read where they're on: off, the query isn't sent, so there's
+/// nothing for it to say.
+#[test]
+fn the_mysql_template_reads_binary_logs_only_where_they_are_on() {
+    let mut mysql = built_in::all()
+        .unwrap()
+        .into_iter()
+        .find(|one| one.template.key == "mysql")
+        .unwrap()
+        .template;
+    for query in &mut mysql.queries {
+        query.enabled = true;
+    }
+    let sent = |binary_logging: f64, mariadb: f64| -> Vec<String> {
+        let found = json!({
+            "version": "8.4.3",
+            "mariadb": mariadb,
+            "binary_logging": binary_logging,
+        });
+        work::database_work(&mysql, "shop", found.as_object())
+            .queries
+            .into_iter()
+            .map(|query| query.key)
+            .collect()
+    };
+    assert!(sent(1.0, 0.0).contains(&"binary_logs".to_string()));
+    assert!(!sent(0.0, 0.0).contains(&"binary_logs".to_string()));
+    // MySQL's queries and MariaDB's are each sent only to their own.
+    assert!(sent(1.0, 0.0).contains(&"replication".to_string()));
+    assert!(!sent(1.0, 0.0).contains(&"replication_mariadb".to_string()));
+    assert!(sent(1.0, 1.0).contains(&"replication_mariadb".to_string()));
+    assert!(!sent(1.0, 1.0).contains(&"status".to_string()));
+}
