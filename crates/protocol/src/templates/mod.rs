@@ -187,27 +187,34 @@ pub struct Query {
     pub metrics: Vec<Metric>,
 }
 
-/// The only statements a template may run other than a SELECT: MySQL's and
-/// MariaDB's, for what only SHOW says, such as how far behind a replica is.
-pub const SHOW_STATEMENTS: [&str; 5] = [
-    "SHOW REPLICA STATUS",
-    "SHOW SLAVE STATUS",
-    "SHOW ALL REPLICAS STATUS",
-    "SHOW ALL SLAVES STATUS",
-    "SHOW BINARY LOGS",
-];
+/// The first word of a statement, in capitals, after any comments before it.
+pub fn first_keyword(sql: &str) -> String {
+    let mut rest = sql.trim_start();
+    loop {
+        if let Some(line) = rest.strip_prefix("--") {
+            rest = line
+                .split_once('\n')
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else if let Some(block) = rest.strip_prefix("/*") {
+            rest = block
+                .split_once("*/")
+                .map_or("", |(_, after)| after)
+                .trim_start();
+        } else {
+            break;
+        }
+    }
+    let rest = rest.trim_start_matches('(').trim_start();
+    rest.split(|c: char| !c.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+}
 
-/// What a template's statement is: a SHOW statement, and whether it's one of
-/// [`SHOW_STATEMENTS`], or `None` for anything else.
-pub fn show_statement(sql: &str) -> Option<bool> {
-    let words: Vec<String> = sql
-        .trim()
-        .trim_end_matches(';')
-        .split_whitespace()
-        .map(str::to_ascii_uppercase)
-        .collect();
-    (words.first().map(String::as_str) == Some("SHOW"))
-        .then(|| SHOW_STATEMENTS.contains(&words.join(" ").as_str()))
+/// Whether a statement is a SHOW, whose columns aren't known until it runs.
+pub fn is_show(sql: &str) -> bool {
+    first_keyword(sql) == "SHOW"
 }
 
 /// A piece of SQL picked by version, filling `{{ key }}` in a query.

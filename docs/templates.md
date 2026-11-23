@@ -240,8 +240,8 @@ query "checkpoints" {
 `interval` runs a query less often than the agent samples, and `enabled = false`
 ships it turned off.
 
-**How SQL runs.** Each query and discover block has to be one `SELECT`, or for a
-query, one of a few [`SHOW` statements](#show-statements), which saving checks. It
+**How SQL runs.** Each discover block has to be one `SELECT`, and each query one
+`SELECT` or [`SHOW`](#show-statements), which saving checks. It
 runs on its own, as a prepared statement, in a read-only transaction, and the database
 stops it after 5 seconds. On PostgreSQL a statement that worked commits its
 transaction, as nothing in it could write, so PostgreSQL's own count of rollbacks
@@ -253,17 +253,14 @@ allowed to, so give MaxNines a [read-only account](#read-only-database-accounts)
 
 #### SHOW statements
 
-A query is a single `SELECT`, with one exception: some of what MySQL and MariaDB know is
-only said by a `SHOW` statement, such as how far behind a replica is. So a MySQL
-template's query can be one of these, and nothing else:
-
-- `SHOW REPLICA STATUS` and `SHOW SLAVE STATUS`
-- `SHOW ALL REPLICAS STATUS` and `SHOW ALL SLAVES STATUS`, MariaDB's
-- `SHOW BINARY LOGS`
-
-Which ones is checked as a template is saved or imported, and again by the agent or
-server before it runs one. Each runs as a query does: one statement, in a read-only
-transaction on a read-only session, with a time limit.
+A query is one statement: a `SELECT`, or a `SHOW`, any the database takes, as some of
+what a database knows is only said by `SHOW`, such as how far behind a MySQL replica
+is. There's no list of which: what a template can read is up to the account it signs in
+as, which is why MaxNines warns when that account [can do more than
+read](database-stats.md#what-the-account-may-do). Saving or importing a template checks
+it's one statement, and the agent or server checks again that it's a `SELECT` or `SHOW`
+before it runs one. Each runs as any query does: prepared, in a read-only transaction
+on a read-only session, with a time limit, or on ClickHouse as a GET.
 
 What a `SHOW` statement gives isn't known until it runs, so `columns` names each column
 it reads, as a metric or a label, and no other column is read:

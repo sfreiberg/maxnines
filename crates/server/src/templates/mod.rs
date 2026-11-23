@@ -26,8 +26,7 @@ use sqlparser::dialect::{
 use sqlparser::parser::Parser;
 
 use maxnines_protocol::templates::{
-    Alert, Place, Problem, Problems, SHOW_STATEMENTS, Target, Template, filled_sql, is_key,
-    parse_duration, show_statement,
+    Alert, Place, Problem, Problems, Target, Template, filled_sql, is_key, is_show, parse_duration,
 };
 
 use crate::alert_conditions::{Names, Variable};
@@ -155,7 +154,6 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
             found.push((name.clone(), index, column));
         }
     }
-    let mysql = matches!(&template.target, Some(Target::Database(kind)) if kind == "mysql");
     for (index, query) in template.queries.iter().enumerate() {
         let place = Place::Query(index);
         let columns = match query_columns(dialect.as_ref(), query) {
@@ -165,23 +163,12 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
                 continue;
             }
         };
-        if filled_sql(query)
-            .iter()
-            .any(|sql| show_statement(sql).is_some())
-        {
-            if !mysql {
-                problems.push(Problem::new(
-                    place,
-                    "sql",
-                    "is a SHOW statement, which only a MySQL template can run",
-                ));
-            } else if query.columns.is_empty() {
-                problems.push(Problem::new(
-                    place,
-                    "columns",
-                    "has to name the columns a SHOW statement reads, such as lag = \"Seconds_Behind_Source\"",
-                ));
-            }
+        if query.columns.is_empty() && filled_sql(query).iter().any(|sql| is_show(sql)) {
+            problems.push(Problem::new(
+                place,
+                "columns",
+                "has to name the columns a SHOW statement reads, such as lag = \"Seconds_Behind_Source\"",
+            ));
         }
         for label in &query.labels {
             if !columns.contains(label) {
@@ -372,28 +359,19 @@ fn query_columns(
 ) -> Result<Vec<String>, String> {
     let mut all = Vec::new();
     for sql in filled_sql(query) {
-        match show_statement(&sql) {
-            Some(true) => {
-                for name in query.columns.keys() {
-                    if !all.contains(name) {
-                        all.push(name.clone());
-                    }
+        if one_show(dialect, &sql)? {
+            for name in query.columns.keys() {
+                if !all.contains(name) {
+                    all.push(name.clone());
                 }
-                continue;
             }
-            Some(false) => {
-                return Err(format!(
-                    "is a SHOW statement templates can't run: they can only run {}",
-                    SHOW_STATEMENTS.join(", ")
-                ));
-            }
-            None if !query.columns.is_empty() => {
-                return Err(
-                    "names its columns in columns, which is only for a SHOW statement: name them with AS"
-                        .to_string(),
-                );
-            }
-            None => {}
+            continue;
+        }
+        if !query.columns.is_empty() {
+            return Err(
+                "names its columns in columns, which is only for a SHOW statement: name them with AS"
+                    .to_string(),
+            );
         }
         for column in columns(dialect, &sql)? {
             if !all.contains(&column) {
@@ -402,6 +380,21 @@ fn query_columns(
         }
     }
     Ok(all)
+}
+
+/// Whether a statement is one SHOW, which any the database takes can be, as what a
+/// template may read is up to its account. Anything else has to be one SELECT,
+/// which [`columns`] checks.
+fn one_show(dialect: &dyn Dialect, sql: &str) -> Result<bool, String> {
+    if !is_show(sql) {
+        return Ok(false);
+    }
+    let statements =
+        Parser::parse_sql(dialect, sql).map_err(|error| format!("can't be read: {error}"))?;
+    match statements.as_slice() {
+        [one] if one.to_string().to_ascii_uppercase().starts_with("SHOW") => Ok(true),
+        _ => Err("has to be one SELECT or SHOW statement".to_string()),
+    }
 }
 
 /// The names of the columns a `SELECT` gives, which have to be names a metric can

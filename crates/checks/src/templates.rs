@@ -692,6 +692,10 @@ mod tests {
         assert_eq!(session.connections(), 1);
         assert!(session.is_up());
 
+        // A SHOW runs as any statement does.
+        let shown = session.run("SHOW server_version", LIMIT).await.unwrap();
+        assert!(matches!(&shown[0][0].1, Cell::Text(_)), "{shown:?}");
+
         // A statement that runs too long is stopped by the database.
         let error = session.run("SELECT pg_sleep(30)", LIMIT).await.unwrap_err();
         assert!(format!("{error}").contains("statement timeout"), "{error}");
@@ -756,7 +760,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_real_mysql_runs_the_show_statements_templates_may() {
+    async fn a_real_mysql_runs_show_statements() {
         let Some(mut session) = real("MAXNINES_TEST_CHECK_MYSQL", CheckKind::Mysql) else {
             return;
         };
@@ -814,6 +818,8 @@ mod tests {
         assert!(format!("{error}").contains("readonly"), "{error}");
         session.run("SELECT 1 AS one", LIMIT).await.unwrap();
         assert!(session.is_up());
+        let shown = session.run("SHOW DATABASES", LIMIT).await.unwrap();
+        assert!(!shown.is_empty());
     }
 
     #[tokio::test]

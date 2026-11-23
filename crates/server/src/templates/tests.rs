@@ -567,7 +567,7 @@ fn what_discover_blocks_find_is_found_once() {
 }
 
 #[test]
-fn a_mysql_template_can_run_a_few_show_statements_naming_their_columns() {
+fn a_query_can_be_one_show_statement_naming_its_columns() {
     let template = |database: &str, sql: &str, columns: &str| {
         format!(
             r#"template "my" {{
@@ -589,6 +589,10 @@ fn a_mysql_template_can_run_a_few_show_statements_naming_their_columns() {
         query_columns_of(&parsed, &parsed.queries[0]),
         ["channel", "behind"]
     );
+    // Any SHOW the database takes, on any kind of database: what it may read is up to
+    // its account.
+    let any = template("postgres", "SHOW GRANTS", columns);
+    assert_eq!(problems(&any), Vec::<String>::new());
     let refused = |text: String, expected: &str| {
         let found = problems(&text);
         assert!(
@@ -597,12 +601,8 @@ fn a_mysql_template_can_run_a_few_show_statements_naming_their_columns() {
         );
     };
     refused(
-        template("mysql", "SHOW GRANTS", columns),
-        "SHOW statement templates can't run",
-    );
-    refused(
-        template("postgres", "SHOW REPLICA STATUS", columns),
-        "only a MySQL template can run",
+        template("mysql", "SHOW STATUS; DROP TABLE x", columns),
+        "one SELECT or SHOW statement",
     );
     refused(
         template("mysql", "SHOW REPLICA STATUS", ""),

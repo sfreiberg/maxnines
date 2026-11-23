@@ -374,13 +374,16 @@ fn check_sql(key: &str, sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// A statement is a SELECT, or one of the few SHOW statements templates may run,
-/// which is checked again here, as where it runs is the last place it can be.
+/// A statement is one SELECT or one SHOW, which saving checks and is checked again
+/// here, as where it runs is the last place it can be. What it may read is up to
+/// the account it runs as.
 pub fn check_statement(key: &str, sql: &str) -> Result<()> {
     ensure!(
-        super::show_statement(sql) != Some(false),
-        "query {key:?} is a SHOW statement templates can't run: only {} are",
-        super::SHOW_STATEMENTS.join(", ")
+        matches!(
+            super::first_keyword(sql).as_str(),
+            "SELECT" | "WITH" | "SHOW"
+        ),
+        "query {key:?} has to be one SELECT or SHOW statement"
     );
     Ok(())
 }

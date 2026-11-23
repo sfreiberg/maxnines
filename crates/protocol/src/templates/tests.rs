@@ -467,16 +467,19 @@ fn an_error_is_sent_no_longer_than_an_agent_sends_one() {
 }
 
 #[test]
-fn only_a_few_show_statements_can_be_run() {
-    assert_eq!(show_statement("SELECT 1"), None);
-    assert_eq!(show_statement("  show   replica status ;"), Some(true));
-    assert_eq!(show_statement("SHOW ALL SLAVES STATUS"), Some(true));
-    assert_eq!(show_statement("SHOW BINARY LOGS"), Some(true));
-    assert_eq!(show_statement("SHOW GRANTS"), Some(false));
-    assert_eq!(
-        show_statement("SHOW BINARY LOGS; DROP TABLE x"),
-        Some(false)
-    );
-    assert!(work::check_statement("q", "SHOW PROCESSLIST").is_err());
-    assert!(work::check_statement("q", "SHOW REPLICA STATUS").is_ok());
+fn a_statement_is_a_select_or_a_show() {
+    assert!(!is_show("SELECT 1"));
+    assert!(is_show("  show   replica status ;"));
+    assert!(is_show("-- what's behind\n/* note */ SHOW BINARY LOGS"));
+    assert_eq!(first_keyword("(SELECT 1) UNION (SELECT 2)"), "SELECT");
+    for fine in [
+        "SELECT 1",
+        "WITH a AS (SELECT 1) SELECT * FROM a",
+        "SHOW GRANTS",
+    ] {
+        assert!(work::check_statement("q", fine).is_ok(), "{fine}");
+    }
+    for refused in ["DELETE FROM orders", "SET ROLE admin", "CALL rebuild()"] {
+        assert!(work::check_statement("q", refused).is_err(), "{refused}");
+    }
 }
