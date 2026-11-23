@@ -1,0 +1,17 @@
+{% if runs %}
+<div class="table-scroll"><table>
+  <thead><tr><th>{% if by_template %}Template{% else %}Host{% endif %}</th><th>Database</th><th>Discovery found</th><th>Reads</th><th>Going wrong</th></tr></thead>
+  <tbody>
+    {% for run in runs %}
+    <tr>
+      <td>{% if by_template %}<a href="/templates/{{ run.template_id }}">{{ run.template_name }}</a>{% else %}<a href="/hosts/{{ run.host_id }}">{{ run.hostname }}</a>{% endif %}</td>
+      <td>{% if run.database %}<code>{{ run.database }}</code>{% else %}<span class="hint">The host</span>{% endif %}</td>
+      <td>{% if run.found %}{% for found in run.found %}<code class="under">{{ found }}</code>{% endfor %}{% else %}<span class="hint">Nothing yet</span>{% endif %}</td>
+      <td>{% if run.reads %}{% for part in run.reads %}<code class="under">{{ part }}</code>{% endfor %}{% else %}<span class="hint">Nothing yet</span>{% endif %}</td>
+      <td>{% if run.errors %}{% for error in run.errors %}<div class="condition"><span class="badge bad">{{ error.part }}</span> {{ error.message }}<span class="under">Since {{ error.since }}</span></div>{% endfor %}{% else %}<span class="badge good">Nothing</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% if more_runs > 0 %}<p class="hint">And {{ more_runs }} more, which the API lists.</p>{% endif %}
+{% endif %}

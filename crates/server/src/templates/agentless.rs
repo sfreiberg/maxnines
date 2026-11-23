@@ -18,7 +18,9 @@ use anyhow::{Result, anyhow};
 use maxnines_checks::databases::{self as stats, is_database};
 use maxnines_checks::templates::reader::{Reader, Results};
 use maxnines_protocol::Sample;
-use maxnines_protocol::templates::work::{DISCOVERED, Discovered, TemplateWork};
+use maxnines_protocol::templates::work::{
+    DISCOVERED, Discovered, ERRORS, TemplateErrors, TemplateWork,
+};
 use serde_json::{Map, Value};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -26,7 +28,7 @@ use tracing::warn;
 
 use super::hosts::{DatabaseKinds, RunningTemplates};
 use super::values::{LastSent, QueryValues, strip_queries, work_out};
-use super::work::{Discoveries, forget_unread, keep_read, work_for};
+use super::work::{Discoveries, forget_unread, keep_read, keep_read_errors, work_for};
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::Database;
 use crate::remote_checks::RemoteCheck;
@@ -267,7 +269,8 @@ pub struct Saving<'a> {
 }
 
 /// Saves what's been read, as a sample's `entries`, from a host: what discovery
-/// found for what's still read, by `sent`, is kept with the host, and the rest is
+/// found and what's going wrong for what's still read, by `sent`, are kept with the
+/// host, and the rest is
 /// saved as its metrics, with the `value` metrics of `values` worked out.
 pub async fn save_read(
     entries: Map<String, Value>,
@@ -306,6 +309,24 @@ pub async fn save_read(
                 }
             }
             Err(error) => warn!(host_id, %error, "skipping what discovery found"),
+        }
+    }
+    if let Some(said) = sample.metrics.remove(ERRORS) {
+        match serde_json::from_value::<Vec<TemplateErrors>>(said) {
+            Ok(mut said) => {
+                keep_read_errors(&mut said, &lock(sent));
+                if let Err(error) = database
+                    .save_template_errors(&host_id, &said, sample.time)
+                    .await
+                {
+                    warn!(
+                        host_id,
+                        error = format!("{error:#}"),
+                        "saving what's going wrong reading templates failed"
+                    );
+                }
+            }
+            Err(error) => warn!(host_id, %error, "skipping what's going wrong reading templates"),
         }
     }
     if !values.is_empty() {

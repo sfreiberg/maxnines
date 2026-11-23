@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, PoisonError};
 
@@ -9,7 +10,9 @@ use axum::http::HeaderMap;
 use axum::response::Response;
 use ipnet::IpNet;
 use maxnines_protocol::actions::ActionResult;
-use maxnines_protocol::templates::work::{DISCOVERED, Discovered, MAX_WORK, TemplateWork};
+use maxnines_protocol::templates::work::{
+    DISCOVERED, Discovered, ERRORS, MAX_WORK, TemplateErrors, TemplateWork,
+};
 use maxnines_protocol::{
     AgentMessage, COLLECTORS, ProtocolFit, Protocols, RegistrationStatus, ServerMessage, auth,
 };
@@ -31,7 +34,7 @@ use crate::presence::Presence;
 use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
 use crate::templates::values::{LastSent, strip_queries, work_out};
-use crate::templates::work::{forget_unread, keep_read};
+use crate::templates::work::{forget_unread, keep_read, keep_read_errors};
 use crate::times::{self, Timestamp};
 
 /// Far more than real facts need, so one agent can't fill the database.
@@ -329,6 +332,8 @@ enum Job {
     Boot(Timestamp),
     /// What templates' discovery found, as a sample taken at this time said.
     Discovered(Vec<Discovered>, Timestamp),
+    /// What's going wrong reading templates, as a sample taken at this time said.
+    Errors(Vec<TemplateErrors>, Timestamp),
 }
 
 /// Reads from the agent and pings it until the connection ends, returning why.
@@ -480,6 +485,9 @@ async fn do_jobs(
         work: sent_work,
     };
     let mut known_boot = None;
+    // When what's going wrong was last said of each template and database, as
+    // samples the agent kept while it was away come after newer ones.
+    let mut errors_said: HashMap<(String, Option<String>), Timestamp> = HashMap::new();
 
     send_config(&configs, agent, state, &mut sent).await;
     loop {
@@ -519,6 +527,27 @@ async fn do_jobs(
                             error = format!("{error:#}"),
                             "saving what discovery found failed"
                         ),
+                    }
+                }
+                Some(Job::Errors(mut said, at)) => {
+                    keep_read_errors(
+                        &mut said,
+                        &sent.work.lock().unwrap_or_else(PoisonError::into_inner).work,
+                    );
+                    said.retain(|one| {
+                        let key = (one.template.clone(), one.database.clone());
+                        let newer = errors_said.get(&key).is_none_or(|last| *last <= at);
+                        if newer {
+                            errors_said.insert(key, at);
+                        }
+                        newer
+                    });
+                    if let Err(error) = state.database.save_template_errors(&agent.id, &said, at).await {
+                        warn!(
+                            id = agent.id,
+                            error = format!("{error:#}"),
+                            "saving what's going wrong reading templates failed"
+                        );
                     }
                 }
                 Some(Job::Boot(booted_at)) => {
@@ -649,6 +678,7 @@ fn receive(
         Ok(AgentMessage::Sample(mut sample)) => {
             note_boot(&sample, agent, jobs, last_boot);
             note_discovered(&mut sample, agent, jobs);
+            note_errors(&mut sample, agent, jobs);
             let templates = state.database.running_templates();
             if !templates.worked_out().is_empty() {
                 let sent = sent_work.lock().unwrap_or_else(PoisonError::into_inner);
@@ -819,6 +849,34 @@ fn note_discovered(
         warn!(
             id = agent.id,
             "too much waiting on the database, skipping what discovery found"
+        );
+    }
+}
+
+/// Takes what's going wrong reading templates out of a sample, as it's kept with
+/// the host rather than as metrics, and passes it on.
+fn note_errors(sample: &mut maxnines_protocol::Sample, agent: &Agent, jobs: &mpsc::Sender<Job>) {
+    let Some(said) = sample.metrics.remove(ERRORS) else {
+        return;
+    };
+    let said: Vec<TemplateErrors> = match serde_json::from_value(said) {
+        Ok(said) => said,
+        Err(error) => {
+            warn!(id = agent.id, %error, "skipping what's going wrong reading templates");
+            return;
+        }
+    };
+    if said.len() > MAX_WORK {
+        warn!(
+            id = agent.id,
+            "skipping what's going wrong reading templates, as it's too much"
+        );
+        return;
+    }
+    if jobs.try_send(Job::Errors(said, sample.time)).is_err() {
+        warn!(
+            id = agent.id,
+            "too much waiting on the database, skipping what's going wrong reading templates"
         );
     }
 }

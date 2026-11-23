@@ -21,7 +21,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use maxnines_protocol::templates::work::{
-    CounterWork, CountersWork, Discovered, Instances, MAX_INSTANCES, QUERY_FIELD, TemplateWork,
+    CounterWork, CountersWork, Discovered, Instances, MAX_INSTANCES, QUERY_FIELD, TemplateErrors,
+    TemplateWork, error_text, part_name,
 };
 use regex_lite::Regex;
 use serde_json::{Map, Value, json};
@@ -269,6 +270,9 @@ struct HostTemplate {
     /// What was last sent of what discovery found.
     said: Option<Map<String, Value>>,
     counters: Vec<CountersAt>,
+    /// What was last sent of what's going wrong: nothing yet, so the first
+    /// collection says it, even that all's well.
+    said_errors: Option<BTreeMap<String, String>>,
 }
 
 impl HostTemplate {
@@ -301,6 +305,8 @@ pub struct HostRead {
     /// Each template's rows, by its key.
     pub rows: BTreeMap<String, Vec<Value>>,
     pub discovered: Vec<Discovered>,
+    /// What's going wrong, for each template whose errors changed.
+    pub errors: Vec<TemplateErrors>,
 }
 
 impl HostTemplates {
@@ -360,6 +366,7 @@ impl HostTemplates {
                             work: one.clone(),
                             discover_at: vec![(now, None); one.discover.len()],
                             said: None,
+                            said_errors: None,
                             counters: one
                                 .counters
                                 .iter()
@@ -434,6 +441,25 @@ impl HostTemplates {
             }
             if !read_now.is_empty() {
                 read.rows.insert(key.clone(), read_now);
+            }
+            let errors: BTreeMap<String, String> = running
+                .counters
+                .iter()
+                .filter_map(|counters| {
+                    let problem = counters.reader.problem()?;
+                    Some((
+                        part_name("counters", &counters.work.key),
+                        error_text(&problem),
+                    ))
+                })
+                .collect();
+            if running.said_errors.as_ref() != Some(&errors) {
+                read.errors.push(TemplateErrors {
+                    template: key.clone(),
+                    database: None,
+                    errors: errors.clone(),
+                });
+                running.said_errors = Some(errors);
             }
         }
         read
@@ -612,6 +638,30 @@ mod platform {
                 readings.joined = numbered(raw_names(*handle));
             }
             Some(readings)
+        }
+    }
+
+    impl CounterReader {
+        /// What's wrong with reading its counters, if anything: a query Windows
+        /// wouldn't open, or counters it doesn't have.
+        pub fn problem(&self) -> Option<String> {
+            if self.query.is_none() {
+                return Some("Windows wouldn't open a query for its counters".to_string());
+            }
+            let missing: Vec<&str> = self
+                .counters
+                .iter()
+                .filter(|(_, _, handle)| handle.is_none())
+                .map(|(_, path, _)| path.as_str())
+                .collect();
+            match missing.as_slice() {
+                [] => None,
+                [one] => Some(format!("Windows has no counter {one}")),
+                [first, rest @ ..] => Some(format!(
+                    "Windows has no counter {first}, nor {} more of its counters",
+                    rest.len()
+                )),
+            }
         }
     }
 
@@ -856,6 +906,10 @@ mod platform {
         }
 
         pub fn read(&mut self) -> Option<Readings> {
+            None
+        }
+
+        pub fn problem(&self) -> Option<String> {
             None
         }
     }

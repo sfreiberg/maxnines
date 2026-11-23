@@ -36,6 +36,18 @@ pub const DISCOVERED: &str = "discovered";
 /// for each of `overprivileged`, `superuser`, `writes`, `manages` and
 /// `server_files`.
 pub const ACCOUNTS: &str = "database_accounts";
+/// What a sample calls what's going wrong reading templates: [`TemplateErrors`],
+/// each sent when it changes.
+pub const ERRORS: &str = "template_errors";
+/// What going wrong reaching a database, or opening counters, is called.
+pub const CONNECTING: &str = "connecting";
+/// What going wrong reading what a database's account may do is called.
+pub const ACCOUNT: &str = "account";
+/// The longest an error is sent.
+pub const MAX_ERROR_LEN: usize = 1024;
+/// The most errors one template sends for one database or the host: one for each
+/// statement and counters block, and for connecting and for the account.
+pub const MAX_ERRORS: usize = MAX_STATEMENTS + 2;
 /// What each of a template's rows says it's from: the key of the query or counters
 /// block. It can't be a metric's, as a key starts with a letter, and the server takes
 /// it out before the rows are stored.
@@ -193,6 +205,34 @@ pub struct QueryWork {
     /// one found.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub omit: Vec<String>,
+}
+
+/// What's going wrong reading one template for one database, or on the host, as a
+/// sample sends it: each thing that went wrong the last time it ran, by what it is,
+/// [`CONNECTING`], [`ACCOUNT`] or a part as [`part_name`] says it, with what it said.
+/// It's sent whenever it changes, and when a reading starts, so nothing at all means
+/// all's well.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemplateErrors {
+    pub template: String,
+    /// The database, for a template that's for a kind of database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
+    pub errors: BTreeMap<String, String>,
+}
+
+/// What a part is called among a template's errors: `query sessions`.
+pub fn part_name(kind: &str, key: &str) -> String {
+    format!("{kind} {key}")
+}
+
+/// An error as it's sent: no longer than [`MAX_ERROR_LEN`] characters, an ellipsis
+/// ending one that was longer.
+pub fn error_text(error: &str) -> String {
+    match error.char_indices().nth(MAX_ERROR_LEN - 1) {
+        Some((at, _)) => format!("{}…", &error[..at]),
+        None => error.to_string(),
+    }
 }
 
 /// What one discovery found for one database, or on the host, as a sample sends it.

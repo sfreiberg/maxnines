@@ -18,7 +18,7 @@ use serde_json::{Map, Value};
 
 use maxnines_protocol::templates::work::{
     CounterWork, CountersWork, DiscoverWork, Discovered, Instances, JoinWork, MAX_WORK, QueryWork,
-    RegistryWork, TemplateWork,
+    RegistryWork, TemplateErrors, TemplateWork,
 };
 use maxnines_protocol::templates::{
     Counters, DEFAULT_DISCOVERY_INTERVAL, Metric, Query, Target, Template, Version, fill,
@@ -26,7 +26,7 @@ use maxnines_protocol::templates::{
 };
 use tracing::warn;
 
-use super::hosts::{DatabaseKinds, RunningTemplates};
+use super::hosts::{Assigned, DatabaseKinds, RunningTemplates};
 use crate::metrics::{INSTANCE_LABEL, series_values};
 use crate::models::Database;
 use crate::rule_engine::{Condition, Host};
@@ -47,14 +47,22 @@ pub fn instance_of(database: Option<&str>) -> String {
 /// Keeps only what discovery found for what's read, by `work`, as a sample can come
 /// after what's read changed.
 pub fn keep_read(found: &mut Vec<Discovered>, work: &[TemplateWork]) {
-    found.retain(|one| {
-        work.iter()
-            .any(|read| read.template == one.template && read.database == one.database)
-    });
+    found.retain(|one| is_read(work, &one.template, one.database.as_ref()));
 }
 
-/// Forgets what discovery found on a host for anything not in `work`, what the
-/// host reads now.
+/// Keeps only what's said to be going wrong for what's read, by `work`, as
+/// [`keep_read`] does what discovery found.
+pub fn keep_read_errors(said: &mut Vec<TemplateErrors>, work: &[TemplateWork]) {
+    said.retain(|one| is_read(work, &one.template, one.database.as_ref()));
+}
+
+fn is_read(work: &[TemplateWork], template: &str, database: Option<&String>) -> bool {
+    work.iter()
+        .any(|read| read.template == template && read.database.as_ref() == database)
+}
+
+/// Forgets what discovery found on a host, and what's going wrong reading it, for
+/// anything not in `work`, what the host reads now.
 pub async fn forget_unread(database: &Database, host_id: &str, work: &[TemplateWork]) {
     let reads: Vec<(String, String)> = work
         .iter()
@@ -65,6 +73,13 @@ pub async fn forget_unread(database: &Database, host_id: &str, work: &[TemplateW
             host_id,
             error = format!("{error:#}"),
             "forgetting what discovery found failed"
+        );
+    }
+    if let Err(error) = database.forget_template_errors(host_id, &reads).await {
+        warn!(
+            host_id,
+            error = format!("{error:#}"),
+            "forgetting what's going wrong reading templates failed"
         );
     }
 }
@@ -183,30 +198,7 @@ pub fn work_for(
 ) -> Vec<TemplateWork> {
     let mut work = Vec::new();
     for assigned in templates.for_host(host) {
-        let template = assigned.template();
-        match &template.target {
-            Some(Target::Database(_)) => {
-                let instances = assigned.instances(host.facts, databases);
-                for database in instances.into_iter().flatten() {
-                    let found = discoveries.get(&(assigned.id(), database.clone()));
-                    work.push(database_work(template, &database, found));
-                }
-            }
-            // Once on the host, for what it reads there, which is the registry and
-            // performance counters, as SQL needs a database: only on Windows, and a
-            // template with nothing for the agent to read there isn't sent.
-            Some(Target::Service(_) | Target::Os(_)) | None => {
-                let windows = host.facts["os"]["family"].as_str() == Some("windows");
-                if !windows || assigned.instances(host.facts, databases).is_empty() {
-                    continue;
-                }
-                let found = discoveries.get(&(assigned.id(), ON_HOST.to_string()));
-                let one = host_work(template, found);
-                if !one.discover.is_empty() || !one.counters.is_empty() {
-                    work.push(one);
-                }
-            }
-        }
+        work.extend(assigned_work(assigned, host, databases, discoveries));
     }
     // An agent takes so much at once, so the rest isn't sent rather than all of it
     // being refused.
@@ -219,6 +211,42 @@ pub fn work_for(
         work.truncate(MAX_WORK);
     }
     work
+}
+
+/// What's read for one template, on and for this host, of its `databases`.
+pub fn assigned_work(
+    assigned: &Assigned,
+    host: &Host,
+    databases: &DatabaseKinds,
+    discoveries: &Discoveries,
+) -> Vec<TemplateWork> {
+    let template = assigned.template();
+    match &template.target {
+        Some(Target::Database(_)) => assigned
+            .instances(host.facts, databases)
+            .into_iter()
+            .flatten()
+            .map(|database| {
+                let found = discoveries.get(&(assigned.id(), database.clone()));
+                database_work(template, &database, found)
+            })
+            .collect(),
+        // Once on the host, for what it reads there, which is the registry and
+        // performance counters, as SQL needs a database: only on Windows, and a
+        // template with nothing for the agent to read there isn't sent.
+        Some(Target::Service(_) | Target::Os(_)) | None => {
+            let windows = host.facts["os"]["family"].as_str() == Some("windows");
+            if !windows || assigned.instances(host.facts, databases).is_empty() {
+                return Vec::new();
+            }
+            let found = discoveries.get(&(assigned.id(), ON_HOST.to_string()));
+            let one = host_work(template, found);
+            match one.discover.is_empty() && one.counters.is_empty() {
+                true => Vec::new(),
+                false => vec![one],
+            }
+        }
+    }
 }
 
 /// What's read of one database for a template for its kind, where discovery found

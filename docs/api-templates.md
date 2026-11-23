@@ -4,7 +4,9 @@
 its parts, not as text, so comments and layout in HCL you send aren't kept, and the HCL
 given back is written out from the parts. The built-in ones can be turned on and off,
 and their alerts, discover blocks, queries and counters blocks changed by making your
-own copy of one, but not changed or deleted themselves, which gives `422`.
+own copy of one, but not changed or deleted themselves, which gives `422`. Changing a
+template's discover blocks, queries and counters blocks on their own, and where each
+template runs, are under [Template parts](api-template-parts.md).
 
 | Field | Description |
 | --- | --- |
@@ -214,39 +216,6 @@ Deletes your copy of a built-in or imported template's alert, as deleting the co
 [alert rule](api-alert-rules.md#delete-an-alert-rule) does, so the template's own rule
 is checked again, taking the copy's open alerts, silences and maintenance windows with
 it. It also forgets whether you chose the alert on or off. `404` if there's neither.
-
-## Change a template's discover block, query or counters block
-
-`GET`, `PUT` and `DELETE /api/v1/templates/{id}/discover/{key}`, `/queries/{key}` and `/counters/{key}`
-
-`GET` gives the part as it runs, field by field as `template` has it, with `copied`,
-`enabled_choice` and `original_changed_at` as in `choices`, and for your own copy, the
-template's own as `template_part`.
-
-`PUT` changes it. The body is the part as `GET` gives it; its key is the address's,
-whatever the body says, and whether it's on isn't changed here. It's checked in the
-template, in place of what it changes, so a column one of the template's alerts uses
-can't go, and everything wrong is in the `error`. For a built-in or imported
-template, the first change makes your own copy, used in place of the template's own
-from then on, which newer versions leave alone; later changes update the copy, and a
-body that says what the template's own does deletes it. For a template of your own,
-the template itself is changed. Gives back `204`.
-
-```sh
-curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"sql": "SELECT count(*) AS tills FROM tills WHERE open", "interval": "1m", "enabled": true}' \
-  "$MAXNINES_URL/api/v1/templates/4/queries/tills"
-```
-
-`DELETE`, or `POST …/reset`, puts a built-in or imported template's part back: it
-deletes your copy and forgets whether you chose it on or off. `404` if there's
-neither.
-
-`POST /api/v1/templates/{id}/queries/{key}/enable` and `…/disable`, and the same for
-`counters`, turn a query or counters block on or off: your choice for a built-in or
-imported template, which newer versions leave alone, or the template itself for one of
-your own. A discover block can't be turned off, as what it finds is waited on.
 
 ## What an upgrade changed
 

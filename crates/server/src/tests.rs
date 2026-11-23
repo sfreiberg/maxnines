@@ -12,6 +12,7 @@ mod proxies;
 mod roles;
 mod sign_ins;
 mod template_parts;
+mod template_runs;
 mod templates;
 mod two_factor;
 mod users;

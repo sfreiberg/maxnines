@@ -65,6 +65,8 @@ erDiagram
     template_discoveries ||--o{ template_registry_reads : "reads"
     templates ||--o{ template_notices : "notes"
     templates ||--o{ template_queries : "queries"
+    hosts ||--o{ template_errors : "goes wrong reading"
+    templates ||--o{ template_errors : "goes wrong in"
     template_queries ||--o{ template_fills : "fills"
     template_fills ||--o{ template_fill_versions : "by version"
     templates ||--o{ template_counters : "counts"
@@ -244,6 +246,15 @@ erDiagram
         int position
         text when_condition
         text text
+    }
+    template_errors {
+        int id PK
+        string host_id FK
+        int template_id FK
+        string database_name "empty for one on the host"
+        string part "connecting, account, or a part such as query sessions"
+        text message
+        timestamp since "when it first said this"
     }
     template_queries {
         int id PK
@@ -679,6 +690,7 @@ erDiagram
 | `alert_rules`, `alert_rule_channels` | What raises an alert, and who hears of it. A deleted rule is kept, marked by `deleted_at`, so its alerts still name it. A template's alert is a rule too. A built-in or imported template's rule isn't people's to change, and is rewritten by a newer version, `enabled` included, which is what it ships: what someone chose instead is in `enabled_choice`, which a newer version never writes; someone changing it makes a copy of their own, a second rule whose `replaces_id` points at it, which is used in its place until it's deleted. Making or deleting a copy hands the open alerts, silences and maintenance windows of one to the other |
 | `templates` | What MaxNines watches for in something it monitors: by `origin`, the built-in ones, which the server writes each time it starts, imported ones, which importing a newer version rewrites the same way, and people's own. HCL is only how they come in and go out. A deleted one is kept, marked by `deleted_at`, as its rules point at it |
 | `template_renames`, `template_services`, `template_counter_sets`, `template_registry_values`, `template_query_labels`, `template_counters_excludes`, `template_counters_groups`, `template_metric_states` | The short lists and maps of a template and its parts, a row to an item, in order by `position`, written over the rows they have by the item's name as the parts are. A copy of a part brings its items with it, so they have no `replaces_id` of their own. None of a template is kept as JSON |
+| `template_errors` | What's going wrong reading each template for each database a host reads, or on the host with an empty `database_name`: a row to each thing that went wrong last time, by `part`, with the `message` the database or Windows gave and `since`, when it first said it. Agents, and the server for hosts with no agent, say it whenever it changes, and what they say replaces what was kept for that template and database, so only what's wrong now is kept; the same message keeps its `since`. A sample older than one already said of the same template and database, as one an agent kept while away, is let go. It's forgotten with what discovery found when the host no longer reads the template there, and goes with its host or template |
 | `template_discoveries`, `template_registry_reads`, `template_notices`, `template_queries`, `template_fills`, `template_fill_versions`, `template_counters`, `template_metrics` | A template's parts, one row to a block or entry, each with its key as the HCL has it and its `position` among the others. A save, an import or a start writes each part over the row with its key, within its template, query, counters or fill, so a row keeps its `id` while its part is there, and only the rows of parts that are gone are deleted. A fill's versions are matched by `version`, and a part given another key is a new part. They go with their template, query, counters or fill. Each has a `replaces_id` for someone's own copy of a built-in or imported template's part, as alert rules have. A copy of a discover block, query or counters block is a second row, with the rows of its own fills, versions, metrics and items, whose `replaces_id` points at the template's own, used in its place until it's reset; `original_changed_at` on it says when a newer version changed the part it copies, and a part a newer version drops takes its copy with it. Whether a query or counters block is on is only ever the template's own row's `enabled` and `enabled_choice`, which a newer version never writes |
 | `alerts` | Every alert, open or resolved. Its rule's name and its host's are read from them, so it shows what they're called now. A host's alerts go with it |
 | `alert_rule_actions` | The actions each rule runs on an alert's host, and when in the alert's life |

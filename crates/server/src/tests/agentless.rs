@@ -1443,6 +1443,9 @@ async fn a_database_check_reads_what_templates_have_it_read() {
                interval = "1s"
                sql      = "SELECT count(*) AS sessions FROM pg_stat_activity"
              }
+             query "broken" {
+               sql = "SELECT count(*) AS missing FROM no_such_table"
+             }
            }"#,
         &json!({}),
         &crate::catalog::Catalog::built_in(),
@@ -1499,13 +1502,37 @@ async fn a_database_check_reads_what_templates_have_it_read() {
         );
     }
 
+    // What goes wrong is kept as an agent's is.
+    let broken = loop {
+        let errors = database.template_errors(Some(&id), None).await.unwrap();
+        if let Some(error) = errors
+            .into_iter()
+            .find(|error| error.part == "query broken")
+        {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no error for the broken query");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        now += TimeDelta::seconds(11);
+        run_due(&mut scheduler, now).await;
+    };
+    assert_eq!(broken.database.as_deref(), Some("orders"));
+    assert!(broken.message.contains("no_such_table"), "{broken:?}");
+
     // A check that doesn't read stats has nothing read, and what discovery found
-    // through it is forgotten.
+    // and what went wrong through it are forgotten.
     let path = format!("/api/v1/remote-checks/{}", added["id"]);
     let (status, body) = api(&server, "PUT", &path, &check(false)).await;
     assert_eq!(status, 204, "{body}");
     run_due(&mut scheduler, now + TimeDelta::seconds(11)).await;
     assert!(database.discoveries(&id).await.unwrap().is_empty());
+    assert!(
+        database
+            .template_errors(Some(&id), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Reads the throwaway PostgreSQL, named as `host:port username`, as the server's

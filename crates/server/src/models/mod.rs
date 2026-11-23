@@ -51,6 +51,8 @@ mod stats;
 mod template;
 mod template_counters;
 mod template_discovery;
+mod template_error;
+mod template_errors;
 mod template_fill;
 mod template_fill_version;
 mod template_host;

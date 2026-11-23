@@ -432,6 +432,25 @@ changed but not turned off, as what it finds is what the rest waits on.
 For a template of **your own**, changing a part changes the template itself, and
 **Disable** clears its **Enabled** box.
 
+## Where it runs, and what's going wrong
+
+A template's page lists **Where it runs**: each host it's on and for, each database it
+reads there, or the host itself for one that runs once on it, what its discovery last
+found there, and the discover blocks, queries and counters blocks it reads now, which
+is what that host's agent, or the server for a host with no agent, is sent. A host's
+page lists the same for every template on it, under **Templates**. Anything going
+wrong comes first, with what the database or Windows said and since when:
+
+- `connecting`: the database can't be reached or signed in to, or the agent's config
+  has no database by that name;
+- `account`: what the account may do couldn't be read;
+- a discover block, query or counters block, by its key: the database refused the
+  SQL, as for a table that isn't there or a view the account can't read, or Windows
+  has no such counter.
+
+The agent says it whenever it changes, and once it's right again it goes. Each page
+lists at most 100; the API lists them all.
+
 ## Names, keys and upgrades
 
 A built-in template is known by its key, so an upgrade can rename it or change

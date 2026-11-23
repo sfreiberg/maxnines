@@ -26,7 +26,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use maxnines_protocol::templates::work::{
-    ACCOUNTS, DISCOVERED, Discovered, TemplateWork, collector_of,
+    ACCOUNT, ACCOUNTS, CONNECTING, DISCOVERED, Discovered, ERRORS, TemplateErrors, TemplateWork,
+    collector_of, error_text, part_name,
 };
 use serde_json::{Map, Value, json};
 use tokio::runtime::Handle;
@@ -50,6 +51,23 @@ struct Read {
     /// What each database's account may do beyond reading, by the database's name,
     /// once it's been read.
     accounts: BTreeMap<String, Privileges>,
+    /// What's going wrong, for each template and database whose errors changed.
+    errors: Vec<TemplateErrors>,
+}
+
+impl Read {
+    /// Says what's going wrong reading a template for a database now, in place of
+    /// anything said of it that hasn't been taken yet.
+    fn say_errors(&mut self, template: &str, database: &str, errors: BTreeMap<String, String>) {
+        self.errors.retain(|said| {
+            (said.template.as_str(), said.database.as_deref()) != (template, Some(database))
+        });
+        self.errors.push(TemplateErrors {
+            template: template.to_string(),
+            database: Some(database.to_string()),
+            errors,
+        });
+    }
 }
 
 /// How long after failing to reach a database it's tried again, at first, and at
@@ -65,13 +83,9 @@ pub const FIRST_RETRY: Duration = Duration::from_millis(100);
 pub const MAX_RETRY: Duration = Duration::from_millis(400);
 /// What's run to see a database still answers when nothing else has for a while.
 const ALIVE: &str = "SELECT 1";
-/// What errors reaching a database are noted under.
-const CONNECTING: &str = "connecting";
 /// How often what the account may do is read again while connected, so taking a
 /// privilege away shows within minutes.
 const ACCOUNT_EVERY: Duration = Duration::from_secs(5 * 60);
-/// What errors reading what the account may do are noted under.
-const ACCOUNT: &str = "account";
 
 /// What one database's task is told to do: its work, and how often a sample is.
 type Told = (TemplateWork, Duration);
@@ -120,6 +134,13 @@ impl Results {
                 })
             });
             entries.insert(ACCOUNTS.to_string(), accounts.collect());
+        }
+        let errors = std::mem::take(&mut read.errors);
+        if !errors.is_empty() {
+            let errors = errors
+                .iter()
+                .filter_map(|one| serde_json::to_value(one).ok());
+            entries.insert(ERRORS.to_string(), errors.collect());
         }
         let found = std::mem::take(&mut read.discovered);
         if !found.is_empty() {
@@ -231,6 +252,7 @@ impl Reader {
                 }
                 Err(error) => {
                     let error = format!("{error:#}");
+                    let mut read = self.results.lock();
                     if self.unreadable.get(&key) != Some(&error) {
                         warn!(
                             template,
@@ -238,9 +260,11 @@ impl Reader {
                             error,
                             "a template can't read a database"
                         );
+                        let errors = BTreeMap::from([(CONNECTING.to_string(), error_text(&error))]);
+                        read.say_errors(template, name, errors);
                         self.unreadable.insert(key.clone(), error);
                     }
-                    self.results.lock().up.insert(key, false);
+                    read.up.insert(key, false);
                 }
             }
         }
@@ -393,6 +417,9 @@ async fn run(
     // What was last said discovery found.
     let mut said: Option<Map<String, Value>> = None;
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
+    // What was last said is going wrong: nothing yet, so the first round says it,
+    // even that all's well, in place of anything said before it started.
+    let mut said_errors: Option<BTreeMap<String, String>> = None;
     let mut connections = 0;
     let mut retry_at = start;
     let mut retry = FIRST_RETRY;
@@ -460,12 +487,13 @@ async fn run(
                     Ok(rows) => {
                         block.found = Some(discovered(&rows));
                         discovered_now = true;
-                        errors.remove(&discover.key);
+                        errors.remove(&part_name("discover", &discover.key));
                         block.at = now + discover.interval;
                         block.retry = FIRST_RETRY;
                     }
                     Err(error) => {
-                        note(work, &database, &discover.key, &error, &mut errors);
+                        let part = part_name("discover", &discover.key);
+                        note(work, &database, &part, &error, &mut errors);
                         // Sooner than its interval, as what it finds is waited on.
                         block.at = now + block.retry.min(discover.interval);
                         block.retry = (block.retry * 2).min(MAX_RETRY);
@@ -481,9 +509,12 @@ async fn run(
                 match session.run(&query.sql, TIMEOUT).await {
                     Ok(read) => {
                         rows.extend(metric_rows(&read, query, &database, &mut at.totals));
-                        errors.remove(&query.key);
+                        errors.remove(&part_name("query", &query.key));
                     }
-                    Err(error) => note(work, &database, &query.key, &error, &mut errors),
+                    Err(error) => {
+                        let part = part_name("query", &query.key);
+                        note(work, &database, &part, &error, &mut errors);
+                    }
                 }
                 check_at = now + every;
             }
@@ -518,6 +549,12 @@ async fn run(
             read.up.insert(key.clone(), session.is_up());
             if let Some(account) = account {
                 read.accounts.insert(database.clone(), account);
+            }
+            // Only what's still read, as what it's told to read may have changed.
+            errors.retain(|part, _| still_read(work, part));
+            if said_errors.as_ref() != Some(&errors) {
+                read.say_errors(&key.0, &key.1, errors.clone());
+                said_errors = Some(errors.clone());
             }
             if say && let Some(found) = &found {
                 read.discovered
@@ -559,6 +596,20 @@ async fn run(
     }
 }
 
+/// Whether what an error is about is still read by `work`.
+fn still_read(work: &TemplateWork, part: &str) -> bool {
+    part == CONNECTING
+        || part == ACCOUNT
+        || work
+            .discover
+            .iter()
+            .any(|discover| part == part_name("discover", &discover.key))
+        || work
+            .queries
+            .iter()
+            .any(|query| part == part_name("query", &query.key))
+}
+
 /// Says what went wrong with a statement, once until it changes, as it's likely
 /// to go wrong the same way every time.
 fn note(
@@ -568,7 +619,7 @@ fn note(
     error: &anyhow::Error,
     errors: &mut BTreeMap<String, String>,
 ) {
-    let text = format!("{error:#}");
+    let text = error_text(&format!("{error:#}"));
     if errors.get(key) != Some(&text) {
         warn!(
             template = work.template,
@@ -694,6 +745,56 @@ mod tests {
             json!([{ "labels": { "instance": "nowhere" }, "up": 0 }])
         );
         assert!(output.get(DISCOVERED).is_none());
+        assert_eq!(
+            output[ERRORS],
+            json!([{
+                "template": "pg",
+                "database": "nowhere",
+                "errors": { "connecting": "no database by that name" },
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn what_goes_wrong_is_sent_as_it_changes_and_cleared_once_right() {
+        let Some(database) = real(None) else {
+            return;
+        };
+        let every = Duration::from_millis(200);
+        let mut broken = work("main");
+        broken.queries[0].key = "broken".to_string();
+        broken.queries[0].sql = "SELECT nope AS commits".to_string();
+        let mut reader = reading(&[broken], every, &database);
+        let results = reader.results();
+        // First that nothing's wrong yet, as nothing has run, then the query's error.
+        let says_broken = |output: &Value| {
+            output[ERRORS].as_array().is_some_and(|said| {
+                said.iter()
+                    .any(|one| one["errors"].get("query broken").is_some())
+            })
+        };
+        let output = take_until(&results, says_broken).await;
+        let said = output[ERRORS].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            (&said["template"], &said["database"]),
+            (&json!("pg"), &json!("main"))
+        );
+        let error = said["errors"]["query broken"].as_str().unwrap_or_default();
+        assert!(error.contains("nope"), "{output}");
+
+        // Said once, not every round.
+        sleep(every * 3).await;
+        assert!(Value::from(results.take()).get(ERRORS).is_none());
+
+        // Right again: all's well is said.
+        reader.update(&[work("main")], every, &Handle::current(), |_| {
+            Ok(database.clone())
+        });
+        let output = take_until(&results, |output| output.get(ERRORS).is_some()).await;
+        assert_eq!(
+            output[ERRORS],
+            json!([{"template": "pg", "database": "main", "errors": {}}])
+        );
     }
 
     /// Passes connections on to `to` once `forward` is set, and closes them until

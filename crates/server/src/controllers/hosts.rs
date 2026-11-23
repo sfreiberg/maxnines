@@ -619,6 +619,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(checks) => checks,
         Err(error) => return server_error(&error),
     };
+    let (runs, more_runs) = match super::templates::run_rows(&state, Some(&id), None).await {
+        Ok(runs) => runs,
+        Err(error) => return server_error(&error),
+    };
     let reach = state.presence.reach(&host);
     let health = Health::of(reach, &here);
     let mut row = row(&state, host.clone(), Some(&flat), reach, health);
@@ -630,6 +634,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("host", &row)
         .with("pages", &pages)
         .with("checks", &checks)
+        .with("runs", &runs)
+        .with("more_runs", &more_runs)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)

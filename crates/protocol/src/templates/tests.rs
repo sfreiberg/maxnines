@@ -450,3 +450,13 @@ fn only_the_hosts_own_registry_keys_are_read() {
     assert_eq!(local_machine_key("HKLM"), None);
     assert_eq!(local_machine_key(r"HKLM\"), None);
 }
+
+#[test]
+fn an_error_is_sent_no_longer_than_an_agent_sends_one() {
+    use super::work::{MAX_ERROR_LEN, error_text};
+    assert_eq!(error_text("refused"), "refused");
+    let long = "é".repeat(MAX_ERROR_LEN * 2);
+    let sent = error_text(&long);
+    assert_eq!(sent.chars().count(), MAX_ERROR_LEN);
+    assert!(sent.ends_with('…'));
+}

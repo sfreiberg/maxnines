@@ -16,7 +16,7 @@ use serde_json::json;
 use maxnines_protocol::templates::{Problem, Problems, Template, parse, to_hcl};
 
 use super::template_form::{TemplateForm, field_errors};
-use super::{CsrfForm, Page, local_date, server_error};
+use super::{CsrfForm, Page, local_date, local_time, server_error};
 use crate::alerting::{AlertRule, AlertRuleInput, NameTaken};
 use crate::app_state::AppState;
 use crate::metrics::{INSTANCE_LABEL, Kind};
@@ -67,6 +67,8 @@ pub fn api_routes() -> Router<AppState> {
             put(api_override_alert).delete(api_reset_alert),
         )
         .route("/templates/{id}/alerts/{key}/reset", post(api_reset_alert))
+        .route("/templates/{id}/runs", get(api_runs))
+        .route("/hosts/{id}/templates", get(api_host_runs))
 }
 
 /// What a template runs for, in words.
@@ -331,6 +333,101 @@ fn reads(part: &Part) -> String {
     }
 }
 
+/// Where a template runs, as a page lists it.
+#[derive(Serialize)]
+pub(super) struct RunRow {
+    host_id: String,
+    hostname: String,
+    template_id: i64,
+    template_name: String,
+    /// The database, or empty for the host itself.
+    database: String,
+    /// What discovery found, `name = value`.
+    found: Vec<String>,
+    /// What's read there now, as `query sessions`.
+    reads: Vec<String>,
+    errors: Vec<RunErrorRow>,
+}
+
+#[derive(Serialize)]
+pub(super) struct RunErrorRow {
+    part: String,
+    message: String,
+    since: String,
+}
+
+/// The most places a page lists that a template runs.
+pub(super) const MOST_RUNS: usize = 100;
+
+/// Where templates run, as a page lists it, those going wrong first, and how many
+/// more there are than it lists.
+pub(super) async fn run_rows(
+    state: &AppState,
+    host_id: Option<&str>,
+    template_id: Option<i64>,
+) -> Result<(Vec<RunRow>, usize)> {
+    let runs = crate::templates::runs::runs(state, host_id, template_id).await?;
+    let more = runs.len().saturating_sub(MOST_RUNS);
+    let rows = runs
+        .into_iter()
+        .take(MOST_RUNS)
+        .map(|run| {
+            let mut reads: Vec<String> = Vec::new();
+            reads.extend(run.discover.iter().map(|key| format!("discover {key}")));
+            reads.extend(run.queries.iter().map(|key| format!("query {key}")));
+            reads.extend(run.counters.iter().map(|key| format!("counters {key}")));
+            RunRow {
+                host_id: run.host_id,
+                hostname: run.hostname,
+                template_id: run.template_id,
+                template_name: run.template_name,
+                database: run.database.unwrap_or_default(),
+                found: run
+                    .found
+                    .iter()
+                    .map(|(name, value)| match value {
+                        serde_json::Value::String(text) => format!("{name} = {text}"),
+                        value => format!("{name} = {value}"),
+                    })
+                    .collect(),
+                reads,
+                errors: run
+                    .errors
+                    .into_iter()
+                    .map(|error| RunErrorRow {
+                        part: error.part,
+                        message: error.message,
+                        since: local_time(error.since),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    Ok((rows, more))
+}
+
+async fn api_runs(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
+    match state.database.get_template(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return super::api::server_error(&error),
+    }
+    match crate::templates::runs::runs(&state, None, Some(id)).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(error) => super::api::server_error(&error),
+    }
+}
+
+async fn api_host_runs(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match crate::templates::runs::runs(&state, Some(&id), None).await {
+        Ok(runs) => Json(runs).into_response(),
+        Err(error) => super::api::server_error(&error),
+    }
+}
+
 /// A card of a template's page listing one kind of its parts.
 #[derive(Serialize)]
 struct PartSection {
@@ -516,14 +613,15 @@ async fn show_page(
             return Ok(None);
         };
         let alerts = state.database.template_alerts(stored.id).await?;
+        let runs = run_rows(state, None, Some(stored.id)).await?;
         let as_run = state
             .database
             .template_as_run(stored.id)
             .await?
             .unwrap_or_else(|| stored.template.clone());
-        anyhow::Ok(Some((stored, alerts, as_run)))
+        anyhow::Ok(Some((stored, alerts, as_run, runs)))
     };
-    let (stored, alerts, as_run) = match loaded.await {
+    let (stored, alerts, as_run, (runs, more_runs)) = match loaded.await {
         Ok(Some(found)) => found,
         Ok(None) => return not_found(state, token),
         Err(error) => return server_error(&error),
@@ -563,6 +661,8 @@ async fn show_page(
         .with("source", &stored.hcl())
         .with("alerts", &alert_rows(&alerts))
         .with("part_sections", &part_sections(&stored, &as_run))
+        .with("runs", &runs)
+        .with("more_runs", &more_runs)
         .with("metrics", &metric_rows(&as_run));
     match typed {
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),

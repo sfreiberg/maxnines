@@ -35,6 +35,7 @@
   - [Maintenance windows](api-maintenance-windows.md)
   - [Alert rules](api-alert-rules.md)
   - [Templates](api-templates.md)
+  - [Template parts](api-template-parts.md)
   - [Notification channels](api-notification-channels.md)
   - [Remote checks](api-remote-checks.md)
   - [Map](api-map.md)

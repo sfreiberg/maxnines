@@ -168,6 +168,15 @@
 </section>
 {% endif %}
 
+{% if runs %}
+<section class="card">
+  <h2>Templates</h2>
+  <p class="hint">What each template on and for this host reads here, what its discovery found, and anything going wrong.</p>
+  {% set by_template = true %}
+  {% include "templates/_runs.html" %}
+</section>
+{% endif %}
+
 <div class="split">
   <section class="card">
     <h2>Status</h2>

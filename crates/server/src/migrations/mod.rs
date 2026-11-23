@@ -1253,6 +1253,54 @@ impl MigrationTrait for CreateTables {
             None,
         )
         .await?;
+        // What's going wrong reading each template for each database on each host,
+        // or on the host, empty for that: each thing that went wrong, with what it
+        // said and since when it's said it.
+        manager
+            .create_table(
+                Table::create()
+                    .table(TemplateErrors::Table)
+                    .col(id(TemplateErrors::Id))
+                    .col(
+                        ColumnDef::new(TemplateErrors::HostId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(TemplateErrors::TemplateId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(exact_text(backend, TemplateErrors::DatabaseName, 255).not_null())
+                    .col(exact_text(backend, TemplateErrors::Part, 300).not_null())
+                    .col(ColumnDef::new(TemplateErrors::Message).text().not_null())
+                    .col(moment(backend, TemplateErrors::Since).not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_errors_host_id")
+                            .from(TemplateErrors::Table, TemplateErrors::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_template_errors_template_id")
+                            .from(TemplateErrors::Table, TemplateErrors::TemplateId)
+                            .to(Templates::Table, Templates::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        index_of(
+            manager,
+            Unique,
+            "idx_template_errors_host_template_database_part",
+            "template_errors",
+            "host_id, template_id, database_name, part",
+            None,
+        )
+        .await?;
         // A rule is only ever marked deleted, as its alerts keep it, and its name is
         // used once among those that aren't. A template's alert is a rule, which for
         // a built-in template belongs to the server: someone changing it makes a copy
@@ -2368,6 +2416,18 @@ enum TemplateInstanceValues {
     Name,
     Value,
     ValueType,
+}
+
+#[derive(Iden)]
+enum TemplateErrors {
+    Table,
+    Id,
+    HostId,
+    TemplateId,
+    DatabaseName,
+    Part,
+    Message,
+    Since,
 }
 
 #[derive(Iden)]

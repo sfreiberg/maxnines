@@ -53,6 +53,14 @@
   {% endif %}
 </section>
 
+<section class="card">
+  <h2>Where it runs</h2>
+  <p class="hint">Each host it's on and for, each database it reads there, what its discovery found and what it reads now, which is what the host is sent, and anything going wrong.</p>
+  {% set by_template = false %}
+  {% include "templates/_runs.html" %}
+  {% if not runs %}<p class="empty">It runs nowhere yet: it's off, or no host it's for has what it runs for.</p>{% endif %}
+</section>
+
 {% for section in part_sections %}
 {% set rows = section.rows %}
 {% if rows %}

@@ -18,7 +18,7 @@ use std::time::Duration;
 use anyhow::Result;
 use maxnines_checks::templates::reader::{Reader, Results};
 use maxnines_collectors::host_templates::HostTemplates;
-use maxnines_protocol::templates::work::{DISCOVERED, TemplateWork, collector_of};
+use maxnines_protocol::templates::work::{DISCOVERED, ERRORS, TemplateWork, collector_of};
 use serde_json::{Value, json};
 
 use crate::background::runtime;
@@ -98,14 +98,27 @@ impl Collector for TemplateCollector {
                 all.extend(rows);
             }
         }
-        if !host.discovered.is_empty() {
-            let found = entries.entry(DISCOVERED).or_insert_with(|| json!([]));
-            if let Value::Array(all) = found {
-                all.extend(
-                    host.discovered
-                        .into_iter()
-                        .filter_map(|one| serde_json::to_value(one).ok()),
-                );
+        for (entry, said) in [
+            (
+                DISCOVERED,
+                host.discovered
+                    .into_iter()
+                    .filter_map(|one| serde_json::to_value(one).ok())
+                    .collect::<Vec<Value>>(),
+            ),
+            (
+                ERRORS,
+                host.errors
+                    .into_iter()
+                    .filter_map(|one| serde_json::to_value(one).ok())
+                    .collect(),
+            ),
+        ] {
+            if said.is_empty() {
+                continue;
+            }
+            if let Value::Array(all) = entries.entry(entry).or_insert_with(|| json!([])) {
+                all.extend(said);
             }
         }
         Ok(match entries.is_empty() {
@@ -148,5 +161,16 @@ mod tests {
             json!([{ "labels": { "instance": "nowhere" }, "up": 0 }])
         );
         assert!(output.get(DISCOVERED).is_none());
+        // Why, once, until it changes.
+        assert_eq!(
+            output[ERRORS],
+            json!([{
+                "template": "pg",
+                "database": "nowhere",
+                "errors": { "connecting": "the agent's config has no database by that name" },
+            }])
+        );
+        let again = collector.collect().unwrap();
+        assert!(again.get(ERRORS).is_none(), "{again}");
     }
 }
