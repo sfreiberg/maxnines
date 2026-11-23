@@ -651,9 +651,16 @@ mod tests {
         let error = session
             .run("SELECT SLEEP(30) AS slept FROM DUAL", LIMIT)
             .await;
-        // MySQL stops a SELECT that runs too long, and says it was interrupted.
+        // MySQL stops a SELECT that runs too long, and says it was interrupted, as
+        // MariaDB does in its own words.
         match error {
-            Err(error) => assert!(format!("{error}").contains("execution time"), "{error}"),
+            Err(error) => {
+                let text = format!("{error}");
+                assert!(
+                    text.contains("execution time") || text.contains("max_statement_time"),
+                    "{text}"
+                );
+            }
             Ok(rows) => assert_eq!(discovered(&rows)["slept"], 1.0, "SLEEP says 1 when stopped"),
         }
     }
