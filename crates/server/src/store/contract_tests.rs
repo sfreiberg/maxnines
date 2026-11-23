@@ -917,6 +917,10 @@ fn new_metrics_read_what_the_agent_sends() {
             "records": 2, "packet_loss_percent": 20.0,
         },
         { "name": "db", "up": 0, "error": "couldn't connect" },
+        {
+            "name": "cache", "up": 1, "hit_rate_percent": 75.0, "evictions": 3,
+            "memory_used_bytes": 16, "memory_limit_bytes": 64, "connections": 7,
+        },
     ]);
     write_metric(&mut store, "a", 20_000, "checks", checks);
     let services = json!([{ "name": "nginx", "running": 1, "state": "active" }]);
@@ -960,6 +964,11 @@ fn new_metrics_read_what_the_agent_sends() {
     assert_eq!(value("check.status", "site"), Some(200.0));
     assert_eq!(value("check.records", "site"), Some(2.0));
     assert_eq!(value("check.packet_loss", "site"), Some(20.0));
+    assert_eq!(value("check.hit_rate", "cache"), Some(75.0));
+    assert_eq!(value("check.evictions", "cache"), Some(3.0));
+    assert_eq!(value("check.memory_used", "cache"), Some(16.0));
+    assert_eq!(value("check.memory_usage", "cache"), Some(25.0));
+    assert_eq!(value("check.connections", "cache"), Some(7.0));
     assert_eq!(value("service.running", "nginx"), Some(1.0));
     assert_eq!(value("file.exists", "/b"), Some(1.0));
     assert_eq!(value("file.exists", "/gone"), Some(0.0));

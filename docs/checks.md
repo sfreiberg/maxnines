@@ -17,6 +17,7 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **PostgreSQL** (`postgres`) | `host:port` | That it answers as PostgreSQL, or that an account can sign in |
 | **MySQL or MariaDB** (`mysql`) | `host:port` | Its version, from its greeting, or that an account can sign in |
 | **Redis** (`redis`) | `host:port` | That it answers PING, or that an account can sign in, and its version |
+| **Memcached** (`memcached`) | `host:port` | Its version, connections, memory used against its limit, hit rate and evictions |
 | **MongoDB** (`mongodb`) | `host:port` | That it answers as MongoDB, or that an account can sign in, and its version |
 | **ClickHouse** (`clickhouse`) | `host:port`, its HTTP port | That it answers its ping, or that an account can sign in, and its version |
 | **SSH** (`ssh`) | `host:port` | Its host key and the ways it offers to sign in, or that an account can sign in |
@@ -37,7 +38,7 @@ named after what the check reaches, in lower case:
 | Kind | Named after | Example target | Host's name |
 |---|---|---|---|
 | `http` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
-| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3` | What's before the port | `db1.internal:5432` | `db1.internal` |
+| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3` | What's before the port | `db1.internal:5432` | `db1.internal` |
 | `dns` | The name it looks up | `example.com` | `example.com` |
 | `ping` | The host it pings | `192.0.2.7` | `192.0.2.7` |
 
@@ -78,6 +79,27 @@ not when a router answers that it can't be reached. Pings that went unanswered
 show in its packet loss. On Windows MaxNines sends the pings itself.
 On Linux, macOS and FreeBSD it runs the system's own `ping`, which every account can
 use there, and pings the name's IPv4 address if it has one.
+
+## Memcached
+
+A Memcached check asks for Memcached's `stats` in its plain-text protocol, and reports:
+
+| Field | Chart | What it is |
+|---|---|---|
+| `server_version` | | Memcached's version |
+| `connections` | **Open connections** | Connections it has open, the check's own included |
+| `memory_used_bytes`, `memory_limit_bytes` | **Cache memory used**, **Cache memory used of its limit** | What its keys take, and what they're allowed (`-m`) |
+| `hit_rate_percent` | **Cache hit rate** | Of the reads since it started, the share it had the key for |
+| `evictions` | **Cache evictions** | Keys dropped to make room since it started, which grows when it's too small |
+
+A check keeps nothing between runs, so the hit rate and evictions are since Memcached
+last started, not since the last run. A sudden drop in the hit rate shows best on a
+Memcached that's been up a while.
+
+It never signs in: Memcached only does that with SASL over its binary protocol, which
+the check doesn't speak, so a Memcached that needs it doesn't answer `stats` and
+counts as down. Tick **Use TLS from the start** for a Memcached started with TLS
+(`-Z`), and its certificate is read as a website's is.
 
 ## Domain expiry
 

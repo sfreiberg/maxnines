@@ -872,7 +872,7 @@ async fn page(
                 },
                 tone: if signed_in == Some(false) { "bad" } else { "" },
             });
-        } else if input.check.kind.signs_in() {
+        } else if input.check.kind.signs_in() || result["server_version"].is_string() {
             tiles.push(Tile {
                 label: "Server",
                 value: result["server_version"]

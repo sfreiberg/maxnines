@@ -558,8 +558,8 @@ pub struct Check {
     /// database the account belongs to. Defaults to `admin`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub database: Option<String>,
-    /// mysql, redis, mongodb and clickhouse: connect over TLS, which they don't
-    /// offer on their own. For ClickHouse, that's HTTPS.
+    /// mysql, redis, memcached, mongodb and clickhouse: connect over TLS, which
+    /// they don't offer on their own. For ClickHouse, that's HTTPS.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
     /// ssh: the host key's SHA-256 fingerprint, as `ssh-keygen -l` prints it, such
@@ -583,6 +583,7 @@ pub enum CheckKind {
     Postgres,
     Mysql,
     Redis,
+    Memcached,
     Mongodb,
     Clickhouse,
     Ssh,
@@ -604,7 +605,7 @@ impl CheckKind {
     /// Every kind this build can run.
     /// In the order people are offered them. `Unknown` stays the last variant, which
     /// a test relies on to check that nothing's missing here.
-    pub const KNOWN: [Self; 14] = [
+    pub const KNOWN: [Self; 15] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -613,6 +614,7 @@ impl CheckKind {
         Self::Postgres,
         Self::Mysql,
         Self::Redis,
+        Self::Memcached,
         Self::Mongodb,
         Self::Clickhouse,
         Self::Ssh,
@@ -631,6 +633,7 @@ impl CheckKind {
             Self::Postgres => "postgres",
             Self::Mysql => "mysql",
             Self::Redis => "redis",
+            Self::Memcached => "memcached",
             Self::Mongodb => "mongodb",
             Self::Clickhouse => "clickhouse",
             Self::Ssh => "ssh",
@@ -746,6 +749,7 @@ impl Check {
             | CheckKind::Postgres
             | CheckKind::Mysql
             | CheckKind::Redis
+            | CheckKind::Memcached
             | CheckKind::Mongodb
             | CheckKind::Clickhouse
             | CheckKind::Ssh
@@ -788,6 +792,7 @@ impl Check {
                 CheckKind::Postgres,
                 CheckKind::Mysql,
                 CheckKind::Redis,
+                CheckKind::Memcached,
                 CheckKind::Mongodb,
                 CheckKind::Clickhouse,
                 CheckKind::Smtp,
@@ -807,6 +812,7 @@ impl Check {
                 CheckKind::Postgres,
                 CheckKind::Mysql,
                 CheckKind::Redis,
+                CheckKind::Memcached,
                 CheckKind::Mongodb,
                 CheckKind::Clickhouse,
                 CheckKind::Smtp,
@@ -1687,6 +1693,7 @@ mod tests {
             | CheckKind::Postgres
             | CheckKind::Mysql
             | CheckKind::Redis
+            | CheckKind::Memcached
             | CheckKind::Mongodb
             | CheckKind::Clickhouse
             | CheckKind::Ssh

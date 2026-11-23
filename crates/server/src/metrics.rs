@@ -832,6 +832,66 @@ pub const METRICS: &[StaticMetric] = &[
         },
         chart: ShowChart::WithData,
     },
+    // Memcached's own figures, from its stats. A check keeps nothing between runs,
+    // so hits and evictions are counted since Memcached last started.
+    StaticMetric {
+        name: "check.hit_rate",
+        title: "Cache hit rate",
+        unit: Unit::Percent,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.hit_rate_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "check.memory_used",
+        title: "Cache memory used",
+        unit: Unit::Bytes,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.memory_used_bytes"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "check.memory_usage",
+        title: "Cache memory used of its limit",
+        unit: Unit::Percent,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Percent {
+                part: "$.memory_used_bytes",
+                whole: "$.memory_limit_bytes",
+            },
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "check.evictions",
+        title: "Cache evictions",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.evictions"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "check.connections",
+        title: "Open connections",
+        unit: Unit::Number,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.connections"),
+        },
+        chart: ShowChart::WithData,
+    },
     StaticMetric {
         name: "service.running",
         title: "Services running",

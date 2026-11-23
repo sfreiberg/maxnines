@@ -7,12 +7,15 @@
 
 pub mod databases;
 mod mail;
+mod memcached;
 pub mod openmetrics;
 #[cfg(windows)]
 mod ping;
 mod rdap;
 mod sign_in;
 pub mod templates;
+#[cfg(test)]
+mod test_tls;
 
 pub use sign_in::Credentials;
 
@@ -93,6 +96,7 @@ pub fn host_reached(check: &Check) -> String {
         | CheckKind::Postgres
         | CheckKind::Mysql
         | CheckKind::Redis
+        | CheckKind::Memcached
         | CheckKind::Mongodb
         | CheckKind::Clickhouse
         | CheckKind::Ssh
@@ -163,6 +167,15 @@ struct Findings {
     domain_expires_at: Option<DateTime<Utc>>,
     domain_days_left: Option<i64>,
     domain_error: Option<String>,
+    /// memcached: since it started, the share of reads it had the key for, and how
+    /// many keys it's dropped to make room.
+    hit_rate_percent: Option<f64>,
+    evictions: Option<u64>,
+    /// memcached: the memory its keys take, and how much they're allowed.
+    memory_used_bytes: Option<u64>,
+    memory_limit_bytes: Option<u64>,
+    /// memcached: how many connections it has open, this one included.
+    connections: Option<u64>,
     packet_loss_percent: Option<f64>,
     rtt_min_secs: Option<f64>,
     rtt_max_secs: Option<f64>,
@@ -218,6 +231,7 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Postgres => sign_in::check_postgres(check, credentials, &mut findings).await,
             CheckKind::Mysql => sign_in::check_mysql(check, credentials, &mut findings).await,
             CheckKind::Redis => sign_in::check_redis(check, credentials, &mut findings).await,
+            CheckKind::Memcached => memcached::check_memcached(check, &mut findings).await,
             CheckKind::Mongodb => sign_in::check_mongodb(check, credentials, &mut findings).await,
             CheckKind::Clickhouse => {
                 sign_in::check_clickhouse(check, credentials, &mut findings).await
