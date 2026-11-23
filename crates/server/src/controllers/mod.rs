@@ -263,6 +263,8 @@ pub fn app(state: AppState) -> Router {
         // Open to all, so a form being filled in isn't lost to a login that ran out.
         .merge(update_notice::routes())
         .merge(health::routes())
+        // Scheduled work pings these with a token of its own, never signing in.
+        .merge(crate::heartbeats::routes())
         .merge(app_sign_ins::app_routes())
         .nest(api::BASE_PATH, api::routes(state.clone()))
         .layer(middleware::from_fn_with_state(state.clone(), note_source))

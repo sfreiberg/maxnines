@@ -32,21 +32,27 @@
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
-      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% else %}FTP or FTPS{% endif %}</option>
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% elif kind == "ftp" %}FTP or FTPS{% else %}Heartbeat (pinged by scheduled work){% endif %}</option>
       {% endfor %}
     </select>
   </label>
 
-  <label>Target
-    <input type="text" name="target" value="{{ check.target }}" required maxlength="255" spellcheck="false">
+  <label class="not-for-heartbeat">Target
+    <input type="text" name="target" value="{{ check.target }}" maxlength="255" spellcheck="false">
     <small>A web address for websites, a host name for DNS and ping, and <code>host:port</code> for the rest, such as <code>db.example.com:5432</code>.</small>
   </label>
 
   <label>Run every (seconds)
-    <input type="number" name="interval_secs" value="{{ check.interval_secs }}" min="10" max="86400" required>
+    <input type="number" name="interval_secs" value="{{ check.interval_secs }}" min="10" max="2678400" required>
+    <small class="for-heartbeat">For a heartbeat, how often the work runs, and so should ping: from a minute to 31 days, such as 86400 for every day.</small>
   </label>
 
-  <label>Timeout (seconds)
+  <label class="for-heartbeat">Grace time (seconds)
+    <input type="number" name="grace_secs" value="{{ check.grace_secs }}" min="0" max="604800">
+    <small>How much later than that a ping can come before it's down, for work that starts late or takes a while. Leave empty for none.</small>
+  </label>
+
+  <label class="not-for-heartbeat">Timeout (seconds)
     <input type="number" name="timeout_secs" value="{{ check.timeout_secs }}" min="1" max="60">
     <small>Leave empty for 10 seconds.</small>
   </label>

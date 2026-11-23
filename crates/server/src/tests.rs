@@ -8,6 +8,7 @@ mod built_in_rules;
 mod dashboards;
 mod docs;
 mod events;
+mod heartbeats;
 mod proxies;
 mod roles;
 mod sign_ins;
@@ -259,6 +260,7 @@ async fn start_with_heartbeat(
         csrf: CsrfConfig::default(),
         web_url: "http://site.test".into(),
         sign_ins: Arc::default(),
+        pings: Arc::default(),
         require_two_factor: Arc::default(),
         pending_sign_ins: Arc::default(),
         health_limit,

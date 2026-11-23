@@ -29,6 +29,7 @@ use crate::dashboard_variables::{self, Picks, Variable};
 use crate::dashboards::{Placed, WidgetInput, check_layout, check_name};
 use crate::events::EventInput;
 use crate::facts::unflatten;
+use crate::heartbeats;
 use crate::locations::{LocationRuleInput, check_rule};
 use crate::maintenance::MaintenanceWindowInput;
 use crate::metrics::{SeriesResult, TimeRange, Unit};
@@ -185,6 +186,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
                 .put(update_remote_check)
                 .delete(delete_remote_check),
         )
+        .route("/remote-checks/{id}/ping-address", post(new_ping_address))
         .route(
             "/location-rules",
             get(list_location_rules).post(create_location_rule),
@@ -2042,6 +2044,9 @@ struct RemoteCheckView {
     host_id: String,
     check: maxnines_protocol::Check,
     interval_secs: u64,
+    /// For a heartbeat: how late a ping can be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grace_secs: Option<u64>,
     enabled: bool,
     read_stats: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2087,6 +2092,7 @@ impl RemoteCheckView {
             host_id: input.host_id,
             check: input.check,
             interval_secs: input.interval.as_secs(),
+            grace_secs: input.grace.map(|grace| grace.as_secs()),
             enabled: input.enabled,
             read_stats: input.read_stats,
             extras: input.extras,
@@ -2157,7 +2163,18 @@ async fn create_remote_check(
         .await
     {
         Ok((id, host_id)) => {
-            let added = json!({ "id": id, "host_id": host_id });
+            let mut added = json!({ "id": id, "host_id": host_id });
+            // Whoever adds a heartbeat needs its address, and only they may see it.
+            match state.database.get_remote_check(id).await {
+                Ok(Some(RemoteCheck {
+                    ping_token: Some(token),
+                    ..
+                })) => {
+                    added["ping_url"] = json!(heartbeats::ping_url(&state.web_url, &token));
+                }
+                Ok(_) => {}
+                Err(error) => return server_error(&error),
+            }
             (StatusCode::CREATED, Json(added)).into_response()
         }
         Err(error) if error.is::<NameTaken>() => refused(&error),
@@ -2191,6 +2208,19 @@ async fn update_remote_check(
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) if error.is::<NameTaken>() => refused(&error),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Gives a heartbeat a new address, so the old one stops working, and says what it
+/// is. It's never shown otherwise, as reading a check needs less than changing one.
+async fn new_ping_address(State(state): State<AppState>, UrlPath(id): UrlPath<i64>) -> Response {
+    match state.database.new_ping_token(id).await {
+        Ok(Some(token)) => {
+            let url = heartbeats::ping_url(&state.web_url, &token);
+            Json(json!({ "ping_url": url })).into_response()
+        }
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
     }
 }

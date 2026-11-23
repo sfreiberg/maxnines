@@ -225,6 +225,8 @@ button.danger:hover { border-color: var(--bad); background: var(--bad-surface); 
 .tablebox { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; }
 /* A table inside a card scrolls on its own when it's wider than a phone, rather than widening the page. */
 .table-scroll { overflow-x: auto; }
+/* A heartbeat's address breaks anywhere rather than widening the page. */
+.ping-url { overflow-wrap: anywhere; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 12px 18px; text-align: left; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; white-space: nowrap; }
@@ -604,6 +606,8 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mongodb"]:checked)) .for-database { display: none; }
 .remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="redis"]:checked)):not(:has(option[value="memcached"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)):not(:has(option[value="smtp"]:checked)):not(:has(option[value="imap"]:checked)):not(:has(option[value="pop3"]:checked)):not(:has(option[value="ftp"]:checked)) .for-tls-option { display: none; }
 .remote-check:not(:has(option[value="ssh"]:checked)) .for-ssh { display: none; }
+.remote-check:not(:has(option[value="heartbeat"]:checked)) .for-heartbeat { display: none; }
+.remote-check:has(option[value="heartbeat"]:checked) .not-for-heartbeat { display: none; }
 .remote-check:not(:has(select[name="host_id"] option[value=""]:checked)) .for-new-host { display: none; }
 .remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)) .for-stats { display: none; }
 .remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="redis"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)):not(:has(option[value="ssh"]:checked)):not(:has(option[value="smtp"]:checked)):not(:has(option[value="imap"]:checked)):not(:has(option[value="pop3"]:checked)):not(:has(option[value="ftp"]:checked)) .for-sign-in { display: none; }

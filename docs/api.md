@@ -105,7 +105,7 @@ Each part has a page of its own:
 | [Templates](api-templates.md) | What MaxNines watches for in what it monitors, as HCL, with their alerts and what's changed of them |
 | [Template parts](api-template-parts.md) | A template's discover blocks, queries and counters blocks changed on their own, and where each template runs and what's going wrong there |
 | [Notification channels](api-notification-channels.md) | Where notifications go, and testing them |
-| [Remote checks](api-remote-checks.md) | Checks the server runs against other sites |
+| [Remote checks](api-remote-checks.md) | Checks the server runs against other sites, and heartbeats that scheduled work pings |
 | [Map](api-map.md) | Where hosts are, and the rules that place them |
 | [Server](api-server.md) | The server's own status and history |
 | [Health](api-health.md) | Whether the server is up, for load balancers and uptime monitors |

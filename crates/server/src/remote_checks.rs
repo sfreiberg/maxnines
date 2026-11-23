@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, warn};
 
+use crate::heartbeats::{self, Pings};
 use crate::models::Database;
 use crate::presence::{Presence, Reached};
 use crate::registration::{HostState, Registry};
@@ -42,6 +43,12 @@ const TICK: Duration = Duration::from_secs(5);
 const MIN_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_INTERVAL: Duration = Duration::from_secs(86_400);
 
+/// How often a heartbeat can be expected, from cron's finest to monthly work.
+const MIN_PERIOD: Duration = Duration::from_secs(60);
+const MAX_PERIOD: Duration = Duration::from_secs(31 * 86_400);
+/// How late a heartbeat's ping can be.
+const MAX_GRACE: Duration = Duration::from_secs(7 * 86_400);
+
 /// How many checks run at once. Anything over this waits its turn.
 pub const MAX_RUNNING: usize = 32;
 
@@ -51,6 +58,10 @@ pub struct RemoteCheck {
     pub id: i64,
     #[serde(flatten)]
     pub input: RemoteCheckInput,
+    /// A heartbeat's token, which the address it's pinged at holds. Only those who
+    /// can change the check are shown it, and it's kept out of the audit log.
+    #[serde(skip)]
+    pub ping_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,9 +71,18 @@ pub struct RemoteCheckInput {
     #[serde(skip_deserializing)]
     pub host_id: String,
     pub check: Check,
-    /// How often it runs.
+    /// How often it runs, or for a heartbeat, how often it should be pinged.
     #[serde(rename = "interval_secs", with = "maxnines_protocol::time::seconds")]
     pub interval: Duration,
+    /// For a heartbeat: how much later than its interval a ping can come before
+    /// it's down. None is none.
+    #[serde(
+        rename = "grace_secs",
+        with = "maxnines_protocol::time::optional_seconds",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub grace: Option<Duration>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// For a database: also read its health and replication, as an agent reads
@@ -279,12 +299,26 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
         input.check.interval.is_none(),
         "a remote check's interval goes beside the check, as interval_secs"
     );
+    let heartbeat = input.check.kind == CheckKind::Heartbeat;
+    let (shortest, longest) = if heartbeat {
+        (MIN_PERIOD, MAX_PERIOD)
+    } else {
+        (MIN_INTERVAL, MAX_INTERVAL)
+    };
     ensure!(
-        (MIN_INTERVAL..=MAX_INTERVAL).contains(&input.interval),
+        (shortest..=longest).contains(&input.interval),
         "the interval has to be from {} to {} seconds",
-        MIN_INTERVAL.as_secs(),
-        MAX_INTERVAL.as_secs()
+        shortest.as_secs(),
+        longest.as_secs()
     );
+    if let Some(grace) = input.grace {
+        ensure!(heartbeat, "only a heartbeat has a grace time");
+        ensure!(
+            grace <= MAX_GRACE,
+            "the grace time can be at most {} seconds",
+            MAX_GRACE.as_secs()
+        );
+    }
     ensure!(
         !input.read_stats || is_database(input.check.kind),
         "only database checks can read a database's stats"
@@ -381,6 +415,26 @@ pub struct Scheduler {
     readers: HashMap<i64, StatsReader>,
     /// What templates have read through those checks.
     templates: AgentlessTemplates,
+    /// Each heartbeat that's on, by ID.
+    watched: HashMap<i64, Watched>,
+    /// When the scheduler started, which a heartbeat never pinged counts from.
+    started_at: Timestamp,
+    /// Whether it's yet to look at the checks, so what it finds is what was there
+    /// when the server started.
+    first_pass: bool,
+}
+
+/// How a heartbeat is being watched.
+struct Watched {
+    input: RemoteCheckInput,
+    /// When it began being watched as it is now, which a run that's due counts
+    /// from if that's later than its last ping: since it was added, changed or
+    /// resumed. Nothing for one there when the server started, so a restart never
+    /// gives a run that's late more time.
+    since: Option<Timestamp>,
+    /// When its result was last saved, whether it was up then, and when it had
+    /// last been pinged.
+    saved: Option<(Timestamp, bool, Option<Timestamp>)>,
 }
 
 impl Scheduler {
@@ -401,6 +455,9 @@ impl Scheduler {
             next_run: HashMap::new(),
             readers: HashMap::new(),
             templates: AgentlessTemplates::default(),
+            watched: HashMap::new(),
+            started_at: times::now(),
+            first_pass: true,
         }
     }
 
@@ -427,6 +484,17 @@ impl Scheduler {
         self.results.keep_only(&ids);
         self.next_run.retain(|id, _| ids.contains(id));
         self.keep_readers(&checks);
+        let watching: BTreeSet<i64> = checks
+            .iter()
+            .filter(|check| is_heartbeat(check) && check.input.enabled)
+            .map(|check| check.id)
+            .collect();
+        self.watched.retain(|id, _| watching.contains(id));
+        let pings = if watching.is_empty() {
+            HashMap::new()
+        } else {
+            self.database.heartbeat_pings().await?
+        };
 
         // A host with no agent is as present as its checks and pages say.
         let agentless: BTreeMap<String, String> = self.registry.read(|hosts| {
@@ -456,6 +524,15 @@ impl Scheduler {
 
         let mut started = Vec::new();
         for check in checks {
+            if is_heartbeat(&check) {
+                if let Some(hostname) = agentless.get(&check.input.host_id)
+                    && check.input.enabled
+                {
+                    let pings = pings.get(&check.id).cloned().unwrap_or_default();
+                    self.watch(&check, hostname.clone(), &pings, now).await;
+                }
+                continue;
+            }
             let due = self
                 .next_run
                 .get(&check.id)
@@ -478,7 +555,55 @@ impl Scheduler {
             };
             started.push(self.start(check, hostname, slot));
         }
+        self.first_pass = false;
         Ok(started)
+    }
+
+    /// Works out how a heartbeat is now, and saves that when it's changed, when it's
+    /// been pinged, and otherwise every so often, so its charts and its host carry
+    /// on between pings however far apart they are.
+    async fn watch(
+        &mut self,
+        check: &RemoteCheck,
+        hostname: String,
+        pings: &Pings,
+        now: Timestamp,
+    ) {
+        let first_pass = self.first_pass;
+        let watched = self.watched.entry(check.id).or_insert_with(|| Watched {
+            input: check.input.clone(),
+            since: (!first_pass).then_some(now),
+            saved: None,
+        });
+        if watched.input != check.input {
+            watched.input = check.input.clone();
+            watched.since = Some(now);
+        }
+        let since = watched.since.unwrap_or(match pings.pinged_at {
+            // Its last ping is what counts.
+            Some(_) => Timestamp::MIN_UTC,
+            None => self.started_at,
+        });
+        let result = heartbeats::status(check, pings, since, now);
+        let up = result["up"] == 1;
+        let due = watched.saved.is_none_or(|(saved_at, was_up, pinged_at)| {
+            was_up != up
+                || pinged_at != pings.pinged_at
+                || now - saved_at >= heartbeats::REPORT_EVERY
+        });
+        if !due {
+            return;
+        }
+        watched.saved = Some((now, up, pings.pinged_at));
+        keep(
+            check,
+            hostname,
+            result,
+            &self.writer,
+            &self.results,
+            &self.presence,
+        )
+        .await;
     }
 
     /// A reader for each enabled check that reads stats, made again when its
@@ -572,7 +697,6 @@ pub async fn run(
     results: &LatestResults,
     presence: &Presence,
 ) {
-    let host_id = &check.input.host_id;
     // A password or key named as an environment variable is read each time, so
     // a changed one is used without restarting.
     let result = match check.input.sign_in.credentials() {
@@ -581,12 +705,30 @@ pub async fn run(
         }
         Err(why) => maxnines_checks::failed_report(&check.input.check, &why),
     };
+    keep(check, hostname, result, writer, results, presence).await;
+}
+
+/// Keeps what a check found: as its latest result, as what's known of its host,
+/// and in the metrics store.
+pub async fn keep(
+    check: &RemoteCheck,
+    hostname: String,
+    result: Value,
+    writer: &mpsc::Sender<WriterCommand>,
+    results: &LatestResults,
+    presence: &Presence,
+) {
+    let host_id = &check.input.host_id;
     results.set(check.id, result.clone());
     // One that's turned off says nothing about whether its host is there.
     if check.input.enabled {
         presence.reached(host_id, Reached::Check(check.id), result["up"] == 1);
     }
     save(writer, host_id.clone(), hostname, "checks", json!([result])).await;
+}
+
+fn is_heartbeat(check: &RemoteCheck) -> bool {
+    check.input.check.kind == CheckKind::Heartbeat
 }
 
 async fn save(
@@ -625,7 +767,28 @@ mod tests {
             read_stats: false,
             extras: Vec::new(),
             sign_in: Default::default(),
+            grace: None,
         }
+    }
+
+    #[test]
+    fn a_heartbeat_is_expected_from_every_minute_to_monthly_with_some_grace() {
+        let mut heartbeat = input(Duration::from_secs(3600));
+        heartbeat.check = Check::new("backup", CheckKind::Heartbeat, "");
+        heartbeat.grace = Some(Duration::from_secs(300));
+        check_input(&heartbeat).unwrap();
+        heartbeat.interval = MAX_PERIOD;
+        check_input(&heartbeat).unwrap();
+        heartbeat.interval = Duration::from_secs(30);
+        assert!(check_input(&heartbeat).is_err());
+        heartbeat.interval = MIN_PERIOD;
+        heartbeat.grace = Some(MAX_GRACE + Duration::from_secs(1));
+        assert!(check_input(&heartbeat).is_err());
+
+        // Only a heartbeat has a grace time.
+        let mut site = input(Duration::from_secs(60));
+        site.grace = Some(Duration::from_secs(60));
+        assert!(check_input(&site).is_err());
     }
 
     #[test]

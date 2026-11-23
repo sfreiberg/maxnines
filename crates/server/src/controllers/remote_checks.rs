@@ -20,15 +20,17 @@ use super::hosts::{described, maintenance_choices, maintenance_length};
 use super::metrics::{
     CheckRow, RangeParams, check_row, one_series, range_links, selected_range, time_range,
 };
-use super::{CsrfForm, Page, recorded_by, server_error, viewer_zone};
+use super::{CsrfForm, Page, recorded_by, server_error, signed_in_user, viewer_zone};
 use crate::alerting::NameTaken;
 use crate::app_state::{AppState, CheckHost};
 use crate::check_history;
+use crate::heartbeats;
 use crate::host_filter;
 use crate::metric_charts::{self, Chart, Frame};
 use crate::metrics::{self, Metric, Series, SeriesResult, TimeRange, Unit};
 use crate::registration::HostState;
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn, SignInWith};
+use crate::roles::Role;
 use crate::silences::{ActiveSilences, SilenceInput};
 use crate::times::{self, Timestamp};
 
@@ -40,6 +42,7 @@ pub fn routes() -> Router<AppState> {
         .route("/checks/{id}", get(show).post(update))
         .route("/checks/{id}/edit", get(edit))
         .route("/checks/{id}/run", post(run_now))
+        .route("/checks/{id}/ping-address", post(new_ping_address))
         .route("/checks/{id}/pause", post(pause))
         .route("/checks/{id}/maintenance", post(start_maintenance))
         .route("/checks/{id}/maintenance/end", post(end_maintenance))
@@ -59,6 +62,8 @@ struct CheckForm {
     target: String,
     interval_secs: String,
     timeout_secs: String,
+    /// For a heartbeat: how late a ping can be.
+    grace_secs: String,
     method: String,
     body: String,
     regex: String,
@@ -108,6 +113,7 @@ impl CheckForm {
         Self {
             kind: CheckKind::Http.as_str().to_string(),
             interval_secs: "60".to_string(),
+            grace_secs: "300".to_string(),
             enabled: true,
             domain_expiry: true,
             ..Self::default()
@@ -127,6 +133,10 @@ impl CheckForm {
             timeout_secs: check
                 .timeout
                 .map(|timeout| timeout.as_secs().to_string())
+                .unwrap_or_default(),
+            grace_secs: input
+                .grace
+                .map(|grace| grace.as_secs().to_string())
                 .unwrap_or_default(),
             method: text(&check.method),
             body: text(&check.body),
@@ -163,6 +173,7 @@ impl CheckForm {
             target: text("target"),
             interval_secs: text("interval_secs"),
             timeout_secs: text("timeout_secs"),
+            grace_secs: text("grace_secs"),
             method: text("method"),
             body: text("body"),
             regex: text("regex"),
@@ -198,6 +209,24 @@ impl CheckForm {
         let Some(kind) = CheckKind::parse(&self.kind) else {
             bail!("choose a kind of check");
         };
+        let interval = number(&self.interval_secs, "the interval")?
+            .map(Duration::from_secs)
+            .context("a check needs an interval")?;
+        // A heartbeat reaches nothing, so whatever's left in the other boxes from
+        // another kind doesn't count.
+        if kind == CheckKind::Heartbeat {
+            let input = RemoteCheckInput {
+                host_id: self.host_id.clone(),
+                check: Check::new(self.name.trim(), kind, ""),
+                interval,
+                grace: number(&self.grace_secs, "the grace time")?.map(Duration::from_secs),
+                enabled: self.enabled,
+                read_stats: false,
+                extras: Vec::new(),
+                sign_in: SignIn::default(),
+            };
+            return Ok((input, SignInWith::None));
+        }
         let mut check = Check::new(self.name.trim(), kind, self.target.trim());
         check.timeout = number(&self.timeout_secs, "the timeout")?.map(Duration::from_secs);
         check.method = optional(&self.method);
@@ -212,9 +241,6 @@ impl CheckForm {
         check.host_key = optional(&self.host_key);
         // Only a website check has a domain to look up, and on is how it starts.
         check.domain_expiry = (kind == CheckKind::Http && !self.domain_expiry).then_some(false);
-        let interval = number(&self.interval_secs, "the interval")?
-            .map(Duration::from_secs)
-            .context("a check needs an interval")?;
         let with = match self.sign_in.as_str() {
             "password" if kind.signs_in() => SignInWith::Password,
             "key" if kind == CheckKind::Ssh => SignInWith::Key,
@@ -244,6 +270,7 @@ impl CheckForm {
             host_id: self.host_id.clone(),
             check,
             interval,
+            grace: None,
             enabled: self.enabled,
             read_stats,
             extras: if read_stats {
@@ -398,6 +425,10 @@ async fn form_page(
 fn new_host_placeholder(form: &CheckForm) -> String {
     let target = form.target.trim();
     match CheckKind::parse(&form.kind) {
+        Some(CheckKind::Heartbeat) if !form.name.trim().is_empty() => {
+            maxnines_checks::host_reached(&Check::new(form.name.trim(), CheckKind::Heartbeat, ""))
+        }
+        Some(CheckKind::Heartbeat) => String::new(),
         Some(kind) if !target.is_empty() => {
             maxnines_checks::host_reached(&Check::new("", kind, target))
         }
@@ -407,6 +438,8 @@ fn new_host_placeholder(form: &CheckForm) -> String {
 
 #[derive(Deserialize)]
 struct NewHostParams {
+    #[serde(default)]
+    name: String,
     #[serde(default)]
     kind: String,
     #[serde(default)]
@@ -423,6 +456,7 @@ async fn new_host_name(
     token: CsrfToken,
 ) -> Response {
     let form = CheckForm {
+        name: params.name,
         kind: params.kind,
         target: params.target,
         hostname: params.hostname,
@@ -720,8 +754,10 @@ async fn page(
     params: &RangeParams,
 ) -> Result<Response> {
     let id = check.id;
+    let ping_token = check.ping_token;
     let input = check.input;
     let name = &input.check.name;
+    let heartbeat = input.check.kind == CheckKind::Heartbeat;
     let (selected, _, length) = selected_range(params);
     let range = time_range(length).context("no such time range")?;
     let charts = charts(state, &input.host_id, name, range, selected).await?;
@@ -789,15 +825,33 @@ async fn page(
         }
     };
     tiles.push(status);
-    tiles.push(Tile {
-        label: "Last run",
-        value: state
-            .check_results
-            .ran_at(id)
-            .map_or("Not yet".to_string(), |ran| ran_text(ran, now)),
-        note: format!("every {} s, from the server", input.interval.as_secs()),
-        tone: "",
-    });
+    if heartbeat {
+        let pinged = latest
+            .as_ref()
+            .and_then(|(_, result)| result["pinged_at"].as_str())
+            .and_then(times::parse_moment);
+        let grace = input.grace.unwrap_or_default();
+        tiles.push(Tile {
+            label: "Last ping",
+            value: pinged.map_or("Not yet".to_string(), |pinged| ran_text(pinged, now)),
+            note: format!(
+                "expected every {}, with {} to spare",
+                heartbeats::length_text(input.interval),
+                heartbeats::length_text(grace)
+            ),
+            tone: "",
+        });
+    } else {
+        tiles.push(Tile {
+            label: "Last run",
+            value: state
+                .check_results
+                .ran_at(id)
+                .map_or("Not yet".to_string(), |ran| ran_text(ran, now)),
+            note: format!("every {} s, from the server", input.interval.as_secs()),
+            tone: "",
+        });
+    }
     if let Some((row, result)) = &latest {
         if let Some(response) = &row.response {
             let mut parts: Vec<String> = Vec::new();
@@ -812,7 +866,11 @@ async fn page(
                 parts.push(tls.clone());
             }
             tiles.push(Tile {
-                label: "Response time",
+                label: if heartbeat {
+                    "Last run took"
+                } else {
+                    "Response time"
+                },
                 value: response.clone(),
                 note: parts.join(" · "),
                 tone: "",
@@ -926,8 +984,16 @@ async fn page(
     })
     .await?;
 
+    // The address only lets work say it ran, but that's enough to hide a failure,
+    // so only those who could change the check see it.
+    let can_edit = signed_in_user().is_some_and(|user| user.role >= Role::Editor);
+    let ping_url = ping_token
+        .filter(|_| can_edit)
+        .map(|token| heartbeats::ping_url(&state.web_url, &token));
+
     Ok(Page::new(state, token, "remote_checks/show.html")
         .with("id", &id)
+        .with("ping_url", &ping_url)
         .with("name", name)
         .with("kind", input.check.kind.as_str())
         .with("target", &input.check.target)
@@ -955,6 +1021,10 @@ async fn run_now(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfF
         Ok(None) => return not_found(&state, &form.token),
         Err(error) => return server_error(&error),
     };
+    // A heartbeat waits to be pinged, so there's nothing to run.
+    if check.input.check.kind == CheckKind::Heartbeat {
+        return (form.token, Redirect::to(&format!("/checks/{id}"))).into_response();
+    }
     let Some(host) = state.agentless_host(&check.input.host_id).await else {
         return not_found(&state, &form.token);
     };
@@ -967,6 +1037,23 @@ async fn run_now(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfF
     )
     .await;
     (form.token, Redirect::to(&format!("/checks/{id}"))).into_response()
+}
+
+/// Gives a heartbeat a new address, so the old one stops working at once, as when
+/// it's been seen by someone it shouldn't have.
+async fn new_ping_address(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    form: CsrfForm,
+) -> Response {
+    match state.database.new_ping_token(id).await {
+        Ok(Some(_)) => {
+            let back = format!("/checks/{id}#ping-address");
+            (form.token, Redirect::to(&back)).into_response()
+        }
+        Ok(None) => not_found(&state, &form.token),
+        Err(error) => server_error(&error),
+    }
 }
 
 /// Stops running a check, or starts it again: the same as its form's "Run this
@@ -1167,6 +1254,7 @@ mod tests {
             read_stats: false,
             extras: Vec::new(),
             sign_in: SignIn::default(),
+            grace: None,
         }
     }
 
@@ -1189,6 +1277,7 @@ mod tests {
             read_stats: false,
             extras: Vec::new(),
             sign_in: SignIn::default(),
+            grace: None,
         };
         assert_eq!(
             CheckForm::from_input(&original).to_input().unwrap().0,

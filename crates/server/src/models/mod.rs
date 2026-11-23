@@ -25,6 +25,8 @@ mod dashboard_widget;
 mod dashboards;
 mod event;
 mod events;
+mod heartbeat;
+mod heartbeats;
 mod host;
 mod host_boot;
 mod host_config_status;
@@ -2517,6 +2519,7 @@ mod tests {
             read_stats: false,
             extras: Vec::new(),
             sign_in: Default::default(),
+            grace: None,
         };
 
         let id = database.create_remote_check(&input).await.unwrap();

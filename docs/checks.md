@@ -24,6 +24,7 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
 | **FTP or FTPS** (`ftp`) | `host:port` | That it greets as FTP, and its certificate where it offers TLS, or that an account can sign in |
+| **Heartbeat** (`heartbeat`) | None | That scheduled work, such as a cron job or a backup, pinged its address in time, or [said it failed](#heartbeats) |
 
 An agent older than a kind of check doesn't know it. It runs the rest of its checks,
 and reports that one as down, saying the agent needs upgrading.
@@ -41,6 +42,7 @@ named after what the check reaches, in lower case:
 | `http` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
 | `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp` | What's before the port | `db1.internal:5432` | `db1.internal` |
 | `dns` | The name it looks up | `example.com` | `example.com` |
+| `heartbeat` | The check's own name | | `nightly backup` |
 | `ping` | The host it pings | `192.0.2.7` | `192.0.2.7` |
 
 An address stays an address, and an IPv6 one loses its brackets, so
@@ -116,6 +118,85 @@ mail check, it never sends a password without TLS, so signing in to a server tha
 doesn't offer it counts as down without the password being sent. To check a plain
 FTP server, don't sign in. No data connection is ever opened, so nothing is listed,
 fetched or sent.
+
+## Heartbeats
+
+A heartbeat check watches work that runs on a schedule, which no outward check can
+see: a cron job, a backup, a batch run. Instead of the server reaching it, the work
+calls the heartbeat's own address when it finishes, and the check is down if it
+hasn't by the time it should have. Only the server watches heartbeats, so they're
+added on the **Checks** page or through the [API](api-remote-checks.md), never in a
+config rule.
+
+- **Run every** is how often the work runs, from a minute to 31 days, and **Grace
+  time** how much later than that a ping can come, for work that starts late or
+  takes a while. A heartbeat pinged every day at 02:00 with an hour's grace is down
+  from 03:00 the next day if it hasn't been pinged again. The period is a length of
+  time, not a cron schedule, so work that only runs on weekdays needs a grace time
+  that covers the weekend.
+- A new heartbeat, or one changed or resumed, is given its first period and grace
+  from then. So is one that has never been pinged when the server starts; one that
+  has keeps counting from its last ping, so a restart never hides a run that's late.
+- It's down from the moment its work says it failed, until a run works.
+
+Its address is on the check's page, shown only to editors and admins, and is the
+server's own address, on its one port, followed by `/ping/` and a random token:
+
+```text
+https://monitor.example.com/ping/0f3c9a6e5b1d4c7a8e2f6b9d1a3c5e7f
+```
+
+| Address | What it says |
+|---|---|
+| `…/ping/<token>` | A run finished and worked |
+| `…/ping/<token>/start` | A run started, so the next ping times it, as **Last run took** and on **Check response time** |
+| `…/ping/<token>/fail` | A run failed, so the check is down now rather than when the next one is due |
+
+Each takes `GET`, `HEAD` or `POST`, needs no sign in, and answers `200` with `OK`.
+What's sent with it is never read. An address that isn't a heartbeat's answers
+`404`, and pings to one heartbeat closer together than a second, or many wrong
+addresses from one place, are turned away with `429`. Pings to a paused heartbeat
+are kept, but say nothing until it's resumed.
+
+Anyone with the address can say the work ran, which could hide a failure, so keep
+it as you would a password. **New address** on the check's page, or
+[`POST /api/v1/remote-checks/{id}/ping-address`](api-remote-checks.md#give-a-heartbeat-a-new-address),
+gives it a new one and stops the old one working at once. Who did that is in the
+audit log; the address never is.
+
+### From cron
+
+Ping when the work worked, and say it failed when it didn't:
+
+```sh
+0 2 * * * /usr/local/bin/backup.sh && curl -fsS -m 10 --retry 3 https://monitor.example.com/ping/0f3c… > /dev/null || curl -fsS -m 10 --retry 3 https://monitor.example.com/ping/0f3c…/fail > /dev/null
+```
+
+To time each run too, ping `/start` first:
+
+```sh
+#!/bin/sh
+url=https://monitor.example.com/ping/0f3c…
+curl -fsS -m 10 --retry 3 "$url/start" > /dev/null
+if /usr/local/bin/backup.sh; then
+  curl -fsS -m 10 --retry 3 "$url" > /dev/null
+else
+  curl -fsS -m 10 --retry 3 "$url/fail" > /dev/null
+fi
+```
+
+### From a Windows scheduled task
+
+Windows 10, 11 and Server 2019 and later come with `curl.exe`. In the task's action,
+run a PowerShell script such as:
+
+```powershell
+$url = "https://monitor.example.com/ping/0f3c…"
+& C:\Scripts\backup.ps1
+if ($?) { curl.exe -fsS -m 10 --retry 3 $url } else { curl.exe -fsS -m 10 --retry 3 "$url/fail" }
+```
+
+Or ping with PowerShell alone: `Invoke-WebRequest -UseBasicParsing -TimeoutSec 10 $url`.
 
 ## Domain expiry
 

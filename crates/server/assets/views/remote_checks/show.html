@@ -6,10 +6,10 @@
 <div class="title-row">
   <div>
     <h1>{{ name }}</h1>
-    <p class="subtitle check-target"><span class="badge neutral">{{ kind }}</span> <code>{{ target }}</code> <span>{% if host %}· about <a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% endif %}</span></p>
+    <p class="subtitle check-target"><span class="badge neutral">{{ kind }}</span> {% if target %}<code>{{ target }}</code>{% endif %} <span>{% if host %}· about <a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% endif %}</span></p>
   </div>
   <div class="actions">
-    {% if can_respond and enabled %}
+    {% if can_respond and enabled and kind != "heartbeat" %}
     <form method="post" action="/checks/{{ id }}/run">
       <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
       <button type="submit" class="secondary">Check now</button>
@@ -34,6 +34,21 @@
   </div>
   {% endfor %}
 </section>
+
+{% if ping_url %}
+<section id="ping-address" class="card">
+  <div class="title-row">
+    <h2>Ping address</h2>
+    <form method="post" action="/checks/{{ id }}/ping-address">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">New address</button>
+    </form>
+  </div>
+  <p>Have the work fetch this when it finishes, such as with <code>curl -fsS -m 10 --retry 3</code>:</p>
+  <p><code class="ping-url">{{ ping_url }}</code></p>
+  <p class="hint">Add <code>/start</code> to the address as it starts, to time each run, and <code>/fail</code> when it fails, to be told at once. Anyone with the address can say the work ran, so keep it like a password. <strong>New address</strong> stops this one working at once. See <a href="/docs/checks#heartbeats">Heartbeats</a>.</p>
+</section>
+{% endif %}
 
 {% if alerts %}
 <section class="card">

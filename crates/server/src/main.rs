@@ -29,6 +29,7 @@ mod docs;
 mod events;
 mod fact_history;
 mod facts;
+mod heartbeats;
 mod host_filter;
 mod locations;
 mod maintenance;
@@ -449,6 +450,7 @@ async fn serve(path: &Path) -> Result<()> {
         csrf,
         web_url: web_url(config.audience()).unwrap_or_default().into(),
         sign_ins: Arc::default(),
+        pings: Arc::default(),
         require_two_factor: Arc::new(require_two_factor.into()),
         pending_sign_ins: Arc::default(),
         health_limit: controllers::health::CHECK_LIMIT,

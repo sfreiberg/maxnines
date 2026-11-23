@@ -4,16 +4,17 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use maxnines_protocol::{Check, CheckKind};
-use sea_orm::{ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
 
-use super::audit::record_change;
-use super::{Database, name_key, name_taken_or, remote_check, save_host_in};
+use super::audit::{record, record_change};
+use super::{Database, heartbeat, name_key, name_taken_or, remote_check, save_host_in};
 use crate::alerting::NameTaken;
-use crate::audit::{Kind, Snapshot};
+use crate::audit::{Action, Kind, Record, Snapshot, Subject};
+use crate::heartbeats::new_token;
 use crate::registration::HostRecord;
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn};
 
-fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
+pub(super) fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     let kind = CheckKind::parse(&row.kind).context("unknown kind of check")?;
     let mut check = Check::new(&row.name, kind, &row.target);
     check.timeout = row
@@ -34,10 +35,16 @@ fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     check.domain_expiry = row.domain_expiry;
     Ok(RemoteCheck {
         id: row.id,
+        ping_token: row.ping_token,
         input: RemoteCheckInput {
             host_id: row.host_id,
             check,
             interval: Duration::from_secs(u64::try_from(row.interval_secs)?),
+            grace: row
+                .grace_secs
+                .map(u64::try_from)
+                .transpose()?
+                .map(Duration::from_secs),
             enabled: row.enabled,
             read_stats: row.read_stats,
             extras: row
@@ -82,6 +89,10 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         domain_expiry: Set(check.domain_expiry),
         read_stats: Set(input.read_stats),
         extras: Set((!input.extras.is_empty()).then(|| input.extras.join(","))),
+        grace_secs: Set(input
+            .grace
+            .map(|grace| i64::try_from(grace.as_secs()))
+            .transpose()?),
         username: Set(input.sign_in.username.clone()),
         password: Set(input.sign_in.password.clone()),
         password_env: Set(input.sign_in.password_env.clone()),
@@ -98,13 +109,46 @@ fn name_taken(input: &RemoteCheckInput) -> NameTaken {
 
 /// Adds a check, and records it, in `connection`'s transaction.
 async fn insert<C: ConnectionTrait>(connection: &C, input: &RemoteCheckInput) -> Result<i64> {
-    let id = remote_check::Entity::insert(to_row(input)?)
+    let mut row = to_row(input)?;
+    row.ping_token = Set(is_heartbeat(input).then(new_token).transpose()?);
+    let id = remote_check::Entity::insert(row)
         .exec(connection)
         .await
         .map_err(|error| name_taken_or(error, name_taken(input), "saving check"))?
         .last_insert_id;
-    record(connection, id, None).await?;
+    record_check(connection, id, None).await?;
     Ok(id)
+}
+
+fn is_heartbeat(input: &RemoteCheckInput) -> bool {
+    input.check.kind == CheckKind::Heartbeat
+}
+
+/// Gives heartbeat `id` a new token for its address, recording that it was given
+/// one but never the token. Gives the token, or nothing if there's no such heartbeat.
+pub(super) async fn renew_ping_token(
+    connection: &sea_orm::DatabaseConnection,
+    id: i64,
+) -> Result<Option<String>> {
+    let transaction = connection.begin().await.context("saving check")?;
+    let Some(row) = remote_check::Entity::find_by_id(id)
+        .one(&transaction)
+        .await
+        .context("loading check")?
+    else {
+        return Ok(None);
+    };
+    if row.ping_token.is_none() {
+        return Ok(None);
+    }
+    let token = new_token()?;
+    let subject = Subject::new(Kind::RemoteCheck, id, row.name.clone());
+    let mut row: remote_check::ActiveModel = row.into();
+    row.ping_token = Set(Some(token.clone()));
+    row.update(&transaction).await.context("saving check")?;
+    record(&transaction, Record::new(Action::NewPingAddress, subject)).await?;
+    transaction.commit().await.context("saving check")?;
+    Ok(Some(token))
 }
 
 async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<RemoteCheck>> {
@@ -116,7 +160,7 @@ async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Remo
 }
 
 /// Records how a check changed from `before`, reading it as it is now.
-async fn record<C: ConnectionTrait>(
+async fn record_check<C: ConnectionTrait>(
     connection: &C,
     id: i64,
     before: Option<&RemoteCheck>,
@@ -180,11 +224,22 @@ impl Database {
         };
         let mut row = to_row(input)?;
         row.id = Set(id);
+        // A heartbeat keeps its address through changes, and anything else has none.
+        row.ping_token = Set(match before.ping_token.clone() {
+            Some(token) if is_heartbeat(input) => Some(token),
+            _ => is_heartbeat(input).then(new_token).transpose()?,
+        });
         remote_check::Entity::update(row)
             .exec(&transaction)
             .await
             .map_err(|error| name_taken_or(error, name_taken(input), "saving check"))?;
-        record(&transaction, id, Some(&before)).await?;
+        if !is_heartbeat(input) {
+            heartbeat::Entity::delete_by_id(id)
+                .exec(&transaction)
+                .await
+                .context("saving check")?;
+        }
+        record_check(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving check")?;
         Ok(true)
     }
@@ -197,7 +252,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("deleting check")?;
-        record(&transaction, id, before.as_ref()).await?;
+        record_check(&transaction, id, before.as_ref()).await?;
         transaction.commit().await.context("deleting check")?;
         Ok(result.rows_affected > 0)
     }

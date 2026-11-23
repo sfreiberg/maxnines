@@ -6401,6 +6401,7 @@ mod remote {
             read_stats: false,
             extras: Vec::new(),
             sign_in: Default::default(),
+            grace: None,
         }
     }
 
@@ -8130,6 +8131,7 @@ mod pages {
             read_stats: false,
             extras: Vec::new(),
             sign_in: Default::default(),
+            grace: None,
         };
         test.database().create_remote_check(&input).await.unwrap();
         let mut waiting = test.server.connect().await;
@@ -8447,6 +8449,7 @@ mod pages {
             read_stats: false,
             extras: Vec::new(),
             sign_in: Default::default(),
+            grace: None,
         };
         let database = &server.state.database;
         database

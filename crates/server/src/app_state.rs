@@ -89,6 +89,8 @@ pub struct AppState {
     /// Where people reach the site, for links they're given.
     pub web_url: Arc<str>,
     pub sign_ins: Arc<SignInThrottle>,
+    /// Turns away heartbeat pings that come too fast.
+    pub pings: Arc<crate::heartbeats::PingLimiter>,
     /// Whether everyone has to set up two-factor before using the pages. Kept
     /// here so each request doesn't ask the database.
     pub require_two_factor: Arc<std::sync::atomic::AtomicBool>,

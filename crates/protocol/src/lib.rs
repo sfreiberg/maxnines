@@ -592,6 +592,9 @@ pub enum CheckKind {
     Imap,
     Pop3,
     Ftp,
+    /// Scheduled work pings the server when it finishes, and it's down when it
+    /// hasn't in time. Only the server watches these: an agent never runs one.
+    Heartbeat,
     /// A kind this build doesn't know, from a newer server. The server never saves
     /// one, and an agent reports that it can't run it rather than turning down the
     /// whole of its config.
@@ -607,7 +610,7 @@ impl CheckKind {
     /// Every kind this build can run.
     /// In the order people are offered them. `Unknown` stays the last variant, which
     /// a test relies on to check that nothing's missing here.
-    pub const KNOWN: [Self; 16] = [
+    pub const KNOWN: [Self; 17] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -624,6 +627,7 @@ impl CheckKind {
         Self::Imap,
         Self::Pop3,
         Self::Ftp,
+        Self::Heartbeat,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -644,6 +648,7 @@ impl CheckKind {
             Self::Imap => "imap",
             Self::Pop3 => "pop3",
             Self::Ftp => "ftp",
+            Self::Heartbeat => "heartbeat",
             Self::Unknown => "unknown",
         }
     }
@@ -736,6 +741,19 @@ impl Check {
         let name = &self.name;
         validate_check_name(name)?;
         let target = &self.target;
+        if self.kind == CheckKind::Heartbeat {
+            ensure!(
+                target.is_empty(),
+                "check {name:?} is a heartbeat, which is pinged rather than reaching anything, \
+                 so it has no target"
+            );
+            ensure!(
+                self.timeout.is_none(),
+                "check {name:?} is a heartbeat, which is pinged rather than run, so it has no \
+                 timeout"
+            );
+            return self.validate_options();
+        }
         ensure!(
             !target.is_empty() && target.len() <= MAX_SETTING_LEN,
             "check {name:?} needs a target of at most {MAX_SETTING_LEN} characters"
@@ -773,6 +791,7 @@ impl Check {
                 is_plain_name(target, ":"),
                 "check {name:?} needs a hostname as its target"
             ),
+            CheckKind::Heartbeat => {}
         }
         self.validate_options()
     }
@@ -1125,6 +1144,14 @@ impl CollectorSettings {
             checks.len() + local.len() <= MAX_CHECKS,
             "a collector can run at most {MAX_CHECKS} checks"
         );
+        for check in checks {
+            ensure!(
+                check.kind != CheckKind::Heartbeat,
+                "check {:?} is a heartbeat, which the server watches for pings, so an agent \
+                 can't run it",
+                check.name
+            );
+        }
         for check in checks {
             // Its name is still a series, so it has to be one.
             if check.kind == CheckKind::Unknown && checking == Checking::Sent {
@@ -1677,6 +1704,26 @@ mod tests {
     }
 
     #[test]
+    fn a_heartbeat_has_no_target_and_is_never_an_agent_s() {
+        let heartbeat = Check::new("backup", CheckKind::Heartbeat, "");
+        heartbeat.validate().unwrap();
+        let aimed = Check::new("backup", CheckKind::Heartbeat, "example.com:22");
+        assert!(aimed.validate().is_err());
+        let mut timed = heartbeat.clone();
+        timed.timeout = Some(Duration::from_secs(5));
+        assert!(timed.validate().is_err());
+
+        let config: AgentConfig = serde_json::from_value(json!({
+            "collectors": { "checks": { "checks": [
+                { "name": "backup", "kind": "heartbeat", "target": "" },
+            ] } },
+        }))
+        .unwrap();
+        let refused = config.validate_sent().unwrap_err().to_string();
+        assert!(refused.contains("heartbeat"), "{refused}");
+    }
+
+    #[test]
     fn check_kinds_read_back_as_written() {
         for kind in CheckKind::KNOWN {
             assert_eq!(CheckKind::parse(kind.as_str()), Some(kind));
@@ -1708,7 +1755,8 @@ mod tests {
             | CheckKind::Smtp
             | CheckKind::Imap
             | CheckKind::Pop3
-            | CheckKind::Ftp => true,
+            | CheckKind::Ftp
+            | CheckKind::Heartbeat => true,
             CheckKind::Unknown => false,
         };
         assert!(CheckKind::KNOWN.into_iter().all(runs));

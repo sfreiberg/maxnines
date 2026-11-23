@@ -9,7 +9,8 @@ that host. A check added without a host gets a new host of its own.
 | `host_id` | The host it's about, which has to be one without an agent. Leave it out, or give `null`, when adding a check, and a new host is made for it, as **Add a host** makes one. Left out when changing a check, the check stays on its host |
 | `hostname` | When adding a check without `host_id`: what the new host is called. Left out, it's named after the host the check reaches, as [Checks](checks.md#a-host-for-each-check) describes. Refused with `host_id` and when changing a check |
 | `check` | Required. What to check, as below |
-| `interval_secs` | Required. How often it runs |
+| `interval_secs` | Required. How often it runs, from 10 seconds to a day. For a heartbeat, how often it should be pinged, from a minute to 31 days |
+| `grace_secs` | For a heartbeat: how much later than `interval_secs` a ping can come before it's down, up to 7 days. Left out, none |
 | `enabled` | Defaults to `true` |
 | `read_stats` | For a PostgreSQL, MySQL, MongoDB or ClickHouse check: `true` also reads the database's health and replication, saved under the check's host, as described in [database stats](database-stats.md#hosts-without-an-agent) |
 | `extras` | With `read_stats`, what else to read, such as `["sizes"]` |
@@ -32,9 +33,9 @@ started, and a paused check keeps the result from before it was paused.
 | `check` field | For | Description |
 | --- | --- | --- |
 | `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one, which for checks the server runs is ignoring case |
-| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3` or `ftp` |
-| `target` | All | Required. An address for http, a host for dns and ping, and `host:port` for the rest, which for clickhouse is its HTTP port |
-| `timeout_secs` | All | How long it gets, up to a minute |
+| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp` or `heartbeat` |
+| `target` | All | Required. An address for http, a host for dns and ping, and `host:port` for the rest, which for clickhouse is its HTTP port. A heartbeat has none, so it's `""` |
+| `timeout_secs` | All but heartbeat | How long it gets, up to a minute |
 | `interval_secs` | All | For a check an agent runs, how often it runs, up to a day. It runs with every sample without one, and never more often than samples are sent, as it's rounded up to whole samples. Between runs, each sample repeats its last result. A remote check's interval goes beside `check` instead |
 | `method` | http | Defaults to `GET` |
 | `body` | http | What to send, for methods like `POST` |
@@ -82,6 +83,31 @@ Two checks added without a host get two hosts, even with the same name, as hosts
 are never matched by name. To add another check to the same host, give its
 `host_id`.
 
+A [heartbeat](checks.md#heartbeats) waits to be pinged rather than reaching
+anything, and a new host for one is named after the check:
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "check": {"name": "Nightly backup", "kind": "heartbeat", "target": ""},
+    "interval_secs": 86400,
+    "grace_secs": 3600
+  }' \
+  "$MAXNINES_URL/api/v1/remote-checks"
+```
+
+What comes back also has `ping_url`, the address the work pings. It's only given
+here and when a new one is made, as reading a check needs less than changing one:
+
+```json
+{
+  "id": 2,
+  "host_id": "9b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e",
+  "ping_url": "https://monitor.example.com/ping/0f3c9a6e5b1d4c7a8e2f6b9d1a3c5e7f"
+}
+```
+
 ## Get a remote check
 
 `GET /api/v1/remote-checks/{id}`
@@ -121,6 +147,23 @@ curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \
     "interval_secs": 300
   }' \
   "$MAXNINES_URL/api/v1/remote-checks/1"
+```
+
+## Give a heartbeat a new address
+
+`POST /api/v1/remote-checks/{id}/ping-address`
+
+Makes a new address for a heartbeat to be pinged at, and stops the old one working
+at once. It answers with the new `ping_url`, or `404` for a check that isn't a
+heartbeat. The audit log records that it was done, but never the address.
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/remote-checks/2/ping-address"
+```
+
+```json
+{ "ping_url": "https://monitor.example.com/ping/7d2e4b6a8c0f1e3d5b7a9c2e4f6a8b0d" }
 ```
 
 ## Delete a remote check

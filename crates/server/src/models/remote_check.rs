@@ -39,6 +39,10 @@ pub struct Model {
     pub read_stats: bool,
     /// What else to read from it, separated by commas.
     pub extras: Option<String>,
+    /// For a heartbeat: how late a ping can be.
+    pub grace_secs: Option<i64>,
+    /// For a heartbeat: the token in the address it's pinged at.
+    pub ping_token: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

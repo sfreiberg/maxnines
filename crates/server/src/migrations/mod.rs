@@ -1896,6 +1896,8 @@ impl MigrationTrait for CreateTables {
                             .default(false),
                     )
                     .col(ColumnDef::new(RemoteChecks::Extras).string_len(255))
+                    .col(ColumnDef::new(RemoteChecks::GraceSecs).big_integer())
+                    .col(ColumnDef::new(RemoteChecks::PingToken).string_len(64))
                     .foreign_key(
                         ForeignKey::create()
                             .name("fk_remote_checks_host_id")
@@ -1909,6 +1911,38 @@ impl MigrationTrait for CreateTables {
         // A check's name only has to differ from the others about the same host.
         let (name, columns) = ("idx_remote_checks_host_name", "host_id, name_key");
         index_of(manager, Unique, name, "remote_checks", columns, None).await?;
+        // A heartbeat is found by the token it's pinged with.
+        let (name, columns) = ("idx_remote_checks_ping_token", "ping_token");
+        index_of(manager, Unique, name, "remote_checks", columns, None).await?;
+        manager
+            .create_table(
+                Table::create()
+                    .table(Heartbeats::Table)
+                    .col(
+                        ColumnDef::new(Heartbeats::RemoteCheckId)
+                            .big_integer()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(moment(backend, Heartbeats::PingedAt))
+                    .col(
+                        ColumnDef::new(Heartbeats::Failed)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .col(moment(backend, Heartbeats::StartedAt))
+                    .col(ColumnDef::new(Heartbeats::RunSecs).double())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_heartbeats_remote_check_id")
+                            .from(Heartbeats::Table, Heartbeats::RemoteCheckId)
+                            .to(RemoteChecks::Table, RemoteChecks::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
         manager
             .create_table(
                 Table::create()
@@ -2536,6 +2570,18 @@ enum RemoteChecks {
     DomainExpiry,
     ReadStats,
     Extras,
+    GraceSecs,
+    PingToken,
+}
+
+#[derive(Iden)]
+enum Heartbeats {
+    Table,
+    RemoteCheckId,
+    PingedAt,
+    Failed,
+    StartedAt,
+    RunSecs,
 }
 
 #[derive(Iden)]

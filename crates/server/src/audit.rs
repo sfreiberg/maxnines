@@ -180,10 +180,12 @@ pub enum Action {
     Unacknowledged,
     /// Someone asked a host to run one of its actions.
     Ran,
+    /// A heartbeat check was given a new address to be pinged at.
+    NewPingAddress,
 }
 
 impl Action {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Created,
         Self::Changed,
         Self::Deleted,
@@ -194,6 +196,7 @@ impl Action {
         Self::Acknowledged,
         Self::Unacknowledged,
         Self::Ran,
+        Self::NewPingAddress,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -208,6 +211,7 @@ impl Action {
             Self::Acknowledged => "acknowledged",
             Self::Unacknowledged => "unacknowledged",
             Self::Ran => "ran_action",
+            Self::NewPingAddress => "new_ping_address",
         }
     }
 
@@ -223,6 +227,7 @@ impl Action {
             Self::Acknowledged => "Acknowledged",
             Self::Unacknowledged => "Unacknowledged",
             Self::Ran => "Ran an action",
+            Self::NewPingAddress => "New ping address",
         }
     }
 

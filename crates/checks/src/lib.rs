@@ -109,6 +109,8 @@ pub fn host_reached(check: &Check) -> String {
             .map_or(target, |(host, _port)| host)
             .to_string(),
         CheckKind::Dns | CheckKind::Ping | CheckKind::Unknown => target.to_string(),
+        // It reaches nothing, so its host is named after the work it watches.
+        CheckKind::Heartbeat => check.name.clone(),
     };
     host.trim_start_matches('[')
         .trim_end_matches(']')
@@ -243,6 +245,9 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Imap => mail::check_imap(check, credentials, &mut findings).await,
             CheckKind::Pop3 => mail::check_pop3(check, credentials, &mut findings).await,
             CheckKind::Ftp => ftp::check_ftp(check, credentials, &mut findings).await,
+            CheckKind::Heartbeat => Err(anyhow!(
+                "a heartbeat is pinged at the server rather than run"
+            )),
             CheckKind::Unknown => Err(anyhow!(CheckKind::UNKNOWN_MESSAGE)),
         }
     };
