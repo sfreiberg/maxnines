@@ -322,6 +322,7 @@ mod tests {
             config,
             matched_rules: Vec::new(),
             skipped_collectors: Vec::new(),
+            facts: Value::Null,
         };
         let changes = describe_changes(
             &resolved(config(json!(["nginx"]))),
@@ -337,6 +338,7 @@ mod tests {
             config: serde_json::from_value(json!({ "collectors": collectors })).unwrap(),
             matched_rules: Vec::new(),
             skipped_collectors: Vec::new(),
+            facts: Value::Null,
         };
         let web = json!({ "name": "web", "kind": "tcp", "target": "a:80" });
 

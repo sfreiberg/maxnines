@@ -1,20 +1,25 @@
 //! Reads what templates have this agent read: for each database a template runs
 //! for, its discover blocks and queries, as the server worked them out for this
-//! host. How it's read is in [`maxnines_checks::templates::reader`], which the
-//! server shares for hosts with no agent: a task for each database, on the
-//! background runtime. A sample takes what's been read since the last one.
+//! host, and on Windows, for a template that runs once on the host, its registry
+//! values, counter sets and performance counters. How databases are read is in
+//! [`maxnines_checks::templates::reader`], which the server shares for hosts with
+//! no agent: a task for each database, on the background runtime. How the host is
+//! read is in [`maxnines_collectors::host_templates`], as each sample is taken. A
+//! sample takes what's been read since the last one.
 //!
 //! A new config changes each database's task only as much as its work changed: one
 //! whose work is the same carries on, and one whose work changed keeps its
 //! connection, what it found, and the running totals of each query whose SQL is
-//! the same.
+//! the same. A template on the host keeps its counters, and their running totals,
+//! for each counters block that's the same.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use maxnines_checks::templates::reader::{Reader, Results};
-use maxnines_protocol::templates::work::TemplateWork;
-use serde_json::Value;
+use maxnines_collectors::host_templates::HostTemplates;
+use maxnines_protocol::templates::work::{DISCOVERED, TemplateWork, collector_of};
+use serde_json::{Value, json};
 
 use crate::background::runtime;
 use crate::collector::Collector;
@@ -23,6 +28,9 @@ use crate::databases::DatabaseDefinitions;
 pub struct TemplateCollector {
     reader: Reader,
     results: Results,
+    host: HostTemplates,
+    /// How often a sample is taken.
+    interval: Duration,
 }
 
 impl TemplateCollector {
@@ -37,6 +45,8 @@ impl TemplateCollector {
         let mut collector = Self {
             results: reader.results(),
             reader,
+            host: HostTemplates::default(),
+            interval,
         };
         collector.update(work, definitions, interval)?;
         Ok(collector)
@@ -50,6 +60,8 @@ impl TemplateCollector {
         definitions: &DatabaseDefinitions,
         interval: Duration,
     ) -> Result<()> {
+        self.interval = interval;
+        self.host.update(work);
         let runtime = runtime()?;
         self.reader.update(work, interval, &runtime, |name| {
             definitions
@@ -75,7 +87,26 @@ impl Collector for TemplateCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        let entries = self.results.take();
+        let mut entries = self.results.take();
+        let host = self.host.collect(self.interval);
+        for (template, rows) in host.rows {
+            let read = entries
+                .entry(collector_of(&template))
+                .or_insert_with(|| json!([]));
+            if let Value::Array(all) = read {
+                all.extend(rows);
+            }
+        }
+        if !host.discovered.is_empty() {
+            let found = entries.entry(DISCOVERED).or_insert_with(|| json!([]));
+            if let Value::Array(all) = found {
+                all.extend(
+                    host.discovered
+                        .into_iter()
+                        .filter_map(|one| serde_json::to_value(one).ok()),
+                );
+            }
+        }
         Ok(match entries.is_empty() {
             // Nothing read yet.
             true => Value::Null,
@@ -86,8 +117,7 @@ impl Collector for TemplateCollector {
 
 #[cfg(test)]
 mod tests {
-    use maxnines_protocol::templates::work::{DISCOVERED, DiscoverWork};
-    use serde_json::json;
+    use maxnines_protocol::templates::work::DiscoverWork;
 
     use super::*;
 
@@ -101,9 +131,12 @@ mod tests {
             discover: vec![DiscoverWork {
                 key: "server".to_string(),
                 interval: Duration::from_secs(3600),
-                sql: "SELECT 1 AS one".to_string(),
+                sql: Some("SELECT 1 AS one".to_string()),
+                registry: Vec::new(),
+                counter_sets: Default::default(),
             }],
             queries: Vec::new(),
+            counters: Vec::new(),
         };
         let mut collector =
             TemplateCollector::new(&[work], &DatabaseDefinitions::new(), Duration::from_secs(1))

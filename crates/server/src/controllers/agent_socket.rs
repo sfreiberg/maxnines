@@ -31,6 +31,7 @@ use crate::presence::Presence;
 use crate::registration::Admission;
 use crate::store::{NewSample, WriterCommand, can_store};
 use crate::templates::values::{LastSent, strip_queries, work_out};
+use crate::templates::work::instance_of;
 use crate::times::{self, Timestamp};
 
 /// Far more than real facts need, so one agent can't fill the database.
@@ -507,11 +508,11 @@ async fn do_jobs(
                     // Only for what the agent's still sent to read, as a sample can
                     // come after what it reads changed.
                     {
-                        let work = sent.work.lock().unwrap_or_else(PoisonError::into_inner);
+                        let sent = sent.work.lock().unwrap_or_else(PoisonError::into_inner);
                         found.retain(|one| {
-                            work.iter().any(|work| {
+                            sent.work.iter().any(|work| {
                                 work.template == one.template
-                                    && work.database.as_deref() == Some(one.database.as_str())
+                                    && work.database == one.database
                             })
                         });
                     }
@@ -549,7 +550,7 @@ async fn send_config(
     state: &AppState,
     sent: &mut SentConfig,
 ) {
-    let resolved = match state.config_for(&agent.id).await {
+    let mut resolved = match state.config_for(&agent.id).await {
         Ok(resolved) => resolved,
         Err(error) => {
             warn!(
@@ -566,7 +567,7 @@ async fn send_config(
         .config
         .templates
         .iter()
-        .filter_map(|work| Some((work.template.clone(), work.database.clone()?)))
+        .map(|work| (work.template.clone(), instance_of(work.database.as_deref())))
         .collect();
     if let Err(error) = state.database.forget_discovered(&agent.id, &reads).await {
         warn!(
@@ -587,6 +588,7 @@ async fn send_config(
     }
 
     let work = resolved.config.templates.clone();
+    let facts = std::mem::take(&mut resolved.facts);
     let message = ServerMessage::Config {
         version: resolved.version.clone(),
         config: resolved.config,
@@ -595,7 +597,7 @@ async fn send_config(
         Ok(text) => {
             if configs.send(text).await.is_ok() {
                 sent.version = Some(resolved.version);
-                *sent.work.lock().unwrap_or_else(PoisonError::into_inner) = work;
+                *sent.work.lock().unwrap_or_else(PoisonError::into_inner) = Sent { work, facts };
             }
         }
         Err(error) => warn!(id = agent.id, %error, "encoding config failed"),
@@ -617,7 +619,15 @@ struct Connection<'a> {
 }
 
 /// What an agent was last sent to read for its templates.
-type SentWork = Arc<std::sync::Mutex<Vec<TemplateWork>>>;
+type SentWork = Arc<std::sync::Mutex<Sent>>;
+
+/// What an agent was last sent to read for its templates, and the facts that was
+/// worked out from, which the metrics templates work out can use.
+#[derive(Default)]
+struct Sent {
+    work: Vec<TemplateWork>,
+    facts: Value,
+}
 
 /// What an agent was last sent.
 struct SentConfig {
@@ -659,7 +669,13 @@ fn receive(
             let templates = state.database.running_templates();
             if !templates.worked_out().is_empty() {
                 let sent = sent_work.lock().unwrap_or_else(PoisonError::into_inner);
-                work_out(&mut sample, templates.worked_out(), &sent, last_sent);
+                work_out(
+                    &mut sample,
+                    templates.worked_out(),
+                    &sent.work,
+                    &sent.facts,
+                    last_sent,
+                );
             }
             strip_queries(&mut sample);
             let command = WriterCommand::SaveAndAck {

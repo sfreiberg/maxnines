@@ -4025,12 +4025,15 @@ dependencies = [
  "maxnines-protocol",
  "objc2-core-foundation",
  "objc2-io-kit",
+ "regex-lite",
  "rustix 1.1.6",
  "serde_json",
  "sysctl",
  "sysinfo",
  "systemstat",
  "tokio",
+ "tracing",
+ "windows-registry",
  "windows-sys 0.61.2",
 ]
 

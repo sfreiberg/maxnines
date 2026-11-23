@@ -548,6 +548,16 @@ pub fn named_groups(pattern: &str) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The path of a registry key under `HKEY_LOCAL_MACHINE`, written `HKLM\...` or
+/// `HKEY_LOCAL_MACHINE\...`, or nothing for one anywhere else: the host's own
+/// settings are all a template reads, as the agent runs as a service with no user's.
+pub fn local_machine_key(key: &str) -> Option<&str> {
+    let (root, path) = key.trim().split_once('\\')?;
+    let local =
+        root.eq_ignore_ascii_case("HKLM") || root.eq_ignore_ascii_case("HKEY_LOCAL_MACHINE");
+    (local && !path.trim_matches('\\').is_empty()).then(|| path.trim_matches('\\'))
+}
+
 /// Whether a name can be a key or a label: lowercase letters, digits and
 /// underscores, starting with a letter, so CEL and metric names can use it.
 pub fn is_key(name: &str) -> bool {
@@ -665,6 +675,22 @@ impl Template {
             {
                 say(place, "sql", "can't be empty".to_string());
             }
+            let looked_for = discover
+                .registry
+                .iter()
+                .map(|read| read.values.len())
+                .sum::<usize>()
+                + discover.counter_sets.len();
+            if looked_for > work::MAX_LOOKED_FOR {
+                say(
+                    place,
+                    "",
+                    format!(
+                        "looks for more than {} registry values and counter sets",
+                        work::MAX_LOOKED_FOR
+                    ),
+                );
+            }
             let mut keys = BTreeSet::new();
             for read in &discover.registry {
                 if !keys.insert(&read.key) {
@@ -676,6 +702,15 @@ impl Template {
                 }
                 if read.key.trim().is_empty() {
                     say(place, "registry", "needs a registry key".to_string());
+                } else if local_machine_key(&read.key).is_none() {
+                    say(
+                        place,
+                        "registry",
+                        format!(
+                            "{:?} isn't under HKLM: only HKEY_LOCAL_MACHINE, the host's own, is read",
+                            read.key
+                        ),
+                    );
                 }
                 if read.values.is_empty() {
                     say(place, "registry", format!("{:?} reads no values", read.key));
@@ -704,16 +739,52 @@ impl Template {
             }
         }
 
-        // An agent is sent its discover blocks and queries together, which has a limit.
-        if self.discover.len() + self.queries.len() > work::MAX_STATEMENTS {
+        // An agent is sent its discover blocks, queries and counters together, which
+        // has a limit.
+        if self.discover.len() + self.queries.len() + self.counters.len() > work::MAX_STATEMENTS {
             say(
                 top,
                 "",
                 format!(
-                    "has more than {} discover blocks and queries together",
+                    "has more than {} discover blocks, queries and counters together",
                     work::MAX_STATEMENTS
                 ),
             );
+        }
+        // The registry and performance counters are the host's, and only Windows'.
+        let reads_windows = match &self.target {
+            Some(Target::Database(_)) => Err(
+                "is the host's, not a database's: read it in a template for the service or for windows",
+            ),
+            Some(Target::Os(systems)) if !systems.iter().any(|system| system == "windows") => {
+                Err("is only on Windows: add \"windows\" to os")
+            }
+            _ => Ok(()),
+        };
+        if let Err(message) = reads_windows {
+            for (index, discover) in self.discover.iter().enumerate() {
+                if !discover.registry.is_empty() {
+                    say(
+                        Place::Discover(index),
+                        "registry",
+                        format!("The registry {message}"),
+                    );
+                }
+                if !discover.counter_sets.is_empty() {
+                    say(
+                        Place::Discover(index),
+                        "counter_sets",
+                        format!("A counter set {message}"),
+                    );
+                }
+            }
+            for index in 0..self.counters.len() {
+                say(
+                    Place::Counters(index),
+                    "object",
+                    format!("A performance counter {message}"),
+                );
+            }
         }
         check_keys(self.queries.iter().map(|q| &q.key), Place::Query, &mut say);
         for (index, query) in self.queries.iter().enumerate() {
@@ -989,6 +1060,60 @@ fn check_counters(index: usize, counters: &Counters, say: &mut dyn FnMut(Place, 
     }
     if let Some(since) = &counters.since {
         check_version(since, &mut |message| say(place, "since", message));
+    }
+    // An agent takes names of up to 255 characters, as Windows' are shorter.
+    let long = |text: &str| text.len() > MAX_NAME_LEN;
+    if long(&counters.object)
+        || counters
+            .join
+            .as_ref()
+            .is_some_and(|join| long(&join.object))
+    {
+        say(
+            place,
+            "object",
+            format!("can be up to {MAX_NAME_LEN} characters"),
+        );
+    }
+    if counters.instance.as_deref().is_some_and(long) {
+        say(
+            place,
+            "instance",
+            format!("can be up to {MAX_NAME_LEN} characters"),
+        );
+    }
+    if counters.groups.len() > work::MAX_COLUMNS {
+        say(
+            place,
+            "groups",
+            format!("can be up to {}", work::MAX_COLUMNS),
+        );
+    }
+    if counters
+        .groups
+        .values()
+        .chain(counters.metrics.iter().filter_map(|m| m.counter.as_ref()))
+        .any(|counter| long(counter))
+    {
+        say(
+            place,
+            "metrics",
+            format!("a counter's name can be up to {MAX_NAME_LEN} characters"),
+        );
+    }
+    if counters.exclude.len() > work::MAX_INSTANCES {
+        say(
+            place,
+            "exclude",
+            format!("can list up to {}", work::MAX_INSTANCES),
+        );
+    }
+    if counters.metrics.len() > work::MAX_COLUMNS {
+        say(
+            place,
+            "metrics",
+            format!("can be up to {}", work::MAX_COLUMNS),
+        );
     }
     for (index, instance) in counters.exclude.iter().enumerate() {
         if counters.exclude[..index].contains(instance) {

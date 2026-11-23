@@ -7,19 +7,22 @@
 //! depends on what discovery finds waits until something has been found. When what
 //! discovery finds changes, so does what's sent.
 //!
-//! A template that isn't for a database is sent once for the host, if it reads
-//! anything there. What those read is performance counters and the registry, which
-//! aren't sent yet, so agents have nothing to run for them so far. Templates for a
-//! Windows service aren't sent until then either.
+//! A template that isn't for a database runs once on the host, and only on Windows,
+//! as what it reads is the registry and performance counters: its discover blocks,
+//! and its counters blocks picked the same way as queries are.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use serde_json::{Map, Value};
 
-use maxnines_protocol::templates::work::{DiscoverWork, MAX_WORK, QueryWork, TemplateWork};
+use maxnines_protocol::templates::work::{
+    CounterWork, CountersWork, DiscoverWork, Instances, JoinWork, MAX_WORK, QueryWork,
+    RegistryWork, TemplateWork,
+};
 use maxnines_protocol::templates::{
-    DEFAULT_DISCOVERY_INTERVAL, Query, Target, Template, Version, fill, parse_duration,
+    Counters, DEFAULT_DISCOVERY_INTERVAL, Metric, Query, Target, Template, Version, fill,
+    parse_duration,
 };
 use tracing::warn;
 
@@ -27,8 +30,18 @@ use super::hosts::{DatabaseKinds, RunningTemplates};
 use crate::metrics::{INSTANCE_LABEL, series_values};
 use crate::rule_engine::{Condition, Host};
 
-/// What discovery found on one host, by template ID and database.
+/// What discovery found on one host, by template ID and database, or [`ON_HOST`]
+/// for a template that runs once on the host.
 pub type Discoveries = HashMap<(i64, String), Map<String, Value>>;
+
+/// What stands for the database of a template that isn't for one, where what its
+/// discovery found is kept. No database can be called it, as a name has letters.
+pub const ON_HOST: &str = "";
+
+/// Where what's found is kept for a template run for `database`, or on the host.
+pub fn instance_of(database: Option<&str>) -> String {
+    database.unwrap_or(ON_HOST).to_string()
+}
 
 /// The column discovery finds a version in.
 pub const VERSION: &str = "version";
@@ -98,7 +111,8 @@ pub fn picked_databases(
 }
 
 /// Keeps only the series of the databases picked on a host, for a rule whose series
-/// have a label for the database. `labels` are the series' labels, in order.
+/// have a label for the database, or, for a template that runs on the host, all of
+/// them or none, as the host is picked. `labels` are the series' labels, in order.
 pub fn keep_picked(
     series: &mut Vec<String>,
     labels: &[String],
@@ -106,6 +120,9 @@ pub fn keep_picked(
     picked: &HashSet<(String, String)>,
 ) {
     let Some(at) = labels.iter().position(|label| label == INSTANCE_LABEL) else {
+        if !picked.contains(&(host_id.to_string(), ON_HOST.to_string())) {
+            series.clear();
+        }
         return;
     };
     series.retain(|series| {
@@ -140,22 +157,18 @@ pub fn work_for(
                     work.push(database_work(template, &database, found));
                 }
             }
-            // Counters and the registry are for the Windows services' templates,
-            // which agents don't read yet.
-            Some(Target::Service(_)) => {}
-            // Once on the host, for what it reads there, which is only counters and
-            // the registry so far, as SQL needs a database: a template with nothing
-            // for the agent to read isn't sent.
-            Some(Target::Os(_)) | None => {
-                let reads_something =
-                    !template.discover.is_empty() || !template.counters.is_empty();
-                if reads_something && !assigned.instances(host.facts, databases).is_empty() {
-                    work.push(TemplateWork {
-                        template: template.key.clone(),
-                        database: None,
-                        discover: Vec::new(),
-                        queries: Vec::new(),
-                    });
+            // Once on the host, for what it reads there, which is the registry and
+            // performance counters, as SQL needs a database: only on Windows, and a
+            // template with nothing for the agent to read there isn't sent.
+            Some(Target::Service(_) | Target::Os(_)) | None => {
+                let windows = host.facts["os"]["family"].as_str() == Some("windows");
+                if !windows || assigned.instances(host.facts, databases).is_empty() {
+                    continue;
+                }
+                let found = discoveries.get(&(assigned.id(), ON_HOST.to_string()));
+                let one = host_work(template, found);
+                if !one.discover.is_empty() || !one.counters.is_empty() {
+                    work.push(one);
                 }
             }
         }
@@ -185,7 +198,44 @@ pub fn database_work(
         database: Some(database.to_string()),
         discover: discover_work(template),
         queries: query_work(template, found),
+        counters: Vec::new(),
     }
+}
+
+/// What's read on a Windows host for a template that runs once there, where
+/// discovery found `found`, or nothing yet: its registry values and counter sets
+/// to look for, and the counters blocks that read now.
+pub fn host_work(template: &Template, found: Option<&Map<String, Value>>) -> TemplateWork {
+    let discover = template
+        .discover
+        .iter()
+        .filter(|discover| !discover.registry.is_empty() || !discover.counter_sets.is_empty())
+        .map(|discover| DiscoverWork {
+            key: discover.key.clone(),
+            interval: discover_interval(discover.interval.as_ref()),
+            sql: None,
+            registry: discover
+                .registry
+                .iter()
+                .map(|read| RegistryWork {
+                    key: read.key.clone(),
+                    values: read.values.clone().into_iter().collect(),
+                })
+                .collect(),
+            counter_sets: discover.counter_sets.clone().into_iter().collect(),
+        })
+        .collect();
+    TemplateWork {
+        template: template.key.clone(),
+        database: None,
+        discover,
+        queries: Vec::new(),
+        counters: counters_work(template, found),
+    }
+}
+
+fn discover_interval(interval: Option<&String>) -> Duration {
+    seconds(interval).unwrap_or(DEFAULT_DISCOVERY_INTERVAL)
 }
 
 fn discover_work(template: &Template) -> Vec<DiscoverWork> {
@@ -195,20 +245,39 @@ fn discover_work(template: &Template) -> Vec<DiscoverWork> {
         .filter_map(|discover| {
             Some(DiscoverWork {
                 key: discover.key.clone(),
-                interval: seconds(discover.interval.as_ref()).unwrap_or(DEFAULT_DISCOVERY_INTERVAL),
-                sql: discover.sql.clone()?,
+                interval: discover_interval(discover.interval.as_ref()),
+                sql: Some(discover.sql.clone()?),
+                registry: Vec::new(),
+                counter_sets: BTreeMap::new(),
             })
         })
         .collect()
 }
 
-/// Whether a query needs to know what discovery found before it can run.
-fn needs_discovery(template: &Template, query: &Query) -> bool {
-    query.when.is_some()
-        || query.since.is_some()
-        || !query.fills.is_empty()
+/// Whether a query or counters block needs to know what discovery found before it
+/// can run, by its `when`, its `since`, its metrics' or the template's version.
+fn needs_discovery(
+    template: &Template,
+    when: Option<&String>,
+    since: Option<&String>,
+    metrics: &[Metric],
+) -> bool {
+    when.is_some()
+        || since.is_some()
         || template.min_version.is_some()
-        || query.metrics.iter().any(|metric| metric.since.is_some())
+        || metrics.iter().any(|metric| metric.since.is_some())
+}
+
+/// Whether a metric is only from a version later than the one found, or from one
+/// when none was found.
+fn too_new(metric: &Metric, version: Option<&Version>) -> bool {
+    metric
+        .since
+        .as_deref()
+        .is_some_and(|since| match (version, Version::parse(since)) {
+            (Some(at), Some(since)) => *at < since,
+            _ => true,
+        })
 }
 
 /// A query's metrics that are only from a version later than the one found, or
@@ -217,34 +286,38 @@ fn omitted(query: &Query, version: Option<&Version>) -> Vec<String> {
     query
         .metrics
         .iter()
-        .filter(|metric| {
-            metric
-                .since
-                .as_deref()
-                .is_some_and(|since| match (version, Version::parse(since)) {
-                    (Some(at), Some(since)) => *at < since,
-                    _ => true,
-                })
-        })
+        .filter(|metric| too_new(metric, version))
         .map(|metric| metric.key.clone())
         .collect()
 }
 
+/// Whether the template is for a version older than the one found, so only its
+/// discovery runs.
+fn below_min_version(template: &Template, version: Option<&Version>) -> bool {
+    matches!(
+        (template.min_version.as_deref().and_then(Version::parse), version),
+        (Some(oldest), Some(at)) if *at < oldest
+    )
+}
+
 fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<QueryWork> {
     let version = found.and_then(version_in);
-    // Below the oldest version it's for, only discovery runs.
-    if let (Some(oldest), Some(at)) = (
-        template.min_version.as_deref().and_then(Version::parse),
-        &version,
-    ) && *at < oldest
-    {
+    if below_min_version(template, version.as_ref()) {
         return Vec::new();
     }
     template
         .queries
         .iter()
         .filter(|query| query.enabled)
-        .filter(|query| !needs_discovery(template, query) || found.is_some())
+        .filter(|query| {
+            let needs = needs_discovery(
+                template,
+                query.when.as_ref(),
+                query.since.as_ref(),
+                &query.metrics,
+            );
+            !(needs || !query.fills.is_empty()) || found.is_some()
+        })
         .filter(|query| picked(query.when.as_deref(), query.since.as_deref(), found))
         .map(|query| QueryWork {
             key: query.key.clone(),
@@ -260,6 +333,76 @@ fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<Qu
             omit: omitted(query, version.as_ref()),
         })
         .collect()
+}
+
+/// A template's counters blocks that read now, picked as queries are, each with
+/// only the metrics for the version found.
+fn counters_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<CountersWork> {
+    let version = found.and_then(version_in);
+    if below_min_version(template, version.as_ref()) {
+        return Vec::new();
+    }
+    template
+        .counters
+        .iter()
+        .filter(|counters| counters.enabled)
+        .filter(|counters| {
+            let needs = needs_discovery(
+                template,
+                counters.when.as_ref(),
+                counters.since.as_ref(),
+                &counters.metrics,
+            );
+            !needs || found.is_some()
+        })
+        .filter(|counters| picked(counters.when.as_deref(), counters.since.as_deref(), found))
+        .filter_map(|counters| {
+            let metrics: Vec<CounterWork> = counters
+                .metrics
+                .iter()
+                .filter(|metric| !too_new(metric, version.as_ref()))
+                .filter_map(|metric| {
+                    let counter = metric.counter.clone()?;
+                    Some(CounterWork {
+                        key: metric.key.clone(),
+                        // A percentage of several instances is the highest of them.
+                        highest: counter.trim_start().starts_with('%')
+                            || metric.unit.as_deref() == Some("%"),
+                        counter,
+                        total: metric.total,
+                    })
+                })
+                .collect();
+            if metrics.is_empty() {
+                return None;
+            }
+            Some(CountersWork {
+                key: counters.key.clone(),
+                object: counters.object.clone(),
+                instances: instances_of(counters),
+                exclude: counters.exclude.clone(),
+                groups: counters.groups.clone().into_iter().collect(),
+                join: counters.join.as_ref().map(|join| JoinWork {
+                    object: join.object.clone(),
+                    pattern: join.pattern.clone(),
+                }),
+                interval: seconds(counters.interval.as_ref()),
+                metrics,
+            })
+        })
+        .collect()
+}
+
+/// Which of a counter set's instances a counters block reads.
+fn instances_of(counters: &Counters) -> Instances {
+    match (&counters.label, &counters.pattern, &counters.instance) {
+        (Some(label), _, _) => Instances::Labelled(label.clone()),
+        (_, Some(pattern), _) => Instances::Pattern(pattern.clone()),
+        (_, _, Some(instance)) => Instances::One(instance.clone()),
+        // Joined by groups read from counters alone, it reads every instance.
+        _ if counters.join.is_some() => Instances::Pattern(String::new()),
+        _ => Instances::None,
+    }
 }
 
 #[cfg(test)]
@@ -383,12 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn a_template_not_for_a_database_is_sent_once_if_it_reads_anything() {
+    fn a_template_not_for_a_database_is_sent_once_to_a_windows_host_if_it_reads_anything() {
         let os = |reads: &str| {
             running(&format!(
                 r#"template "win" {{
                      name = "Win"
-                     os   = ["windows"]
+                     os   = ["windows", "linux"]
                      {reads}
                    }}"#
             ))
@@ -397,7 +540,12 @@ mod tests {
         let linux = json!({ "os": { "family": "linux" } });
         let counters = r#"counters "cpu" {
                             object  = "Processor"
-                            metrics = { busy = "% Processor Time" }
+                            instance = "_Total"
+                            metrics = {
+                              busy   = "% Processor Time"
+                              ticks  = { counter = "Interrupts/sec" }
+                              shared = { counter = "Total Thing", total = true }
+                            }
                           }"#;
         let work = work_of(
             &os(counters),
@@ -407,9 +555,139 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].database, None);
         assert!(work[0].queries.is_empty() && work[0].discover.is_empty());
-        // Not on the systems it's for, or with nothing to read.
+        let cpu = &work[0].counters[0];
+        assert_eq!(cpu.object, "Processor");
+        assert_eq!(cpu.instances, Instances::One("_Total".to_string()));
+        let flags: Vec<(&str, bool, bool)> = cpu
+            .metrics
+            .iter()
+            .map(|metric| (metric.key.as_str(), metric.total, metric.highest))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("busy", false, true),
+                ("ticks", false, false),
+                ("shared", true, false)
+            ]
+        );
+        // Only Windows has counters, and a template with nothing to read isn't sent.
         assert!(work_of(&os(counters), &Host::new(&linux, "a"), &Discoveries::new()).is_empty());
         assert!(work_of(&os(""), &Host::new(&windows, "a"), &Discoveries::new()).is_empty());
+    }
+
+    const IIS: &str = r#"
+        template "iis" {
+          name    = "IIS"
+          service = "W3SVC"
+          discover "iis" {
+            registry "HKLM\\SOFTWARE\\Microsoft\\InetStp" {
+              version = "VersionString"
+            }
+            counter_sets = { process_v2 = "Process V2" }
+          }
+          counters "sites" {
+            object  = "Web Service"
+            label   = "site"
+            exclude = ["Default Web Site"]
+            metrics = {
+              requests = "Total Method Requests/sec"
+              newer    = { counter = "New", since = "10" }
+            }
+          }
+          counters "pool_processes" {
+            when    = "process_v2"
+            object  = "Process V2"
+            pattern = "^w3wp:(?<pid>\\d+)$"
+            join {
+              object  = "W3SVC_W3WP"
+              pattern = "^(?<pid>\\d+)_(?<pool>.+)$"
+            }
+            metrics = { pool_memory = { counter = "Working Set - Private", unit = "bytes" } }
+          }
+          counters "pool_processes_older" {
+            when   = "!process_v2"
+            object = "Process"
+            groups = { pid = "ID Process" }
+            join {
+              object  = "W3SVC_W3WP"
+              pattern = "^(?<pid>\\d+)_(?<pool>.+)$"
+            }
+            metrics = { pool_memory = { counter = "Working Set - Private", unit = "bytes" } }
+          }
+        }
+    "#;
+
+    #[test]
+    fn a_services_template_is_sent_to_hosts_with_the_service_by_what_discovery_found() {
+        let templates = running(IIS);
+        let facts = json!({ "os": { "family": "windows" }, "services": ["Dnscache", "w3svc"] });
+        let host = Host::new(&facts, "a");
+        let keys = |work: &[TemplateWork]| -> Vec<String> {
+            work[0]
+                .counters
+                .iter()
+                .map(|counters| counters.key.clone())
+                .collect()
+        };
+
+        // Before discovery, only what discovery looks for: every counters block
+        // waits, the first as one of its metrics has a since.
+        let work = work_of(&templates, &host, &Discoveries::new());
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].database, None);
+        let discover = &work[0].discover[0];
+        assert_eq!(discover.sql, None);
+        assert_eq!(discover.interval, DEFAULT_DISCOVERY_INTERVAL);
+        assert_eq!(discover.registry[0].key, r"HKLM\SOFTWARE\Microsoft\InetStp");
+        assert_eq!(discover.registry[0].values["version"], "VersionString");
+        assert_eq!(discover.counter_sets["process_v2"], "Process V2");
+        assert!(keys(&work).is_empty());
+        let found = |values: Value| {
+            Discoveries::from([(
+                (7, ON_HOST.to_string()),
+                values.as_object().unwrap().clone(),
+            )])
+        };
+
+        let work = work_of(
+            &templates,
+            &host,
+            &found(json!({ "version": "Version 10.0", "process_v2": true })),
+        );
+        assert_eq!(keys(&work), ["sites", "pool_processes"]);
+        let sites = &work[0].counters[0];
+        assert_eq!(sites.instances, Instances::Labelled("site".to_string()));
+        assert_eq!(sites.exclude, ["Default Web Site"]);
+        assert_eq!(sites.metrics.len(), 2);
+        let processes = &work[0].counters[1];
+        assert_eq!(
+            processes.instances,
+            Instances::Pattern(r"^w3wp:(?<pid>\d+)$".to_string())
+        );
+        assert_eq!(processes.join.as_ref().unwrap().object, "W3SVC_W3WP");
+
+        let work = work_of(&templates, &host, &found(json!({ "process_v2": false })));
+        assert_eq!(keys(&work), ["sites", "pool_processes_older"]);
+        let older = &work[0].counters[1];
+        // Joined by a group read from a counter, so every instance is read.
+        assert_eq!(older.instances, Instances::Pattern(String::new()));
+        assert_eq!(older.groups["pid"], "ID Process");
+
+        // Not on a host without the service.
+        let without = json!({ "os": { "family": "windows" }, "services": ["Dnscache"] });
+        assert!(work_of(&templates, &Host::new(&without, "a"), &Discoveries::new()).is_empty());
+    }
+
+    #[test]
+    fn a_rule_for_a_template_on_the_host_keeps_its_series_only_where_picked() {
+        let picked = HashSet::from([("a".to_string(), ON_HOST.to_string())]);
+        let labels = vec!["pool".to_string()];
+        let mut series = vec!["x".to_string(), "y".to_string()];
+        keep_picked(&mut series, &labels, "a", &picked);
+        assert_eq!(series.len(), 2);
+        keep_picked(&mut series, &labels, "b", &picked);
+        assert!(series.is_empty());
     }
 
     #[test]

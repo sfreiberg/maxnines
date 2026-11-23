@@ -26,7 +26,7 @@ use tracing::warn;
 
 use super::hosts::{DatabaseKinds, RunningTemplates};
 use super::values::{LastSent, QueryValues, strip_queries, work_out};
-use super::work::{Discoveries, work_for};
+use super::work::{Discoveries, instance_of, work_for};
 use crate::facts::{FlatFacts, unflatten};
 use crate::models::Database;
 use crate::remote_checks::RemoteCheck;
@@ -229,7 +229,7 @@ async fn work_out_all(
 async fn forget_others(database: &Database, host_id: &str, work: &[TemplateWork]) {
     let reads: Vec<(String, String)> = work
         .iter()
-        .filter_map(|one| Some((one.template.clone(), one.database.clone()?)))
+        .map(|one| (one.template.clone(), instance_of(one.database.as_deref())))
         .collect();
     if let Err(error) = database.forget_discovered(host_id, &reads).await {
         warn!(
@@ -303,8 +303,7 @@ pub async fn save_read(
                     let sent = lock(sent);
                     found.retain(|one| {
                         sent.iter().any(|work| {
-                            work.template == one.template
-                                && work.database.as_deref() == Some(one.database.as_str())
+                            work.template == one.template && work.database == one.database
                         })
                     });
                 }
@@ -323,7 +322,14 @@ pub async fn save_read(
         }
     }
     if !values.is_empty() {
-        work_out(&mut sample, values, &lock(sent), &mut lock(last_sent));
+        // A host with no agent has no facts of its own to work anything out from.
+        work_out(
+            &mut sample,
+            values,
+            &lock(sent),
+            &Value::Null,
+            &mut lock(last_sent),
+        );
     }
     strip_queries(&mut sample);
     let command = WriterCommand::Save(NewSample {

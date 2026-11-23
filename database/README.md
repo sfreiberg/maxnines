@@ -204,13 +204,13 @@ erDiagram
         int id PK
         string host_id FK
         int template_id FK
-        string database_name "the database in the agent's config, unique with host and template"
+        string database_name "the database in the agent's config, or empty on the host itself, unique with host and template"
         timestamp discovered_at "the time of the sample that last said what discovery found"
     }
     template_instance_values {
         int id PK
         int instance_id FK
-        string name "a column discovery found, unique with instance_id"
+        string name "a column, registry value or counter set discovery found, unique with instance_id"
         text value
         string value_type "string, number or boolean, as facts have"
     }

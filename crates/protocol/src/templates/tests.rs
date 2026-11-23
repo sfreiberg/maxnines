@@ -369,7 +369,7 @@ fn a_template_can_only_ask_what_an_agent_takes() {
     for expected in [
         r#"template "app", discover "d", interval: can be up to a day"#,
         r#"template "app", discover "d", sql: can be up to 64 KB"#,
-        r#"template "app": has more than 64 discover blocks and queries together"#,
+        r#"template "app": has more than 64 discover blocks, queries and counters together"#,
     ] {
         assert!(
             found.iter().any(|problem| problem.starts_with(expected)),
@@ -388,4 +388,65 @@ fn a_template_can_only_ask_what_an_agent_takes() {
            }"#,
     );
     assert!(found.is_empty(), "{found:#?}");
+}
+
+#[test]
+fn the_registry_and_counters_are_only_read_on_windows_hosts() {
+    let reading = |target: &str, key: &str| {
+        problems(&format!(
+            r#"template "app" {{
+                 name = "App"
+                 {target}
+                 discover "d" {{
+                   registry "{key}" {{ version = "Version" }}
+                   counter_sets = {{ asp = "ASP.NET" }}
+                 }}
+                 counters "c" {{
+                   object  = "Web Service"
+                   metrics = {{ m = "Current Connections" }}
+                 }}
+               }}"#
+        ))
+    };
+    for target in [r#"service = "W3SVC""#, r#"os = ["windows", "linux"]"#, ""] {
+        let found = reading(target, r"HKLM\\SOFTWARE\\App");
+        assert!(found.is_empty(), "{target}: {found:#?}");
+    }
+    let found = reading(r#"database = "postgres""#, r"HKLM\\SOFTWARE\\App");
+    for expected in [
+        r#"template "app", discover "d", registry: The registry is the host's, not a database's"#,
+        r#"template "app", discover "d", counter_sets: A counter set is the host's"#,
+        r#"template "app", counters "c", object: A performance counter is the host's"#,
+    ] {
+        assert!(
+            found.iter().any(|problem| problem.starts_with(expected)),
+            "{expected}\n{found:#?}"
+        );
+    }
+    let found = reading(r#"os = ["linux"]"#, r"HKCU\\SOFTWARE\\App");
+    for expected in [
+        r#"template "app", discover "d", registry: The registry is only on Windows"#,
+        r#"template "app", counters "c", object: A performance counter is only on Windows"#,
+        r#"template "app", discover "d", registry: "HKCU\\SOFTWARE\\App" isn't under HKLM"#,
+    ] {
+        assert!(
+            found.iter().any(|problem| problem.starts_with(expected)),
+            "{expected}\n{found:#?}"
+        );
+    }
+}
+
+#[test]
+fn only_the_hosts_own_registry_keys_are_read() {
+    assert_eq!(
+        local_machine_key(r"HKLM\SOFTWARE\Microsoft\InetStp"),
+        Some(r"SOFTWARE\Microsoft\InetStp")
+    );
+    assert_eq!(
+        local_machine_key(r"hkey_local_machine\SOFTWARE\"),
+        Some("SOFTWARE")
+    );
+    assert_eq!(local_machine_key(r"HKCU\SOFTWARE"), None);
+    assert_eq!(local_machine_key("HKLM"), None);
+    assert_eq!(local_machine_key(r"HKLM\"), None);
 }

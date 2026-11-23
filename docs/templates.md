@@ -94,7 +94,10 @@ One field says what a template is for, and it runs once for each match on a host
 
 Only a template for a database has SQL, its `query` blocks and the `sql` of its
 discover blocks, as there's nothing else to run SQL on. The others read Windows
-performance counters and the registry, which agents don't read yet.
+performance counters and the registry, so they run only on Windows hosts with an
+agent, and a template for `os` has to list `windows` to read them. A database's
+template can't read them, as they're the host's: read them in a template for the
+service, such as `service = "MSSQLSERVER"`.
 
 `min_version` is the oldest version it's for. `services` lists services that the
 host's own **Service stopped** alert should watch.
@@ -124,7 +127,11 @@ changes quickly can be looked at often and what hardly changes rarely:
 
 - `sql`: each column of the first row, by its name. A column called `version` is
   read as a version, from the first number in it, so `16.4 (Debian 16.4-1)` is 16.4;
-- `registry "<key>" { name = "Value" }`: Windows registry values, each by its name;
+- `registry "<key>" { name = "Value" }`: Windows registry values, each by its name.
+  Only keys under `HKLM` (`HKEY_LOCAL_MACHINE`) are read, as the agent runs as a
+  service with no user's settings. Text is read as text and numbers as numbers, and
+  a list of pieces of text as one, joined with commas. A value that isn't there isn't
+  found;
 - `counter_sets = { name = "Counter set" }`: whether the host has each performance
   counter set, true or false.
 
@@ -145,10 +152,11 @@ last found there, their SQL filled in for that version. A query with a `when`,
 `since` or `fill`, or in a template with a `min_version`, waits until discovery has
 found something, and below `min_version` only discovery runs. When what discovery
 finds changes, the agent is sent what to read again. The agent itself only runs the
-SQL it's sent. A template that isn't for a database is sent once for each host it's
-for that runs what it's for, if it reads anything, but performance counters and
-registry values aren't sent or read yet, so agents have nothing to run for one so far.
-Templates for a Windows service aren't sent until then.
+SQL it's sent. A template that isn't for a database is sent once to each Windows host it's for
+that runs what it's for, if it reads anything there: what its discover blocks look
+for, and its counters blocks picked by `when` and `since` as queries are, each with
+only its metrics for the version found. What it finds is kept for the host, and its
+alerts with `when` or `since` are checked on the hosts where what was found fits.
 
 On a host without an agent, the server reads its databases itself, the same way and
 with the same limits: what's read through each database check is worked out as an
@@ -194,7 +202,8 @@ query "throughput" {
 ```
 
 A `value` is worked out by the server as each sample arrives, for each row of its
-query, from that row's numbers by their columns' names. `rate(x)` is a running total's
+query, from that row's numbers by their columns' names, with the host's facts under
+`facts` on a host with an agent. `rate(x)` is a running total's
 change each second since the query last sent that row's series, so a series' first
 row has no rate, and nor does a sample the agent kept while away and sent after newer
 ones. Nothing is worked out from a column the row doesn't have. A metric with
@@ -264,6 +273,24 @@ counters "sites" {
   patterns, which the other groups then label. `groups = { pid = "ID Process" }` reads a
   group's value from a counter rather than the instance's name;
 - series that end up with the same labels add up; percentages take the highest.
+
+With none of `label`, `pattern` or `instance`, the counter set is read as one with no
+instances, such as `Memory`. A `join` matches each instance to the other counter set's
+instances its pattern matches, and an instance with no match, or no value for a
+`groups` counter, is left out; with `groups` and no `pattern`, every instance is read.
+Up to 256 series are read from a counters block.
+
+A `value` is worked out by the server as each sample arrives, from the counter's own
+reading, `value`, and the host's facts, so `value / facts.cpu.logical_cores` is a
+share of the whole host. What it works out takes the reading's place.
+
+`when`, `since` and `interval` work as a query's do, and a metric's `since` leaves it
+out below that version. Counters are read through Windows' English names, so a
+template works whatever language Windows is in. Counter sets a `join` reads and that
+`counter_sets` looks for are found by the names Windows lists them by, which are the
+same in every language for most applications' own, such as IIS's `W3SVC_W3WP`, but not
+for Windows' own, such as `Process`. To see which counters a host has, run
+`typeperf -qx "<Counter set>"` there.
 
 ### Alerts
 

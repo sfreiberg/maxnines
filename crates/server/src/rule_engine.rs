@@ -38,6 +38,10 @@ pub struct ResolvedConfig {
     pub matched_rules: Vec<String>,
     /// Collectors the rules turned on that this agent can't run.
     pub skipped_collectors: Vec<String>,
+    /// The host's facts it was worked out from, in their natural shape, which the
+    /// metrics its templates work out can use.
+    #[serde(skip)]
+    pub facts: Value,
 }
 
 /// Checks a rule before it's saved, so a mistake is caught by whoever made it
@@ -250,6 +254,7 @@ impl ConfigRules {
             config,
             matched_rules,
             skipped_collectors,
+            facts: host.facts.clone(),
         })
     }
 }

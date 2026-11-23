@@ -1,5 +1,6 @@
 //! What templates' discovery found, for each database a template runs for on each
-//! host. Agents report it with their samples, and the server works out from it which
+//! host, or on the host itself for a template that runs once there, kept with an
+//! empty database name. Agents report it with their samples, and the server works out from it which
 //! queries each runs and which databases a template's alerts with `when` or `since`
 //! are for.
 
@@ -14,7 +15,7 @@ use maxnines_protocol::templates::work::Discovered;
 
 use super::{Database, template, template_instance, template_instance_value};
 use crate::facts::{decode, encode};
-use crate::templates::work::Discoveries;
+use crate::templates::work::{Discoveries, instance_of};
 use crate::times::Timestamp;
 
 /// The most columns one database's discovery is kept for.
@@ -25,7 +26,7 @@ pub const MAX_VALUE_LEN: usize = 1024;
 /// Whether what an agent says discovery found could be kept.
 pub fn can_keep(found: &Discovered) -> bool {
     found.values.len() <= MAX_VALUES
-        && found.database.len() <= 255
+        && found.database.as_ref().is_none_or(|name| name.len() <= 255)
         && found.values.iter().all(|(name, value)| {
             !name.is_empty()
                 && name.len() <= 255
@@ -68,10 +69,11 @@ impl Database {
             let Some(template_id) = templates.get(&one.template) else {
                 continue;
             };
+            let database = instance_of(one.database.as_deref());
             let existing = template_instance::Entity::find()
                 .filter(template_instance::Column::HostId.eq(host_id))
                 .filter(template_instance::Column::TemplateId.eq(*template_id))
-                .filter(template_instance::Column::DatabaseName.eq(&one.database))
+                .filter(template_instance::Column::DatabaseName.eq(&database))
                 .one(&transaction)
                 .await
                 .context("loading what discovery found")?;
@@ -90,7 +92,7 @@ impl Database {
                     let id = template_instance::Entity::insert(template_instance::ActiveModel {
                         host_id: Set(host_id.to_string()),
                         template_id: Set(*template_id),
-                        database_name: Set(one.database.clone()),
+                        database_name: Set(database.clone()),
                         discovered_at: Set(at),
                         ..Default::default()
                     })
@@ -181,8 +183,9 @@ impl Database {
     }
 
     /// Forgets what discovery found on a host for any template and database it
-    /// isn't sent to read any more, by template key and database: one taken out
-    /// of the agent's config, or a template that's off or no longer for the host.
+    /// isn't sent to read any more, by template key and database, empty for one on
+    /// the host: one taken out of the agent's config, or a template that's off or
+    /// no longer for the host.
     pub async fn forget_discovered(&self, host_id: &str, sent: &[(String, String)]) -> Result<()> {
         let all = self.all_discoveries().await?;
         let Some(found) = all.get(host_id) else {

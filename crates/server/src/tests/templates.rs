@@ -2326,3 +2326,152 @@ async fn what_discovery_finds_is_kept_and_picks_queries_and_alerts() {
     let databases: Vec<&str> = kept.keys().map(|(_, database)| database.as_str()).collect();
     assert_eq!(databases, ["a"]);
 }
+
+/// A template for a Windows service, whose counters depend on what its discovery
+/// finds on the host, with a metric worked out from a counter and the host's facts.
+const WEB: &str = r#"template "web" {
+  name    = "Web"
+  service = "W3SVC"
+  discover "iis" {
+    registry "HKLM\\SOFTWARE\\Microsoft\\InetStp" {
+      version = "VersionString"
+    }
+    counter_sets = { queues = "HTTP Service Request Queues" }
+  }
+  counters "sites" {
+    object  = "Web Service"
+    label   = "site"
+    metrics = { connections = "Current Connections" }
+  }
+  counters "queues" {
+    when    = "queues"
+    object  = "HTTP Service Request Queues"
+    label   = "pool"
+    metrics = {
+      queue_length = "CurrentQueueSize"
+      queue_share  = { counter = "CurrentQueueSize", value = "value / facts.cpu.logical_cores" }
+    }
+  }
+  alert "busy" {
+    name    = "Queues busy"
+    when    = "queues"
+    warning = "queue_length > 10"
+  }
+}"#;
+
+#[tokio::test]
+async fn a_services_template_reads_a_windows_host_by_what_its_discovery_finds() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    TestServer::next_config(&mut client).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({
+            "os": { "family": "windows" },
+            "cpu": { "logical_cores": 4 },
+            "services": ["Dnscache", "W3SVC"],
+        }),
+    };
+    send(&mut client, &facts).await;
+    server.wait_for_facts(&host.id(), 1).await;
+    let database = &server.state.database;
+    let template = crate::templates::load(WEB, &json!({}), &database.catalog()).unwrap();
+    database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+
+    // Before discovery, what it looks for, and the counters that need nothing found.
+    let (_, config) = TestServer::next_config(&mut client).await;
+    let blocks = |config: &AgentConfig| -> Vec<String> {
+        let work = config
+            .templates
+            .iter()
+            .find(|work| work.template == "web")
+            .unwrap();
+        assert_eq!(work.database, None);
+        work.counters
+            .iter()
+            .map(|counters| counters.key.clone())
+            .collect()
+    };
+    assert_eq!(blocks(&config), ["sites"]);
+    let discover = &config.templates[0].discover[0];
+    assert_eq!(discover.registry[0].values["version"], "VersionString");
+    assert_eq!(
+        discover.counter_sets["queues"],
+        "HTTP Service Request Queues"
+    );
+
+    // The agent sends what it found on the host, which picks the queues' counters.
+    let found = |queues: bool| json!([{ "template": "web", "values": { "version": "Version 10.0", "queues": queues } }]);
+    let sample = AgentMessage::Sample(Sample {
+        time: crate::times::now() - TimeDelta::seconds(1),
+        metrics: BTreeMap::from([("discovered".to_string(), found(true))]),
+    });
+    send(&mut client, &sample).await;
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(blocks(&config), ["sites", "queues"]);
+    let kept = database.discoveries(&host.id()).await.unwrap();
+    assert_eq!(kept.len(), 1);
+    assert!(kept.keys().all(|(_, database)| database.is_empty()));
+
+    // Its rows are stored, with the metric worked out from the counter and facts.
+    let rows = json!([
+        { "labels": { "site": "Shop" }, "_query": "sites", "connections": 3 },
+        { "labels": { "pool": "shop" }, "_query": "queues", "queue_length": 20, "queue_share": 20 },
+    ]);
+    let sample = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("template.web".to_string(), rows)]),
+    });
+    send(&mut client, &sample).await;
+    let read = |metric: &str| {
+        let path = format!("/api/v1/hosts/{}/metrics/{metric}", host.id());
+        let server = &server;
+        async move { json_body(&server.http("GET", &path, Some(&server.api_key)).await) }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let share = loop {
+        let share = read("web.queue_share").await;
+        let has = share["series"]
+            .as_array()
+            .is_some_and(|series| !series.is_empty());
+        if has || std::time::Instant::now() > deadline {
+            break share;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(share["series"][0]["name"], "shop", "{share}");
+    assert_eq!(share["series"][0]["points"][0]["avg"], 5.0, "{share}");
+
+    // The alert is for this host while discovery finds the queues, and not after.
+    let mut evaluator = crate::alert_evaluator::Evaluator::new(
+        &server.state,
+        crate::times::now() - TimeDelta::hours(1),
+    );
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    let open = database.open_alerts().await.unwrap();
+    assert_eq!(open.len(), 1, "{open:?}");
+    let sample = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("discovered".to_string(), found(false))]),
+    });
+    send(&mut client, &sample).await;
+    let (_, config) = TestServer::next_config(&mut client).await;
+    assert_eq!(blocks(&config), ["sites"]);
+    evaluator.evaluate(crate::times::now()).await.unwrap();
+    assert!(database.open_alerts().await.unwrap().is_empty());
+
+    // Not on a host that isn't Windows, though it says it has the service.
+    let other = identity();
+    let mut linux = server.connect_approved(&other, "linux-1").await;
+    TestServer::next_config(&mut linux).await;
+    let facts = AgentMessage::Facts {
+        facts: json!({ "os": { "family": "linux" }, "services": ["W3SVC"] }),
+    };
+    send(&mut linux, &facts).await;
+    server.wait_for_facts(&other.id(), 1).await;
+    let config = server.state.config_for(&other.id()).await.unwrap().config;
+    assert!(config.templates.is_empty(), "{config:?}");
+}

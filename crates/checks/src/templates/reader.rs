@@ -413,10 +413,14 @@ async fn run(
                 check_at = now + every;
             }
             for (block, discover) in discover_at.iter_mut().zip(&work.discover) {
+                // A database's discover blocks all have SQL, as work is checked.
+                let Some(sql) = &discover.sql else {
+                    continue;
+                };
                 if block.at > now || !session.is_up() {
                     continue;
                 }
-                match session.run(&discover.sql, TIMEOUT).await {
+                match session.run(sql, TIMEOUT).await {
                     Ok(rows) => {
                         found.extend(discovered(&rows));
                         discovered_now = true;
@@ -471,10 +475,10 @@ async fn run(
             }
             if discovered_now {
                 read.discovered
-                    .retain(|d| (&d.template, &d.database) != (&key.0, &key.1));
+                    .retain(|d| (&d.template, d.database.as_ref()) != (&key.0, Some(&key.1)));
                 read.discovered.push(Discovered {
                     template: work.template.clone(),
-                    database: database.clone(),
+                    database: Some(database.clone()),
                     values: found.clone(),
                 });
             }
@@ -548,9 +552,13 @@ mod tests {
             discover: vec![DiscoverWork {
                 key: "server".to_string(),
                 interval: Duration::from_secs(3600),
-                sql: "SELECT current_setting('server_version') AS version, \
-                      pg_is_in_recovery() AS replica"
-                    .to_string(),
+                sql: Some(
+                    "SELECT current_setting('server_version') AS version, \
+                     pg_is_in_recovery() AS replica"
+                        .to_string(),
+                ),
+                registry: Vec::new(),
+                counter_sets: Default::default(),
             }],
             queries: vec![QueryWork {
                 key: "throughput".to_string(),
@@ -562,6 +570,7 @@ mod tests {
                 totals: vec!["commits".to_string()],
                 omit: Vec::new(),
             }],
+            counters: Vec::new(),
         }
     }
 

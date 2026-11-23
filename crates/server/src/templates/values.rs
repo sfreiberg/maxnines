@@ -1,14 +1,16 @@
-//! Metrics a template works out with CEL, `value = "<CEL>"`, from the other columns
-//! of its query's rows, which the server does as an agent's samples arrive, as
-//! agents have no CEL.
+//! Metrics a template works out with CEL, `value = "<CEL>"`, which the server does
+//! as an agent's samples arrive, as agents have no CEL: for a query, from the other
+//! columns of its rows, and for a counters block, from the counter's own reading,
+//! `value`, which the worked-out number then takes the place of.
 //!
-//! Each row an agent sends says which query it's from, which is taken out before
-//! it's stored. Each metric is worked out for the rows of its query, from each
-//! row's numbers by their names. `rate(x)` is a running total's change over the seconds since that query
-//! last sent that series, so its first sample has none, and nor does one sent late,
-//! after a newer one, as an agent sends samples it kept while away. A metric naming
-//! a column the row doesn't have isn't worked out, and nor is one left out where it
-//! runs, as its `since` is past the version found there.
+//! Each row an agent sends says which query or counters block it's from, which is
+//! taken out before it's stored. Each metric is worked out for the rows of its
+//! query or block, from each row's numbers by their names, with the host's facts
+//! under `facts`. `rate(x)` is a running total's change over the seconds since that
+//! query last sent that series, so its first sample has none, and nor does one sent
+//! late, after a newer one, as an agent sends samples it kept while away. A metric
+//! naming a column the row doesn't have isn't worked out, and nor is one left out
+//! where it runs, as its `since` is past the version found there.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,8 +21,8 @@ use chrono::TimeDelta;
 use serde_json::{Map, Value, json};
 
 use maxnines_protocol::Sample;
-use maxnines_protocol::templates::Template;
 use maxnines_protocol::templates::work::{QUERY_FIELD, TemplateWork, collector_of};
+use maxnines_protocol::templates::{Metric, Template};
 
 use crate::cel_env::{FUNCTIONS, NUMBER, fractions, number};
 use crate::metrics::INSTANCE_LABEL;
@@ -28,29 +30,35 @@ use crate::times::Timestamp;
 
 /// A running total's change each second, for a template's `value` metrics.
 pub const RATE: &str = "rate";
+/// What the host's facts are under.
+const FACTS: &str = "facts";
 
 /// How long a series no sample has had is remembered, which is longer than any
 /// query's interval can be.
 const FORGET_AFTER: TimeDelta = TimeDelta::days(2);
 
-/// The metrics one of a template's queries works out, compiled.
+/// What a counters block's `value` calls the counter's own reading.
+pub const VALUE: &str = "value";
+
+/// The metrics one of a template's queries or counters blocks works out, compiled.
 pub struct QueryValues {
     /// The template's key.
     template: String,
+    /// The query's or the counters block's key.
     query: String,
+    /// Whether it's a counters block, whose metrics work out from their own reading.
+    counters: bool,
     metrics: Vec<(String, IdedExpr)>,
 }
 
-/// The metrics a template that's on works out with CEL, by query. One that doesn't
-/// compile is left out, as saving a template refuses it.
+/// The metrics a template that's on works out with CEL, by query and counters
+/// block. One that doesn't compile is left out, as saving a template refuses it.
 pub fn worked_out(template: &Template) -> Vec<QueryValues> {
     if !template.enabled {
         return Vec::new();
     }
-    let mut all = Vec::new();
-    for query in template.queries.iter().filter(|query| query.enabled) {
-        let metrics: Vec<(String, IdedExpr)> = query
-            .metrics
+    let compiled = |metrics: &[Metric]| -> Vec<(String, IdedExpr)> {
+        metrics
             .iter()
             .filter_map(|metric| {
                 let program = Program::compile(metric.value.as_deref()?).ok()?;
@@ -58,17 +66,28 @@ pub fn worked_out(template: &Template) -> Vec<QueryValues> {
                 fractions(&mut expr);
                 Some((metric.key.clone(), expr))
             })
-            .collect();
-        if metrics.is_empty() {
-            continue;
-        }
-        all.push(QueryValues {
+            .collect()
+    };
+    let queries = template
+        .queries
+        .iter()
+        .filter(|query| query.enabled)
+        .map(|query| (&query.key, false, compiled(&query.metrics)));
+    let counters = template
+        .counters
+        .iter()
+        .filter(|counters| counters.enabled)
+        .map(|counters| (&counters.key, true, compiled(&counters.metrics)));
+    queries
+        .chain(counters)
+        .filter(|(_, _, metrics)| !metrics.is_empty())
+        .map(|(key, counters, metrics)| QueryValues {
             template: template.key.clone(),
-            query: query.key.clone(),
+            query: key.clone(),
+            counters,
             metrics,
-        });
-    }
-    all
+        })
+        .collect()
 }
 
 /// When each query last sent each series on a connection, to work out rates.
@@ -76,11 +95,13 @@ pub fn worked_out(template: &Template) -> Vec<QueryValues> {
 pub struct LastSent(HashMap<(String, String), Timestamp>);
 
 /// Works out each `value` metric for the rows of a sample, adding it to each row
-/// of its query. `sent` is what the agent was last sent to read.
+/// of its query, or putting it in place of a counter's reading. `sent` is what the
+/// agent was last sent to read, and `facts` the host's, in their natural shape.
 pub fn work_out(
     sample: &mut Sample,
     queries: &[QueryValues],
     sent: &[TemplateWork],
+    facts: &Value,
     last_sent: &mut LastSent,
 ) {
     for query in queries {
@@ -107,24 +128,51 @@ pub fn work_out(
                 continue;
             }
             let database = labels.get(INSTANCE_LABEL).and_then(Value::as_str);
-            let Some(omit) = sent
+            let mut sent_for = sent
                 .iter()
                 .filter(|work| work.template == query.template)
-                .filter(|work| work.database.as_deref() == database)
-                .flat_map(|work| &work.queries)
-                .find(|sent| sent.key == query.query)
-                .map(|sent| &sent.omit)
-            else {
-                continue;
+                .filter(|work| work.database.as_deref() == database);
+            // Whether each metric is read where the row is from: a query's, unless
+            // it's left out, or a counters block's, if it was sent.
+            let read: Box<dyn Fn(&str) -> bool> = match query.counters {
+                false => {
+                    let Some(omit) = sent_for
+                        .find_map(|work| work.queries.iter().find(|sent| sent.key == query.query))
+                        .map(|sent| &sent.omit)
+                    else {
+                        continue;
+                    };
+                    Box::new(move |key: &str| !omit.iter().any(|left_out| left_out == key))
+                }
+                true => {
+                    let Some(block) = sent_for
+                        .find_map(|work| work.counters.iter().find(|sent| sent.key == query.query))
+                    else {
+                        continue;
+                    };
+                    Box::new(move |key: &str| block.metrics.iter().any(|metric| metric.key == key))
+                }
             };
             let series = Value::Object(labels).to_string();
             seen.insert(series.clone());
             let elapsed = last_sent.note(&collector, &query.query, series, sample.time);
             for (key, expr) in &query.metrics {
-                if omit.contains(key) || row.contains_key(key) {
+                if !read(key) {
                     continue;
                 }
-                if let Some(value) = evaluate(expr, &numbers, elapsed) {
+                if query.counters {
+                    // The counter's reading, which what's worked out takes the place of.
+                    let Some(reading) = row.remove(key) else {
+                        continue;
+                    };
+                    let mut numbers = numbers.clone();
+                    numbers.insert(VALUE.to_string(), reading);
+                    if let Some(value) = evaluate(expr, &numbers, facts, elapsed) {
+                        row.insert(key.clone(), json!(value));
+                    }
+                } else if !row.contains_key(key)
+                    && let Some(value) = evaluate(expr, &numbers, facts, elapsed)
+                {
                     row.insert(key.clone(), json!(value));
                 }
             }
@@ -185,12 +233,19 @@ pub fn strip_queries(sample: &mut Sample) {
     }
 }
 
-/// A metric's value from a row's numbers, or nothing if it can't be worked out.
-fn evaluate(expr: &IdedExpr, numbers: &Map<String, Value>, elapsed: Option<f64>) -> Option<f64> {
+/// A metric's value from a row's numbers and the host's facts, or nothing if it
+/// can't be worked out.
+fn evaluate(
+    expr: &IdedExpr,
+    numbers: &Map<String, Value>,
+    facts: &Value,
+    elapsed: Option<f64>,
+) -> Option<f64> {
     let mut context = CelContext::with_env(FUNCTIONS.clone());
     for (name, value) in numbers {
         context.add_variable_from_value(name.as_str(), CelValue::Float(value.as_f64()?));
     }
+    context.add_variable(FACTS, facts).ok()?;
     let rate = move |Arguments(args): Arguments| -> Result<CelValue, ExecutionError> {
         let change = match args.as_slice() {
             [CelValue::Float(change)] => *change,
@@ -272,6 +327,7 @@ mod tests {
                 query("sessions", &[]),
                 query("slots", &[]),
             ],
+            counters: Vec::new(),
         }]
     }
 
@@ -285,7 +341,13 @@ mod tests {
     fn worked(at: Timestamp, rows: Value, omit: &[&str], last_sent: &mut LastSent) -> Vec<Value> {
         let template = maxnines_protocol::templates::parse(PG).unwrap();
         let mut sample = sample(at, rows);
-        work_out(&mut sample, &worked_out(&template), &sent(omit), last_sent);
+        work_out(
+            &mut sample,
+            &worked_out(&template),
+            &sent(omit),
+            &Value::Null,
+            last_sent,
+        );
         sample.metrics["template.pg"].as_array().unwrap().clone()
     }
 
@@ -383,5 +445,60 @@ mod tests {
             &mut last_sent,
         );
         assert_eq!(last_sent.len(), 1);
+    }
+
+    #[test]
+    fn a_counters_value_takes_the_place_of_its_reading_with_the_hosts_facts() {
+        let template = maxnines_protocol::templates::parse(
+            r#"template "iis" {
+                 name    = "IIS"
+                 service = "W3SVC"
+                 counters "pools" {
+                   object  = "APP_POOL_WAS"
+                   label   = "pool"
+                   metrics = {
+                     pool_state   = "Current Application Pool State"
+                     pool_running = { counter = "Current Application Pool State", value = "value == 3" }
+                     pool_cpu     = { counter = "% Processor Time", value = "value / facts.cpu.logical_cores" }
+                     newer        = { counter = "Newer", value = "value * 2", since = "10" }
+                   }
+                 }
+               }"#,
+        )
+        .unwrap();
+        let found = json!({ "version": "9" });
+        let sent = crate::templates::work::host_work(&template, found.as_object());
+        // Only from a later version than the one found, so not read.
+        assert!(
+            sent.counters[0]
+                .metrics
+                .iter()
+                .all(|metric| metric.key != "newer"),
+            "{sent:?}"
+        );
+        let facts = json!({ "cpu": { "logical_cores": 4 } });
+        let mut sample = Sample {
+            time: crate::times::now(),
+            metrics: BTreeMap::from([(
+                "template.iis".to_string(),
+                json!([
+                    { "labels": { "pool": "a" }, "_query": "pools", "pool_state": 3, "pool_running": 3, "pool_cpu": 50 },
+                    { "labels": { "pool": "b" }, "_query": "pools", "pool_state": 5, "pool_running": 5 },
+                ]),
+            )]),
+        };
+        work_out(
+            &mut sample,
+            &worked_out(&template),
+            &[sent],
+            &facts,
+            &mut LastSent::default(),
+        );
+        let rows = &sample.metrics["template.iis"];
+        assert_eq!(rows[0]["pool_state"], 3);
+        assert_eq!(rows[0]["pool_running"], 1.0);
+        assert_eq!(rows[0]["pool_cpu"], 12.5);
+        assert_eq!(rows[1]["pool_running"], 0.0);
+        assert!(rows[1].get("pool_cpu").is_none(), "{}", rows[1]);
     }
 }

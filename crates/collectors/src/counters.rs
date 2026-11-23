@@ -182,7 +182,8 @@ pub(crate) mod pdh {
     // at a time, as `read` and `drop` take it mutably.
     unsafe impl Send for Counters {}
 
-    fn added(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER, &'static str> {
+    /// Adds a counter by its English path to an open query.
+    pub(crate) fn added(query: PDH_HQUERY, path: &str) -> Result<PDH_HCOUNTER, &'static str> {
         let mut counter: PDH_HCOUNTER = null_mut();
         let path = wide(path);
         // SAFETY: the query is open, the path ends with a zero, and the handle has
@@ -197,7 +198,38 @@ pub(crate) mod pdh {
         }
     }
 
+    /// What a counter's values were at the last collection, each by its instance's
+    /// name, or why there are none.
+    pub(crate) enum Formatted {
+        Values(Vec<(String, f64)>),
+        /// A rate that has nothing to compare with yet.
+        Waiting,
+        Failed,
+    }
+
     fn values(path: &str, counter: PDH_HCOUNTER) -> Reading {
+        let usable = match formatted(counter) {
+            Formatted::Values(usable) => usable,
+            Formatted::Waiting => return Reading::Waiting,
+            Formatted::Failed => return Reading::Failed(NOT_READ),
+        };
+        if !path.contains("(*)") {
+            return Reading::Values {
+                values: usable
+                    .first()
+                    .map(|(_, value)| (path.to_string(), *value))
+                    .into_iter()
+                    .collect(),
+                dropped: 0,
+            };
+        }
+        let (values, dropped) = kept_instances(path, usable);
+        Reading::Values { values, dropped }
+    }
+
+    /// A counter's values, by instance, as Windows gives them: instances of programs
+    /// that share a name come with the same name.
+    pub(crate) fn formatted(counter: PDH_HCOUNTER) -> Formatted {
         let (mut size, mut count) = (0u32, 0u32);
         // SAFETY: asking how much room the values need, with nowhere to put them yet.
         let status = unsafe {
@@ -205,14 +237,9 @@ pub(crate) mod pdh {
         };
         match status {
             PDH_MORE_DATA => {}
-            0 => {
-                return Reading::Values {
-                    values: Vec::new(),
-                    dropped: 0,
-                };
-            }
-            PDH_INVALID_DATA | PDH_CSTATUS_INVALID_DATA | PDH_NO_DATA => return Reading::Waiting,
-            _ => return Reading::Failed(NOT_READ),
+            0 => return Formatted::Values(Vec::new()),
+            PDH_INVALID_DATA | PDH_CSTATUS_INVALID_DATA | PDH_NO_DATA => return Formatted::Waiting,
+            _ => return Formatted::Failed,
         }
         // In eights, as the items hold numbers and pointers that need that alignment.
         let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
@@ -222,8 +249,8 @@ pub(crate) mod pdh {
             unsafe { PdhGetFormattedCounterArrayW(counter, FORMAT, &mut size, &mut count, items) };
         match status {
             0 => {}
-            PDH_INVALID_DATA | PDH_CSTATUS_INVALID_DATA | PDH_NO_DATA => return Reading::Waiting,
-            _ => return Reading::Failed(NOT_READ),
+            PDH_INVALID_DATA | PDH_CSTATUS_INVALID_DATA | PDH_NO_DATA => return Formatted::Waiting,
+            _ => return Formatted::Failed,
         }
         // SAFETY: Windows filled in `count` items at the start of the buffer.
         let items = unsafe { std::slice::from_raw_parts(items, count as usize) };
@@ -241,18 +268,7 @@ pub(crate) mod pdh {
                 unsafe { (from_wide(item.szName), item.FmtValue.Anonymous.doubleValue) }
             })
             .collect();
-        if !path.contains("(*)") {
-            return Reading::Values {
-                values: usable
-                    .first()
-                    .map(|(_, value)| (path.to_string(), *value))
-                    .into_iter()
-                    .collect(),
-                dropped: 0,
-            };
-        }
-        let (values, dropped) = kept_instances(path, usable);
-        Reading::Values { values, dropped }
+        Formatted::Values(usable)
     }
 
     impl Counters {

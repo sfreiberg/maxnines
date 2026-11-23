@@ -7,6 +7,7 @@ mod file_systems;
 #[cfg(target_os = "macos")]
 pub mod gpu;
 pub mod host;
+pub mod host_templates;
 pub mod interface_drops;
 pub mod system;
 pub mod tcp;
