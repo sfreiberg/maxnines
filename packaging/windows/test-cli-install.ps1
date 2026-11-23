@@ -72,6 +72,8 @@ $env:MAXNINES_CONFIG_DIR = $config
 & $found get hosts 2>$null | Out-Null
 Check ($LASTEXITCODE -eq 4) "with no sign-in it says so, exiting 4 (exited $LASTEXITCODE)"
 Remove-Item Env:MAXNINES_CONFIG_DIR
+# Otherwise the step would end with that exit code, as if this had failed.
+$global:LASTEXITCODE = 0
 
 # An upgrade.
 Msiexec 'upgrade' @('/i', "`"$Upgrade`"")
@@ -88,3 +90,4 @@ Check (-not ($path.Split(';') -contains $program)) 'uninstalling takes it off th
 Check (-not (Test-Path 'HKLM:\SOFTWARE\MaxNines\Command Line')) 'uninstalling leaves nothing in the registry'
 
 Write-Host 'The installer works.'
+exit 0
