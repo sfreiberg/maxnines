@@ -1269,7 +1269,7 @@ pub const METRICS: &[StaticMetric] = &[
     },
     StaticMetric {
         name: "apache.up",
-        title: "Apache status page answering",
+        title: "Apache status page up",
         unit: Unit::Number,
         collector: "apache",
         source: Source::Items {
@@ -1371,7 +1371,7 @@ pub const METRICS: &[StaticMetric] = &[
     },
     StaticMetric {
         name: "nginx.up",
-        title: "nginx status page answering",
+        title: "nginx status page up",
         unit: Unit::Number,
         collector: "nginx",
         source: Source::Items {
@@ -1459,7 +1459,7 @@ pub const METRICS: &[StaticMetric] = &[
     },
     StaticMetric {
         name: "php_fpm.up",
-        title: "PHP-FPM status page answering",
+        title: "PHP-FPM status page up",
         unit: Unit::Number,
         collector: "php_fpm",
         source: Source::Items {
@@ -1561,7 +1561,7 @@ pub const METRICS: &[StaticMetric] = &[
     // they're numbers here: levels as they are, and running totals as rates.
     StaticMetric {
         name: "openmetrics.up",
-        title: "OpenMetrics page answering",
+        title: "OpenMetrics page up",
         unit: Unit::Number,
         collector: "openmetrics",
         source: Source::Items {

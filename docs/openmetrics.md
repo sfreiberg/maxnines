@@ -75,7 +75,7 @@ Two more metrics are there to alert on, and aren't charted:
 
 | Metric | What it says |
 | --- | --- |
-| **OpenMetrics page answering** | 1 while a page can be read, 0 when it can't, with why, such as a timeout |
+| **OpenMetrics page up** | 1 while a page can be read, 0 when it can't, with why, such as a timeout |
 | **OpenMetrics series over the limit** | How many series a page had that weren't kept |
 
 ## Pages that need signing in

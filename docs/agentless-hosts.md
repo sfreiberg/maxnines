@@ -60,7 +60,7 @@ host covers it too.
 A host with no agent is online while any of its pages answers or any of its checks
 passes, so the built-in **Host offline** rule alerts once nothing has for a minute.
 A single page or check that fails while others carry on is an alert of its own
-instead, on **OpenMetrics page answering** or **Checks passing**. A host with no pages or
+instead, on **OpenMetrics page up** or **Checks passing**. A host with no pages or
 checks, or with all of them turned off, is neither online nor offline. It's marked
 **Not read**, left out of the counts of hosts online and offline, and nothing
 alerts about it.
