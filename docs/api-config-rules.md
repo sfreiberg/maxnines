@@ -58,8 +58,8 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/rules/1"
 ```json
 {
   "id": 1,
-  "built_in": "default",
-  "name": "Default",
+  "built_in": "host",
+  "name": "Host",
   "priority": 0,
   "applies_to": null,
   "operating_systems": [],

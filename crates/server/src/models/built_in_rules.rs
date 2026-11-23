@@ -73,7 +73,7 @@ impl Database {
             let key = name_key(&built_in.rule.name);
             let existing = rows
                 .iter()
-                .find(|row| row.built_in.as_deref() == Some(built_in.key));
+                .find(|row| row.built_in.as_deref() == Some(built_in.key.as_str()));
 
             // Someone's own rule with this name, as names are compared, keeps
             // everything it had under a name of its own.

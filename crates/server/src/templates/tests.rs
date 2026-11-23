@@ -647,3 +647,40 @@ fn the_mysql_template_reads_binary_logs_only_where_they_are_on() {
     assert!(sent(1.0, 1.0).contains(&"replication_mariadb".to_string()));
     assert!(!sent(1.0, 1.0).contains(&"status".to_string()));
 }
+
+/// A built-in template's settings are a config rule's, checked as one is, and go
+/// out and back in HCL as they are.
+#[test]
+fn a_templates_config_is_checked_as_a_rules_settings_and_kept_in_hcl() {
+    let with = |settings: &str| {
+        format!(
+            r#"template "box" {{
+                 name = "Box"
+                 os   = ["linux"]
+                 config {{
+                   {settings}
+                 }}
+               }}"#
+        )
+    };
+    let fine = with("collectors = { gpu = { enabled = true } }\n interval_secs = 30");
+    assert_eq!(problems(&fine), Vec::<String>::new());
+    let template = parse(&fine).unwrap();
+    assert_eq!(
+        template.config.as_ref().unwrap()["collectors"]["gpu"]["enabled"],
+        true
+    );
+    let again = parse(&maxnines_protocol::templates::to_hcl(&template)).unwrap();
+    assert_eq!(again, template);
+    let rule = crate::built_in_rules::of_template(&template).unwrap();
+    assert_eq!(rule.key, "box");
+    assert_eq!(rule.rule.name, "Box");
+    assert_eq!(rule.rule.operating_systems, ["linux"]);
+    assert_eq!(rule.rule.priority, 0);
+
+    let wrong = problems(&with("collectors = { teleporter = { enabled = true } }"));
+    assert!(
+        wrong.iter().any(|problem| problem.contains("config")),
+        "{wrong:#?}"
+    );
+}

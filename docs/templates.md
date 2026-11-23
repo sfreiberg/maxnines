@@ -36,7 +36,8 @@ shown afterwards is written out from the parts.
 
 | Template | What it watches |
 | --- | --- |
-| **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules) |
+| **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules), and the [agent settings](#agent-settings) every host gets |
+| **macOS** | Macs: the agent settings they get beyond every host's, which read the GPU |
 | **ClickHouse** | Each ClickHouse database: its load against its limits, inserts and parts, memory, merges and background pools, mutations, error codes worth knowing about, disks, replication, Keeper and Distributed tables, with 7 alerts. Its database sizes and query times ship turned off, as they cost more. What it reads is listed under [database stats](database-stats.md#clickhouse-1) |
 | **MySQL** | Each MySQL or MariaDB database: its load, InnoDB, transactions and queries, replication into it, read through `SHOW`, semi-synchronous replication, Group Replication and Galera, with 7 alerts. MySQL's and MariaDB's differences are queries of their own, picked by what discovery finds. Its database and binary log sizes ship turned off. What it reads is listed under [database stats](database-stats.md#mysql-and-mariadb-1) |
 | **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed under [database stats](database-stats.md#postgresql-1) |
@@ -377,6 +378,33 @@ newest for each database a template runs for on each host. It's forgotten once t
 agent isn't sent that template for that database any more, as when the database
 leaves the agent's config or the template is turned off or no longer for the host,
 and found again when it is.
+
+### Agent settings
+
+A template that comes with MaxNines can have a `config` block: the agent settings the
+hosts it's for get, the same settings a [config rule](agents.md) sets.
+
+```hcl
+template "macos" {
+  name = "macOS"
+  os   = ["macos"]
+  config {
+    collectors = {
+      gpu = { enabled = true }
+    }
+  }
+}
+```
+
+Each becomes a built-in config rule of its own, named after the template, for the hosts
+the template is for, at priority 0, where it's listed as coming with MaxNines. Your own
+rules apply over it as over any rule: one at a higher priority wins, so a rule of your
+own changes what a template's settings say without touching the template, and upgrades
+leave it alone. The rule can be turned off, which lasts through upgrades.
+
+Templates you import or write can't have a `config` block, and one that does is refused:
+give agents' settings in a config rule, which says plainly what it changes on which
+hosts.
 
 ### Notices
 

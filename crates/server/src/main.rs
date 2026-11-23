@@ -390,7 +390,7 @@ async fn serve(path: &Path) -> Result<()> {
     let database = Database::connect(&database_url).await?;
     // The config rules that come with this version, which an upgrade may change.
     let changed = database
-        .sync_built_in_rules(&built_in_rules::all(), crate::times::now())
+        .sync_built_in_rules(&built_in_rules::all()?, crate::times::now())
         .await
         .context("updating the built-in config rules")?;
     if !changed.is_empty() {

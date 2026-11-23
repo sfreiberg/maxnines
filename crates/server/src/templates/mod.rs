@@ -96,6 +96,13 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
         cel(Place::Alert(index), "when", &alert.when);
     }
 
+    // Its settings are a config rule's, checked as one is.
+    if let Some(rule) = crate::built_in_rules::of_template(template)
+        && let Err(error) = crate::rule_engine::check_rule(&rule.rule)
+    {
+        say(Place::Template, "config", format!("{error:#}"));
+    }
+
     let dialect = dialect_for(template.target.as_ref());
     // SQL runs on a database, so only a template for a kind of database has any.
     if !matches!(template.target, Some(Target::Database(_))) {

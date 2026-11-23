@@ -6,3 +6,4 @@ host
 postgres
 clickhouse
 mysql
+macos

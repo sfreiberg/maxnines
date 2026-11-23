@@ -54,6 +54,25 @@ pub fn all() -> Result<Vec<BuiltIn>> {
     Ok(all)
 }
 
+/// A built-in template's agent settings, as this server was built with it, which
+/// is the only place a template's settings come from, as only built-in ones have
+/// any.
+pub fn config_of(key: &str) -> Option<serde_json::Map<String, Value>> {
+    static CONFIGS: std::sync::OnceLock<Vec<(String, serde_json::Map<String, Value>)>> =
+        std::sync::OnceLock::new();
+    let configs = CONFIGS.get_or_init(|| {
+        all()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|one| Some((one.template.key, one.template.config?)))
+            .collect()
+    });
+    configs
+        .iter()
+        .find(|(of, _)| of == key)
+        .map(|(_, config)| config.clone())
+}
+
 /// A built-in template from its file, read and checked.
 pub fn from_source(source: String) -> Result<BuiltIn> {
     // A built-in template is checked against the metrics the code has, as it's

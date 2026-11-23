@@ -11,7 +11,7 @@ async fn with_every_built_in_rule() -> TestServer {
     server
         .state
         .database
-        .sync_built_in_rules(&all(), crate::times::now())
+        .sync_built_in_rules(&all().unwrap(), crate::times::now())
         .await
         .unwrap();
     server.state.config_changed();
@@ -51,7 +51,7 @@ async fn a_mac_gets_its_gpu_watched_and_linux_does_not() {
     send(&mut mac, &facts).await;
     let (_, config) = TestServer::next_config(&mut mac).await;
     assert!(config.collectors["gpu"].enabled, "{config:?}");
-    // The Default rule still applies under it.
+    // The Host template's rule still applies under it.
     assert!(config.collectors["cpu"].enabled);
 
     let mut linux = server.connect_approved(&identity(), "web-1").await;
@@ -100,11 +100,11 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
         .create_rule("linux", 50, "true", json!({ "interval_secs": 9 }))
         .await;
 
-    let mut later = all();
+    let mut later = all().unwrap();
     later[1].rule.settings =
         json!({ "collectors": { "gpu": { "enabled": true }, "sensors": { "enabled": true } } });
     later.push(BuiltInRule {
-        key: "linux",
+        key: "linux".to_string(),
         rule: RuleInput {
             name: "Linux".to_string(),
             priority: 0,
@@ -143,7 +143,7 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
 
     // A built-in rule no longer shipped goes.
     let changed = database
-        .sync_built_in_rules(&all(), crate::times::now())
+        .sync_built_in_rules(&all().unwrap(), crate::times::now())
         .await
         .unwrap();
     assert!(changed.contains(&"Linux".to_string()), "{changed:?}");
@@ -208,15 +208,22 @@ async fn a_built_in_rule_is_locked_on_its_page_and_can_be_customized() {
     let mut browser = Browser::default();
 
     let list = browser.get(&server, "/rules").await;
-    assert!(list.body.contains("Comes with MaxNines"), "{}", list.body);
+    assert!(
+        list.body
+            .contains("Comes with MaxNines, from the macOS template"),
+        "{}",
+        list.body
+    );
 
     let edit = format!("/rules/{}/edit", mac.id);
     let page = browser.get(&server, &edit).await;
     assert!(
-        page.body.contains("comes with MaxNines and is updated"),
+        page.body
+            .contains("comes with MaxNines, as the agent settings of the built-in"),
         "{}",
         page.body
     );
+    assert!(page.body.contains("macOS template</a>"), "{}", page.body);
     assert!(page.body.contains(r#"<fieldset class="bare" disabled>"#));
     assert!(!page.body.contains(&format!("/rules/{}/delete", mac.id)));
 

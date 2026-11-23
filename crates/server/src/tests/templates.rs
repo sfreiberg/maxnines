@@ -110,8 +110,10 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
     assert!(database.template_upgrades().await.unwrap().is_empty());
 
     let templates = database.list_templates().await.unwrap();
-    let keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
-    assert_eq!(keys, ["clickhouse", "host", "mysql", "postgres"]);
+    let mut keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
+    // As the databases sort names differently.
+    keys.sort_unstable();
+    assert_eq!(keys, ["clickhouse", "host", "macos", "mysql", "postgres"]);
     for template in &templates {
         assert!(template.origin == Origin::BuiltIn && template.enabled);
     }
@@ -2509,4 +2511,41 @@ async fn a_services_template_reads_a_windows_host_by_what_its_discovery_finds() 
     server.wait_for_facts(&other.id(), 1).await;
     let config = server.state.config_for(&other.id()).await.unwrap().config;
     assert!(config.templates.is_empty(), "{config:?}");
+}
+
+/// Agent settings are only the built-in templates': an import, someone's own
+/// template, or a change to one with them is refused, and a built-in one read back
+/// has the settings it ships with.
+#[tokio::test]
+async fn only_a_built_in_template_has_agent_settings() {
+    let server = with_built_in_templates().await;
+    let database = &server.state.database;
+    let with_config = parse(&APP.replacen(
+        "template \"app\" {",
+        "template \"app\" {\n  config {\n    interval_secs = 30\n  }",
+        1,
+    ))
+    .unwrap();
+    assert!(with_config.config.is_some());
+    for refused in [
+        database
+            .import_template(&with_config, crate::times::now())
+            .await
+            .map(|_| ()),
+        database
+            .create_template(&with_config, crate::times::now())
+            .await
+            .map(|_| ()),
+    ] {
+        let error = refused.unwrap_err();
+        assert!(error.downcast_ref::<Refused>().is_some(), "{error:#}");
+        assert!(format!("{error:#}").contains("config rule"), "{error:#}");
+    }
+    let host = template_id(database, "host").await;
+    let stored = database.get_template(host).await.unwrap().unwrap();
+    assert_eq!(
+        stored.template.config.as_ref().unwrap()["interval_secs"],
+        15
+    );
+    assert!(stored.hcl().contains("config {"), "{}", stored.hcl());
 }

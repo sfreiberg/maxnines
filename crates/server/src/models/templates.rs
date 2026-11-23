@@ -552,10 +552,16 @@ async fn read_template<C: ConnectionTrait>(
         (Some(kind), Some(value)) => Target::from_parts(kind, value),
         _ => None,
     };
+    // Only a built-in template has settings, which are as this server ships them.
+    let config = match row.origin == Origin::BuiltIn.as_str() {
+        true => crate::templates::built_in::config_of(&row.key),
+        false => None,
+    };
     Ok(Template {
         key: row.key.clone(),
         name: row.name.clone(),
         description: row.description.clone(),
+        config,
         target,
         applies_to: match reading {
             Reading::AsWritten => row.applies_to.clone(),
@@ -2030,6 +2036,7 @@ impl Database {
 
     /// Adds someone's own template, checked already, with its alerts as rules.
     pub async fn create_template(&self, template: &Template, now: Timestamp) -> Result<i64> {
+        refuse_config(template)?;
         let transaction = self.connection.begin().await.context("saving template")?;
         refuse_taken(&transaction, template, None).await?;
         let mut active = template::ActiveModel {
@@ -2063,6 +2070,7 @@ impl Database {
         template: &Template,
         now: Timestamp,
     ) -> Result<bool> {
+        refuse_config(template)?;
         let transaction = self.connection.begin().await.context("saving template")?;
         let Some(stored) = load_template(&transaction, id).await? else {
             return Ok(false);
@@ -2641,10 +2649,22 @@ impl Database {
     }
 }
 
+/// Agent settings are only for the templates that come with MaxNines: anyone else's
+/// go in a config rule, which says plainly what it changes on which hosts.
+fn refuse_config(template: &Template) -> Result<()> {
+    if template.config.is_some() {
+        bail!(Refused(
+            "a config block is only for the templates that come with MaxNines: give agents' settings in a config rule instead".to_string()
+        ));
+    }
+    Ok(())
+}
+
 async fn import_outcome_in<C: ConnectionTrait>(
     connection: &C,
     template: &Template,
 ) -> Result<(Imported, Option<template::Model>)> {
+    refuse_config(template)?;
     let live = template::Entity::find()
         .filter(template::Column::DeletedAt.is_null())
         .all(connection)

@@ -194,8 +194,9 @@ async fn start_with_heartbeat(
     // Tests start with the Default config rule alone, and no alert rules, so each
     // says what it relies on. The other built-in rules have tests of their own.
     let default_rule: Vec<_> = crate::built_in_rules::all()
+        .unwrap()
         .into_iter()
-        .filter(|built_in| built_in.key == "default")
+        .filter(|built_in| built_in.key == "host")
         .collect();
     database
         .sync_built_in_rules(&default_rule, crate::times::now())
@@ -1831,7 +1832,7 @@ async fn an_agents_config_result_is_recorded_and_shown() {
 
     assert_eq!(view["desired"]["version"], json!(version));
     assert_eq!(view["desired"]["config"]["interval_secs"], 15);
-    assert_eq!(view["desired"]["matched_rules"], json!(["Default"]));
+    assert_eq!(view["desired"]["matched_rules"], json!(["Host"]));
     assert_eq!(view["reported"]["version"], json!(version));
 }
 
@@ -1939,7 +1940,7 @@ async fn invalid_rules_are_refused_with_a_reason() {
             "unknown collector",
         ),
         (
-            r#"{"name":"Default","priority":1,"applies_to":null,"settings":{}}"#,
+            r#"{"name":"Host","priority":1,"applies_to":null,"settings":{}}"#,
             "already exists",
         ),
     ];
@@ -2551,7 +2552,7 @@ async fn an_invalid_rule_shows_why_and_keeps_what_was_typed() {
             &[("name", "a"), ("priority", "1"), ("interval_secs", "0")],
             "at least 1",
         ),
-        (&[("name", "Default"), ("priority", "1")], "already exists"),
+        (&[("name", "Host"), ("priority", "1")], "already exists"),
     ];
 
     for (fields, reason) in cases {

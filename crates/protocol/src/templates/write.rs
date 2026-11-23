@@ -120,6 +120,16 @@ fn template_block(template: &Template) -> Block {
     attributes.list("services", &template.services);
 
     let mut block = attributes.block("template", Some(&template.key));
+    if let Some(config) = &template.config {
+        let mut settings = Attributes::new();
+        for (name, value) in config {
+            // Settings are numbers, words, lists and maps, which HCL writes as they are.
+            let value = hcl::to_expression(value)
+                .unwrap_or_else(|error| unreachable!("writing a setting: {error}"));
+            settings.add(name, value);
+        }
+        block = block.add_block(settings.block("config", None).build());
+    }
     for discover in &template.discover {
         block = block.add_block(discover_block(discover));
     }

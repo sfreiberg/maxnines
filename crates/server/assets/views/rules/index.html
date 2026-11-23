@@ -16,7 +16,7 @@
     {% for rule in rules %}
     <tr{% if not rule.enabled %} class="disabled"{% endif %}>
       <td class="number">{{ rule.priority }}</td>
-      <td><a href="/rules/{{ rule.id }}/edit">{{ rule.name }}</a>{% if rule.built_in %}<span class="under">Comes with MaxNines{% if rule.built_in_changed %} · updated {{ rule.built_in_changed }}{% endif %}</span>{% endif %}</td>
+      <td><a href="/rules/{{ rule.id }}/edit">{{ rule.name }}</a>{% if rule.built_in %}<span class="under">Comes with MaxNines, from the {{ rule.name }} template{% if rule.built_in_changed %} · updated {{ rule.built_in_changed }}{% endif %}</span>{% endif %}</td>
       <td>{% if rule.systems %}{{ rule.systems }}{% if rule.description or rule.applies_to %}, where {% endif %}{% endif %}{% if rule.description %}{{ rule.description }}{% elif rule.applies_to %}<code>{{ rule.applies_to }}</code>{% elif not rule.systems %}Every host{% endif %}</td>
       <td>{{ rule.summary }}</td>
       <td class="number">{{ rule.hosts }}</td>

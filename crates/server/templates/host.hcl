@@ -6,6 +6,21 @@ template "host" {
   name        = "Host"
   description = "Whether each host is online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read."
 
+  # The agent settings every host gets, as the config rule named Host. Rules of
+  # your own apply over it.
+  config {
+    interval_secs       = 15
+    facts_interval_secs = 3600
+    collectors = {
+      host    = { enabled = true }
+      cpu     = { enabled = true }
+      memory  = { enabled = true }
+      disk    = { enabled = true }
+      network = { enabled = true }
+      system  = { enabled = true }
+    }
+  }
+
   alert "offline" {
     name             = "Host offline"
     critical         = "!online"

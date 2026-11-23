@@ -391,7 +391,7 @@ async fn a_new_config_is_marked_but_not_the_first() {
     let events = wait_for_kind(&server, &host, "config").await;
     assert_eq!(events.len(), 1, "{events:?}");
     assert_eq!(events[0]["title"], "Config changed");
-    assert_eq!(events[0]["detail"], "From rules: Default, Slower.");
+    assert_eq!(events[0]["detail"], "From rules: Host, Slower.");
 }
 
 #[tokio::test]

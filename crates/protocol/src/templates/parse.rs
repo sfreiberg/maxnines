@@ -133,6 +133,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
         renamed_from: fields.renamed_from,
         enabled: fields.enabled,
         services: fields.services,
+        config: None,
         discover: Vec::new(),
         notices: Vec::new(),
         queries: Vec::new(),
@@ -141,6 +142,16 @@ fn read_template(key: String, body: Body) -> Result<Template> {
     };
     for block in blocks {
         match block.identifier.as_str() {
+            "config" => {
+                no_label(&block)?;
+                ensure!(template.config.is_none(), "a template has one config block");
+                let settings: serde_json::Value =
+                    hcl::from_body(block.body).map_err(|error| anyhow!("config: {error}"))?;
+                let serde_json::Value::Object(settings) = settings else {
+                    bail!("config holds settings, like interval_secs = 15");
+                };
+                template.config = Some(settings);
+            }
             "discover" => {
                 let key = label_of(&block, "discover")?;
                 let discover = read_discover(key.clone(), block.body)
@@ -172,7 +183,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
                 template.alerts.push(alert);
             }
             other => bail!(
-                "a template has no {other} blocks: it has discover, notice, query, counters and alert"
+                "a template has no {other} blocks: it has config, discover, notice, query, counters and alert"
             ),
         }
     }

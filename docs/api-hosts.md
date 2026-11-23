@@ -243,7 +243,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
       "facts_interval_secs": 3600,
       "collectors": { "cpu": { "enabled": true } }
     },
-    "matched_rules": ["Default"],
+    "matched_rules": ["Host"],
     "skipped_collectors": []
   },
   "reported": {

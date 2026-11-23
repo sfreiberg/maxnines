@@ -64,6 +64,11 @@ pub struct Template {
     /// Services that the host's own service alerts should watch.
     #[serde(default)]
     pub services: Vec<String>,
+    /// The agent settings it gives the hosts it's for, as a config rule's settings
+    /// are. Only a template that comes with MaxNines can have one, which becomes a
+    /// config rule of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Map<String, serde_json::Value>>,
     /// What's found first, each on its own schedule.
     #[serde(default)]
     pub discover: Vec<Discover>,

@@ -81,11 +81,13 @@ starts every collector again.
 
 ### Built-in rules
 
-Some rules come with MaxNines, and are marked **Comes with MaxNines**:
+Some rules come with MaxNines, and are marked **Comes with MaxNines**. Each is a
+built-in [template's](templates.md#agent-settings) agent settings, named after it, at
+priority 0, so a rule of your own at a higher priority applies over it:
 
 | Rule | Applies to | Sets |
 |---|---|---|
-| **Default** | Every host | A sample every 15 seconds, facts every hour, and the host, CPU, memory, disk, network and system collectors |
+| **Host** | Every host | A sample every 15 seconds, facts every hour, and the host, CPU, memory, disk, network and system collectors |
 | **macOS** | Macs | The [GPU](collectors-operating-system.md#gpus) collector |
 
 An upgrade can change them, add more or remove one, and the audit log and the Config

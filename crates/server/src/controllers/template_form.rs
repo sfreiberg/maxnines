@@ -530,6 +530,7 @@ impl TemplateForm {
             })
             .collect();
         let template = Template {
+            config: None,
             key: self.key.trim().to_string(),
             name: self.name.trim().to_string(),
             description: optional(&self.description),
