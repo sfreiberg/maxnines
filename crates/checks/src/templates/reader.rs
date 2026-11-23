@@ -138,6 +138,9 @@ pub struct Reader {
     results: Results,
     /// By template and database.
     tasks: HashMap<(String, String), Task>,
+    /// Why each template and database that can't be read can't, as last said, so
+    /// it's said once until it changes.
+    unreadable: HashMap<(String, String), String>,
 }
 
 impl Reader {
@@ -174,7 +177,12 @@ impl Reader {
             found.entry(name.clone()).or_insert_with(|| database(name));
         }
         // What isn't wanted any more, or is somewhere else now, stops, and says
-        // nothing more.
+        // nothing more: its task finds whoever told it gone before it says anything.
+        self.unreadable.retain(|key, _| {
+            found
+                .get(&key.1)
+                .is_some_and(|now| now.is_err() && wanted.contains_key(key))
+        });
         self.tasks.retain(|key, task| {
             let keep = wanted.contains_key(key)
                 && found
@@ -222,12 +230,16 @@ impl Reader {
                     );
                 }
                 Err(error) => {
-                    warn!(
-                        template,
-                        database = name,
-                        error = format!("{error:#}"),
-                        "a template can't read a database"
-                    );
+                    let error = format!("{error:#}");
+                    if self.unreadable.get(&key) != Some(&error) {
+                        warn!(
+                            template,
+                            database = name,
+                            error,
+                            "a template can't read a database"
+                        );
+                        self.unreadable.insert(key.clone(), error);
+                    }
                     self.results.lock().up.insert(key, false);
                 }
             }
@@ -243,10 +255,22 @@ impl Drop for Reader {
     }
 }
 
-/// When one discover block runs next, and how long it waits after failing.
+/// When one discover block runs next, how long it waits after failing, and what
+/// it found last, if it's found anything yet.
 struct DiscoverAt {
     at: Instant,
     retry: Duration,
+    found: Option<Map<String, Value>>,
+}
+
+impl DiscoverAt {
+    fn now(now: Instant) -> Self {
+        Self {
+            at: now,
+            retry: FIRST_RETRY,
+            found: None,
+        }
+    }
 }
 
 /// When one query runs next, and its running totals.
@@ -264,6 +288,22 @@ struct Schedule {
     queries: Vec<QueryAt>,
 }
 
+/// What every discover block found, together, or nothing if none has found
+/// anything yet.
+fn found_by(blocks: &[DiscoverAt]) -> Option<Map<String, Value>> {
+    let mut all: Option<Map<String, Value>> = None;
+    for block in blocks {
+        if let Some(found) = &block.found {
+            all.get_or_insert_with(Map::new).extend(
+                found
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+        }
+    }
+    all
+}
+
 impl Schedule {
     fn new((work, every): Told, now: Instant, before: Option<Self>) -> Self {
         let mut before = before;
@@ -271,7 +311,8 @@ impl Schedule {
             .discover
             .iter()
             .map(|discover| {
-                // The same block keeps its place; a new or changed one runs now.
+                // The same block keeps its place and what it found; a new or
+                // changed one runs now, and what one that's gone found goes with it.
                 let same = before.as_mut().and_then(|before| {
                     let index = before
                         .work
@@ -280,16 +321,10 @@ impl Schedule {
                         .position(|old| old == discover)?;
                     Some(std::mem::replace(
                         &mut before.discover[index],
-                        DiscoverAt {
-                            at: now,
-                            retry: FIRST_RETRY,
-                        },
+                        DiscoverAt::now(now),
                     ))
                 });
-                same.unwrap_or(DiscoverAt {
-                    at: now,
-                    retry: FIRST_RETRY,
-                })
+                same.unwrap_or_else(|| DiscoverAt::now(now))
             })
             .collect();
         let queries = work
@@ -355,7 +390,8 @@ async fn run(
 ) {
     let start = Instant::now();
     let mut schedule = Schedule::new(told.borrow_and_update().clone(), start, None);
-    let mut found = Map::new();
+    // What was last said discovery found.
+    let mut said: Option<Map<String, Value>> = None;
     let mut errors: BTreeMap<String, String> = BTreeMap::new();
     let mut connections = 0;
     let mut retry_at = start;
@@ -422,7 +458,7 @@ async fn run(
                 }
                 match session.run(sql, TIMEOUT).await {
                     Ok(rows) => {
-                        found.extend(discovered(&rows));
+                        block.found = Some(discovered(&rows));
                         discovered_now = true;
                         errors.remove(&discover.key);
                         block.at = now + discover.interval;
@@ -463,8 +499,18 @@ async fn run(
                 retry = (retry * 2).min(MAX_RETRY);
             }
         }
+        // Said again whenever discovery ran, and when what was found changes as
+        // what it's told to discover does.
+        let found = found_by(discover_at);
+        let say = found.is_some() && (discovered_now || found != said);
         {
             let mut read = results.lock();
+            // Whoever told it to read has stopped it, and may have forgotten what it
+            // said, so it says nothing more. Asked while holding what's read, so it
+            // can't say anything after that's forgotten.
+            if told.has_changed().is_err() {
+                return;
+            }
             read.rows
                 .entry(work.template.clone())
                 .or_default()
@@ -473,15 +519,18 @@ async fn run(
             if let Some(account) = account {
                 read.accounts.insert(database.clone(), account);
             }
-            if discovered_now {
+            if say && let Some(found) = &found {
                 read.discovered
                     .retain(|d| (&d.template, d.database.as_ref()) != (&key.0, Some(&key.1)));
                 read.discovered.push(Discovered {
-                    template: work.template.clone(),
+                    template: key.0.clone(),
                     database: Some(database.clone()),
                     values: found.clone(),
                 });
             }
+        }
+        if say {
+            said = found;
         }
 
         let next = match session.is_up() {
@@ -780,6 +829,47 @@ mod tests {
         sleep(Duration::from_millis(300)).await;
         results.take();
         assert!(results.take().is_empty());
+    }
+
+    /// What a discover block that's gone found goes with it, and what one that ran
+    /// again found is what it finds now, not added to what it found before.
+    #[tokio::test]
+    async fn what_discovery_found_is_what_its_blocks_find_now() {
+        let Some(database) = real(None) else {
+            return;
+        };
+        let every = Duration::from_millis(200);
+        let mut both = work("main");
+        both.discover.push(DiscoverWork {
+            key: "role".to_string(),
+            interval: Duration::from_secs(3600),
+            sql: Some("SELECT 'primary' AS role".to_string()),
+            registry: Vec::new(),
+            counter_sets: Default::default(),
+        });
+        let mut reader = reading(std::slice::from_ref(&both), every, &database);
+        let results = reader.results();
+        let found = |output: &Value| output[DISCOVERED][0]["values"].clone();
+        let first = take_until(&results, |output| output.get(DISCOVERED).is_some()).await;
+        assert_eq!(found(&first)["role"], json!("primary"), "{first}");
+        assert!(found(&first).get("version").is_some(), "{first}");
+
+        // The role block goes, so what it found goes too, at once.
+        reader.update(&[work("main")], every, &Handle::current(), |_| {
+            Ok(database.clone())
+        });
+        let after = take_until(&results, |output| output.get(DISCOVERED).is_some()).await;
+        assert!(found(&after).get("role").is_none(), "{after}");
+        assert!(found(&after).get("version").is_some(), "{after}");
+
+        // A changed block runs again, and what it finds now replaces what it found.
+        let mut changed = work("main");
+        changed.discover[0].sql = Some("SELECT 'replica' AS role".to_string());
+        reader.update(&[changed], every, &Handle::current(), |_| {
+            Ok(database.clone())
+        });
+        let again = take_until(&results, |output| output.get(DISCOVERED).is_some()).await;
+        assert_eq!(found(&again), json!({ "role": "replica" }), "{again}");
     }
 
     #[tokio::test]
