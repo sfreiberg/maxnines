@@ -273,6 +273,7 @@ jobs:
             cp "msi/maxnines-$program-$VERSION-$TARGET.msi" dist/
           done
       - name: Test the agent's installer
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $x64 = if (Test-Path msi/x64/maxnines-agent.msi) { @{ X64OnArm = 'msi/x64/maxnines-agent.msi' } } else { @{} }
@@ -280,6 +281,7 @@ jobs:
             -Msi "msi/maxnines-agent-$env:VERSION-$env:TARGET.msi" `
             -Upgrade msi/upgrade/maxnines-agent.msi @x64
       - name: Test the server's installer
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $x64 = if (Test-Path msi/x64/maxnines-server.msi) { @{ X64OnArm = 'msi/x64/maxnines-server.msi' } } else { @{} }
@@ -287,6 +289,7 @@ jobs:
             -Msi "msi/maxnines-server-$env:VERSION-$env:TARGET.msi" `
             -Upgrade msi/upgrade/maxnines-server.msi @x64
       - name: Test the command line's installer
+        timeout-minutes: 10
         shell: pwsh
         run: |
           $x64 = if (Test-Path msi/x64/maxnines-cli.msi) { @{ X64OnArm = 'msi/x64/maxnines-cli.msi' } } else { @{} }
@@ -298,6 +301,7 @@ jobs:
       # refused still has to report the real processor.
       - name: Check an emulated agent reports the real processor
         if: matrix.arch == 'aarch64'
+        timeout-minutes: 20
         shell: pwsh
         run: |
           rustup target add x86_64-pc-windows-msvc

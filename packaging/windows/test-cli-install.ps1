@@ -29,6 +29,7 @@ function Check([bool] $ok, [string] $what) {
 
 function Msiexec([string] $name, [string[]] $arguments) {
     $log = Join-Path $logs "cli-$name.log"
+    Write-Host "msiexec $name"
     $process = Start-Process msiexec.exe -Wait -PassThru `
         -ArgumentList ($arguments + @('/qn', '/l*v', "`"$log`""))
     if ($process.ExitCode -ne 0) {

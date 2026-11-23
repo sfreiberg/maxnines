@@ -32,6 +32,7 @@ function Check([bool] $ok, [string] $what) {
 
 function Msiexec([string] $name, [string[]] $arguments) {
     $log = Join-Path $logs "server-$name.log"
+    Write-Host "msiexec $name"
     $process = Start-Process msiexec.exe -Wait -PassThru `
         -ArgumentList ($arguments + @('/qn', '/l*v', "`"$log`""))
     if ($process.ExitCode -ne 0) {
@@ -105,7 +106,7 @@ $url = (Get-Content $link | Where-Object { $_ -like 'URL=*' }) -replace '^URL=',
 Check ($url -like 'http://localhost:9123/setup/*') "the link to set a password is saved for the finish page (found: $url)"
 $token = $url.Split('/')[-1]
 Check (-not (Select-String -Path $log -SimpleMatch $token -Quiet)) 'the link is not in the log'
-$page = Invoke-WebRequest $url -UseBasicParsing
+$page = Invoke-WebRequest $url -UseBasicParsing -TimeoutSec 30
 Check ($page.StatusCode -eq 200 -and $page.Content -match 'password') 'the link opens the page for setting a password'
 
 $remembered = Get-ItemProperty 'HKLM:\SOFTWARE\MaxNines\Server'
