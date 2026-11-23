@@ -19,11 +19,11 @@ Every server starts with nine alert rules, from the built-in **Host**
 
 The built-in **PostgreSQL** template brings 14 more, for each PostgreSQL database it
 reads, one of them off until you say how many standbys a primary should have: they're
-listed under [database stats](database-stats.md#postgresql-1). The built-in **ClickHouse**
-template brings 7, for each ClickHouse database it reads, listed under [database
-stats](database-stats.md#clickhouse-1), and the built-in **MySQL** template 7 more, for
-each MySQL or MariaDB database, listed under [database
-stats](database-stats.md#mysql-and-mariadb-1).
+listed on the [PostgreSQL](collectors-postgresql.md#built-in-alerts) page. The built-in
+**ClickHouse** template brings 7, for each ClickHouse database it reads, listed on the
+[ClickHouse](collectors-clickhouse.md#built-in-alerts) page, and the built-in **MySQL**
+template 7 more, for each MySQL or MariaDB database, listed on the [MySQL and
+MariaDB](collectors-mysql.md#built-in-alerts) page.
 
 Each disk alerts on its own. Every alert resolves as soon as its problem is gone,
 without waiting, so a recovery is known at once, and something that keeps failing and

@@ -890,19 +890,21 @@ mod tests {
         ("collectors-apache", &["apache"]),
         ("collectors-nginx", &["nginx"]),
         ("collectors-php-fpm", &["php_fpm"]),
+        ("collectors-mongodb", &["databases"]),
+        ("database-stats", &["database_accounts"]),
+    ];
+
+    /// The pages that list a built-in database template's metrics, each with the
+    /// template's key.
+    const TEMPLATE_PAGES: &[(&str, &str)] = &[
+        ("collectors-postgresql", "postgres"),
+        ("collectors-mysql", "mysql"),
+        ("collectors-clickhouse", "clickhouse"),
     ];
 
     /// Collectors whose metrics are described elsewhere, without a table of every
     /// metric yet. Move one to `COLLECTOR_PAGES` once its page has one.
-    const NO_METRIC_TABLE_YET: &[&str] = &[
-        "databases",
-        "database_accounts",
-        "checks",
-        "commands",
-        "custom",
-        "openmetrics",
-        "server",
-    ];
+    const NO_METRIC_TABLE_YET: &[&str] = &["checks", "commands", "custom", "openmetrics", "server"];
 
     /// The metric each row of a page's tables starts with, such as `cpu.usage` in
     /// ``| `cpu.usage` | % | ...``.
@@ -934,6 +936,51 @@ mod tests {
                 unknown.is_empty(),
                 "{page}.md lists {unknown:?}, which aren't its collectors' metrics"
             );
+        }
+    }
+
+    #[test]
+    fn each_database_page_lists_every_metric_of_its_template_and_no_others() {
+        let built_in = crate::templates::built_in::all().unwrap();
+        for (page, key) in TEMPLATE_PAGES {
+            let template = &built_in
+                .iter()
+                .find(|built_in| built_in.template.key == *key)
+                .unwrap_or_else(|| panic!("there's no built-in {key} template"))
+                .template;
+            let markdown = file(&format!("{page}.md")).unwrap();
+            let listed = metrics_listed(&markdown);
+            let read = crate::templates::metrics_of(template);
+            let expected: HashSet<&str> = read
+                .iter()
+                .map(|(metric, _)| metric.name.as_str())
+                .collect();
+            let mut missing: Vec<_> = expected.difference(&listed).collect();
+            let mut unknown: Vec<_> = listed.difference(&expected).collect();
+            missing.sort();
+            unknown.sort();
+            assert!(missing.is_empty(), "{page}.md doesn't list {missing:?}");
+            assert!(
+                unknown.is_empty(),
+                "{page}.md lists {unknown:?}, which the {key} template doesn't read"
+            );
+        }
+    }
+
+    #[test]
+    fn every_built_in_database_template_has_a_page() {
+        for built_in in crate::templates::built_in::all().unwrap() {
+            let template = built_in.template;
+            if matches!(
+                template.target,
+                Some(maxnines_protocol::templates::Target::Database(_))
+            ) {
+                assert!(
+                    TEMPLATE_PAGES.iter().any(|(_, key)| *key == template.key),
+                    "the built-in {} template has no page listing its metrics",
+                    template.key
+                );
+            }
         }
     }
 

@@ -38,9 +38,9 @@ shown afterwards is written out from the parts.
 | --- | --- |
 | **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules), and the [agent settings](#agent-settings) every host gets |
 | **macOS** | Macs: the agent settings they get beyond every host's, which read the GPU |
-| **ClickHouse** | Each ClickHouse database: its load against its limits, inserts and parts, memory, merges and background pools, mutations, error codes worth knowing about, disks, replication, Keeper and Distributed tables, with 7 alerts. Its database sizes and query times ship turned off, as they cost more. What it reads is listed under [database stats](database-stats.md#clickhouse-1) |
-| **MySQL** | Each MySQL or MariaDB database: its load, InnoDB, transactions and queries, replication into it, read through `SHOW`, semi-synchronous replication, Group Replication and Galera, with 7 alerts. MySQL's and MariaDB's differences are queries of their own, picked by what discovery finds. Its database and binary log sizes ship turned off. What it reads is listed under [database stats](database-stats.md#mysql-and-mariadb-1) |
-| **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed under [database stats](database-stats.md#postgresql-1) |
+| **ClickHouse** | Each ClickHouse database: its load against its limits, inserts and parts, memory, merges and background pools, mutations, error codes worth knowing about, disks, replication, Keeper and Distributed tables, with 7 alerts. Its database sizes and query times ship turned off, as they cost more. What it reads is listed on the [ClickHouse](collectors-clickhouse.md) page |
+| **MySQL** | Each MySQL or MariaDB database: its load, InnoDB, transactions and queries, replication into it, read through `SHOW`, semi-synchronous replication, Group Replication and Galera, with 7 alerts. MySQL's and MariaDB's differences are queries of their own, picked by what discovery finds. Its database and binary log sizes ship turned off. What it reads is listed on the [MySQL and MariaDB](collectors-mysql.md) page |
+| **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed on the [PostgreSQL](collectors-postgresql.md) page |
 
 ## What templates can read so far
 
@@ -52,9 +52,9 @@ shown afterwards is written out from the parts.
   template, which isn't decided yet.
 - **Windows:** performance counters and registry values, on hosts with an agent.
 - **What MaxNines reads itself:** PostgreSQL, MySQL and MariaDB, and ClickHouse are
-  read by their built-in templates. MaxNines' own reading of [database
-  stats](database-stats.md) still reads MongoDB, under its own metric names, such as
-  `mongodb.connections`, so a template can't use those names.
+  read by their built-in templates. MaxNines still reads [MongoDB](collectors-mongodb.md)
+  itself, under its own metric names, such as `mongodb.connections`, so a template
+  can't use those names.
 
 Where a template is read, and how, is the same on an agent and on the server for a
 [host without an agent](#hosts-without-an-agent-and-maxnines-own-database).
@@ -449,58 +449,16 @@ reads it, whichever it is.
 MaxNines only ever reads, but a template's SQL runs as whatever account the agent or
 the database check signs in as, so what that account may do is what a template could
 do. Give it an account of its own that can read what monitoring needs and change
-nothing. Whenever it connects, and every 5 minutes, MaxNines reads what the account
-may do beyond reading, as the metrics `database_account.overprivileged`,
-`database_account.superuser`, `database_account.writes`,
-`database_account.manages` and `database_account.server_files`, one series for each
-database, and the built-in **Database account can do more than read** alert, in the
-**Host** template, warns about any that may do more. The account is still used, as
-what it may do is up to you: [what each
-counts](database-stats.md#what-the-account-may-do) is with the database stats. It's
-built into MaxNines rather than a template, so it can't be changed by changing a
-template; its alert can be changed or turned off.
-
-**PostgreSQL**
-
-```sql
-CREATE ROLE maxnines WITH LOGIN PASSWORD 'a long random password' CONNECTION LIMIT 3;
-GRANT pg_monitor TO maxnines;
-ALTER ROLE maxnines SET default_transaction_read_only = on;
-```
-
-On PostgreSQL 14 and older, everyone can create tables in the `public` schema until
-that's taken away, which counts as writing, so the alert warns until you run:
-
-```sql
-REVOKE CREATE ON SCHEMA public FROM PUBLIC;
-```
-
-A role the account is in only after `SET ROLE`, one made `NOINHERIT`, isn't looked at.
-
-**MySQL**
-
-```sql
-CREATE USER 'maxnines'@'127.0.0.1' IDENTIFIED BY 'a long random password'
-  WITH MAX_USER_CONNECTIONS 3;
-GRANT PROCESS, REPLICATION CLIENT ON *.* TO 'maxnines'@'127.0.0.1';
-GRANT SELECT ON performance_schema.* TO 'maxnines'@'127.0.0.1';
-```
-
-**MariaDB**
-
-The same as MySQL, and on 10.5.9 and later also:
-
-```sql
-GRANT REPLICA MONITOR ON *.* TO 'maxnines'@'127.0.0.1';
-```
-
-On both, every role the account has been given counts, whether or not it's in use, as
-the account could start using it, and so do roles given to those roles.
+nothing: each database's page gives one, for [PostgreSQL](collectors-postgresql.md#the-account-to-sign-in-as),
+[MySQL and MariaDB](collectors-mysql.md#the-account-to-sign-in-as) and
+[ClickHouse](collectors-clickhouse.md#the-account-to-sign-in-as). Whenever it connects,
+and every 5 minutes, MaxNines reads [what the account may
+do](database-stats.md#what-the-account-may-do) beyond reading, and the built-in
+**Database account can do more than read** alert warns about any that may do more. The
+account is still used, as what it may do is up to you.
 
 **Your own tables.** A template that reads your application's tables needs `SELECT`
 on them and nothing more, such as `GRANT SELECT ON shop.orders TO maxnines`.
-`EXECUTE` and `LOCK TABLES` don't count as writing, as MySQL's `sys` schema needs
-`EXECUTE`.
 
 ## Examples
 
@@ -516,7 +474,7 @@ under **Settings > Templates** and choose **Export** for its HCL. The built-in
   moved between versions, such as checkpoints in 17, so each query is written once;
 - `labels` give a series to each standby, slot and subscription;
 - `value` works the cache hit rate out from two running totals with `rate()`;
-- the slow queries, database and WAL sizes, ship with `enabled = false`;
+- the database and WAL sizes ship with `enabled = false`;
 - its alerts use the short names, such as `lag > duration('30s')` and `!receiving`,
   and `when` keeps the replica's alerts to replicas.
 

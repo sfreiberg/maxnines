@@ -1671,7 +1671,7 @@ pub const METRICS: &[StaticMetric] = &[
     // MongoDB.
     StaticMetric {
         name: "mongodb.up",
-        title: "MongoDB answering",
+        title: "MongoDB up",
         unit: Unit::Number,
         collector: "databases",
         source: Source::Items {

@@ -269,7 +269,7 @@ check "cache" {
 }
 ```
 
-Each can also have `insecure = true`. A database is a [`database` block](database-stats.md)
+Each can also have `insecure = true`. A database is a [`database` block](database-stats.md#the-database-block)
 instead, which reads its stats as well as whether it answers. The agent tells the server the names of the
 checks its config allows, never more, and a [config rule](api-config-rules.md) picks
 which of them to run and how often, under **Checks from the agent's config**. A name
