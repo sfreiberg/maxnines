@@ -117,7 +117,8 @@ mod tests {
 
     #[test]
     fn comments_and_layout_leave_the_fingerprint_alone() {
-        let host = &all().unwrap()[0];
+        let all = all().unwrap();
+        let host = all.iter().find(|one| one.template.key == "host").unwrap();
         let reworded = format!(
             "# Another comment.\n{}",
             host.source.replace("  name", "  name  ")

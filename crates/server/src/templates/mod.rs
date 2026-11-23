@@ -20,7 +20,9 @@ use cel::{Context as CelContext, Program, Value as CelValue};
 use chrono::TimeDelta;
 use serde_json::Value;
 use sqlparser::ast::{Expr, SelectItem, SetExpr, Statement};
-use sqlparser::dialect::{Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect};
+use sqlparser::dialect::{
+    ClickHouseDialect, Dialect, GenericDialect, MsSqlDialect, MySqlDialect, PostgreSqlDialect,
+};
 use sqlparser::parser::Parser;
 
 use maxnines_protocol::templates::{
@@ -302,6 +304,7 @@ fn dialect_for(target: Option<&Target>) -> Box<dyn Dialect> {
         Some(Target::Database(kind)) => match kind.as_str() {
             "postgres" => Box::new(PostgreSqlDialect {}),
             "mysql" => Box::new(MySqlDialect {}),
+            "clickhouse" => Box::new(ClickHouseDialect {}),
             "mssql" | "sqlserver" => Box::new(MsSqlDialect {}),
             _ => Box::new(GenericDialect {}),
         },

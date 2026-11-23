@@ -391,8 +391,9 @@ fn validate_check_timing(
 }
 
 /// What can be read from a database beyond what always is, each costing more:
-/// sizes on disk, and, for ClickHouse, how long queries took.
-pub const DATABASE_EXTRAS: [&str; 2] = ["sizes", "queries"];
+/// sizes on disk. Kinds read by templates have queries of their own to turn on
+/// instead.
+pub const DATABASE_EXTRAS: [&str; 1] = ["sizes"];
 
 /// How many databases one agent can be asked to read.
 const MAX_DATABASES: usize = 16;

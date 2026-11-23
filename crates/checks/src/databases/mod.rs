@@ -1,11 +1,11 @@
 //! Reads a database's health, load and replication, for the `databases`
 //! collector on agents and for hosts without an agent on the server, for the kinds
-//! MaxNines reads itself: [`has_reader`] says which. PostgreSQL is read by its
-//! built-in template instead, through [`crate::templates`].
+//! MaxNines reads itself: [`has_reader`] says which. PostgreSQL and ClickHouse are
+//! read by their built-in templates instead, through [`crate::templates`].
 //!
 //! A [`Reader`] keeps its connection open between rounds, so each round costs a
 //! few queries rather than a sign-in, and opens a new one when the old one stops
-//! working. ClickHouse, read over HTTP, has one for each round instead. Each round gives rows: one for the database itself, named as it's
+//! working. Each round gives rows: one for the database itself, named as it's
 //! defined, and one for each thing it has several of, such as standbys or
 //! replication slots, named after it. A sample groups rows by their database's
 //! kind, as `{"mysql": [...], "mongodb": [...]}`, so each kind's values are its
@@ -46,12 +46,9 @@ pub fn is_database(kind: CheckKind) -> bool {
 }
 
 /// Whether a reader here reads this kind of database. The rest are read only by
-/// templates, such as PostgreSQL by the built-in `postgres` template.
+/// templates, such as PostgreSQL and ClickHouse by their built-in templates.
 pub fn has_reader(kind: CheckKind) -> bool {
-    matches!(
-        kind,
-        CheckKind::Mysql | CheckKind::Mongodb | CheckKind::Clickhouse
-    )
+    matches!(kind, CheckKind::Mysql | CheckKind::Mongodb)
 }
 
 /// Where a database is and how to sign in to it.
@@ -66,8 +63,6 @@ pub struct Database {
 enum Open {
     Mysql(mysql::Mysql),
     Mongodb(mongodb::Mongodb),
-    /// Boxed, as it holds what it's read between rounds, and its connection.
-    Clickhouse(Box<clickhouse::Clickhouse>),
 }
 
 pub struct Reader {
@@ -141,7 +136,6 @@ impl Reader {
         match self.open.as_mut() {
             Some(Open::Mysql(open)) => open.read(&mut rows, extras).await?,
             Some(Open::Mongodb(open)) => open.read(&mut rows, extras).await?,
-            Some(Open::Clickhouse(open)) => open.read(&mut rows, extras).await?,
             None => bail!("not connected"),
         }
         Ok(rows.finish())
@@ -156,10 +150,6 @@ impl Reader {
             CheckKind::Mongodb => Ok(Open::Mongodb(
                 mongodb::Mongodb::connect(check, credentials).await?,
             )),
-            CheckKind::Clickhouse => Ok(Open::Clickhouse(Box::new(clickhouse::Clickhouse::new(
-                check,
-                credentials,
-            )?))),
             other => bail!("{} isn't a database read here", other.as_str()),
         }
     }

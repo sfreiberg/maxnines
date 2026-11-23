@@ -84,12 +84,12 @@
     <legend>Database stats</legend>
     <label class="checkbox">
       <input type="checkbox" name="read_stats"{% if check.read_stats %} checked{% endif %}> Read its health and replication
-      <small>As an agent reads a database it's allowed, using the login below, and charted on the host's metrics page. PostgreSQL is read by its built-in template. See <a href="/docs/database-stats">Database stats</a> for what's read and the account it needs.</small>
+      <small>As an agent reads a database it's allowed, using the login below, and charted on the host's metrics page. PostgreSQL and ClickHouse are read by their built-in templates. See <a href="/docs/database-stats">Database stats</a> for what's read and the account it needs.</small>
     </label>
     {% for extra in database_extras %}
     <label class="checkbox">
-      <input type="checkbox" name="extra_{{ extra }}"{% if extra in check.extras %} checked{% endif %}> Also read {% if extra == "sizes" %}sizes{% elif extra == "queries" %}query latency{% else %}{{ extra }}{% endif %}
-      {% if extra == "sizes" %}<small>Each database's size on disk, which costs more to read. Not PostgreSQL: turn on its template's <code>sizes</code> query instead.</small>{% elif extra == "queries" %}<small>ClickHouse only: how long queries took over the last five minutes, and how many failed, from its query log, which can be large.</small>{% endif %}
+      <input type="checkbox" name="extra_{{ extra }}"{% if extra in check.extras %} checked{% endif %}> Also read {% if extra == "sizes" %}sizes{% else %}{{ extra }}{% endif %}
+      {% if extra == "sizes" %}<small>Each database's size on disk, which costs more to read. Not PostgreSQL or ClickHouse: turn on their templates' <code>sizes</code> query instead.</small>{% endif %}
     </label>
     {% endfor %}
   </fieldset>

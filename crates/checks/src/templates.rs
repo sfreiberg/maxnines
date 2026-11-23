@@ -67,6 +67,9 @@ enum Open {
         /// MariaDB, which answers to some things differently.
         mariadb: bool,
     },
+    /// Over its HTTP interface, where every statement is a GET, which ClickHouse
+    /// only lets read.
+    Clickhouse(Box<crate::databases::clickhouse::Clickhouse>),
 }
 
 impl Drop for Open {
@@ -151,6 +154,7 @@ impl Session {
                 use mysql_async::prelude::Queryable;
                 connection.ping().await.is_ok()
             }
+            Some(Open::Clickhouse(clickhouse)) => clickhouse.ping().await.is_ok(),
             None => false,
         }
     }
@@ -190,6 +194,13 @@ impl Session {
                     mariadb,
                 })
             }
+            CheckKind::Clickhouse => {
+                let mut clickhouse =
+                    crate::databases::clickhouse::Clickhouse::new(check, credentials)?;
+                // Says it can be signed in to and asked anything.
+                clickhouse.version().await?;
+                Ok(Open::Clickhouse(Box::new(clickhouse)))
+            }
             other => bail!("templates can't read {} yet", other.as_str()),
         }
     }
@@ -202,6 +213,7 @@ impl Session {
         match self.open.as_mut() {
             Some(Open::Postgres { client, .. }) => run_postgres(client, sql).await,
             Some(Open::Mysql { connection, .. }) => run_mysql(connection, sql).await,
+            Some(Open::Clickhouse(clickhouse)) => clickhouse.typed_rows(sql).await,
             None => bail!("not connected"),
         }
     }
@@ -620,6 +632,47 @@ mod tests {
         // A statement that runs too long is stopped by the database.
         let error = session.run("SELECT pg_sleep(30)", LIMIT).await.unwrap_err();
         assert!(format!("{error}").contains("statement timeout"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_real_clickhouse_is_read_and_can_not_be_written() {
+        let Some(mut session) = real("MAXNINES_TEST_CHECK_CLICKHOUSE", CheckKind::Clickhouse)
+        else {
+            return;
+        };
+        let rows = session
+            .run(
+                "SELECT version() AS version, uptime() AS uptime, true AS yes, \
+                 toUInt8(1) AS flag, 12.5 AS ratio, toInt64(-7) AS count, \
+                 0 / 0 AS not_a_number, CAST(NULL, 'Nullable(UInt64)') AS nothing, \
+                 today() AS day",
+                LIMIT,
+            )
+            .await
+            .unwrap();
+        let found = discovered(&rows);
+        assert!(found["version"].is_string(), "{found:?}");
+        assert!(found["uptime"].as_f64().unwrap() >= 0.0, "{found:?}");
+        assert_eq!(found["yes"], true);
+        assert_eq!(found["flag"], 1.0);
+        assert_eq!(found["ratio"], 12.5);
+        assert_eq!(found["count"], -7.0);
+        assert_eq!(found["not_a_number"], Value::Null);
+        assert_eq!(found["nothing"], Value::Null);
+        // A date isn't anything a template can use.
+        assert!(found.get("day").is_none(), "{found:?}");
+
+        // Every statement is a GET, which ClickHouse only lets read.
+        let error = session
+            .run(
+                "CREATE TABLE maxnines_should_not_exist (id UInt8) ENGINE = Memory",
+                LIMIT,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error}").contains("readonly"), "{error}");
+        session.run("SELECT 1 AS one", LIMIT).await.unwrap();
+        assert!(session.is_up());
     }
 
     #[tokio::test]

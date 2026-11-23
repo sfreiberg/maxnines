@@ -9,7 +9,9 @@
 //! been given, whether or not the role is in use, as the account could start using
 //! it. MySQL lists a role's grants when asked with `USING`; MariaDB only lists those
 //! of the role in use, so each is put in use in turn, and the one in use before is
-//! put back after, so what templates run is run as before.
+//! put back after, so what templates run is run as before. On ClickHouse it's
+//! one query over `system.grants`, for the account and the roles it's been given
+//! and those roles' own, which an account that can read `system.*` can see.
 
 use anyhow::{Result, bail};
 use maxnines_protocol::CheckKind;
@@ -103,17 +105,56 @@ const MYSQL_MANAGES: &[&str] = &[
     "SYSTEM_USER",
 ];
 
+/// ClickHouse: what the account's grants, and its roles', allow, by kind of
+/// privilege. Creating a temporary table isn't counted, as it lasts only as long
+/// as its session.
+const CLICKHOUSE: &str = r"WITH
+  (SELECT groupArray(granted_role_name) FROM system.role_grants
+   WHERE user_name = currentUser()) AS given,
+  (SELECT groupArray(granted_role_name) FROM system.role_grants
+   WHERE has(given, role_name)) AS nested,
+  arrayConcat(given, nested, enabledRoles()) AS roles,
+  toString(access_type) AS access,
+  match(access, '^(CREATE|ALTER|DROP) (USER|ROLE|ROW POLICY|MASKING POLICY|QUOTA|SETTINGS PROFILE|NAMED COLLECTION)$') AS of_access
+SELECT
+  countIf(access = 'ALL' AND database IS NULL) > 0 AS superuser,
+  countIf(access IN ('ALL', 'INSERT', 'ALTER', 'CREATE', 'DROP', 'UNDROP TABLE',
+                     'TRUNCATE', 'OPTIMIZE', 'MOVE PARTITION BETWEEN SHARDS',
+                     'CREATE DATABASE', 'CREATE TABLE', 'CREATE VIEW',
+                     'CREATE DICTIONARY', 'CREATE FUNCTION')
+          OR (match(access, '^(ALTER|DROP) ') AND NOT of_access)) > 0 AS writes,
+  countIf(grant_option = 1 OR of_access OR startsWith(access, 'SYSTEM')
+          OR access IN ('ALL', 'ACCESS MANAGEMENT', 'ROLE ADMIN', 'IMPERSONATE',
+                        'SET DEFINER', 'ALLOW SQL SECURITY NONE', 'CREATE TOKEN',
+                        'KILL QUERY', 'KILL TRANSACTION', 'NAMED COLLECTION ADMIN')) > 0
+    AS manages,
+  countIf(access IN ('ALL', 'BACKUP', 'FILE', 'URL', 'REMOTE', 'MONGO', 'REDIS', 'MYSQL',
+                     'POSTGRES', 'SQLITE', 'ODBC', 'JDBC', 'HDFS', 'S3', 'HIVE', 'AZURE',
+                     'KAFKA', 'NATS', 'RABBITMQ', 'YTSAURUS', 'ARROW FLIGHT', 'BIGQUERY',
+                     'ELASTICSEARCH', 'DISK', 'SOURCES', 'READ', 'WRITE')) > 0 AS server_files
+FROM system.grants
+WHERE is_partial_revoke = 0
+  AND (user_name = currentUser() OR has(roles, ifNull(role_name, '')))";
+
 impl Session {
     /// What the account it signs in as may do beyond reading, connecting first if
     /// it has to.
     pub async fn privileges(&mut self) -> Result<Privileges> {
         match self.database.check.kind {
-            CheckKind::Postgres => {
-                let rows = self.run(POSTGRES, STATEMENT_LIMIT).await?;
+            CheckKind::Postgres | CheckKind::Clickhouse => {
+                let sql = match self.database.check.kind {
+                    CheckKind::Postgres => POSTGRES,
+                    _ => CLICKHOUSE,
+                };
+                let rows = self.run(sql, STATEMENT_LIMIT).await?;
+                // PostgreSQL says true or false, and ClickHouse 1 or 0.
                 let flag = |name: &str| {
                     rows.first()
                         .and_then(|row| row.iter().find(|(column, _)| column == name))
-                        .is_some_and(|(_, cell)| *cell == Cell::Bool(true))
+                        .is_some_and(|(_, cell)| {
+                            matches!(cell, Cell::Bool(true))
+                                || matches!(cell, Cell::Number(n) if *n != 0.0)
+                        })
                 };
                 Ok(Privileges {
                     superuser: flag("superuser"),
@@ -452,6 +493,69 @@ mod tests {
             .batch_execute(&format!("DROP TABLE {name}; DROP ROLE {name}"))
             .await
             .unwrap();
+    }
+
+    /// Runs a statement as the throwaway ClickHouse's own account, as a POST, which
+    /// it lets change things.
+    async fn clickhouse_admin(target: &str, admin: &str, sql: &str) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(target).await.unwrap();
+        let request = format!(
+            "POST /?user={admin} HTTP/1.1\r\nHost: {target}\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{sql}",
+            sql.len()
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        assert!(answer.starts_with("HTTP/1.1 200"), "{sql}: {answer}");
+    }
+
+    #[tokio::test]
+    async fn a_real_clickhouse_account_is_found_to_write_through_its_roles() {
+        let Some((target, admin)) = server("MAXNINES_TEST_CHECK_CLICKHOUSE") else {
+            return;
+        };
+        let name = format!("maxnines_privileges_{}", std::process::id());
+        for statement in [
+            format!("DROP USER IF EXISTS {name}"),
+            format!("DROP ROLE IF EXISTS {name}_role"),
+            format!("CREATE USER {name} IDENTIFIED WITH no_password"),
+            format!("GRANT SELECT ON system.* TO {name}"),
+            format!("CREATE ROLE {name}_role"),
+        ] {
+            clickhouse_admin(&target, &admin, &statement).await;
+        }
+        let mut reads = session(CheckKind::Clickhouse, &target, &name);
+        assert_eq!(reads.privileges().await.unwrap(), Privileges::default());
+
+        for statement in [
+            format!("GRANT INSERT ON default.* TO {name}_role"),
+            format!("GRANT {name}_role TO {name}"),
+        ] {
+            clickhouse_admin(&target, &admin, &statement).await;
+        }
+        let mut writes = session(CheckKind::Clickhouse, &target, &name);
+        let found = writes.privileges().await.unwrap();
+        assert!(
+            found.writes && !found.manages && !found.server_files,
+            "{found:?}"
+        );
+
+        // The server's own account, which can do anything.
+        let mut everything = session(CheckKind::Clickhouse, &target, &admin);
+        let found = everything.privileges().await.unwrap();
+        assert!(
+            found.writes && found.manages && found.server_files,
+            "{found:?}"
+        );
+
+        for statement in [
+            format!("DROP USER {name}"),
+            format!("DROP ROLE {name}_role"),
+        ] {
+            clickhouse_admin(&target, &admin, &statement).await;
+        }
     }
 
     #[tokio::test]

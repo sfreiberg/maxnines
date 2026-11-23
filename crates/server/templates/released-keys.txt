@@ -4,3 +4,4 @@
 # when adding the template.
 host
 postgres
+clickhouse

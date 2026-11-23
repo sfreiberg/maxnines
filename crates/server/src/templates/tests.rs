@@ -375,7 +375,12 @@ fn every_cel_expression_has_to_compile() {
 /// template, which they have to stay.
 #[test]
 fn the_host_template_keeps_the_built_in_alert_rules() {
-    let host = built_in::all().unwrap().remove(0).template;
+    let host = built_in::all()
+        .unwrap()
+        .into_iter()
+        .find(|one| one.template.key == "host")
+        .unwrap()
+        .template;
     let rules: Vec<AlertRuleInput> = host
         .alerts
         .iter()

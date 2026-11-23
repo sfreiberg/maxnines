@@ -111,7 +111,7 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
 
     let templates = database.list_templates().await.unwrap();
     let keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
-    assert_eq!(keys, ["host", "postgres"]);
+    assert_eq!(keys, ["clickhouse", "host", "postgres"]);
     for template in &templates {
         assert!(template.origin == Origin::BuiltIn && template.enabled);
     }
@@ -965,8 +965,13 @@ async fn the_api_covers_what_the_templates_pages_do() {
     let server = with_built_in_templates().await;
     let (status, list) = api(&server, "GET", "/api/v1/templates", &Value::Null).await;
     assert_eq!(status, 200, "{list}");
-    assert_eq!(list[0]["key"], "host");
-    assert_eq!(list[0]["origin"], "built_in");
+    let host = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|one| one["key"] == "host")
+        .unwrap();
+    assert_eq!(host["origin"], "built_in");
 
     let (status, body) = api(&server, "POST", "/api/v1/templates", &json!({ "hcl": APP })).await;
     assert_eq!(status, 201, "{body}");
@@ -1290,8 +1295,11 @@ async fn an_import_in_the_way_of_a_built_in_or_own_template_is_refused() {
         assert!(format!("{error:#}").contains(expected), "{error:#}");
         assert!(database.import_outcome(template).await.is_err());
     }
-    // The two built-in ones, and the person's own.
-    assert_eq!(database.list_templates().await.unwrap().len(), 3);
+    // The built-in ones, and the person's own.
+    assert_eq!(
+        database.list_templates().await.unwrap().len(),
+        built_in::all().unwrap().len() + 1
+    );
 }
 
 #[tokio::test]

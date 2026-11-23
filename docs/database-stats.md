@@ -60,7 +60,9 @@ PostgreSQL `database` block, with no rule needed. What it found, such as the ver
 whether it's a primary or a replica, and anything that went wrong, are on the
 template's page and the host's **Templates** card.
 
-**MySQL and MariaDB, MongoDB and ClickHouse** are read by MaxNines itself, once a
+**ClickHouse** is read by the built-in ClickHouse template the same way.
+
+**MySQL and MariaDB, and MongoDB** are read by MaxNines itself, once a
 [config rule](api-config-rules.md) picks them, under **Databases from the agent's
 config**, one name to a line. A name an agent doesn't have reports that it's missing.
 Nothing of these is read until a rule asks for it. The host's metrics page lists each
@@ -77,14 +79,16 @@ After a database's name in a rule, list anything else to read, which costs more:
 
 | Extra | What it adds |
 |---|---|
-| `sizes` | Each database's size on disk. MySQL adds the binary logs. For PostgreSQL, turn on the PostgreSQL template's `sizes` and `wal_size` queries on its page instead |
-| `queries` | ClickHouse only: how long queries took over the last five minutes, as the median, 95th and 99th percentiles for each kind of query, and how many failed. It's read from `system.query_log`, which keeps everything unless it's given a time to live, so it can be slow on a busy server |
+| `sizes` | Each database's size on disk. MySQL adds the binary logs. For PostgreSQL and ClickHouse, turn on their templates' `sizes` queries on their pages instead, and PostgreSQL's `wal_size` |
 
 ClickHouse is read over its HTTP interface, where a password goes with every
 request as basic authentication, not as a challenge as the others sign in. So
 the agent only sends one over plain HTTP to ClickHouse on its own host, at
 `127.0.0.1` or `localhost`, and anywhere else needs `tls = true`. Every request is a
-GET, which ClickHouse only lets read.
+GET, which ClickHouse only lets read. Its template's `queries` query, off as it ships,
+reads how long queries took over the last five minutes, as the median, 95th and 99th
+percentiles for each kind of query, and how many failed, from `system.query_log`, which
+keeps everything unless it's given a time to live, so it can be slow on a busy server.
 
 A MongoDB database is read from the one server given, so give each member of a
 replica set a block of its own. It takes `host:port`, not a `mongodb+srv://`
@@ -108,8 +112,9 @@ sample, so `<key>.up` is as recent as a sample. A statement the database refuses
 database that can't be reached, is shown on the template's and the host's pages until
 it's right again, as [what's going
 wrong](templates.md#where-it-runs-and-whats-going-wrong). Templates can read
-PostgreSQL, MySQL and MariaDB so far, not MongoDB or ClickHouse. PostgreSQL's stats
-are its built-in template's, and the other kinds' are still this page's readers'.
+PostgreSQL, MySQL and MariaDB, and ClickHouse so far, not MongoDB. PostgreSQL's and
+ClickHouse's stats are their built-in templates', and the other kinds' are still this
+page's readers'.
 What the account may do beyond reading is read too, as [below](#what-the-account-may-do).
 
 ## Hosts without an agent
@@ -120,7 +125,7 @@ host on the **Checks** page, with how it signs in, and tick **Read its health an
 replication**, with any extras. Its stats are charted on the host's metrics page, as
 an agent's are, named after the check, and for the kinds MaxNines reads itself, listed
 under **Latest databases** there. The server keeps one connection open between runs,
-as an agent does. A PostgreSQL check's stats are the built-in PostgreSQL template's,
+as an agent does. A PostgreSQL or ClickHouse check's stats are its built-in template's,
 read as below.
 
 A check that reads its stats is read for [templates](#templates) too, as a database in
@@ -202,10 +207,10 @@ database. Each is 1 if it may and 0 if not:
 | Metric | It may |
 | --- | --- |
 | `database_account.overprivileged` | Do any of the below |
-| `database_account.superuser` | Do anything: a PostgreSQL superuser, or MySQL's `SUPER` or every privilege on `*.*` |
+| `database_account.superuser` | Do anything: a PostgreSQL superuser, MySQL's `SUPER` or every privilege on `*.*`, or ClickHouse's `ALL` on everything |
 | `database_account.writes` | Change data or tables anywhere: insert, update, delete, truncate, create, alter, drop, or add triggers, routines or events, including through a role or only some columns |
 | `database_account.manages` | Manage accounts or the server: create accounts, roles or databases, pass its privileges on (`WITH GRANT OPTION`, `WITH ADMIN OPTION`), replicate, or, on MySQL and MariaDB, `RELOAD`, `SHUTDOWN` or any admin privilege |
-| `database_account.server_files` | Read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE` |
+| `database_account.server_files` | Read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE`. On ClickHouse, `FILE`, `URL`, `REMOTE`, `S3` and the other table functions that reach outside it, and `BACKUP` |
 
 MaxNines only ever reads, in transactions that can't write, but an account that can do
 more is one a template's SQL, or anyone who learns its password, could misuse, so the
@@ -316,6 +321,11 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 
 ### ClickHouse
 
+These are the built-in ClickHouse template's, and it alerts on them itself: down,
+parts piling up and inserts refused, memory running out, replicated tables going read
+only, data lost on a replica, and replication or mutations stuck. Each is charted by
+its name, such as **ClickHouse parts used** for `clickhouse.parts_used`.
+
 | Metric | What it is |
 |---|---|
 | **ClickHouse queries running**, **queries running of the most allowed** | Against `max_concurrent_queries`. Inserts waiting to be batched aren't counted, as they would be from 26.3, when inserts are batched by default |
@@ -328,7 +338,7 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 | **ClickHouse merges running**, **background pool used**, **background pool tasks** | Each pool, such as `events pool merges and mutations`. A full merge pool means merges fall behind and parts pile up |
 | **ClickHouse mutations pending**, **failing**, **slowed**, **refused** | `ALTER … UPDATE` and `DELETE` still to finish, and ones that keep failing |
 | **ClickHouse dictionaries failing**, **detached parts**, **parts detached as broken**, **backups and restores failed** | Read every few minutes. Detached parts on their way somewhere aren't counted |
-| **ClickHouse errors** | For each error code worth knowing about, such as `events error TOO_MANY_PARTS`, once it's happened. ClickHouse's own docs warn that other codes rise while queries succeed |
+| **ClickHouse errors** | Per second, for each error code worth knowing about, labelled by the code and the sort of trouble it is, `capacity`, `integrity`, `replication`, `distributed`, `bug` or `security`. Each is listed from the start, so the first time one happens counts. ClickHouse's own docs warn that other codes rise while queries succeed |
 | **ClickHouse buffer table flush failures**, **slow disk reads**, **failed disk reads**, **failed disk writes** | Trouble underneath |
 | **ClickHouse replicated tables**, **replicated tables read only**, **tables that lost Keeper**, **read-only replicas** | A table goes read only when it loses ClickHouse Keeper or ZooKeeper |
 | **ClickHouse replication queue**, **longest replication queue**, **inserts waiting to replicate**, **merges waiting to replicate**, **parts still to appear**, **parts waiting to be checked**, **oldest replication queue entry**, **replication queue entries stuck**, **entries failing**, **replicas failing to update their queue** | Replication's backlog. An entry tried over 100 times, or put off over 1000, is stuck, and the newest reason one failed is on the database's own row |
@@ -338,11 +348,13 @@ databases**. Ones that aren't in a replica set leave out what's about replicatio
 | **ClickHouse connected to Keeper**, **Keeper session age**, **sessions**, **sessions expired**, **requests in flight**, **average wait**, **connection errors**, **request errors** | Its connection to ClickHouse Keeper or ZooKeeper. The connection table is from 23.5 |
 | **ClickHouse embedded Keeper is leader**, **synced followers**, **over its memory limit**, **clients**, **requests waiting** | When ClickHouse Keeper runs inside this server |
 | **ClickHouse disk free**, **disk used**, **disk broken**, **disk read only** | For each of its disks, such as `events disk default` |
-| **ClickHouse median**, **95th** and **99th percentile query time**, **queries failed in five minutes** | With the `queries` extra, for each kind of query, such as `events queries select` |
+| **ClickHouse median**, **95th** and **99th percentile query time**, **queries failed in five minutes** | With the template's `queries` query turned on, for each kind of query, such as `select` |
+| **ClickHouse query time**, **select time**, **insert time**, **Keeper wait**, **Keeper transactions** | The running totals the averages are worked out from |
 
 ## Good things to alert on
 
-PostgreSQL's template has its alerts already, as above. For the other kinds:
+PostgreSQL's and ClickHouse's templates have their alerts already, as their sections
+say. For the other kinds:
 
 - **answering** at 0, for each kind in use, such as **MySQL answering**.
 - **connections used** over 80%.
@@ -353,15 +365,9 @@ PostgreSQL's template has its alerts already, as above. For the other kinds:
 - **MongoDB replica set has a primary** at 0, or **members healthy** below the
   set's size.
 - **MongoDB oplog window** under a day.
-- **ClickHouse most parts in a partition of where inserts slow** over 80%.
-- **ClickHouse inserts refused for too many parts** above 0.
-- **ClickHouse replicated tables read only** or **tables that lost Keeper** above 0,
-  and **data lost on a replica** above 0.
-- **ClickHouse memory used of its limit** over 90%, and **background pool used**
-  for merges and mutations over 90% for a quarter of an hour.
-- **ClickHouse errors** above 0 for the integrity codes, such as
-  `CHECKSUM_DOESNT_MATCH`.
-- **ClickHouse replication queue entries stuck** or **mutations failing** above 0.
+- On ClickHouse, beyond its template's alerts: **background pool used** for merges
+  and mutations over 90% for a quarter of an hour, and **ClickHouse errors** above 0
+  for the `integrity` codes, such as `CHECKSUM_DOESNT_MATCH`.
 
 Each server reports only what it knows about itself. Comparing servers, such as
 noticing two primaries at once, is planned.

@@ -37,20 +37,23 @@ shown afterwards is written out from the parts.
 | Template | What it watches |
 | --- | --- |
 | **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules) |
+| **ClickHouse** | Each ClickHouse database: its load against its limits, inserts and parts, memory, merges and background pools, mutations, error codes worth knowing about, disks, replication, Keeper and Distributed tables, with 7 alerts. Its database sizes and query times ship turned off, as they cost more. What it reads is listed under [database stats](database-stats.md#clickhouse-1) |
 | **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed under [database stats](database-stats.md#postgresql-1) |
 
 ## What templates can read so far
 
-- **Databases:** PostgreSQL, and MySQL and MariaDB, with SQL. Templates can't read
-  MongoDB or ClickHouse yet: a template for either says so under **Where it runs**,
-  as `connecting`, and reads nothing. MongoDB isn't SQL, so it needs a way of its own
-  to be written in a template, which isn't decided yet.
+- **Databases:** PostgreSQL, MySQL and MariaDB, and ClickHouse, with SQL. ClickHouse
+  is read over its HTTP interface, where every statement is a GET, which it only lets
+  read, and its account's own profile sets its time limit. Templates can't read
+  MongoDB: a template for it says so under **Where it runs**, as `connecting`, and
+  reads nothing. MongoDB isn't SQL, so it needs a way of its own to be written in a
+  template, which isn't decided yet.
 - **Windows:** performance counters and registry values, on hosts with an agent.
-- **What MaxNines reads itself:** PostgreSQL is read by its built-in template. MaxNines'
-  own reading of [database stats](database-stats.md) still reads MySQL and MariaDB,
-  MongoDB and ClickHouse, under its own metric names, such as `mysql.connections`, so
-  a template can't use those names. Templates for MySQL and then ClickHouse are to
-  take its place, with templates for each operating system.
+- **What MaxNines reads itself:** PostgreSQL and ClickHouse are read by their built-in
+  templates. MaxNines' own reading of [database stats](database-stats.md) still reads
+  MySQL and MariaDB, and MongoDB, under its own metric names, such as
+  `mysql.connections`, so a template can't use those names. A template for MySQL is
+  to take its place, with templates for each operating system.
 
 Where a template is read, and how, is the same on an agent and on the server for a
 [host without an agent](#hosts-without-an-agent-and-maxnines-own-database).

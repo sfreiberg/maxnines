@@ -1228,6 +1228,13 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
     assert_eq!(
         names,
         [
+            "ClickHouse data lost on a replica",
+            "ClickHouse down",
+            "ClickHouse memory running out",
+            "ClickHouse parts piling up",
+            "ClickHouse refusing inserts",
+            "ClickHouse replicated tables read only",
+            "ClickHouse replication or mutations stuck",
             "Clock is wrong",
             "Container down",
             "Database account can do more than read",
