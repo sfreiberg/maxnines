@@ -1,11 +1,16 @@
 # Captures what each Linux package manager prints for the commands the agent's
 # updates collector runs, in a container of each system, so the collector's
-# parsers are tested against real output. It runs only by hand, from the Actions
-# tab; download its artifacts into crates/agent/fixtures/updates/.
+# parsers are tested against real output. It runs by hand from the Actions tab, and
+# by itself only when this file or its script changes, never for other pushes, so
+# CI is no slower. Download its artifacts into crates/agent/fixtures/updates/.
 name: Capture update outputs
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/capture-update-outputs.yml
+      - crates/agent/fixtures/updates/capture.sh
 
 permissions:
   contents: read
