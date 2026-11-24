@@ -640,7 +640,8 @@ erDiagram
     app_sign_ins {
         int id PK
         int user_id FK
-        string client_id
+        string client_id "or its client metadata document's address"
+        string client_name "what that document calls it"
         string device "what the app calls its computer, if it said"
         string role
         string access_hash UK
@@ -752,7 +753,7 @@ erDiagram
 | `unifi_devices` | Each device a UniFi check has found, with the host without an agent made for it, so a device keeps its host through renames on the console. It goes with its check or its host, and the host stays when the check goes |
 | `heartbeats` | What each heartbeat check was last pinged with, made by its first ping, which is what lets one that's late stay late through a restart. It goes with its check, or when the check stops being a heartbeat |
 | `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys. Each browser session, key and app sign-in keeps where it was last used from, for the list of who's signed in |
-| `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
+| `app_sign_ins` | Apps people signed in through the browser, such as the command line or an AI assistant, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
 | `audit_log` | Who changed what |
 | `server_settings`, `server_secrets` | Settings for the whole server, and secrets it generates |
 | `proxies` | What admins decided about proxies in front of the server: trusted, or not a proxy. Where a proxy that isn't trusted said a request came from is kept beside the address that connected, as `forwarded_for`, in the audit log and on sessions, keys and app sign-ins |

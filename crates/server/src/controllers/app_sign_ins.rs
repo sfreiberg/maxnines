@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Json, Router};
@@ -17,7 +17,8 @@ use super::users::role_choices;
 use super::{CsrfForm, Page, local_date, local_time, server_error, signed_in_user};
 use crate::app_sign_ins::{
     ACCESS_LIFETIME, AppClient, Approval, DEVICE_INTERVAL, DevicePoll, PENDING_LIFETIME,
-    REFRESH_LIFETIME, check_challenge, check_device, check_redirect, client, known_client,
+    REFRESH_LIFETIME, check_challenge, check_device, check_redirect, client, document_url,
+    known_client, usable_id,
 };
 use crate::app_state::AppState;
 use crate::audit::{self, Actor};
@@ -37,12 +38,59 @@ pub fn routes() -> Router<AppState> {
         .route("/settings/apps/{id}/revoke", post(revoke))
 }
 
-/// What apps call, with no one signed in: they prove themselves with what they hold.
+/// What apps call, with no one signed in: they prove themselves with what they hold,
+/// apart from what describes how to sign in, which is open to all.
 pub fn app_routes() -> Router<AppState> {
     Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(authorization_server),
+        )
         .route("/oauth/token", post(token))
         .route("/oauth/device", post(start_device))
         .route("/oauth/revoke", post(revoke_token))
+}
+
+/// What this server calls itself to apps, as their authorization server: the config's
+/// `public_url` as a web address when it says, and otherwise the address the request
+/// was made to, over plain HTTP, as with HTTPS the config has to say. Everything that
+/// names the issuer has to agree exactly.
+pub(super) fn site_origin(state: &AppState, headers: &HeaderMap) -> String {
+    if let Some(url) = &state.public_web_url {
+        return url.to_string();
+    }
+    let host = headers
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .filter(|host| {
+            !host.is_empty()
+                && host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-.:[]".contains(c))
+        })
+        .unwrap_or("localhost");
+    format!("http://{host}")
+}
+
+/// RFC 8414: how an app signs in here, for apps that find out for themselves. Apps on
+/// the web name themselves with the address of a client metadata document, as nothing
+/// registers here.
+async fn authorization_server(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let issuer = site_origin(&state, &headers);
+    Json(json!({
+        "issuer": issuer,
+        "authorization_endpoint": format!("{issuer}/oauth/authorize"),
+        "token_endpoint": format!("{issuer}/oauth/token"),
+        "revocation_endpoint": format!("{issuer}/oauth/revoke"),
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "revocation_endpoint_auth_methods_supported": ["none"],
+        "client_id_metadata_document_supported": true,
+        "authorization_response_iss_parameter_supported": true,
+    }))
+    .into_response()
 }
 
 // The approval page.
@@ -89,9 +137,12 @@ fn chosen_role(fields: &Fields, asked: Option<Role>) -> Option<Role> {
 /// while the person's own role was lowered.
 const ROLE_GONE: &str = "That role isn't one you can give it now. Choose again.";
 
-/// Where the browser is sent back to with an answer.
-fn back_to(redirect_uri: &str, answer: &[(&str, &str)]) -> Response {
-    let query = serde_urlencoded::to_string(answer).unwrap_or_default();
+/// Where the browser is sent back to with an answer, which always says who it's from,
+/// as RFC 9207 has it, so an app talking to several servers can tell.
+fn back_to(redirect_uri: &str, issuer: &str, answer: &[(&str, &str)]) -> Response {
+    let mut answer = answer.to_vec();
+    answer.push(("iss", issuer));
+    let query = serde_urlencoded::to_string(&answer).unwrap_or_default();
     let joiner = if redirect_uri.contains('?') { '&' } else { '?' };
     Redirect::to(&format!("{redirect_uri}{joiner}{query}")).into_response()
 }
@@ -117,26 +168,51 @@ struct Asked {
 }
 
 enum Checked {
-    Asked(Asked),
+    Asked(Box<Asked>),
     /// Said on the page.
-    Refused(&'static str),
+    Refused(String),
     /// Sent back to the app as an OAuth error.
     SendBack(String, String, &'static str),
 }
 
-fn check_ask(fields: &Fields) -> Checked {
-    let Some(client) = client(field(fields, "client_id")) else {
-        return Checked::Refused(
-            "The app didn't give an ID MaxNines can take, so it can't be signed in. An ID is up \
-             to 64 lowercase letters, digits, dots, dashes and underscores.",
-        );
+/// The app asking, as its ID says. One named by the address of a client metadata
+/// document is as that document says, read from there.
+async fn asking_client(state: &AppState, id: &str) -> Result<AppClient, String> {
+    if document_url(id).is_some() {
+        return state
+            .client_documents
+            .client(id, crate::times::now())
+            .await
+            .map_err(|error| {
+                format!(
+                    "The app is described at {id}, but MaxNines can't use what's there, so it \
+                     can't be signed in: {error:#}."
+                )
+            });
+    }
+    client(id).ok_or_else(|| {
+        "The app didn't give an ID MaxNines can take, so it can't be signed in. An ID is up \
+         to 64 lowercase letters, digits, dots, dashes and underscores, or the https:// \
+         address of a description of the app."
+            .to_string()
+    })
+}
+
+async fn check_ask(state: &AppState, fields: &Fields) -> Checked {
+    let client = match asking_client(state, field(fields, "client_id")).await {
+        Ok(client) => client,
+        Err(message) => return Checked::Refused(message),
     };
     let redirect_uri = field(fields, "redirect_uri").to_string();
-    let Ok(origin) = check_redirect(&redirect_uri) else {
-        return Checked::Refused(
+    let Ok(origin) = check_redirect(&redirect_uri, &client) else {
+        let message = if client.document.is_some() {
+            "The app asked to be answered at an address its description doesn't list, so it \
+             can't be signed in."
+        } else {
             "The app asked to be answered somewhere other than this computer, so it can't be \
-             signed in this way.",
-        );
+             signed in this way."
+        };
+        return Checked::Refused(message.to_string());
     };
     let state = field(fields, "state").to_string();
     if field(fields, "response_type") != "code" {
@@ -151,7 +227,7 @@ fn check_ask(fields: &Fields) -> Checked {
     ) else {
         return Checked::SendBack(redirect_uri, state, "invalid_request");
     };
-    Checked::Asked(Asked {
+    Checked::Asked(Box::new(Asked {
         client,
         redirect_uri,
         origin,
@@ -159,10 +235,18 @@ fn check_ask(fields: &Fields) -> Checked {
         challenge: challenge.to_string(),
         device,
         role,
-    })
+    }))
 }
 
-/// The page where someone approves an app that will be sent back to this computer.
+/// The host an app on the web is sent back to, to show on the approval page, or
+/// nothing for this computer.
+fn web_host(redirect_uri: &str) -> Option<String> {
+    let url = url::Url::parse(redirect_uri).ok()?;
+    (url.scheme() == "https").then(|| url.host_str().unwrap_or_default().to_string())
+}
+
+/// The page where someone approves an app that will be sent back to this computer, or
+/// for an app on the web, to an address its client metadata document lists.
 fn approval_page(
     state: &AppState,
     token: &CsrfToken,
@@ -170,11 +254,15 @@ fn approval_page(
     error: Option<&str>,
 ) -> Response {
     let role = asked.role.map_or("", Role::as_str);
+    let document = asked.client.document.as_ref();
     let page = Page::new(state, token, "app_sign_ins/approve.html")
         .with("action", "/oauth/authorize")
         .with("app", &asked.client.name)
         .with("app_id", &asked.client.id)
         .with("known", &asked.client.known)
+        .with("document", &document.is_some())
+        .with("app_host", &document.map(|document| document.host.clone()))
+        .with("redirect_host", &web_host(&asked.redirect_uri))
         .with("device", &asked.device)
         .with("email", &signed_in_user().map(|user| user.email.clone()))
         .with("error", &error)
@@ -197,8 +285,8 @@ fn approval_page(
         page
     };
     let mut response = role_offer(page, asked.role).render();
-    // The answer goes back to the app on this computer, which the page's policy has to
-    // let the form lead to.
+    // The answer goes back to the app, on this computer or on the web, which the page's
+    // policy has to let the form lead to.
     let policy = super::CONTENT_SECURITY_POLICY.replace(
         "form-action 'self'",
         &format!("form-action 'self' {}", asked.origin),
@@ -213,14 +301,16 @@ fn approval_page(
 
 async fn authorize_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     token: CsrfToken,
     Query(fields): Query<Fields>,
 ) -> Response {
-    match check_ask(&fields) {
+    let issuer = site_origin(&state, &headers);
+    match check_ask(&state, &fields).await {
         Checked::Asked(asked) => approval_page(&state, &token, &asked, None),
-        Checked::Refused(message) => refusal_page(&state, &token, message),
+        Checked::Refused(message) => refusal_page(&state, &token, &message),
         Checked::SendBack(uri, app_state, error) => {
-            back_to(&uri, &[("error", error), ("state", &app_state)])
+            back_to(&uri, &issuer, &[("error", error), ("state", &app_state)])
         }
     }
 }
@@ -242,17 +332,19 @@ fn hidden(fields: &[(&'static str, &str)]) -> Vec<Hidden> {
         .collect()
 }
 
-async fn authorize(State(state): State<AppState>, form: CsrfForm) -> Response {
-    let asked = match check_ask(&form.fields) {
+async fn authorize(State(state): State<AppState>, headers: HeaderMap, form: CsrfForm) -> Response {
+    let issuer = site_origin(&state, &headers);
+    let asked = match check_ask(&state, &form.fields).await {
         Checked::Asked(asked) => asked,
-        Checked::Refused(message) => return refusal_page(&state, &form.token, message),
+        Checked::Refused(message) => return refusal_page(&state, &form.token, &message),
         Checked::SendBack(uri, app_state, error) => {
-            return back_to(&uri, &[("error", error), ("state", &app_state)]);
+            return back_to(&uri, &issuer, &[("error", error), ("state", &app_state)]);
         }
     };
     if field(&form.fields, "decision") != "allow" {
         return back_to(
             &asked.redirect_uri,
+            &issuer,
             &[("error", "access_denied"), ("state", &asked.state)],
         );
     }
@@ -273,6 +365,7 @@ async fn authorize(State(state): State<AppState>, form: CsrfForm) -> Response {
     ) {
         Ok(code) => back_to(
             &asked.redirect_uri,
+            &issuer,
             &[("code", &code), ("state", &asked.state)],
         ),
         Err(error) => server_error(&error),
@@ -426,6 +519,7 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
         state.database.create_app_sign_in(
             approval.user_id,
             &approval.client.id,
+            approval.client.client_name(),
             approval.device.as_deref(),
             approval.role.min(user.role),
             crate::times::now(),
@@ -440,7 +534,7 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
 
 async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Response {
     let client_id = field(&fields, "client_id");
-    if client(client_id).is_none() {
+    if !usable_id(client_id) {
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
@@ -564,7 +658,7 @@ async fn start_device(State(state): State<AppState>, Form(fields): Form<Fields>)
 /// it can't be used to find out which tokens are real.
 async fn revoke_token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Response {
     let client_id = field(&fields, "client_id");
-    if client(client_id).is_none() {
+    if !usable_id(client_id) {
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",

@@ -219,7 +219,7 @@ async fn nothing_is_given_without_the_right_proof_or_address() {
     // An answer is never sent anywhere but this computer.
     for elsewhere in [
         "https://evil.example.com/callback",
-        "http://localhost:5555/",
+        "http://localhost.evil.example.com:5555/",
         // A page's policy can't name an IPv6 address, so the browser couldn't go back.
         "http://[::1]:5555/",
     ] {
@@ -496,6 +496,7 @@ async fn tokens_expire_and_stop_with_their_owner() {
         .create_app_sign_in(
             id,
             "maxnines-desktop-mac",
+            None,
             Some("Mac"),
             Role::Responder,
             now,
@@ -539,7 +540,7 @@ async fn tokens_expire_and_stop_with_their_owner() {
     // An app can't be signed in to do more than its person.
     assert!(
         database
-            .create_app_sign_in(id, "maxnines-cli", None, Role::Admin, now)
+            .create_app_sign_in(id, "maxnines-cli", None, None, Role::Admin, now)
             .await
             .is_err()
     );
@@ -552,13 +553,21 @@ async fn signed_in_apps_are_listed_and_revoked() {
     let owner = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (first, first_tokens) = database
-        .create_app_sign_in(owner, "maxnines-cli", Some("laptop"), Role::Viewer, now)
+        .create_app_sign_in(
+            owner,
+            "maxnines-cli",
+            None,
+            Some("laptop"),
+            Role::Viewer,
+            now,
+        )
         .await
         .unwrap();
     let (_, second_tokens) = database
         .create_app_sign_in(
             owner,
             "maxnines-desktop-windows",
+            None,
             Some("office PC"),
             Role::Viewer,
             now,
@@ -670,7 +679,7 @@ async fn using_a_swapped_token_again_never_stretches_its_minute() {
     let owner = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (_, first) = database
-        .create_app_sign_in(owner, "maxnines-cli", None, Role::Viewer, now)
+        .create_app_sign_in(owner, "maxnines-cli", None, None, Role::Viewer, now)
         .await
         .unwrap();
     let refresh = |token: String, at: Timestamp| async move {
@@ -708,7 +717,7 @@ async fn two_refreshes_at_once_both_get_tokens_and_the_newest_works() {
     let owner = database.list_users().await.unwrap()[0].id;
     let now = crate::times::now();
     let (_, first) = database
-        .create_app_sign_in(owner, "maxnines-cli", None, Role::Viewer, now)
+        .create_app_sign_in(owner, "maxnines-cli", None, None, Role::Viewer, now)
         .await
         .unwrap();
     let (one, two) = tokio::join!(
@@ -762,6 +771,7 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
         .create_app_sign_in(
             admin,
             "maxnines-cli",
+            None,
             Some("admin's laptop"),
             Role::Viewer,
             now,
@@ -794,6 +804,7 @@ async fn only_your_own_apps_can_be_revoked_and_old_ones_are_cleared_away() {
         .create_app_sign_in(
             admin,
             "maxnines-cli",
+            None,
             Some("new laptop"),
             Role::Viewer,
             much_later,
@@ -823,4 +834,218 @@ async fn me_says_who_a_request_acts_as_and_through_what() {
     assert_eq!(me["via"]["kind"], "app");
     assert_eq!(me["via"]["name"], "MaxNines command line on laptop");
     assert_eq!(me["via"]["id"], tokens["sign_in_id"]);
+}
+
+#[tokio::test]
+async fn apps_find_out_how_to_sign_in_without_signing_in() {
+    let server = start().await;
+    let response = server
+        .http("GET", "/.well-known/oauth-authorization-server", None)
+        .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let (_, body) = response.split_once("\r\n\r\n").unwrap();
+    let metadata: Value = serde_json::from_str(body).unwrap();
+    // The issuer is the address asked for, as the config gives no public_url.
+    assert_eq!(metadata["issuer"], "http://x");
+    assert_eq!(
+        metadata["authorization_endpoint"],
+        "http://x/oauth/authorize"
+    );
+    assert_eq!(metadata["token_endpoint"], "http://x/oauth/token");
+    assert_eq!(metadata["revocation_endpoint"], "http://x/oauth/revoke");
+    assert_eq!(metadata["response_types_supported"], json!(["code"]));
+    assert_eq!(
+        metadata["code_challenge_methods_supported"],
+        json!(["S256"])
+    );
+    assert_eq!(
+        metadata["token_endpoint_auth_methods_supported"],
+        json!(["none"])
+    );
+    assert_eq!(metadata["client_id_metadata_document_supported"], true);
+    assert_eq!(
+        metadata["authorization_response_iss_parameter_supported"],
+        true
+    );
+    assert!(metadata.get("registration_endpoint").is_none());
+}
+
+/// Serves client metadata documents over HTTPS on a port of this computer, as an app
+/// on the web does, giving back the server's address and the TLS settings that trust
+/// it. `documents` are by path, each JSON with `{url}` in place of its own address.
+async fn document_server(documents: &[(&'static str, Value)]) -> (String, ureq::tls::TlsConfig) {
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+
+    let made = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(made.signing_key.serialize_der()));
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![made.cert.der().clone()], key)
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!(
+        "https://localhost:{}",
+        listener.local_addr().unwrap().port()
+    );
+    let mut routes = axum::Router::new();
+    for (path, document) in documents {
+        let text = document
+            .to_string()
+            .replace("{url}", &format!("{origin}{path}"));
+        routes = routes.route(path, axum::routing::get(move || async move { text }));
+    }
+    let tls = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(config));
+    let serving = axum_server::from_tcp_rustls(listener.into_std().unwrap(), tls).unwrap();
+    tokio::spawn(async move { serving.serve(routes.into_make_service()).await });
+
+    let root = ureq::tls::Certificate::from_der(made.cert.der()).to_owned();
+    let trust = ureq::tls::TlsConfig::builder()
+        .root_certs(ureq::tls::RootCerts::Specific(Arc::new(vec![root])))
+        .build();
+    (origin, trust)
+}
+
+/// Where an app on the web is sent back to.
+const WEB_BACK: &str = "https://assistant.example/oauth/callback";
+
+fn ask_with(client_id: &str, back: &str, extra: &str) -> String {
+    format!(
+        "/oauth/authorize?response_type=code&client_id={}&redirect_uri={}\
+         &code_challenge={CHALLENGE}&code_challenge_method=S256&state=xyz{extra}",
+        encode(client_id),
+        encode(back)
+    )
+}
+
+#[tokio::test]
+async fn an_app_on_the_web_signs_in_as_its_client_metadata_document_says() {
+    let server = start().await;
+    let document = json!({
+        "client_id": "{url}",
+        "client_name": "Test Assistant",
+        "redirect_uris": [WEB_BACK, "http://localhost/callback"],
+        "token_endpoint_auth_method": "none",
+    });
+    let wrong = json!({ "client_id": "https://elsewhere.example/client.json", "redirect_uris": [WEB_BACK] });
+    let (origin, trust) =
+        document_server(&[("/client.json", document), ("/wrong.json", wrong)]).await;
+    server.state.client_documents.trust(trust);
+    let client_id = format!("{origin}/client.json");
+    let mut browser = Browser::default();
+
+    // The page names the app, where it's described, and where it'll go back to.
+    let path = ask_with(&client_id, WEB_BACK, "");
+    let page = browser.get(&server, &path).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("Sign in Test Assistant (localhost)?"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body
+            .contains("sends you back to <strong>assistant.example</strong>"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("This isn't one of MaxNines' own apps"));
+    let policy = page.header("content-security-policy").unwrap();
+    assert!(
+        policy.contains("form-action 'self' https://assistant.example;"),
+        "{policy}"
+    );
+
+    // Allowed, it's sent back there with the code, and who it's from.
+    let fields = [
+        ("response_type", "code"),
+        ("client_id", client_id.as_str()),
+        ("redirect_uri", WEB_BACK),
+        ("state", "xyz"),
+        ("code_challenge", CHALLENGE),
+        ("code_challenge_method", "S256"),
+        ("chosen_role", "viewer"),
+        ("decision", "allow"),
+    ];
+    let page = browser
+        .submit(&server, &path, "/oauth/authorize", &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let back = page.header("location").unwrap();
+    assert!(back.starts_with(&format!("{WEB_BACK}?code=mxc_")), "{back}");
+    assert_eq!(query_value(back, "iss").as_deref(), Some("http://x"));
+    let code = query_value(back, "code").unwrap();
+
+    let swap = [
+        ("grant_type", "authorization_code"),
+        ("code", code.as_str()),
+        ("redirect_uri", WEB_BACK),
+        ("client_id", client_id.as_str()),
+        ("code_verifier", VERIFIER),
+    ];
+    let (status, tokens) = app_post(&server, "/oauth/token", &swap).await;
+    assert_eq!(status, 200, "{tokens}");
+    let access = tokens["access_token"].as_str().unwrap();
+    let (status, listed) = call_json(&server, access, "GET", "/api/v1/app-sign-ins").await;
+    assert_eq!(status, 200);
+    assert_eq!(listed[0]["app"], "Test Assistant (localhost)");
+    assert_eq!(listed[0]["client_id"], client_id.as_str());
+
+    // Turned down, it's told so, saying who it's from.
+    let fields_denied: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|&(name, value)| (name, if name == "decision" { "deny" } else { value }))
+        .collect();
+    let page = browser
+        .submit(&server, &path, "/oauth/authorize", &fields_denied)
+        .await;
+    let back = page.header("location").unwrap();
+    assert_eq!(query_value(back, "error").as_deref(), Some("access_denied"));
+    assert_eq!(query_value(back, "iss").as_deref(), Some("http://x"));
+
+    // On this computer, any port will do, with a warning that anything here could
+    // claim to be it.
+    let page = browser
+        .get(
+            &server,
+            &ask_with(&client_id, "http://localhost:4321/callback", ""),
+        )
+        .await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert!(
+        page.body.contains("any program here could use"),
+        "{}",
+        page.body
+    );
+
+    // Anywhere its document doesn't list is refused on the page, never sent there.
+    for unlisted in [
+        "https://assistant.example/other",
+        "https://evil.example/oauth/callback",
+        "http://127.0.0.1:4321/callback",
+    ] {
+        let page = browser
+            .get(&server, &ask_with(&client_id, unlisted, ""))
+            .await;
+        assert_eq!(page.status, 400, "{unlisted}");
+        assert!(page.header("location").is_none(), "{unlisted}");
+        assert!(page.body.contains("doesn&#39;t list"), "{}", page.body);
+    }
+
+    // A document naming another address isn't the app's.
+    let wrong_id = format!("{origin}/wrong.json");
+    let page = browser
+        .get(&server, &ask_with(&wrong_id, WEB_BACK, ""))
+        .await;
+    assert_eq!(page.status, 400, "{}", page.body);
+    assert!(page.header("location").is_none());
+    assert!(
+        page.body
+            .contains("its client_id isn&#39;t the address it&#39;s at"),
+        "{}",
+        page.body
+    );
 }

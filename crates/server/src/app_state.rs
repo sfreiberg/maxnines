@@ -88,6 +88,9 @@ pub struct AppState {
     pub csrf: CsrfConfig,
     /// Where people reach the site, for links they're given.
     pub web_url: Arc<str>,
+    /// Where people reach the site, when the config's `public_url` says. Without it,
+    /// what the site calls itself to apps comes from the address they asked for.
+    pub public_web_url: Option<Arc<str>>,
     pub sign_ins: Arc<SignInThrottle>,
     /// Turns away heartbeat pings that come too fast.
     pub pings: Arc<crate::heartbeats::PingLimiter>,
@@ -96,6 +99,8 @@ pub struct AppState {
     pub require_two_factor: Arc<std::sync::atomic::AtomicBool>,
     /// Apps approved in the browser, waiting to collect their tokens.
     pub pending_sign_ins: Arc<crate::app_sign_ins::PendingSignIns>,
+    /// Apps' client metadata documents, read as they sign in.
+    pub client_documents: Arc<crate::app_sign_ins::ClientDocuments>,
     /// How long the health check waits on each database before calling it failing.
     pub health_limit: std::time::Duration,
     /// The built-in templates an upgrade changed, which admins are told of on every

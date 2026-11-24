@@ -7,8 +7,10 @@ pub struct Model {
     pub id: i64,
     /// Who it acts as.
     pub user_id: i64,
-    /// Which app, such as `maxnines-cli`.
+    /// Which app, such as `maxnines-cli`, or the address of its client metadata document.
     pub client_id: String,
+    /// What its client metadata document called it, for an app with one.
+    pub client_name: Option<String>,
     /// What the app calls the computer it's on.
     pub device: Option<String>,
     /// The most it may do: `viewer`, `responder`, `editor` or `admin`.

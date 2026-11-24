@@ -8,18 +8,26 @@
 //! they sign in an app. The app gets a short-lived access token and a refresh token,
 //! and acts as them with at most the role they chose.
 //!
+//! An app on the web, such as an AI assistant, says what it is with a client metadata
+//! document: its ID is the address of a JSON description of it, which lists where it
+//! may be sent back to. That's how one that isn't on this computer can be answered
+//! somewhere other than a loopback address.
+//!
 //! What's waiting to be approved lives only in memory, for minutes: a restart just
 //! means signing in again.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::TimeDelta;
 use ring::digest::{SHA256, digest};
 use ring::rand::{SecureRandom, SystemRandom};
+use serde_json::Value;
+use url::Url;
 
 use crate::roles::Role;
 use crate::times::Timestamp;
@@ -53,11 +61,32 @@ pub const MAX_DEVICE_CHARS: usize = 100;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppClient {
     pub id: String,
-    /// What people are shown it as: MaxNines' name for one of its own apps, or for any
-    /// other, the ID it gave and that it isn't one of MaxNines' own.
+    /// What people are shown it as: MaxNines' name for one of its own apps, what its
+    /// client metadata document calls it with the host that document is on, or for
+    /// any other, the ID it gave and that it isn't one of MaxNines' own.
     pub name: String,
     /// Whether it's one of MaxNines' own apps.
     pub known: bool,
+    /// What its client metadata document says, for an app whose ID is one's address.
+    pub document: Option<ClientDocument>,
+}
+
+impl AppClient {
+    /// What its client metadata document calls it, to keep with its sign in.
+    pub fn client_name(&self) -> Option<&str> {
+        self.document.as_ref()?.client_name.as_deref()
+    }
+}
+
+/// What an app's client metadata document says about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientDocument {
+    /// The host the document is on, which is all that vouches for it.
+    pub host: String,
+    /// What the app calls itself, if it says.
+    pub client_name: Option<String>,
+    /// Where it may be sent back to.
+    pub redirect_uris: Vec<String>,
 }
 
 struct KnownApp {
@@ -85,8 +114,12 @@ const KNOWN_APPS: [KnownApp; 4] = [
     },
 ];
 
-/// The longest ID an app can give.
+/// The longest ID an app can give, unless it's a client metadata document's address.
 pub const MAX_CLIENT_ID_CHARS: usize = 64;
+/// The longest address of a client metadata document that can be an app's ID.
+pub const MAX_DOCUMENT_URL_CHARS: usize = 255;
+/// The longest name from a client metadata document that's kept. Longer is cut short.
+pub const MAX_CLIENT_NAME_CHARS: usize = 100;
 
 /// One of MaxNines' own apps. Only these can sign in with a code typed on another
 /// device, as nothing ties that sign-in to the computer the person is at, which makes
@@ -99,6 +132,7 @@ pub fn known_client(id: &str) -> Option<AppClient> {
             id: app.id.to_string(),
             name: app.name.to_string(),
             known: true,
+            document: None,
         })
 }
 
@@ -120,13 +154,215 @@ pub fn client(id: &str) -> Option<AppClient> {
             id: id.to_string(),
             name: format!("{id} (not one of MaxNines' own)"),
             known: false,
+            document: None,
         })
     })
 }
 
-/// How an app that's been signed in is shown, in lists and the audit log.
-pub fn app_name(id: &str) -> String {
+/// The address of a client metadata document, if `id` is one an app can have: an
+/// `https` URL with a path, no fragment or user name, written as it would be read
+/// back, so the same document can't go by two IDs.
+pub fn document_url(id: &str) -> Option<Url> {
+    if !id.starts_with("https://") || id.len() > MAX_DOCUMENT_URL_CHARS {
+        return None;
+    }
+    let url = Url::parse(id).ok()?;
+    let usable = url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none()
+        && url.path() != "/"
+        && url.as_str() == id;
+    usable.then_some(url)
+}
+
+/// Whether `id` is one an app can sign in with: one [`client`] takes, or a client
+/// metadata document's address. Checking the document itself is for the approval page.
+pub fn usable_id(id: &str) -> bool {
+    client(id).is_some() || document_url(id).is_some()
+}
+
+/// What an app described by a client metadata document is shown as: what it calls
+/// itself, with the host that vouches for it.
+fn document_app_name(host: &str, client_name: Option<&str>) -> String {
+    match client_name {
+        Some(name) => format!("{name} ({host})"),
+        None => host.to_string(),
+    }
+}
+
+/// An app described by the client metadata document at `id`.
+pub fn document_client(id: &str, document: ClientDocument) -> AppClient {
+    AppClient {
+        id: id.to_string(),
+        name: document_app_name(&document.host, document.client_name.as_deref()),
+        known: false,
+        document: Some(document),
+    }
+}
+
+/// How an app that's been signed in is shown, in lists and the audit log, with what
+/// its client metadata document called it, if it had one.
+pub fn app_name(id: &str, client_name: Option<&str>) -> String {
+    if let Some(url) = document_url(id) {
+        return document_app_name(url.host_str().unwrap_or_default(), client_name);
+    }
     client(id).map_or_else(|| id.to_string(), |client| client.name)
+}
+
+/// A client metadata document read: it has to be JSON naming itself by the address
+/// it was read from, with at least one address to be sent back to that MaxNines can
+/// use, on this computer or `https`. Others it lists, such as an app's own scheme, are
+/// left out.
+pub fn read_document(id: &str, body: &[u8]) -> Result<ClientDocument> {
+    let url = document_url(id).context("that isn't a client metadata document's address")?;
+    let document: Value = serde_json::from_slice(body).context("it isn't JSON")?;
+    ensure!(
+        document["client_id"].as_str() == Some(id),
+        "its client_id isn't the address it's at"
+    );
+    let redirect_uris: Vec<String> = document["redirect_uris"]
+        .as_array()
+        .context("it doesn't list its redirect_uris")?
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|uri| parse_loopback(uri).is_some() || web_redirect(uri).is_some())
+        .map(str::to_string)
+        .collect();
+    ensure!(
+        !redirect_uris.is_empty(),
+        "none of its redirect_uris is an https:// address or on this computer"
+    );
+    let client_name = document["client_name"].as_str().and_then(|name| {
+        let name: String = name
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_CLIENT_NAME_CHARS)
+            .collect();
+        crate::text::non_blank(name.trim())
+    });
+    Ok(ClientDocument {
+        host: url.host_str().unwrap_or_default().to_string(),
+        client_name,
+        redirect_uris,
+    })
+}
+
+/// How long a client metadata document read is used before it's read again.
+pub const DOCUMENT_KEPT_FOR: TimeDelta = TimeDelta::minutes(5);
+/// How long reading one can take.
+const DOCUMENT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most of one that's read.
+const MAX_DOCUMENT_BYTES: u64 = 64 * 1024;
+/// The most documents kept at once.
+const MAX_DOCUMENTS_KEPT: usize = 100;
+
+/// Reads apps' client metadata documents, keeping each for a few minutes, as the
+/// approval page is opened and then sent.
+pub struct ClientDocuments {
+    agent: Mutex<ureq::Agent>,
+    kept: Mutex<HashMap<String, (Timestamp, ClientDocument)>>,
+}
+
+impl Default for ClientDocuments {
+    fn default() -> Self {
+        Self::trusting(ureq::tls::TlsConfig::default())
+    }
+}
+
+/// What reads client metadata documents: within a time limit, and without following
+/// redirects, as a document has to be at the address that's the app's ID.
+fn document_agent(tls: ureq::tls::TlsConfig) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .timeout_global(Some(DOCUMENT_TIMEOUT))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build();
+    ureq::Agent::new_with_config(config)
+}
+
+impl ClientDocuments {
+    /// Reads them over TLS set up as `tls` says.
+    pub fn trusting(tls: ureq::tls::TlsConfig) -> Self {
+        Self {
+            agent: Mutex::new(document_agent(tls)),
+            kept: Mutex::default(),
+        }
+    }
+
+    /// Reads them trusting other certificates from now on, as tests do their own.
+    #[cfg(test)]
+    pub fn trust(&self, tls: ureq::tls::TlsConfig) {
+        *self
+            .agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = document_agent(tls);
+    }
+
+    /// The app whose ID is the address of a client metadata document, as that says.
+    pub async fn client(&self, id: &str, now: Timestamp) -> Result<AppClient> {
+        let kept = {
+            let mut kept = self
+                .kept
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            kept.retain(|_, (read_at, _)| now - *read_at < DOCUMENT_KEPT_FOR);
+            kept.get(id).map(|(_, document)| document.clone())
+        };
+        let document = match kept {
+            Some(document) => document,
+            None => {
+                let document = self.read(id).await?;
+                let mut kept = self
+                    .kept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if kept.len() >= MAX_DOCUMENTS_KEPT {
+                    kept.clear();
+                }
+                kept.insert(id.to_string(), (now, document.clone()));
+                document
+            }
+        };
+        Ok(document_client(id, document))
+    }
+
+    async fn read(&self, id: &str) -> Result<ClientDocument> {
+        ensure!(
+            document_url(id).is_some(),
+            "that isn't a client metadata document's address"
+        );
+        let agent = self
+            .agent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let address = id.to_string();
+        let body = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+            let mut response = agent
+                .get(&address)
+                .header("Accept", "application/json")
+                .call()
+                .map_err(|error| anyhow::anyhow!("it couldn't be read: {error}"))?;
+            let status = response.status();
+            ensure!(
+                status == 200,
+                "reading it gave HTTP status {}",
+                status.as_u16()
+            );
+            response
+                .body_mut()
+                .with_config()
+                .limit(MAX_DOCUMENT_BYTES)
+                .read_to_vec()
+                .map_err(|error| anyhow::anyhow!("it couldn't be read: {error}"))
+        })
+        .await
+        .context("reading a client metadata document")??;
+        read_document(id, &body)
+    }
 }
 
 /// What an app calls the computer it's on, trimmed, which it needn't say: none if
@@ -144,31 +380,73 @@ pub fn check_device(device: &str) -> Result<Option<String>> {
     Ok(crate::text::non_blank(device))
 }
 
-/// Where a browser may be sent back to: a port on 127.0.0.1, written as an IP address,
-/// as RFC 8252 asks, since `localhost` can be made to mean somewhere else. Not `[::1]`,
-/// as a page's policy can't name an IPv6 address, so the browser would refuse to go
-/// back there. Gives back the origin, which the page's policy has to allow.
-pub fn check_redirect(redirect_uri: &str) -> Result<String> {
-    let Some(rest) = redirect_uri.strip_prefix("http://") else {
+/// A loopback address an app is sent back to, as RFC 8252 has native apps listen:
+/// `http` on 127.0.0.1 or `localhost`, with no user name or fragment. Not `[::1]`, as
+/// a page's policy can't name an IPv6 address, so the browser would refuse to go back
+/// there.
+struct Loopback<'a> {
+    host: &'a str,
+    port: Option<u16>,
+    /// The path and query.
+    rest: &'a str,
+}
+
+fn parse_loopback(redirect_uri: &str) -> Option<Loopback<'_>> {
+    let rest = redirect_uri.strip_prefix("http://")?;
+    let (authority, rest) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+    if rest.contains('#') {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (
+            host,
+            Some(port.parse::<u16>().ok().filter(|port| *port > 0)?),
+        ),
+        None => (authority, None),
+    };
+    matches!(host, "127.0.0.1" | "localhost").then_some(Loopback { host, port, rest })
+}
+
+/// An `https` address an app on the web is sent back to, giving back its origin.
+fn web_redirect(redirect_uri: &str) -> Option<String> {
+    let url = Url::parse(redirect_uri).ok()?;
+    let usable = url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none();
+    usable.then(|| url.origin().ascii_serialization())
+}
+
+/// Where a browser may be sent back to for `client`, giving back the origin, which the
+/// approval page's policy has to allow. A port on this computer, for any app, as the
+/// browser then only ever answers on the computer the person is at. Somewhere else
+/// only for an app described by a client metadata document, and exactly as that
+/// lists it, where a port on this computer is matched whatever the port, as RFC 8252
+/// has apps pick a free one.
+pub fn check_redirect(redirect_uri: &str, client: &AppClient) -> Result<String> {
+    if let Some(loopback) = parse_loopback(redirect_uri) {
+        let Some(port) = loopback.port else {
+            bail!("an app's address needs its port");
+        };
+        if let Some(document) = &client.document {
+            let listed = document.redirect_uris.iter().any(|uri| {
+                parse_loopback(uri).is_some_and(|listed| {
+                    listed.host == loopback.host && listed.rest == loopback.rest
+                })
+            });
+            ensure!(listed, "the app's description doesn't list that address");
+        }
+        return Ok(format!("http://{}:{port}", loopback.host));
+    }
+    let Some(document) = &client.document else {
         bail!("an app is sent back to http:// on this computer");
     };
-    let (authority, path) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
     ensure!(
-        !path.contains('#'),
-        "an app's address can't have a fragment"
+        document.redirect_uris.iter().any(|uri| uri == redirect_uri),
+        "the app's description doesn't list that address"
     );
-    let host_end = authority.rfind(':').unwrap_or(authority.len());
-    let (host, port) = authority.split_at(host_end);
-    ensure!(
-        host == "127.0.0.1",
-        "an app is sent back to 127.0.0.1, not {host:?}"
-    );
-    let port = port.strip_prefix(':').unwrap_or_default();
-    ensure!(
-        port.parse::<u16>().is_ok_and(|port| port > 0),
-        "an app's address needs its port"
-    );
-    Ok(format!("http://{authority}"))
+    web_redirect(redirect_uri).context("an app on the web is sent back to an https:// address")
 }
 
 /// Whether `verifier` is the one `challenge` was made from: its SHA-256, in base64url.
@@ -535,7 +813,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            app_name("my-script"),
+            app_name("my-script", None),
             "my-script (not one of MaxNines' own)"
         );
         // Only MaxNines' own apps can use a code typed on another device.
@@ -569,23 +847,122 @@ mod tests {
 
     #[test]
     fn apps_are_only_sent_back_to_this_computer() {
-        assert_eq!(
-            check_redirect("http://127.0.0.1:53682/callback").unwrap(),
-            "http://127.0.0.1:53682"
-        );
+        let app = client("my-script").unwrap();
+        for (uri, origin) in [
+            ("http://127.0.0.1:53682/callback", "http://127.0.0.1:53682"),
+            ("http://localhost:53682/callback", "http://localhost:53682"),
+            ("http://127.0.0.1:80?x=1", "http://127.0.0.1:80"),
+        ] {
+            assert_eq!(check_redirect(uri, &app).unwrap(), origin, "{uri}");
+        }
         for bad in [
             "https://127.0.0.1:53682/",
-            "http://localhost:53682/",
             "http://[::1]:53682/",
             "http://127.0.0.1/",
             "http://127.0.0.1:0/",
+            "http://127.0.0.1:99999/",
             "http://evil.example.com:80/",
             "http://127.0.0.1.evil.example.com:80/",
+            "http://localhost.evil.example.com:80/",
             "http://user@127.0.0.1:80/",
             "http://127.0.0.1:80/#x",
+            "https://claude.ai/api/mcp/auth_callback",
             "javascript:alert(1)",
         ] {
-            assert!(check_redirect(bad).is_err(), "{bad}");
+            assert!(check_redirect(bad, &app).is_err(), "{bad}");
+        }
+    }
+
+    const DOCUMENT_URL: &str = "https://apps.example.com/oauth/client.json";
+
+    fn document(redirect_uris: &[&str]) -> String {
+        serde_json::json!({
+            "client_id": DOCUMENT_URL,
+            "client_name": "  Example\u{7}  App  ",
+            "redirect_uris": redirect_uris,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_client_metadata_document_names_the_app_and_where_it_goes_back_to() {
+        let body = document(&[
+            "https://apps.example.com/callback",
+            "http://localhost/callback",
+            "com.example.app:/callback",
+        ]);
+        let read = read_document(DOCUMENT_URL, body.as_bytes()).unwrap();
+        assert_eq!(read.redirect_uris.len(), 2, "{:?}", read.redirect_uris);
+        assert_eq!(read.host, "apps.example.com");
+        assert_eq!(read.client_name.as_deref(), Some("Example  App"));
+        let app = document_client(DOCUMENT_URL, read);
+        assert_eq!(app.name, "Example  App (apps.example.com)");
+        assert!(!app.known);
+        assert_eq!(
+            app_name(DOCUMENT_URL, Some("Example  App")),
+            "Example  App (apps.example.com)"
+        );
+        assert_eq!(app_name(DOCUMENT_URL, None), "apps.example.com");
+
+        // Exactly as listed on the web, and on this computer whatever the port.
+        assert_eq!(
+            check_redirect("https://apps.example.com/callback", &app).unwrap(),
+            "https://apps.example.com"
+        );
+        assert_eq!(
+            check_redirect("http://localhost:4321/callback", &app).unwrap(),
+            "http://localhost:4321"
+        );
+        for bad in [
+            "https://apps.example.com/callback/",
+            "https://apps.example.com/callback?x=1",
+            "https://evil.example.com/callback",
+            "http://127.0.0.1:4321/callback",
+            "http://localhost:4321/other",
+            "http://localhost/callback",
+        ] {
+            assert!(check_redirect(bad, &app).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_client_metadata_document_has_to_be_about_itself() {
+        let wrong_id = serde_json::json!({
+            "client_id": "https://elsewhere.example.com/client.json",
+            "redirect_uris": ["https://apps.example.com/callback"],
+        });
+        let no_redirects = serde_json::json!({ "client_id": DOCUMENT_URL, "redirect_uris": [] });
+        let plain_http = document(&["http://apps.example.com/callback", "app:/callback"]);
+        for bad in [
+            wrong_id.to_string(),
+            no_redirects.to_string(),
+            plain_http,
+            "not json".to_string(),
+        ] {
+            assert!(
+                read_document(DOCUMENT_URL, bad.as_bytes()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_plain_https_address_can_be_a_client_metadata_document() {
+        assert!(document_url(DOCUMENT_URL).is_some());
+        assert!(usable_id(DOCUMENT_URL));
+        let too_long = format!("https://example.com/{}", "a".repeat(MAX_DOCUMENT_URL_CHARS));
+        for bad in [
+            "http://apps.example.com/client.json",
+            "https://apps.example.com",
+            "https://apps.example.com/",
+            "https://user@apps.example.com/client.json",
+            "https://apps.example.com/client.json#x",
+            "https://apps.example.com/a/../client.json",
+            "https://APPS.example.com/client.json",
+            too_long.as_str(),
+        ] {
+            assert!(document_url(bad).is_none(), "{bad}");
+            assert!(!usable_id(bad), "{bad}");
         }
     }
 

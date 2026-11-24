@@ -13,7 +13,7 @@ use super::users::enabled_user;
 use super::{Database, User, app_sign_in, owner_emails, user};
 use crate::app_sign_ins::{
     ACCESS_LIFETIME, ACCESS_PREFIX, REFRESH_GRACE, REFRESH_LIFETIME, REFRESH_PREFIX, app_name,
-    client, new_secret, secret_hash,
+    new_secret, secret_hash, usable_id,
 };
 use crate::audit::{Kind, Record, Snapshot};
 use crate::roles::Role;
@@ -27,7 +27,9 @@ pub struct AppSignIn {
     /// Who it acts as.
     pub owner: String,
     pub client_id: String,
-    /// The app's name, such as "MaxNines command line".
+    /// The app's name, such as "MaxNines command line", or for one described by a client
+    /// metadata document, what that calls it and the host it's on, such as
+    /// "Claude (claude.ai)".
     pub app: String,
     /// What the app calls the computer it's on, if it said.
     pub device: Option<String>,
@@ -46,7 +48,7 @@ pub struct AppSignIn {
 
 impl AppSignIn {
     fn from_row(row: app_sign_in::Model, owner: String) -> Self {
-        let app = app_name(&row.client_id);
+        let app = app_name(&row.client_id, row.client_name.as_deref());
         Self {
             id: row.id,
             user_id: row.user_id,
@@ -95,7 +97,7 @@ pub enum Refreshed {
 }
 
 fn snapshot(row: &app_sign_in::Model, owner: &str) -> Snapshot {
-    let app = app_name(&row.client_id);
+    let app = app_name(&row.client_id, row.client_name.as_deref());
     let fields = json!({
         "app": app,
         "device": row.device,
@@ -136,18 +138,17 @@ fn new_tokens() -> Result<AppTokens> {
 impl Database {
     /// Signs in an app as `user_id` with at most `role`, giving back its tokens. The
     /// owner has to be someone who can sign in, and the app can't do more than they can.
+    /// `client_name` is what its client metadata document calls it, if it has one.
     pub async fn create_app_sign_in(
         &self,
         user_id: i64,
         client_id: &str,
+        client_name: Option<&str>,
         device: Option<&str>,
         role: Role,
         now: Timestamp,
     ) -> Result<(AppSignIn, AppTokens)> {
-        ensure!(
-            client(client_id).is_some(),
-            "there's no app called {client_id}"
-        );
+        ensure!(usable_id(client_id), "there's no app called {client_id}");
         let tokens = new_tokens()?;
         // Ones that ended long ago go, so the list doesn't grow with every sign in.
         let ended = now - KEPT_AFTER_ENDING;
@@ -168,6 +169,7 @@ impl Database {
         let row = app_sign_in::ActiveModel {
             user_id: Set(user_id),
             client_id: Set(client_id.to_string()),
+            client_name: Set(client_name.map(str::to_string)),
             device: Set(device.map(str::to_string)),
             role: Set(role.as_str().to_string()),
             access_hash: Set(secret_hash(&tokens.access_token)),

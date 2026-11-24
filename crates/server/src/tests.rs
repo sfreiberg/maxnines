@@ -261,10 +261,12 @@ async fn start_with_heartbeat(
         views: Arc::new(Views::load().unwrap()),
         csrf: CsrfConfig::default(),
         web_url: "http://site.test".into(),
+        public_web_url: None,
         sign_ins: Arc::default(),
         pings: Arc::default(),
         require_two_factor: Arc::default(),
         pending_sign_ins: Arc::default(),
+        client_documents: Arc::default(),
         health_limit,
         template_upgrades: Arc::default(),
     };

@@ -1,16 +1,17 @@
 # Signing in apps
 
 The command line and MaxNines Desktop, for Mac, Windows and Linux, sign in through the
-browser instead of asking for an API key. The person approves the app on a MaxNines
-page, signed in however they sign in to the pages, and the app gets tokens that act as
-them with at most the role they chose. Scripts and CI jobs, with nobody to approve
-them, use [API keys](api-keys.md).
+browser instead of asking for an API key, and so can apps on the web. The person
+approves the app on a MaxNines page, signed in however they sign in to the pages, and
+the app gets tokens that act as them with at most the role they chose. Scripts and CI
+jobs, with nobody to approve them, use [API keys](api-keys.md).
 
 It's standard OAuth 2.0 for native apps, with MaxNines as its own authorization server:
 the authorization code flow with PKCE and a loopback redirect
 ([RFC 8252](https://www.rfc-editor.org/rfc/rfc8252),
 [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636)), and the device flow for machines
-without a browser ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)).
+without a browser ([RFC 8628](https://www.rfc-editor.org/rfc/rfc8628)). Apps on the web
+name themselves with a [client metadata document](#apps-on-the-web).
 
 | Token | Lasts | Prefix |
 | --- | --- | --- |
@@ -50,11 +51,65 @@ anywhere else. Signing in from another device is only for MaxNines' own apps: wi
 nothing tying it to the person's computer, it's the one someone could be talked into
 approving for a stranger, so other IDs get `401` with `invalid_client`.
 
+### Apps on the web
+
+An app that isn't on the person's computer, such as an AI assistant, uses as its
+`client_id` the `https://` address of a JSON document describing it, a client
+metadata document. MaxNines reads it when the approval page opens, and keeps it for 5
+minutes. It has to:
+
+- be at an `https://` address with a path, of up to 255 characters, and be answered
+  there directly, within 5 seconds, without a redirect;
+- give that same address as its `client_id`;
+- list where the app may be sent back to in `redirect_uris`: `https://` addresses,
+  which have to match exactly, or `http://127.0.0.1` or `http://localhost` ones, which
+  match on any port.
+
+```json
+{
+  "client_id": "https://assistant.example.com/oauth/client.json",
+  "client_name": "Example Assistant",
+  "redirect_uris": ["https://assistant.example.com/oauth/callback"]
+}
+```
+
+The approval page shows `client_name` with the host the document is on, and where
+the person will be sent back to, and says it isn't one of MaxNines' own. Signed-in
+apps and the audit log show it as `Example Assistant (assistant.example.com)`. Apps
+don't register first, and there's no client secret: like the others, they prove
+themselves with PKCE.
+
+### Finding out how to sign in
+
+`GET /.well-known/oauth-authorization-server`
+
+Open to all, as [RFC 8414](https://www.rfc-editor.org/rfc/rfc8414) has it, for apps
+that find out for themselves:
+
+```json
+{
+  "issuer": "https://monitor.example.com",
+  "authorization_endpoint": "https://monitor.example.com/oauth/authorize",
+  "token_endpoint": "https://monitor.example.com/oauth/token",
+  "revocation_endpoint": "https://monitor.example.com/oauth/revoke",
+  "response_types_supported": ["code"],
+  "grant_types_supported": ["authorization_code", "refresh_token"],
+  "code_challenge_methods_supported": ["S256"],
+  "token_endpoint_auth_methods_supported": ["none"],
+  "revocation_endpoint_auth_methods_supported": ["none"],
+  "client_id_metadata_document_supported": true,
+  "authorization_response_iss_parameter_supported": true
+}
+```
+
+The `issuer` is the server's `public_url` as a web address, such as `https://` for
+`wss://`, or without one, the address the request was made to over `http://`.
+
 ## Sign in through the browser
 
 1. Make a random `code_verifier` of 43 to 128 characters, and its `code_challenge`: the
    SHA-256 of it in base64url without padding.
-2. Listen on a free port of `127.0.0.1`. `localhost` and `[::1]` aren't accepted, as
+2. Listen on a free port of `127.0.0.1` or `localhost`. `[::1]` isn't accepted, as
    the approval page couldn't send the browser back to an IPv6 address.
 3. Open the browser at `/oauth/authorize`:
 
@@ -74,7 +129,9 @@ $MAXNINES_URL/oauth/authorize?response_type=code&client_id=maxnines-cli
 
 The person signs in if they aren't already, and chooses **Allow** or **Deny**. The
 browser comes back to `redirect_uri` with `code` and `state`, or with
-`error=access_denied`. The code lasts 10 minutes and works once.
+`error=access_denied`. Either way it has `iss`, the issuer above, as
+[RFC 9207](https://www.rfc-editor.org/rfc/rfc9207) has it, so an app can check the
+answer is from the server it asked. The code lasts 10 minutes and works once.
 
 4. Swap the code for tokens:
 
@@ -102,8 +159,8 @@ curl -X POST "$MAXNINES_URL/oauth/token" \
 
 Errors are `400` with `error` and `error_description`, as OAuth words them:
 `invalid_grant` for a code that's wrong, used or out of date, a verifier that doesn't
-match, or a person who can't sign in any more, and `invalid_client` (`401`) for an app
-that isn't one of those above. A `500` is the server's own trouble, and worth trying
+match, or a person who can't sign in any more, and `invalid_client` (`401`) for an
+app that isn't one of those above. A `500` is the server's own trouble, and worth trying
 again.
 
 ## Sign in from another device

@@ -891,7 +891,8 @@ impl MigrationTrait for CreateTables {
                         .table(T::Table)
                         .col(id(T::Id))
                         .col(ColumnDef::new(T::UserId).big_integer().not_null())
-                        .col(ColumnDef::new(T::ClientId).string_len(64).not_null())
+                        .col(ColumnDef::new(T::ClientId).string_len(255).not_null())
+                        .col(ColumnDef::new(T::ClientName).string_len(100))
                         .col(ColumnDef::new(T::Device).string_len(100))
                         .col(ColumnDef::new(T::Role).string_len(16).not_null())
                         .col(hash(T::AccessHash).unique_key().to_owned())
@@ -2814,6 +2815,7 @@ enum AppSignIns {
     Id,
     UserId,
     ClientId,
+    ClientName,
     Device,
     Role,
     AccessHash,

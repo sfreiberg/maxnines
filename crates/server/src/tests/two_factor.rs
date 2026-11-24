@@ -378,7 +378,7 @@ async fn keys_and_apps_wait_for_two_factor_while_everyone_has_to_have_it() {
         .await
         .unwrap();
     let (_, app) = database
-        .create_app_sign_in(id, "maxnines-cli", None, Role::Admin, now)
+        .create_app_sign_in(id, "maxnines-cli", None, None, Role::Admin, now)
         .await
         .unwrap();
     let tokens = [key.as_str(), app.access_token.as_str()];

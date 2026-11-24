@@ -450,10 +450,16 @@ async fn serve(path: &Path) -> Result<()> {
         views: Arc::new(Views::load()?),
         csrf,
         web_url: web_url(config.audience()).unwrap_or_default().into(),
+        public_web_url: config
+            .public_url
+            .as_deref()
+            .and_then(web_url)
+            .map(Into::into),
         sign_ins: Arc::default(),
         pings: Arc::default(),
         require_two_factor: Arc::new(require_two_factor.into()),
         pending_sign_ins: Arc::default(),
+        client_documents: Arc::default(),
         health_limit: controllers::health::CHECK_LIMIT,
         template_upgrades: Arc::new(std::sync::Mutex::new(template_upgrades)),
     };
