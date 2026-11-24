@@ -7781,6 +7781,14 @@ mod maintenance_windows {
         ];
 
         let form = "/alerts/maintenance/new";
+        // Its zone is chosen from a list by region, starting at UTC, as a profile's is.
+        let page = browser.get(&test.server, form).await;
+        assert!(page.body.contains(r#"<select name="time_zone" required>"#));
+        assert!(page.body.contains(r#"<optgroup label="Europe">"#));
+        assert!(
+            page.body
+                .contains(r#"<option value="UTC" selected>UTC</option>"#)
+        );
         let page = browser
             .submit(&test.server, form, "/alerts/maintenance", &fields)
             .await;
@@ -7801,7 +7809,8 @@ mod maintenance_windows {
         let edit = format!("/alerts/maintenance/{id}/edit");
         let page = browser.get(&test.server, &edit).await;
         assert!(
-            page.body.contains("value=\"Europe/London\""),
+            page.body
+                .contains("<option value=\"Europe/London\" selected>Europe/London</option>"),
             "{}",
             page.body
         );

@@ -30,10 +30,7 @@
   </label>
 
   <label>Time zone
-    <input type="text" name="time_zone" value="{{ window.time_zone }}" list="time-zones" required spellcheck="false">
-    <datalist id="time-zones">
-      {% for zone in zones %}<option value="{{ zone }}"></option>{% endfor %}
-    </datalist>
+    {% include "profile/_time_zone_select.html" %}
     <small>It keeps its place in the day when the clocks change.</small>
   </label>
 

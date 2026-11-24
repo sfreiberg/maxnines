@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, DurationRound, TimeDelta, Utc};
 use chrono_tz::Tz;
+use serde::Serialize;
 
 /// A moment, as the database keeps them, always in UTC and to the millisecond: the
 /// database's timestamp types, and the API's ISO 8601 times.
@@ -198,12 +199,66 @@ pub fn zone_named(name: &str) -> Option<Tz> {
     name.parse().ok()
 }
 
-/// Every zone's name, for choosing one.
-pub fn zone_names() -> Vec<&'static str> {
-    chrono_tz::TZ_VARIANTS
-        .iter()
-        .map(|zone| zone.name())
-        .collect()
+/// The regions zones are listed under for choosing one, as their names begin.
+const ZONE_REGIONS: [&str; 9] = [
+    "Africa",
+    "America",
+    "Antarctica",
+    "Asia",
+    "Atlantic",
+    "Australia",
+    "Europe",
+    "Indian",
+    "Pacific",
+];
+
+/// Zones listed together for choosing one: a region's, or one alone without a name.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct ZoneGroup {
+    pub region: Option<&'static str>,
+    pub zones: Vec<ZoneChoice>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+pub struct ZoneChoice {
+    pub name: &'static str,
+    pub chosen: bool,
+}
+
+/// Every zone, for choosing one, with `chosen` marked: UTC first, then each region's,
+/// then the rest, such as `Etc/GMT+5` and older names like `US/Eastern`.
+pub fn zone_choices(chosen: &str) -> Vec<ZoneGroup> {
+    let choice = |name: &'static str| ZoneChoice {
+        name,
+        chosen: name == chosen,
+    };
+    let region_of = |name: &str| {
+        let (region, _) = name.split_once('/')?;
+        ZONE_REGIONS.into_iter().find(|known| *known == region)
+    };
+    let names = || chrono_tz::TZ_VARIANTS.iter().map(|zone| zone.name());
+
+    let mut groups = vec![ZoneGroup {
+        region: None,
+        zones: vec![choice(Tz::UTC.name())],
+    }];
+    for region in ZONE_REGIONS {
+        groups.push(ZoneGroup {
+            region: Some(region),
+            zones: names()
+                .filter(|name| region_of(name) == Some(region))
+                .map(choice)
+                .collect(),
+        });
+    }
+    groups.push(ZoneGroup {
+        region: Some("Other"),
+        zones: names()
+            .filter(|name| region_of(name).is_none() && *name != Tz::UTC.name())
+            .map(choice)
+            .collect(),
+    });
+    groups
 }
 
 #[cfg(test)]
@@ -300,6 +355,51 @@ mod tests {
         assert_eq!(zone_named("UTC"), Some(Tz::UTC));
         assert_eq!(zone_named("Mars/Olympus"), None);
         assert_eq!(zone_named(""), None);
-        assert!(zone_names().contains(&"America/New_York"));
+    }
+
+    #[test]
+    fn zones_are_listed_by_region_with_the_chosen_one_marked() {
+        let groups = zone_choices("America/New_York");
+        let regions: Vec<Option<&str>> = groups.iter().map(|group| group.region).collect();
+        assert_eq!(
+            regions,
+            [
+                None,
+                Some("Africa"),
+                Some("America"),
+                Some("Antarctica"),
+                Some("Asia"),
+                Some("Atlantic"),
+                Some("Australia"),
+                Some("Europe"),
+                Some("Indian"),
+                Some("Pacific"),
+                Some("Other"),
+            ]
+        );
+        let names = |region: Option<&str>| -> Vec<&str> {
+            let group = groups.iter().find(|group| group.region == region).unwrap();
+            group.zones.iter().map(|zone| zone.name).collect()
+        };
+        assert_eq!(names(None), ["UTC"]);
+        assert!(names(Some("America")).contains(&"America/Argentina/Buenos_Aires"));
+        assert!(names(Some("Europe")).contains(&"Europe/London"));
+        assert!(names(Some("Other")).contains(&"US/Eastern"));
+        assert!(names(Some("Other")).contains(&"Etc/GMT+5"));
+        assert!(!names(Some("Other")).contains(&"UTC"));
+
+        // Each zone is listed once, and every one there is.
+        let listed: Vec<&str> = groups
+            .iter()
+            .flat_map(|group| group.zones.iter().map(|zone| zone.name))
+            .collect();
+        assert_eq!(listed.len(), chrono_tz::TZ_VARIANTS.len());
+        let chosen: Vec<&str> = groups
+            .iter()
+            .flat_map(|group| &group.zones)
+            .filter(|zone| zone.chosen)
+            .map(|zone| zone.name)
+            .collect();
+        assert_eq!(chosen, ["America/New_York"]);
     }
 }

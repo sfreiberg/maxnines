@@ -718,8 +718,15 @@ async fn each_person_sees_times_in_their_own_time_zone() {
     // Their own last sign in is on the users page.
     let page = browser.get(&server, "/settings/users").await;
     assert!(page.body.contains(" UTC</td>"), "{}", page.body);
+    // Chosen from a list by region, with theirs picked.
     let page = browser.get(&server, "/profile").await;
-    assert!(page.body.contains(r#"name="time_zone" value="UTC""#));
+    assert!(page.body.contains(r#"<select name="time_zone" required>"#));
+    assert!(page.body.contains(r#"<optgroup label="Asia">"#));
+    assert!(
+        page.body
+            .contains(r#"<option value="UTC" selected>UTC</option>"#)
+    );
+    assert_eq!(page.body.matches(" selected>").count(), 1, "{}", page.body);
 
     let fields = [("time_zone", " Asia/Kolkata ")];
     let page = browser
@@ -734,8 +741,9 @@ async fn each_person_sees_times_in_their_own_time_zone() {
     let page = browser.get(&server, "/profile").await;
     assert!(
         page.body
-            .contains(r#"name="time_zone" value="Asia/Kolkata""#)
+            .contains(r#"<option value="Asia/Kolkata" selected>Asia/Kolkata</option>"#)
     );
+    assert!(page.body.contains(r#"<option value="UTC">UTC</option>"#));
 
     let page = Browser::default().get(&server, "/server").await;
     assert!(page.body.contains("Times are in UTC."), "someone else");

@@ -1,0 +1,7 @@
+<select name="time_zone" required>
+  {% for group in zone_groups %}
+  {% if group.region %}<optgroup label="{{ group.region }}">{% endif %}
+    {% for zone in group.zones %}<option value="{{ zone.name }}"{% if zone.chosen %} selected{% endif %}>{{ zone.name }}</option>{% endfor %}
+  {% if group.region %}</optgroup>{% endif %}
+  {% endfor %}
+</select>

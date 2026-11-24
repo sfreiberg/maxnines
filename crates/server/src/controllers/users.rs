@@ -17,7 +17,7 @@ use crate::audit;
 use crate::models::{THEMES, User, UserChange, check_new_password, check_new_user, is_theme};
 use crate::passwords::{hash_password, password_matches};
 use crate::roles::Role;
-use crate::times::{zone_named, zone_names};
+use crate::times::{zone_choices, zone_named};
 use crate::two_factor;
 
 const USERS_PAGE: &str = "/settings/users";
@@ -338,7 +338,7 @@ async fn profile_page(
         .with("sign_ins", &sign_ins)
         .with("person", &user)
         .with("themes", &themes)
-        .with("zones", &zone_names())
+        .with("zone_groups", &zone_choices(&user.time_zone))
         .with("saved", &notes.password_changed)
         .with("two_factor", &two_factor)
         .with("new_codes", &notes.new_codes)
