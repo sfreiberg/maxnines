@@ -48,6 +48,11 @@ axum-server = { version = "0.8", features = ["tls-rustls-no-provider"] }
 futures-util.workspace = true
 rustls-acme = { version = "0.15", default-features = false, features = ["axum", "ring", "tls12", "webpki-roots"] }
 tower-http = { version = "0.6", features = ["compression-gzip"] }
+# The MCP server that AI assistants, such as Claude and ChatGPT, connect to: the
+# protocol's official SDK, serving its Streamable HTTP transport.
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-streamable-http-server"] }
+# Sends each MCP tool's requests through the API's own routes.
+tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tracing.workspace = true
 # Reading the main database's URL into where it is and how to sign in, to read it
 # with templates. Both already come with sqlx.

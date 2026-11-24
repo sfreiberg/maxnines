@@ -85,8 +85,8 @@ See [Proxies](proxies.md).
 
 ### Signed-in apps
 
-The command line and the desktop apps sign in through the browser rather than with a
-key. The app opens a MaxNines page, or shows a code to type at `/device` on any
+The command line, the desktop apps and AI assistants connecting to the
+[MCP server](mcp.md) sign in through the browser rather than with a key. The app opens a MaxNines page, or shows a code to type at `/device` on any
 device, and you choose **Allow** and the most it may do: your role, or lower. Two-factor
 applies as it does to the pages, because it's the pages you approve it on.
 

@@ -72,6 +72,14 @@ pub(super) fn site_origin(state: &AppState, headers: &HeaderMap) -> String {
     format!("http://{host}")
 }
 
+/// Whether an app asking for tokens for `resource`, as RFC 8707 has it, means this
+/// server: the MCP server's address, or the site's.
+fn is_this_server(resource: &str, origin: &str) -> bool {
+    resource
+        .strip_prefix(origin)
+        .is_some_and(|rest| matches!(rest, "" | "/" | super::mcp::PATH))
+}
+
 /// RFC 8414: how an app signs in here, for apps that find out for themselves. Apps on
 /// the web name themselves with the address of a client metadata document, as nothing
 /// registers here.
@@ -165,6 +173,8 @@ struct Asked {
     challenge: String,
     device: Option<String>,
     role: Option<Role>,
+    /// The server the app wants tokens for, as RFC 8707 has it, if it said.
+    resource: String,
 }
 
 enum Checked {
@@ -198,7 +208,7 @@ async fn asking_client(state: &AppState, id: &str) -> Result<AppClient, String> 
     })
 }
 
-async fn check_ask(state: &AppState, fields: &Fields) -> Checked {
+async fn check_ask(state: &AppState, issuer: &str, fields: &Fields) -> Checked {
     let client = match asking_client(state, field(fields, "client_id")).await {
         Ok(client) => client,
         Err(message) => return Checked::Refused(message),
@@ -227,6 +237,10 @@ async fn check_ask(state: &AppState, fields: &Fields) -> Checked {
     ) else {
         return Checked::SendBack(redirect_uri, state, "invalid_request");
     };
+    let resource = field(fields, "resource").to_string();
+    if !resource.is_empty() && !is_this_server(&resource, issuer) {
+        return Checked::SendBack(redirect_uri, state, "invalid_target");
+    }
     Checked::Asked(Box::new(Asked {
         client,
         redirect_uri,
@@ -235,6 +249,7 @@ async fn check_ask(state: &AppState, fields: &Fields) -> Checked {
         challenge: challenge.to_string(),
         device,
         role,
+        resource,
     }))
 }
 
@@ -277,6 +292,7 @@ fn approval_page(
                 ("code_challenge_method", "S256"),
                 ("device", asked.device.as_deref().unwrap_or_default()),
                 ("role", role),
+                ("resource", &asked.resource),
             ]),
         );
     let page = if error.is_some() {
@@ -306,7 +322,7 @@ async fn authorize_page(
     Query(fields): Query<Fields>,
 ) -> Response {
     let issuer = site_origin(&state, &headers);
-    match check_ask(&state, &fields).await {
+    match check_ask(&state, &issuer, &fields).await {
         Checked::Asked(asked) => approval_page(&state, &token, &asked, None),
         Checked::Refused(message) => refusal_page(&state, &token, &message),
         Checked::SendBack(uri, app_state, error) => {
@@ -334,7 +350,7 @@ fn hidden(fields: &[(&'static str, &str)]) -> Vec<Hidden> {
 
 async fn authorize(State(state): State<AppState>, headers: HeaderMap, form: CsrfForm) -> Response {
     let issuer = site_origin(&state, &headers);
-    let asked = match check_ask(&state, &form.fields).await {
+    let asked = match check_ask(&state, &issuer, &form.fields).await {
         Checked::Asked(asked) => asked,
         Checked::Refused(message) => return refusal_page(&state, &form.token, &message),
         Checked::SendBack(uri, app_state, error) => {
@@ -532,13 +548,25 @@ async fn sign_in_approved(state: &AppState, approval: Approval) -> Response {
     }
 }
 
-async fn token(State(state): State<AppState>, Form(fields): Form<Fields>) -> Response {
+async fn token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(fields): Form<Fields>,
+) -> Response {
     let client_id = field(&fields, "client_id");
     if !usable_id(client_id) {
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "invalid_client",
             "That isn't an ID an app can have",
+        );
+    }
+    let resource = field(&fields, "resource");
+    if !resource.is_empty() && !is_this_server(resource, &site_origin(&state, &headers)) {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_target",
+            "Tokens from here are only for this server",
         );
     }
     match field(&fields, "grant_type") {

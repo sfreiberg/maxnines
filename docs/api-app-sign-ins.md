@@ -1,10 +1,11 @@
 # Signing in apps
 
 The command line and MaxNines Desktop, for Mac, Windows and Linux, sign in through the
-browser instead of asking for an API key, and so can apps on the web. The person
-approves the app on a MaxNines page, signed in however they sign in to the pages, and
-the app gets tokens that act as them with at most the role they chose. Scripts and CI
-jobs, with nobody to approve them, use [API keys](api-keys.md).
+browser instead of asking for an API key, and so do AI assistants connecting to the
+[MCP server](mcp.md). The person approves the app on a MaxNines page, signed in however
+they sign in to the pages, and the app gets tokens that act as them with at most the
+role they chose. Scripts and CI jobs, with nobody to approve them, use
+[API keys](api-keys.md).
 
 It's standard OAuth 2.0 for native apps, with MaxNines as its own authorization server:
 the authorization code flow with PKCE and a loopback redirect
@@ -53,10 +54,10 @@ approving for a stranger, so other IDs get `401` with `invalid_client`.
 
 ### Apps on the web
 
-An app that isn't on the person's computer, such as an AI assistant, uses as its
-`client_id` the `https://` address of a JSON document describing it, a client
-metadata document. MaxNines reads it when the approval page opens, and keeps it for 5
-minutes. It has to:
+An app that isn't on the person's computer, such as Claude or ChatGPT connecting to the
+[MCP server](mcp.md), uses as its `client_id` the `https://` address of a JSON
+document describing it, a client metadata document. MaxNines reads it when the
+approval page opens, and keeps it for 5 minutes. It has to:
 
 - be at an `https://` address with a path, of up to 255 characters, and be answered
   there directly, within 5 seconds, without a redirect;
@@ -103,7 +104,9 @@ that find out for themselves:
 ```
 
 The `issuer` is the server's `public_url` as a web address, such as `https://` for
-`wss://`, or without one, the address the request was made to over `http://`.
+`wss://`, or without one, the address the request was made to over `http://`. The
+[MCP server](mcp.md#how-assistants-find-out-how-to-sign-in) has its own document,
+pointing here.
 
 ## Sign in through the browser
 
@@ -126,6 +129,7 @@ $MAXNINES_URL/oauth/authorize?response_type=code&client_id=maxnines-cli
 | `state` | Sent back unchanged, to check the answer is to this request |
 | `device` | The computer's name, up to 100 characters, shown when approving and under Settings. Optional: one left out is `null` in the list of signed-in apps |
 | `role` | `viewer`, `responder`, `editor` or `admin`: the most to offer, and what's picked to begin with. The person can choose lower, and never more than their own. Left out, any role up to theirs is offered, with Viewer picked |
+| `resource` | Optional, as [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) has it: the server the tokens are for, which has to be this one, its address or its MCP server's, such as `https://monitor.example.com/mcp`. Anything else is `invalid_target` |
 
 The person signs in if they aren't already, and chooses **Allow** or **Deny**. The
 browser comes back to `redirect_uri` with `code` and `state`, or with
@@ -159,7 +163,8 @@ curl -X POST "$MAXNINES_URL/oauth/token" \
 
 Errors are `400` with `error` and `error_description`, as OAuth words them:
 `invalid_grant` for a code that's wrong, used or out of date, a verifier that doesn't
-match, or a person who can't sign in any more, and `invalid_client` (`401`) for an
+match, or a person who can't sign in any more, `invalid_target` for a `resource` that
+isn't this server, which `/oauth/token` takes too, and `invalid_client` (`401`) for an
 app that isn't one of those above. A `500` is the server's own trouble, and worth trying
 again.
 

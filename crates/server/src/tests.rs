@@ -9,6 +9,7 @@ mod dashboards;
 mod docs;
 mod events;
 mod heartbeats;
+mod mcp;
 mod proxies;
 mod roles;
 mod sign_ins;

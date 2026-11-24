@@ -59,8 +59,10 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 | `nobody` | Someone who isn't signed in, like a failed sign in |
 
 `via` says how a person acted when it wasn't on the pages: `api_key`, with the key's
-`id` and `name`, or `slack`, for an alert's buttons in Slack, matched to the user by
-email address.
+`id` and `name`, `app`, for a [signed-in app](api-app-sign-ins.md), with its `id` and
+name, `mcp_api_key` and `mcp_app`, for either of those through the
+[MCP server](mcp.md), or `slack`, for an alert's buttons in Slack, matched to the user
+by email address.
 
 `action` is `created`, `changed`, `deleted`, `signed_in`, `sign_in_failed`,
 `signed_out`, `new_setup_link`, `acknowledged`, `unacknowledged`, `ran_action`,

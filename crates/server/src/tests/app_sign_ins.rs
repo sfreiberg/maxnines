@@ -938,7 +938,7 @@ async fn an_app_on_the_web_signs_in_as_its_client_metadata_document_says() {
     let mut browser = Browser::default();
 
     // The page names the app, where it's described, and where it'll go back to.
-    let path = ask_with(&client_id, WEB_BACK, "");
+    let path = ask_with(&client_id, WEB_BACK, "&resource=http%3A%2F%2Fx%2Fmcp");
     let page = browser.get(&server, &path).await;
     assert_eq!(page.status, 200, "{}", page.body);
     assert!(
@@ -967,6 +967,7 @@ async fn an_app_on_the_web_signs_in_as_its_client_metadata_document_says() {
         ("state", "xyz"),
         ("code_challenge", CHALLENGE),
         ("code_challenge_method", "S256"),
+        ("resource", "http://x/mcp"),
         ("chosen_role", "viewer"),
         ("decision", "allow"),
     ];
@@ -985,6 +986,7 @@ async fn an_app_on_the_web_signs_in_as_its_client_metadata_document_says() {
         ("redirect_uri", WEB_BACK),
         ("client_id", client_id.as_str()),
         ("code_verifier", VERIFIER),
+        ("resource", "http://x/mcp"),
     ];
     let (status, tokens) = app_post(&server, "/oauth/token", &swap).await;
     assert_eq!(status, 200, "{tokens}");
@@ -993,8 +995,26 @@ async fn an_app_on_the_web_signs_in_as_its_client_metadata_document_says() {
     assert_eq!(status, 200);
     assert_eq!(listed[0]["app"], "Test Assistant (localhost)");
     assert_eq!(listed[0]["client_id"], client_id.as_str());
+    // Its token works on the MCP server, with the tools of the role it was given.
+    let tools = super::mcp::tool_names(&server, access).await;
+    assert!(tools.iter().any(|name| name == "list_alerts"), "{tools:?}");
+    assert!(
+        !tools.iter().any(|name| name == "create_silence"),
+        "{tools:?}"
+    );
+    // Tokens for anywhere else aren't given.
+    let refresh_token = tokens["refresh_token"].as_str().unwrap();
+    let elsewhere = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id.as_str()),
+        ("resource", "https://elsewhere.example/mcp"),
+    ];
+    let (status, refused) = app_post(&server, "/oauth/token", &elsewhere).await;
+    assert_eq!(status, 400);
+    assert_eq!(refused["error"], "invalid_target");
 
-    // Turned down, it's told so, saying who it's from.
+    // Turned down, or asked for elsewhere, it's told so, saying who it's from.
     let fields_denied: Vec<(&str, &str)> = fields
         .iter()
         .map(|&(name, value)| (name, if name == "decision" { "deny" } else { value }))
@@ -1004,6 +1024,19 @@ async fn an_app_on_the_web_signs_in_as_its_client_metadata_document_says() {
         .await;
     let back = page.header("location").unwrap();
     assert_eq!(query_value(back, "error").as_deref(), Some("access_denied"));
+    assert_eq!(query_value(back, "iss").as_deref(), Some("http://x"));
+    let elsewhere = ask_with(
+        &client_id,
+        WEB_BACK,
+        "&resource=https%3A%2F%2Felsewhere.example",
+    );
+    let page = browser.get(&server, &elsewhere).await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let back = page.header("location").unwrap();
+    assert_eq!(
+        query_value(back, "error").as_deref(),
+        Some("invalid_target")
+    );
     assert_eq!(query_value(back, "iss").as_deref(), Some("http://x"));
 
     // On this computer, any port will do, with a warning that anything here could

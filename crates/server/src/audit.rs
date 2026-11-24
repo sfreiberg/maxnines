@@ -88,6 +88,8 @@ pub enum Via {
     App { id: i64, name: String },
     /// An alert's buttons in Slack, matched to them by email address.
     Slack,
+    /// One of the others, an API key or an app, through the MCP server.
+    Mcp(Box<Via>),
 }
 
 impl Via {
@@ -96,6 +98,10 @@ impl Via {
             Self::ApiKey { .. } => "api_key",
             Self::App { .. } => "app",
             Self::Slack => "slack",
+            Self::Mcp(through) => match **through {
+                Self::App { .. } => "mcp_app",
+                _ => "mcp_api_key",
+            },
         }
     }
 
@@ -103,6 +109,7 @@ impl Via {
         match self {
             Self::ApiKey { id, .. } | Self::App { id, .. } => Some(id.to_string()),
             Self::Slack => None,
+            Self::Mcp(through) => through.id(),
         }
     }
 
@@ -110,6 +117,17 @@ impl Via {
         match self {
             Self::ApiKey { name, .. } | Self::App { name, .. } => name.clone(),
             Self::Slack => "Slack".to_string(),
+            Self::Mcp(through) => through.name(),
+        }
+    }
+
+    /// Whether it's a signed-in app, rather than an API key, whether or not through
+    /// the MCP server.
+    pub fn is_app(&self) -> bool {
+        match self {
+            Self::App { .. } => true,
+            Self::Mcp(through) => through.is_app(),
+            Self::ApiKey { .. } | Self::Slack => false,
         }
     }
 }
@@ -598,6 +616,8 @@ impl Entry {
         let via = self.via.as_ref()?;
         Some(match via.kind.as_str() {
             "api_key" => format!("via API key {}", via.name),
+            "mcp_api_key" => format!("via API key {} over MCP", via.name),
+            "mcp_app" => format!("via {} over MCP", via.name),
             "slack" => "via Slack".to_string(),
             _ => format!("via {}", via.name),
         })

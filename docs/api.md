@@ -30,6 +30,7 @@ API key. Each key belongs to a user and acts as them: what it does is recorded i
 they're disabled. Give each tool its own key. Without a valid key, the answer is
 `401`. Apps that a person uses, such as the command line, instead
 [sign in through the browser](api-app-sign-ins.md) and send an access token the same way.
+AI assistants have an [MCP server](mcp.md) of their own, which signs in the same ways.
 
 **Roles.** A key has a [role](users.md#roles), its owner's or lower, and can do
 what that role can: reading needs a viewer, acknowledging and silencing a responder,

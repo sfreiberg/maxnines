@@ -25,6 +25,7 @@ pub mod host_list;
 mod hosts;
 mod maintenance_windows;
 pub mod map;
+mod mcp;
 mod metrics;
 mod notification_channels;
 mod overview;
@@ -120,7 +121,7 @@ async fn run_as(
     };
     let needed = roles::required(request.method(), route);
     let yours = user.role;
-    let holder = if matches!(via, Some(Via::App { .. })) {
+    let holder = if via.as_ref().is_some_and(Via::is_app) {
         "app"
     } else {
         "key"
@@ -266,6 +267,7 @@ pub fn app(state: AppState) -> Router {
         // Scheduled work pings these with a token of its own, never signing in.
         .merge(crate::heartbeats::routes())
         .merge(app_sign_ins::app_routes())
+        .merge(mcp::routes(state.clone()))
         .nest(api::BASE_PATH, api::routes(state.clone()))
         .layer(middleware::from_fn_with_state(state.clone(), note_source))
         .layer(middleware::from_fn(security_headers))

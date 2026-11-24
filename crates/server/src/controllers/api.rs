@@ -281,7 +281,19 @@ pub async fn key_holder(
     }))
 }
 
+/// Someone whose API key or app's token has already been checked, on a request the
+/// server makes to the API for them, as the MCP server does for each tool. Only the
+/// server can put this on a request.
+#[derive(Debug, Clone)]
+pub struct KeyHolder {
+    pub user: User,
+    pub via: Via,
+}
+
 async fn require_token(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if let Some(KeyHolder { user, via }) = request.extensions().get::<KeyHolder>().cloned() {
+        return super::run_as(&state, user, Some(via), request, next).await;
+    }
     match key_holder(&state, request.headers()).await {
         Ok(Some((owner, via))) => super::run_as(&state, owner, Some(via), request, next).await,
         Ok(None) => StatusCode::UNAUTHORIZED.into_response(),

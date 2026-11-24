@@ -35,6 +35,7 @@
 - [Map](map.md)
 - [Installing as an app](app.md)
 - [Command line](cli.md)
+- [MCP server](mcp.md)
 - [API](api.md)
   - [Hosts](api-hosts.md)
   - [Metrics pages](api-metrics-pages.md)
