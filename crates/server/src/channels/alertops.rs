@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::on_call::{self, Incident};
+use super::on_call::{self, Incident, Step};
 use super::{ChannelType, blocking, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput};
 use crate::notifier::{Notice, Senders};
@@ -14,14 +14,14 @@ pub struct AlertOps;
 /// which of them means what. The form shows this as the sample to map from. An
 /// inbound integration can only open, update and close an alert, so there's nothing
 /// to send for acknowledging one, and AlertOps is never queued that.
-fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Option<Value> {
-    let status = match step {
+fn event(notice: &Notice, step: &Step, web_url: Option<&str>) -> Option<Value> {
+    let status = match step.incident {
         Incident::Open => "open",
         Incident::Close => "closed",
         Incident::Acknowledge => return None,
     };
     let mut event = json!({
-        "alert_id": on_call::id(notice),
+        "alert_id": step.id,
         "status": status,
         "subject": on_call::title(notice),
         "message": notice.text,
@@ -36,14 +36,17 @@ fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Option<Value
 
 /// What AlertOps' sample data box needs, to map its fields from.
 pub fn sample() -> String {
-    let event = event(
+    let opened = Step {
+        incident: Incident::Open,
+        id: on_call::TEST_INCIDENT_ID.to_string(),
+    };
+    event(
         &Notice::test(),
-        Incident::Open,
+        &opened,
         Some("https://maxnines.example.com"),
-    );
-    event
-        .and_then(|event| serde_json::to_string_pretty(&event).ok())
-        .unwrap_or_default()
+    )
+    .and_then(|event| serde_json::to_string_pretty(&event).ok())
+    .unwrap_or_default()
 }
 
 #[async_trait::async_trait]
@@ -74,24 +77,28 @@ impl ChannelType for AlertOps {
         true
     }
 
+    /// `open` is the alert's incident that's open, and what's open after is given
+    /// back, for the next notification about it.
     async fn send(
         &self,
         channel: &Channel,
         notice: &Notice,
-        _reply_to: Option<&str>,
+        open: Option<&str>,
         senders: &Senders,
     ) -> Result<Option<String>> {
         let target = channel.channel.target.clone();
         let web_url = senders.web_url.as_deref();
-        let events: Vec<Value> = on_call::steps(notice)
+        let plan = on_call::plan(notice, &channel.channel, open);
+        let events: Vec<Value> = plan
+            .steps
             .iter()
-            .filter_map(|step| event(notice, *step, web_url))
+            .filter_map(|step| event(notice, step, web_url))
             .collect();
         blocking(move || {
             for event in &events {
                 post_json("AlertOps", &target, event)?;
             }
-            Ok(None)
+            Ok(plan.open)
         })
         .await
     }

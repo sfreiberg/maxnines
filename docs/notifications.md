@@ -223,7 +223,8 @@ The token works like a password, so it can't be read back once saved.
 ## On-call services
 
 Alerts can open incidents in PagerDuty, AlertOps and SIGNL4, and close them again when
-they resolve. Each alert is one incident. PagerDuty and SIGNL4 are also told when it's
+they resolve. Each level an alert reaches is an incident of its own, as described in
+[paging on critical](#paging-on-critical). PagerDuty and SIGNL4 are also told when it's
 acknowledged, as described [below](#acknowledging-and-silencing).
 
 Set them up in the web interface: go to Settings, then notification channels, add a
@@ -242,6 +243,26 @@ and a critical alert is what should page someone. A disk filling up over the wee
 wait until Monday as a warning, but if it becomes critical, the on-call channel hears of
 it starting then, which opens an incident and pages whoever is on call.
 
+A channel that takes warnings too opens an incident for each level an alert reaches, so
+a warning that becomes critical still pages, even if someone acknowledged the warning.
+An alert has one incident at a time in each channel, named
+`maxnines-alert-<id>-warning` or `maxnines-alert-<id>-critical` after the level it
+opened at:
+
+| What happens | What the service is sent |
+| --- | --- |
+| An alert fires | Opens the incident for its level |
+| A warning becomes critical | Opens the `-critical` incident, which pages, then resolves the `-warning` one |
+| A critical alert eases to a warning | Updates the `-critical` incident with the severity `warning`, which doesn't page, and opens nothing new |
+| It becomes critical again | Updates the `-critical` incident again |
+| It's acknowledged, or a silence starts covering it | Acknowledges the incident that's open |
+| It resolves | Resolves the incident that's open |
+
+A new incident only opens when an alert reaches a level above any it has opened in that
+channel, and one the channel takes. A channel taking only warnings, or only critical
+alerts, has a single incident for each alert, named by the level it opened at. A test
+uses `maxnines-test` instead, and closes it straight away.
+
 ### PagerDuty
 
 1. In PagerDuty, open the service that should get the alerts, then its Integrations tab.
@@ -251,7 +272,11 @@ it starting then, which opens an incident and pages whoever is on call.
    `eu.pagerduty.com`, and US, the default, otherwise. Events go to
    `events.pagerduty.com` or `events.eu.pagerduty.com` to match.
 
-An alert's severity, warning or critical, carries over.
+An alert's severity carries over as PagerDuty's own, `warning` or `critical`. For a channel
+that takes warnings too, have the service page by it: in PagerDuty, open the service's
+**Settings** tab, choose **Edit** under **Assign and Notify**, and set **How should
+responders be notified?** to **Dynamic notifications based on alert severity**. Warnings
+then arrive as low urgency, and critical alerts as high.
 
 ### AlertOps
 
@@ -276,8 +301,9 @@ mapping to do. Custom integrations may depend on your AlertOps plan.
    }
    ```
 
-4. Map `alert_id` to both Source Name and Source Id, so each alert stays separate. A
-   fixed Source Name would merge them into one.
+4. Map `alert_id` to both Source Name and Source Id, so each alert stays separate, and a
+   warning that becomes critical is a new alert of its own, as `alert_id` names the
+   level too. A fixed Source Name would merge them into one.
 5. Map `status` as the status field. Open an alert when it contains `open`, and close it
    when it contains `closed`.
 6. Map `subject` and `message` to the text fields you want, and `link` to Source URL.
@@ -294,16 +320,17 @@ secret as the channel's destination.
 
 When an alert is acknowledged in MaxNines, on the pages, through the API, from Slack's
 buttons, or by an app or AI assistant, each on-call channel that was told it started is
-told it's acknowledged, which stops the service escalating it. So is one whose incident is
-already open when a silence starts covering the alert, whether it's a silence, maintenance
-started from a host's page, or a maintenance window coming round. A silence acknowledges an
-incident once, and never resolves it, as the problem isn't fixed. An alert that starts
-during a silence opens no incident, so there's nothing to acknowledge.
+told its open incident is acknowledged, which stops the service escalating it. So is one
+whose incident is already open when a silence starts covering the alert, whether it's a
+silence, maintenance started from a host's page, or a maintenance window coming round. A
+silence acknowledges each incident once, and never resolves it, as the problem isn't
+fixed. An alert that starts during a silence opens no incident, so there's nothing to
+acknowledge.
 
 | Service | Acknowledging or a silence starting | Undoing an acknowledgement | A silence ending |
 | --- | --- | --- | --- |
-| PagerDuty | `event_action` `acknowledge`, with the incident's `dedup_key` | Nothing | Stays acknowledged |
-| SIGNL4 | `X-S4-Status` `acknowledged`, with the alert's `X-S4-ExternalID` | Nothing | Stays acknowledged |
+| PagerDuty | `event_action` `acknowledge`, with the open incident's `dedup_key` | Nothing | Stays acknowledged |
+| SIGNL4 | `X-S4-Status` `acknowledged`, with the open incident's `X-S4-ExternalID` | Nothing | Stays acknowledged |
 | AlertOps | Nothing | Nothing | Keeps escalating, as before |
 
 - **AlertOps** has no acknowledge that stops escalation: an inbound integration can only
@@ -313,14 +340,17 @@ during a silence opens no incident, so there's nothing to acknowledge.
   SIGNL4 has a way to take an acknowledgement back through what MaxNines sends them, and
   sending the alert again doesn't: PagerDuty adds a repeat to an acknowledged incident's
   log without notifying anyone. Acknowledging it again in MaxNines tells them again.
-- **When a silence ends**, MaxNines sends what it held back, as for any channel. For an
-  incident a silence acknowledged, that's only a change of severity during the silence,
-  which updates the incident but leaves it acknowledged. If the problem's still there, it
-  stays acknowledged until it resolves, someone deals with it in the service, or the
-  service's own timeout brings it back: a PagerDuty service with an acknowledgement
-  timeout triggers it again once that runs out.
-- **Getting worse** clears the acknowledgement in MaxNines, and sends the incident its
-  new severity, but the service keeps it acknowledged, for the same reason.
+- **When a silence ends**, MaxNines sends what it held back, as for any channel. A warning
+  that became critical during the silence opens its critical incident then, which pages,
+  as in [paging on critical](#paging-on-critical). Easing only updates the incident,
+  leaving it acknowledged. If the problem's still there, an acknowledged incident stays
+  so until it resolves, someone deals with it in the service, or the service's own
+  timeout brings it back: a PagerDuty service with an acknowledgement timeout triggers
+  it again once that runs out.
+- **Getting worse** clears the acknowledgement in MaxNines. A warning that becomes
+  critical opens a new incident, which pages however the warning's was dealt with. A
+  critical alert that eased and gets worse again updates its incident, which the service
+  keeps acknowledged, for the same reason as undoing an acknowledgement.
 
 What's sent shows with other notifications that haven't arrived, as the event
 `acknowledged`, until it does.

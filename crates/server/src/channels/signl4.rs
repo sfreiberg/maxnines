@@ -3,7 +3,7 @@
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::on_call::{self, Incident};
+use super::on_call::{self, Incident, Step};
 use super::{ChannelType, blocking, post_json, url_preview};
 use crate::alerting::{Channel, ChannelInput};
 use crate::notifier::{Notice, Senders};
@@ -11,9 +11,9 @@ use crate::notifier::{Notice, Senders};
 pub struct Signl4;
 
 /// Names starting `X-S4-` mean something to SIGNL4. It shows the others in the alert.
-fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
-    let id = on_call::id(notice);
-    match step {
+fn event(notice: &Notice, step: &Step, web_url: Option<&str>) -> Value {
+    let id = &step.id;
+    match step.incident {
         Incident::Close => return json!({ "X-S4-ExternalID": id, "X-S4-Status": "resolved" }),
         Incident::Acknowledge => {
             return json!({ "X-S4-ExternalID": id, "X-S4-Status": "acknowledged" });
@@ -68,24 +68,28 @@ impl ChannelType for Signl4 {
         true
     }
 
+    /// `open` is the alert's incident that's open, and what's open after is given
+    /// back, for the next notification about it.
     async fn send(
         &self,
         channel: &Channel,
         notice: &Notice,
-        _reply_to: Option<&str>,
+        open: Option<&str>,
         senders: &Senders,
     ) -> Result<Option<String>> {
         let target = channel.channel.target.clone();
         let web_url = senders.web_url.as_deref();
-        let events: Vec<Value> = on_call::steps(notice)
+        let plan = on_call::plan(notice, &channel.channel, open);
+        let events: Vec<Value> = plan
+            .steps
             .iter()
-            .map(|step| event(notice, *step, web_url))
+            .map(|step| event(notice, step, web_url))
             .collect();
         blocking(move || {
             for event in &events {
                 post_json("SIGNL4", &target, event)?;
             }
-            Ok(None)
+            Ok(plan.open)
         })
         .await
     }

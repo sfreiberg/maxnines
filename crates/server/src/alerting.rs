@@ -1170,7 +1170,8 @@ impl Event {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delivery {
     pub id: i64,
-    /// What the service called the notification before this one for the alert.
+    /// What the service called the alert's first notification, or for an on-call
+    /// service, the alert's incident that's open there.
     pub reply_to: Option<String>,
     pub event: Event,
     pub attempts: i32,

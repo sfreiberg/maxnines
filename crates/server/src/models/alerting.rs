@@ -572,7 +572,9 @@ pub(super) async fn queue_action_output<C: ConnectionTrait>(
 /// The on-call channels with an incident for each alert whose notifications `about`
 /// picks, in services that can acknowledge one. A channel only has an incident once
 /// it's been told the alert started, in one of `told`, such as only `sent`. With
-/// `once`, those that have been asked to acknowledge it already are left out. A
+/// `once`, those that have been asked to acknowledge the incident that's open already
+/// are left out, though not those asked before getting worse opened another. Which
+/// incident is open is what the notifications opening and updating it gave back. A
 /// deleted channel hears nothing more.
 async fn incidents<C: ConnectionTrait>(
     connection: &C,
@@ -594,33 +596,49 @@ async fn incidents<C: ConnectionTrait>(
         .into_iter()
         .chain([Event::Acknowledged])
         .map(Event::as_str);
-    let rows: Vec<(i64, i64, String, String)> = notification::Entity::find()
+    let rows: Vec<(i64, i64, i64, String, String, Option<String>)> = notification::Entity::find()
         .select_only()
+        .column(notification::Column::Id)
         .column(notification::Column::AlertId)
         .column(notification::Column::ChannelId)
         .column(notification::Column::Event)
         .column(notification::Column::State)
+        .column(notification::Column::ExternalId)
         .filter(about)
         .filter(notification::Column::ChannelId.in_subquery(acknowledging))
         .filter(notification::Column::Event.is_in(events))
+        .order_by_asc(notification::Column::Id)
         .into_tuple()
         .all(connection)
         .await
         .context("loading notifications")?;
-    let mut opened = BTreeSet::new();
-    let mut acknowledged = BTreeSet::new();
-    for (alert_id, channel_id, event, state) in rows {
+    // For each alert and channel: the incident that's open, the notification that
+    // opened it, and the last asking for one to be acknowledged.
+    #[derive(Default)]
+    struct Seen {
+        incident: Option<String>,
+        opened: Option<i64>,
+        acknowledged: Option<i64>,
+    }
+    let mut seen: BTreeMap<(i64, i64), Seen> = BTreeMap::new();
+    for (id, alert_id, channel_id, event, state, external_id) in rows {
+        let seen = seen.entry((alert_id, channel_id)).or_default();
         if event == Event::Acknowledged.as_str() {
             if once {
-                acknowledged.insert((alert_id, channel_id));
+                seen.acknowledged = Some(id);
             }
-        } else if told.contains(&state.as_str()) {
-            opened.insert((alert_id, channel_id));
+        } else if told.contains(&state.as_str())
+            && (seen.opened.is_none() || (external_id.is_some() && external_id != seen.incident))
+        {
+            seen.opened = Some(id);
+            seen.incident = external_id;
         }
     }
     let mut incidents: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
-    for (alert_id, channel_id) in opened.difference(&acknowledged) {
-        incidents.entry(*alert_id).or_default().insert(*channel_id);
+    for ((alert_id, channel_id), seen) in seen {
+        if seen.opened.is_some() && seen.acknowledged < seen.opened {
+            incidents.entry(alert_id).or_default().insert(channel_id);
+        }
     }
     Ok(incidents)
 }
@@ -1657,16 +1675,34 @@ impl Database {
             .map(|row| (row.id, to_run(row)))
             .collect();
 
-        // A resolved notification may need what its firing one was called.
-        let earlier: BTreeMap<(i64, i64), String> = notification::Entity::find()
+        // A resolved notification may need what its firing one was called. An on-call
+        // service needs the incident that's open, which the last notification to open
+        // or update one gave, as getting worse can open another.
+        let mut fired: BTreeMap<(i64, i64), String> = BTreeMap::new();
+        let mut latest: BTreeMap<(i64, i64), String> = BTreeMap::new();
+        let called: Vec<(i64, i64, String, Option<String>)> = notification::Entity::find()
+            .select_only()
+            .column(notification::Column::AlertId)
+            .column(notification::Column::ChannelId)
+            .column(notification::Column::Event)
+            .column(notification::Column::ExternalId)
             .filter(notification::Column::AlertId.is_in(due.iter().map(|row| row.alert_id)))
-            .filter(notification::Column::Event.eq(Event::Firing.as_str()))
+            .filter(notification::Column::Event.is_in(OPENING.map(Event::as_str)))
+            .filter(notification::Column::ExternalId.is_not_null())
+            .order_by_asc(notification::Column::Id)
+            .into_tuple()
             .all(&self.connection)
             .await
-            .context("loading notifications")?
-            .into_iter()
-            .filter_map(|row| Some(((row.alert_id, row.channel_id), row.external_id?)))
-            .collect();
+            .context("loading notifications")?;
+        for (alert_id, channel_id, event, external_id) in called {
+            let Some(external_id) = external_id else {
+                continue;
+            };
+            if event == Event::Firing.as_str() {
+                fired.insert((alert_id, channel_id), external_id.clone());
+            }
+            latest.insert((alert_id, channel_id), external_id);
+        }
 
         let delivery = |row: &notification::Model| -> Result<Delivery> {
             let channel = match channels.get(&row.channel_id) {
@@ -1679,6 +1715,11 @@ impl Database {
                 Some(Some(Ok(run))) => Some(run.clone()),
                 Some(Some(Err(error))) => bail!("its action run can't be read: {error:#}"),
                 Some(None) => bail!("its action run has been deleted"),
+            };
+            let earlier = if channel.channel.kind.is_on_call() {
+                &latest
+            } else {
+                &fired
             };
             Ok(Delivery {
                 reply_to: earlier.get(&(row.alert_id, row.channel_id)).cloned(),

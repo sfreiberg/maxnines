@@ -173,8 +173,10 @@ counts from when it first became true, and one that cleared meanwhile starts ove
 - **Clearing** resolves the alert, whichever it was at.
 
 A channel whose first notification hasn't gone out yet gets the alert as it is when it
-does. On-call services get the change on the same incident, so they show the new
-severity without opening another. Webhooks see the events `escalated` and `eased`.
+does. In an on-call service, a warning that becomes critical opens a new incident, which
+pages, and resolves the warning's, while easing updates the critical incident without
+opening another, as in [paging on critical](notifications.md#paging-on-critical).
+Webhooks see the events `escalated` and `eased`.
 
 ## Which channels hear what
 

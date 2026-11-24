@@ -91,7 +91,10 @@ pub trait ChannelType: Send + Sync {
     }
 
     /// Sends one notification, and gives what the service called it if that matters
-    /// later, such as a message to reply to when the alert ends.
+    /// later, such as a message to reply to when the alert ends. `reply_to` is what
+    /// was given before: what the alert's first notification was called, or for an
+    /// on-call service, the incident that's open for it, which changes as it gets
+    /// worse.
     async fn send(
         &self,
         channel: &Channel,

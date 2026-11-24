@@ -4007,6 +4007,280 @@ async fn an_acknowledgement_waits_for_the_incident_a_silence_is_holding_back() {
     assert_eq!(events[0]["dedup_key"], events[1]["dedup_key"]);
 }
 
+/// An on-call channel of `kind` taking `severities`, on a stand-in for its service,
+/// for a disk rule that's a warning above 80% and critical above 90%.
+async fn disk_alerts_on(
+    test: &mut Harness,
+    kind: ChannelKind,
+    severities: &[Severity],
+    service: &FakeOnCall,
+) -> Notifier {
+    let url = service.start().await;
+    let (target, senders) = match kind {
+        ChannelKind::PagerDuty => {
+            let senders = Senders {
+                pagerduty_url: Some(url),
+                ..Senders::default()
+            };
+            (PAGERDUTY_KEY.to_string(), senders)
+        }
+        _ => (url, Senders::default()),
+    };
+    let channel = ChannelInput {
+        name: "On call".to_string(),
+        kind,
+        target,
+        credential: None,
+        app_token: None,
+        severities: severities.iter().copied().collect(),
+        mail: None,
+        request: None,
+        region: None,
+    };
+    let channel = test.database().create_channel(&channel).await.unwrap();
+    let rule = AlertRuleInput {
+        warning: Some("disk.usage > 80".to_string()),
+        critical: Some("disk.usage > 90".to_string()),
+        hold: TimeDelta::seconds(0),
+        channels: vec![channel],
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    Notifier::new(test.database().clone(), senders)
+}
+
+/// The disk at `percent` at `minute`, with what that sends delivered.
+async fn disk_sent(test: &mut Harness, notifier: &Notifier, minute: i32, percent: f64) {
+    disk_at(test, minute, percent).await;
+    notifier
+        .deliver_due(test.now + MINUTE * minute)
+        .await
+        .unwrap();
+}
+
+/// What a service was told, as what to do and the incident's ID, in its own words:
+/// the field saying what to do, and the one naming the incident.
+fn told(service: &FakeOnCall, action: &str, id: &str) -> Vec<(String, String)> {
+    service
+        .events()
+        .iter()
+        .map(|event| {
+            let said = |field: &str| event[field].as_str().unwrap_or_default().to_string();
+            (said(action), said(id))
+        })
+        .collect()
+}
+
+fn pairs(said: &[(&str, &str)]) -> Vec<(String, String)> {
+    said.iter()
+        .map(|(action, id)| (action.to_string(), id.to_string()))
+        .collect()
+}
+
+/// What PagerDuty and SIGNL4 call opening, closing and acknowledging an incident, and
+/// the fields saying which to do and naming it.
+const ON_CALL_WORDS: [(ChannelKind, &str, &str, [&str; 3]); 2] = [
+    (
+        ChannelKind::PagerDuty,
+        "event_action",
+        "dedup_key",
+        ["trigger", "resolve", "acknowledge"],
+    ),
+    (
+        ChannelKind::Signl4,
+        "X-S4-Status",
+        "X-S4-ExternalID",
+        ["new", "resolved", "acknowledged"],
+    ),
+];
+
+#[tokio::test]
+async fn a_warning_that_becomes_critical_opens_a_new_incident_and_closes_the_warnings() {
+    for (kind, action, id, [open, close, acknowledge]) in ON_CALL_WORDS {
+        let mut test = Harness::start().await;
+        let service = FakeOnCall::default();
+        let both = [Severity::Warning, Severity::Critical];
+        let notifier = disk_alerts_on(&mut test, kind, &both, &service).await;
+
+        disk_sent(&mut test, &notifier, 0, 85.0).await;
+        let alert = test.open().await[0].id;
+        let warning = format!("maxnines-alert-{alert}-warning");
+        let critical = format!("maxnines-alert-{alert}-critical");
+        // Acknowledging the warning doesn't keep its getting worse from paging.
+        let acknowledged = test.database().acknowledge_alert(alert, "sam", test.now);
+        assert!(acknowledged.await.unwrap());
+        notifier.deliver_due(test.now).await.unwrap();
+        disk_sent(&mut test, &notifier, 1, 95.0).await;
+        let acknowledged = test
+            .database()
+            .acknowledge_alert(alert, "sam", test.now + MINUTE);
+        assert!(acknowledged.await.unwrap());
+        notifier.deliver_due(test.now + MINUTE).await.unwrap();
+        disk_sent(&mut test, &notifier, 2, 85.0).await;
+        disk_sent(&mut test, &notifier, 3, 95.0).await;
+        disk_sent(&mut test, &notifier, 4, 50.0).await;
+
+        assert_eq!(
+            told(&service, action, id),
+            pairs(&[
+                (open, &warning),
+                (acknowledge, &warning),
+                (open, &critical),
+                (close, &warning),
+                (acknowledge, &critical),
+                (open, &critical),
+                (open, &critical),
+                (close, &critical),
+            ]),
+            "{kind:?}"
+        );
+        let severity = if kind == ChannelKind::PagerDuty {
+            "/payload/severity"
+        } else {
+            "/Severity"
+        };
+        let severities: Vec<Value> = service
+            .events()
+            .iter()
+            .filter(|event| event[action] == open)
+            .map(|event| event.pointer(severity).unwrap().clone())
+            .collect();
+        assert_eq!(severities, ["warning", "critical", "warning", "critical"]);
+        assert!(
+            test.database()
+                .delivery_problems(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_critical_alert_that_eases_updates_its_incident_without_opening_another() {
+    for (kind, action, id, [open, close, _]) in ON_CALL_WORDS {
+        let mut test = Harness::start().await;
+        let service = FakeOnCall::default();
+        let both = [Severity::Warning, Severity::Critical];
+        let notifier = disk_alerts_on(&mut test, kind, &both, &service).await;
+
+        disk_sent(&mut test, &notifier, 0, 95.0).await;
+        let critical = format!("maxnines-alert-{}-critical", test.open().await[0].id);
+        disk_sent(&mut test, &notifier, 1, 85.0).await;
+        disk_sent(&mut test, &notifier, 2, 50.0).await;
+
+        assert_eq!(
+            told(&service, action, id),
+            pairs(&[(open, &critical), (open, &critical), (close, &critical)]),
+            "{kind:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_critical_only_channel_opens_an_incident_once_a_warning_is_critical() {
+    let mut test = Harness::start().await;
+    let pagerduty = FakeOnCall::default();
+    let kind = ChannelKind::PagerDuty;
+    let notifier = disk_alerts_on(&mut test, kind, &[Severity::Critical], &pagerduty).await;
+
+    disk_sent(&mut test, &notifier, 0, 85.0).await;
+    assert!(pagerduty.events().is_empty(), "{:?}", pagerduty.events());
+    disk_sent(&mut test, &notifier, 1, 95.0).await;
+    let critical = format!("maxnines-alert-{}-critical", test.open().await[0].id);
+    disk_sent(&mut test, &notifier, 2, 85.0).await;
+    disk_sent(&mut test, &notifier, 3, 50.0).await;
+
+    assert_eq!(
+        told(&pagerduty, "event_action", "dedup_key"),
+        pairs(&[
+            ("trigger", &critical),
+            ("trigger", &critical),
+            ("resolve", &critical),
+        ])
+    );
+    assert_eq!(pagerduty.events()[0]["payload"]["severity"], "critical");
+    assert_eq!(pagerduty.events()[1]["payload"]["severity"], "warning");
+}
+
+#[tokio::test]
+async fn a_warning_that_becomes_critical_is_a_new_alert_in_alertops() {
+    let mut test = Harness::start().await;
+    let alertops = FakeOnCall::default();
+    let both = [Severity::Warning, Severity::Critical];
+    let notifier = disk_alerts_on(&mut test, ChannelKind::AlertOps, &both, &alertops).await;
+
+    disk_sent(&mut test, &notifier, 0, 85.0).await;
+    let alert = test.open().await[0].id;
+    disk_sent(&mut test, &notifier, 1, 95.0).await;
+    disk_sent(&mut test, &notifier, 2, 50.0).await;
+
+    let (warning, critical) = (
+        format!("maxnines-alert-{alert}-warning"),
+        format!("maxnines-alert-{alert}-critical"),
+    );
+    assert_eq!(
+        told(&alertops, "status", "alert_id"),
+        pairs(&[
+            ("open", &warning),
+            ("open", &critical),
+            ("closed", &warning),
+            ("closed", &critical),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_silence_acknowledges_each_incident_an_alert_opens_once() {
+    for (kind, action, id, [open, close, acknowledge]) in ON_CALL_WORDS {
+        let mut test = Harness::start().await;
+        let service = FakeOnCall::default();
+        let both = [Severity::Warning, Severity::Critical];
+        let notifier = disk_alerts_on(&mut test, kind, &both, &service).await;
+        disk_sent(&mut test, &notifier, 0, 85.0).await;
+        let alert = test.open().await[0].id;
+        let warning = format!("maxnines-alert-{alert}-warning");
+        let critical = format!("maxnines-alert-{alert}-critical");
+
+        let silence = every_alert_for_an_hour();
+        let silence = test.database().create_silence(&silence, "sam", test.now);
+        let silence = silence.await.unwrap();
+        for pass in 0..3 {
+            notifier
+                .deliver_due(test.now + MINUTE * pass)
+                .await
+                .unwrap();
+        }
+        let ended = test.database().end_silence(silence, test.now + MINUTE * 3);
+        assert!(ended.await.unwrap());
+        disk_sent(&mut test, &notifier, 4, 95.0).await;
+
+        let silence = every_alert_for_an_hour();
+        let silenced = test
+            .database()
+            .create_silence(&silence, "sam", test.now + MINUTE * 5);
+        silenced.await.unwrap();
+        for pass in 5..8 {
+            notifier
+                .deliver_due(test.now + MINUTE * pass)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            told(&service, action, id),
+            pairs(&[
+                (open, &warning),
+                (acknowledge, &warning),
+                (open, &critical),
+                (close, &warning),
+                (acknowledge, &critical),
+            ]),
+            "{kind:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn an_eu_pagerduty_channel_sends_to_the_eu_address() {
     let (us, eu) = (FakeOnCall::default(), FakeOnCall::default());

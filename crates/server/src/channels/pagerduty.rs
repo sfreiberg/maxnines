@@ -4,7 +4,7 @@
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 
-use super::on_call::{self, Incident};
+use super::on_call::{self, Incident, Step};
 use super::{ChannelType, blocking, post_json};
 use crate::alerting::{Channel, ChannelInput, PagerDutyRegion};
 use crate::notifier::{Notice, Senders};
@@ -31,14 +31,14 @@ const KEY_LEN: usize = 32;
 
 pub struct PagerDuty;
 
-fn event(notice: &Notice, step: Incident, key: &str, web_url: Option<&str>) -> Value {
-    let dedup_key = on_call::id(notice);
-    let action = match step {
+fn event(notice: &Notice, step: &Step, key: &str, web_url: Option<&str>) -> Value {
+    let dedup_key = &step.id;
+    let action = match step.incident {
         Incident::Open => "trigger",
         Incident::Acknowledge => "acknowledge",
         Incident::Close => "resolve",
     };
-    if step != Incident::Open {
+    if step.incident != Incident::Open {
         return json!({
             "routing_key": key,
             "event_action": action,
@@ -109,18 +109,22 @@ impl ChannelType for PagerDuty {
         true
     }
 
+    /// `open` is the alert's incident that's open, and what's open after is given
+    /// back, for the next notification about it.
     async fn send(
         &self,
         channel: &Channel,
         notice: &Notice,
-        _reply_to: Option<&str>,
+        open: Option<&str>,
         senders: &Senders,
     ) -> Result<Option<String>> {
         let key = &channel.channel.target;
         let web_url = senders.web_url.as_deref();
-        let events: Vec<Value> = on_call::steps(notice)
+        let plan = on_call::plan(notice, &channel.channel, open);
+        let events: Vec<Value> = plan
+            .steps
             .iter()
-            .map(|step| event(notice, *step, key, web_url))
+            .map(|step| event(notice, step, key, web_url))
             .collect();
         let region = channel.channel.region.unwrap_or_default();
         let url = senders.pagerduty_url(region).to_string();
@@ -128,7 +132,7 @@ impl ChannelType for PagerDuty {
             for event in &events {
                 post_json("PagerDuty", &url, event)?;
             }
-            Ok(None)
+            Ok(plan.open)
         })
         .await
     }
@@ -140,23 +144,44 @@ mod tests {
     use crate::alerting::{Alert, Event, Severity};
     use crate::channels::testing::{alert, notice};
 
+    fn on(incident: Incident, id: &str) -> Step {
+        Step {
+            incident,
+            id: id.to_string(),
+        }
+    }
+
     #[test]
-    fn an_eased_alert_updates_the_incident_as_a_warning() {
+    fn an_eased_alert_updates_its_incident_as_a_warning() {
         let eased = Alert {
             severity: Severity::Warning,
             ..alert()
         };
-        let event = event(&notice(Event::Eased, eased), Incident::Open, "key", None);
+        let critical = on(Incident::Open, "maxnines-alert-7-critical");
+        let event = event(&notice(Event::Eased, eased), &critical, "key", None);
         assert_eq!(event["event_action"], "trigger");
         assert_eq!(event["payload"]["severity"], "warning");
-        assert_eq!(event["dedup_key"], "maxnines-alert-7");
+        assert_eq!(event["dedup_key"], "maxnines-alert-7-critical");
+    }
+
+    #[test]
+    fn each_severity_carries_over_as_pagerdutys_own() {
+        let warning = Alert {
+            severity: Severity::Warning,
+            ..alert()
+        };
+        let opened = on(Incident::Open, "maxnines-alert-7-warning");
+        let warned = event(&notice(Event::Firing, warning), &opened, "key", None);
+        assert_eq!(warned["payload"]["severity"], "warning");
+        let paged = event(&notice(Event::Firing, alert()), &opened, "key", None);
+        assert_eq!(paged["payload"]["severity"], "critical");
     }
 
     #[test]
     fn an_incident_links_to_its_alert() {
         let opened = event(
             &notice(Event::Firing, alert()),
-            Incident::Open,
+            &on(Incident::Open, "maxnines-alert-7-critical"),
             "key",
             Some("https://m.example.com"),
         );
@@ -167,7 +192,7 @@ mod tests {
     fn acknowledging_names_only_the_incident() {
         let event = event(
             &notice(Event::Acknowledged, alert()),
-            Incident::Acknowledge,
+            &on(Incident::Acknowledge, "maxnines-alert-7-critical"),
             "key",
             Some("https://m.example.com"),
         );
@@ -176,7 +201,7 @@ mod tests {
             json!({
                 "routing_key": "key",
                 "event_action": "acknowledge",
-                "dedup_key": "maxnines-alert-7",
+                "dedup_key": "maxnines-alert-7-critical",
             })
         );
     }

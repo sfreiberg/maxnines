@@ -480,7 +480,7 @@ erDiagram
         text last_error
         timestamp created_at
         timestamp sent_at
-        string external_id
+        string external_id "what the service called it, such as a message, or the incident an on-call service has open"
         int action_run_id FK "the run it's about, for what an action printed"
     }
     silences {
