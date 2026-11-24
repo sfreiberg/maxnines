@@ -46,9 +46,9 @@
     </details>
   </details>
 
-  <label>Sends to
+  <label><span class="for-any-webhook">URL</span><span class="for-discord">Discord webhook URL</span><span class="for-teams">Workflow URL</span><span class="for-mail">Send to</span><span class="for-slack">Slack channel</span><span class="for-pagerduty">Integration key</span><span class="for-alertops">Integration URL</span><span class="for-signl4">Webhook URL</span><span class="for-telegram">Chat ID</span>
     <input type="text" name="target" value="{{ channel.target }}" spellcheck="false" autocomplete="off"{% if channel.preview %} placeholder="{{ channel.preview }}"{% endif %}>
-    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}A webhook's URL, a Discord webhook URL, a Teams workflow's URL, for email or Resend the addresses to send to, separated by commas, for Slack a channel such as <code>#alerts</code>, for PagerDuty an integration key, the URL from AlertOps or SIGNL4, or for Telegram a chat ID.{% endif %}</small>
+    <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}<span class="for-webhook">Where each alert is posted as JSON.</span><span class="for-custom_webhook">Where the request below is sent.</span><span class="for-discord">From the Discord channel's settings, under Integrations, then Webhooks.</span><span class="for-teams">The URL the Teams workflow gives, as described below.</span><span class="for-mail">The addresses to send to, separated by commas.</span><span class="for-slack">Such as <code>#alerts</code>, or a channel's ID.</span><span class="for-pagerduty">From an Events API V2 integration on a PagerDuty service, as described below.</span><span class="for-alertops">The URL of the AlertOps integration, as described below.</span><span class="for-signl4">The SIGNL4 webhook URL, as described below.</span><span class="for-telegram">The chat or group to message, as a number.</span>{% endif %}</small>
   </label>
 
   <details class="for-pagerduty">

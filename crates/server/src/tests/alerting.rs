@@ -3114,6 +3114,22 @@ async fn a_discord_channel_gets_discords_message_format() {
 }
 
 #[tokio::test]
+async fn a_channels_address_is_labelled_for_its_kind() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let page = browser.get(&server, "/alerts/channels/new").await;
+    for label in [
+        r#"<span class="for-pagerduty">Integration key</span>"#,
+        r#"<span class="for-slack">Slack channel</span>"#,
+        r#"<span class="for-telegram">Chat ID</span>"#,
+        r#"<span class="for-any-webhook">URL</span>"#,
+    ] {
+        assert!(page.body.contains(label), "{label} in {}", page.body);
+    }
+    assert!(!page.body.contains("Sends to"), "{}", page.body);
+}
+
+#[tokio::test]
 async fn a_discord_channel_can_be_made_from_the_form_and_keeps_its_url_hidden() {
     let server = start().await;
     let mut browser = Browser::default();
