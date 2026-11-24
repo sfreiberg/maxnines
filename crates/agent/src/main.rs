@@ -25,6 +25,7 @@ mod identity;
 mod openmetrics;
 mod own_usage;
 mod privileges;
+mod programs;
 mod saved_config;
 mod services;
 mod smart;
@@ -32,6 +33,7 @@ mod spool;
 mod status_pages;
 mod system_collector;
 mod templates;
+mod updates;
 mod websocket;
 
 use std::collections::BTreeMap;

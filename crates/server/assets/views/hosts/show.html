@@ -192,6 +192,23 @@
 </section>
 {% endif %}
 
+{% if updates %}
+<section class="card">
+  <h2>Updates</h2>
+  {% if updates.problem %}<p class="notice">{{ updates.problem }}</p>{% endif %}
+  {% if updates.waiting or updates.reboot or updates.vulnerable or updates.lists_age %}
+  <dl class="summary">
+    {% if updates.waiting %}<dt>Waiting</dt><dd>{{ updates.waiting }}</dd>{% endif %}
+    {% if updates.vulnerable %}<dt>Known vulnerabilities</dt><dd>{{ updates.vulnerable }}</dd>{% endif %}
+    {% if updates.reboot %}<dt>Reboot required</dt><dd>{{ updates.reboot }}</dd>{% endif %}
+    {% if updates.lists_age %}<dt>Package lists</dt><dd>Refreshed {{ updates.lists_age }} ago</dd>{% endif %}
+  </dl>
+  {% endif %}
+  {% if updates.note %}<p class="hint">{{ updates.note }}</p>{% endif %}
+  <p class="hint">Read{% if updates.manager %} with {{ updates.manager }}{% endif %} every hour, without refreshing the package lists. See <a href="/docs/collectors-updates">Updates</a> for what's read and its alerts.</p>
+</section>
+{% endif %}
+
 {% if runs %}
 <section class="card">
   <h2>Templates</h2>

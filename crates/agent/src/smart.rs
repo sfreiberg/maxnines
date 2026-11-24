@@ -22,6 +22,7 @@ use serde_json::{Map, Value, json};
 
 use crate::background::Background;
 use crate::collector::Collector;
+use crate::programs::Ran;
 
 /// SMART changes slowly, so drives are asked this often.
 const EVERY: Duration = Duration::from_secs(15 * 60);
@@ -148,41 +149,15 @@ async fn read() -> Round {
     }
 }
 
-/// Runs a program with nothing to read, giving whether it exited cleanly, its exit
-/// code and what it printed, or why it couldn't run.
+/// Runs a program for what it prints, within [`RUN_LIMIT`].
 async fn run(program: &str, arguments: &[&str]) -> std::result::Result<Ran, String> {
-    let command = tokio::process::Command::new(program)
-        .args(arguments)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(RUN_LIMIT, command).await {
-        Err(_) => Err(format!(
-            "{program} took longer than {} seconds",
-            RUN_LIMIT.as_secs()
-        )),
-        Ok(Err(error)) => Err(format!("couldn't run {program}: {error}")),
-        Ok(Ok(output)) => Ok(Ran {
-            code: output.status.code(),
-            stdout: output.stdout,
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        }),
-    }
-}
-
-struct Ran {
-    #[cfg_attr(windows, allow(dead_code))]
-    code: Option<i32>,
-    stdout: Vec<u8>,
-    #[cfg_attr(windows, allow(dead_code))]
-    stderr: String,
+    crate::programs::run(program, arguments, RUN_LIMIT).await
 }
 
 #[cfg(unix)]
 mod smartctl {
-    use std::path::Path;
-
-    use super::{Drive, Ran, Round, parse_drive, parse_scan, parse_version, run};
+    use super::{Drive, Round, parse_drive, parse_scan, parse_version, run};
+    use crate::programs::{first_of, refused_by_sudo};
 
     /// Where each system's packages put smartctl.
     #[cfg(target_os = "linux")]
@@ -201,13 +176,6 @@ mod smartctl {
     const INSTALL: &str = "brew install smartmontools";
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const INSTALL: &str = "pkg install smartmontools";
-
-    fn first_of(places: &[&'static str]) -> Option<&'static str> {
-        places
-            .iter()
-            .copied()
-            .find(|place| Path::new(place).exists())
-    }
 
     pub async fn read() -> Round {
         let Some(smartctl) = first_of(PLACES) else {
@@ -280,11 +248,6 @@ mod smartctl {
             drives.push(drive);
         }
         Round::Drives(drives)
-    }
-
-    /// sudo says so on its own, and smartctl's JSON never goes there.
-    fn refused_by_sudo(ran: &Ran) -> bool {
-        ran.stdout.is_empty() && ran.code == Some(1) && ran.stderr.starts_with("sudo:")
     }
 
     fn needs_root(smartctl: &str, why: &str) -> String {

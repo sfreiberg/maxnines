@@ -1725,9 +1725,10 @@ async fn an_approved_agent_is_sent_the_default_config() {
 
     assert_eq!(version, config.version().unwrap());
     assert_eq!(config.interval, Duration::from_secs(15));
-    assert_eq!(config.collectors.len(), 7);
+    assert_eq!(config.collectors.len(), 8);
     assert!(config.collectors["system"].enabled);
     assert!(config.collectors["smart"].enabled);
+    assert!(config.collectors["updates"].enabled);
 }
 
 #[tokio::test]
@@ -4546,6 +4547,78 @@ async fn each_drive_gets_series_by_model_and_serial_and_the_host_page_lists_them
         let page = browser.get(&server, &format!("/hosts/{id}")).await;
         if page.body.contains("brew install smartmontools") {
             assert!(!page.body.contains("Unknown USB bridge"), "{}", page.body);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    }
+}
+
+#[tokio::test]
+async fn a_hosts_updates_are_metrics_and_its_page_says_what_is_waiting() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    let id = host.id();
+    let row = json!({
+        "manager": "apt", "pending": 12, "security": 3, "reboot_required": 1,
+        "lists_age_secs": 7200, "problem": "", "note": ""
+    });
+    let message = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("updates".to_string(), row)]),
+    });
+    send(&mut client, &message).await;
+
+    let path = format!("/api/v1/hosts/{id}/metrics/updates.security?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let security = loop {
+        let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| lines.len() == 1)
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sample never arrived: {body}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    assert_eq!(security["series"][0]["points"][0]["avg"], 3.0, "{security}");
+    let path = format!("/api/v1/hosts/{id}/metrics/updates.reboot_required?range=1h");
+    let reboot = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(reboot["series"][0]["points"][0]["avg"], 1.0, "{reboot}");
+
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(page.body.contains("<h2>Updates</h2>"), "{}", page.body);
+    assert!(page.body.contains("12, 3 for security"), "{}", page.body);
+    assert!(page.body.contains("<dt>Reboot required</dt><dd>Yes</dd>"));
+    assert!(page.body.contains("Refreshed 2 h ago"), "{}", page.body);
+    assert!(page.body.contains("Read with apt every hour"));
+
+    // checkupdates missing leaves nothing but what to do about it.
+    let row = json!({
+        "manager": "pacman",
+        "problem": "checkupdates isn't installed. Install it with: pacman -S pacman-contrib",
+        "note": ""
+    });
+    let message = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("updates".to_string(), row)]),
+    });
+    send(&mut client, &message).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = browser.get(&server, &format!("/hosts/{id}")).await;
+        if page.body.contains("pacman -S pacman-contrib") {
+            assert!(!page.body.contains("3 for security"), "{}", page.body);
             break;
         }
         assert!(Instant::now() < deadline, "{}", page.body);

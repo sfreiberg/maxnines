@@ -19,6 +19,7 @@ template "host" {
       network = { enabled = true }
       system  = { enabled = true }
       smart   = { enabled = true }
+      updates = { enabled = true }
     }
   }
 

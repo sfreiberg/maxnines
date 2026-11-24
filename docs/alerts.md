@@ -25,7 +25,8 @@ listed on the [PostgreSQL](collectors-postgresql.md#built-in-alerts) page. The b
 template 7 more, for each MySQL or MariaDB database, listed on the [MySQL and
 MariaDB](collectors-mysql.md#built-in-alerts) page. The built-in **Drives** template
 brings 6, for each drive, listed on the [Drives](collectors-smart.md#built-in-alerts)
-page.
+page, and the built-in **Updates** template 4, on updates waiting, reboots and package
+lists, listed on the [Updates](collectors-updates.md#built-in-alerts) page.
 
 Each disk alerts on its own. Every alert resolves as soon as its problem is gone,
 without waiting, so a recovery is known at once, and something that keeps failing and

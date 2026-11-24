@@ -583,6 +583,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(output) => drives_of(output.as_ref()),
         Err(error) => return server_error(&error),
     };
+    let updates = match state.metrics.latest_output(&id, "updates", now).await {
+        Ok(output) => output.as_ref().and_then(updates_of),
+        Err(error) => return server_error(&error),
+    };
     let uptime = match state.metrics.latest_output(&id, "host", now).await {
         Ok(output) => output.as_ref().and_then(uptime_of),
         Err(error) => return server_error(&error),
@@ -642,6 +646,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("more_runs", &more_runs)
         .with("drives", &drives)
         .with("drives_problem", &drives_problem)
+        .with("updates", &updates)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
@@ -721,6 +726,65 @@ fn drives_of(output: Option<&Value>) -> (Vec<DriveRow>, Option<String>) {
         });
     }
     (drives, problem)
+}
+
+/// Whether a host is up to date, from the updates collector's newest reading, in
+/// words for its page.
+#[derive(Debug, PartialEq, Serialize)]
+struct UpdatesCard {
+    /// What was asked, such as apt.
+    manager: Option<String>,
+    /// How many are waiting, and how many of them are for security if the system
+    /// says.
+    waiting: Option<String>,
+    vulnerable: Option<String>,
+    reboot: Option<&'static str>,
+    lists_age: Option<String>,
+    /// Why nothing could be asked, with what to do about it.
+    problem: Option<String>,
+    /// What went wrong with part of it.
+    note: Option<String>,
+}
+
+fn updates_of(output: &Value) -> Option<UpdatesCard> {
+    if !output.is_object() {
+        return None;
+    }
+    let text = |name: &str| {
+        output[name]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    // The store keeps each number's newest value, so after a problem the numbers
+    // it last read are still there, and aren't what's true now.
+    let problem = text("problem");
+    let fresh = problem.is_none();
+    let count = |name: &str| {
+        output[name]
+            .as_f64()
+            .filter(|_| fresh)
+            .map(|count| count as u64)
+    };
+    let waiting = count("pending").map(|pending| match count("security") {
+        Some(security) => format!("{pending}, {security} for security"),
+        None => pending.to_string(),
+    });
+    Some(UpdatesCard {
+        manager: text("manager"),
+        waiting,
+        vulnerable: count("vulnerable").map(|count| format!("{count} packages")),
+        reboot: output["reboot_required"]
+            .as_f64()
+            .filter(|_| fresh)
+            .map(|reboot| if reboot >= 1.0 { "Yes" } else { "No" }),
+        lists_age: output["lists_age_secs"]
+            .as_f64()
+            .filter(|_| fresh)
+            .map(|secs| format_value(Unit::Seconds, secs)),
+        problem,
+        note: text("note"),
+    })
 }
 
 /// How long maintenance can be started for from a host's page, with what the page

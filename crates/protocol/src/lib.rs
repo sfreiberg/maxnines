@@ -93,7 +93,7 @@ impl Protocols {
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 22] = [
+pub const COLLECTORS: [&str; 23] = [
     "apache",
     "checks",
     "commands",
@@ -116,6 +116,7 @@ pub const COLLECTORS: [&str; 22] = [
     "smart",
     "system",
     "top_processes",
+    "updates",
 ];
 
 /// How many things one collector can be told to watch.
