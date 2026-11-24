@@ -11,11 +11,18 @@ use crate::notifier::{Notice, Senders};
 pub struct AlertOps;
 
 /// Fixed names only, as AlertOps leaves it to whoever sets up the integration to say
-/// which of them means what. The form shows this as the sample to map from.
-fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
+/// which of them means what. The form shows this as the sample to map from. An
+/// inbound integration can only open, update and close an alert, so there's nothing
+/// to send for acknowledging one, and AlertOps is never queued that.
+fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Option<Value> {
+    let status = match step {
+        Incident::Open => "open",
+        Incident::Close => "closed",
+        Incident::Acknowledge => return None,
+    };
     let mut event = json!({
         "alert_id": on_call::id(notice),
-        "status": if step == Incident::Open { "open" } else { "closed" },
+        "status": status,
         "subject": on_call::title(notice),
         "message": notice.text,
         "severity": on_call::severity(notice),
@@ -24,7 +31,7 @@ fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
     if let Some(url) = web_url {
         event["link"] = json!(notice.link(url));
     }
-    event
+    Some(event)
 }
 
 /// What AlertOps' sample data box needs, to map its fields from.
@@ -34,7 +41,9 @@ pub fn sample() -> String {
         Incident::Open,
         Some("https://maxnines.example.com"),
     );
-    serde_json::to_string_pretty(&event).unwrap_or_default()
+    event
+        .and_then(|event| serde_json::to_string_pretty(&event).ok())
+        .unwrap_or_default()
 }
 
 #[async_trait::async_trait]
@@ -76,7 +85,7 @@ impl ChannelType for AlertOps {
         let web_url = senders.web_url.as_deref();
         let events: Vec<Value> = on_call::steps(notice)
             .iter()
-            .map(|step| event(notice, *step, web_url))
+            .filter_map(|step| event(notice, *step, web_url))
             .collect();
         blocking(move || {
             for event in &events {

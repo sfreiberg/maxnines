@@ -11,8 +11,8 @@ use serde::Serialize;
 
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{
-    self, Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, NameTaken, Severity,
-    WebhookMethod, WebhookRequest,
+    self, Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, NameTaken,
+    PagerDutyRegion, Severity, WebhookMethod, WebhookRequest,
 };
 use crate::app_state::AppState;
 use crate::channels;
@@ -65,6 +65,8 @@ struct ChannelForm {
     request_method: String,
     request_content_type: String,
     request_body: String,
+    /// A PagerDuty account's service region.
+    region: String,
 }
 
 impl ChannelForm {
@@ -92,6 +94,7 @@ impl ChannelForm {
             request_method: WebhookMethod::default().as_str().to_string(),
             request_content_type: "application/json".to_string(),
             request_body: custom_webhook::EXAMPLE_BODY.to_string(),
+            region: PagerDutyRegion::default().as_str().to_string(),
         }
     }
 
@@ -147,6 +150,7 @@ impl ChannelForm {
                 request.content_type.clone()
             }),
             request_body: request.map_or(blank.request_body, |request| request.body.clone()),
+            region: channel.region.unwrap_or_default().as_str().to_string(),
         }
     }
 
@@ -175,6 +179,7 @@ impl ChannelForm {
             request_method: text("request_method"),
             request_content_type: text("request_content_type"),
             request_body: text("request_body"),
+            region: text("region"),
         }
     }
 
@@ -288,6 +293,10 @@ impl ChannelForm {
             .collect(),
             mail,
             request: self.to_request(kind)?,
+            region: match kind {
+                ChannelKind::PagerDuty => Some(PagerDutyRegion::parse(self.region.trim())?),
+                _ => None,
+            },
         })
     }
 }
@@ -414,6 +423,10 @@ fn form_page_with(
         .with("slack_manifest_link", &channels::slack::manifest_link())
         .with("securities", &MailSecurity::ALL.map(MailSecurity::as_str))
         .with("methods", &WebhookMethod::ALL.map(WebhookMethod::as_str))
+        .with(
+            "regions",
+            &PagerDutyRegion::ALL.map(PagerDutyRegion::as_str),
+        )
         .with("preview", &preview)
         .with("error", &error);
     match error {
@@ -574,6 +587,7 @@ mod tests {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         }
     }
 

@@ -2262,6 +2262,8 @@ struct ChannelView {
     /// names are shown.
     request: Option<crate::alerting::WebhookRequest>,
     header_names: Option<Vec<String>>,
+    /// A PagerDuty account's service region.
+    region: Option<crate::alerting::PagerDutyRegion>,
 }
 
 impl ChannelView {
@@ -2272,6 +2274,7 @@ impl ChannelView {
             severities: channel.channel.severities.clone(),
             mail: channel.channel.mail.clone(),
             request: channel.channel.request.clone(),
+            region: channel.channel.region,
             header_names: (channel.channel.kind == ChannelKind::CustomWebhook).then(|| {
                 crate::channels::custom_webhook::header_names(
                     channel.channel.credential.as_deref().unwrap_or_default(),

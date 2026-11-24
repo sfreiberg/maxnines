@@ -13,8 +13,12 @@ pub struct Signl4;
 /// Names starting `X-S4-` mean something to SIGNL4. It shows the others in the alert.
 fn event(notice: &Notice, step: Incident, web_url: Option<&str>) -> Value {
     let id = on_call::id(notice);
-    if step == Incident::Close {
-        return json!({ "X-S4-ExternalID": id, "X-S4-Status": "resolved" });
+    match step {
+        Incident::Close => return json!({ "X-S4-ExternalID": id, "X-S4-Status": "resolved" }),
+        Incident::Acknowledge => {
+            return json!({ "X-S4-ExternalID": id, "X-S4-Status": "acknowledged" });
+        }
+        Incident::Open => {}
     }
 
     let mut event = json!({
@@ -57,6 +61,10 @@ impl ChannelType for Signl4 {
     }
 
     fn is_on_call(&self) -> bool {
+        true
+    }
+
+    fn acknowledges(&self) -> bool {
         true
     }
 

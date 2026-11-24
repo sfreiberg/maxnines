@@ -262,7 +262,9 @@ the series it's about, such as one disk or one container.
 Alerts still fire and show while they're silenced. If one is still firing when the
 silence ends, the notifications go out then, and if it ends first, nobody hears about it.
 Anyone who had already been told about an alert still hears when it ends, which keeps
-on-call services from leaving an incident open.
+on-call services from leaving an incident open. A silence that starts covering an alert
+whose incident is already open in PagerDuty or SIGNL4 acknowledges it there, so they stop
+escalating it, without resolving it, as the problem isn't fixed.
 
 To silence one host, such as while it's rebooted or upgraded, use **Start maintenance**
 on its page under **Hosts**. Choose how long, from 30 minutes to a day, and a reason if
@@ -292,5 +294,9 @@ every 5 minutes. Reminders go to the channels that were told it started, except 
 services, which repeat for themselves.
 
 Press **Acknowledge** on a firing alert to say you're dealing with it. That shows your
-name on the Alerts page and stops the reminders. It only applies inside MaxNines, so
-acknowledging an alert here doesn't acknowledge it in PagerDuty, or the other way round.
+name on the Alerts page and stops the reminders. Its incident in PagerDuty or SIGNL4 is
+acknowledged too, which stops them escalating it, however it was acknowledged: on the
+pages, through the API, from Slack's buttons, or by an app or AI assistant. AlertOps can't
+be told, and acknowledging an alert in an on-call service doesn't acknowledge it here.
+Undoing an acknowledgement only applies inside MaxNines, as neither service can take one
+back, as [on-call services](notifications.md#acknowledging-and-silencing) describes.

@@ -187,6 +187,7 @@ mod tests {
                 server: None,
             }),
             request: None,
+            region: None,
         }
     }
 

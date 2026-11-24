@@ -6,11 +6,22 @@ use serde_json::{Value, json};
 
 use super::on_call::{self, Incident};
 use super::{ChannelType, blocking, post_json};
-use crate::alerting::{Channel, ChannelInput};
+use crate::alerting::{Channel, ChannelInput, PagerDutyRegion};
 use crate::notifier::{Notice, Senders};
 
-/// Where PagerDuty takes events.
+/// Where PagerDuty takes events, for an account in its US service region.
 pub const EVENTS_URL: &str = "https://events.pagerduty.com/v2/enqueue";
+
+/// Where PagerDuty takes events, for an account in its EU service region.
+pub const EU_EVENTS_URL: &str = "https://events.eu.pagerduty.com/v2/enqueue";
+
+/// Where an account in `region` takes events.
+pub fn events_url(region: PagerDutyRegion) -> &'static str {
+    match region {
+        PagerDutyRegion::Us => EVENTS_URL,
+        PagerDutyRegion::Eu => EU_EVENTS_URL,
+    }
+}
 
 /// The longest summary PagerDuty accepts.
 const MAX_SUMMARY_CHARS: usize = 1024;
@@ -22,10 +33,15 @@ pub struct PagerDuty;
 
 fn event(notice: &Notice, step: Incident, key: &str, web_url: Option<&str>) -> Value {
     let dedup_key = on_call::id(notice);
-    if step == Incident::Close {
+    let action = match step {
+        Incident::Open => "trigger",
+        Incident::Acknowledge => "acknowledge",
+        Incident::Close => "resolve",
+    };
+    if step != Incident::Open {
         return json!({
             "routing_key": key,
-            "event_action": "resolve",
+            "event_action": action,
             "dedup_key": dedup_key,
         });
     }
@@ -43,7 +59,7 @@ fn event(notice: &Notice, step: Incident, key: &str, web_url: Option<&str>) -> V
     );
     let mut event = json!({
         "routing_key": key,
-        "event_action": "trigger",
+        "event_action": action,
         "dedup_key": dedup_key,
         "client": "MaxNines",
         "payload": {
@@ -89,6 +105,10 @@ impl ChannelType for PagerDuty {
         true
     }
 
+    fn acknowledges(&self) -> bool {
+        true
+    }
+
     async fn send(
         &self,
         channel: &Channel,
@@ -102,7 +122,8 @@ impl ChannelType for PagerDuty {
             .iter()
             .map(|step| event(notice, *step, key, web_url))
             .collect();
-        let url = senders.pagerduty_url().to_string();
+        let region = channel.channel.region.unwrap_or_default();
+        let url = senders.pagerduty_url(region).to_string();
         blocking(move || {
             for event in &events {
                 post_json("PagerDuty", &url, event)?;
@@ -140,6 +161,36 @@ mod tests {
             Some("https://m.example.com"),
         );
         assert_eq!(opened["client_url"], "https://m.example.com/alerts/7");
+    }
+
+    #[test]
+    fn acknowledging_names_only_the_incident() {
+        let event = event(
+            &notice(Event::Acknowledged, alert()),
+            Incident::Acknowledge,
+            "key",
+            Some("https://m.example.com"),
+        );
+        assert_eq!(
+            event,
+            json!({
+                "routing_key": "key",
+                "event_action": "acknowledge",
+                "dedup_key": "maxnines-alert-7",
+            })
+        );
+    }
+
+    #[test]
+    fn each_region_has_its_own_address() {
+        assert_eq!(
+            events_url(PagerDutyRegion::Us),
+            "https://events.pagerduty.com/v2/enqueue"
+        );
+        assert_eq!(
+            events_url(PagerDutyRegion::Eu),
+            "https://events.eu.pagerduty.com/v2/enqueue"
+        );
     }
 
     #[test]

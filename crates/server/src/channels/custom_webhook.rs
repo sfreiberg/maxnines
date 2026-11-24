@@ -624,6 +624,7 @@ mod tests {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: Some(request("application/json", body)),
+            region: None,
         }
     }
 

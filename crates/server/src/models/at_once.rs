@@ -37,6 +37,7 @@ fn webhook() -> ChannelInput {
         severities: every_severity(),
         mail: None,
         request: None,
+        region: None,
     }
 }
 

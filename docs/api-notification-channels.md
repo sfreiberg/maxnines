@@ -13,6 +13,7 @@ and Telegram tokens, mail server passwords and Resend API keys can be set but ne
 | `mail` | Email and Resend only. See below |
 | `request` | Custom webhooks only, and required for them. See below |
 | `app_token` | Optional, Slack only. The app-level token, starting `xapp-`, that adds Acknowledge and Silence buttons |
+| `region` | PagerDuty only. The service region its account is in: `us`, the default, or `eu` for an account whose address ends in `eu.pagerduty.com` |
 | `severities` | Which alerts it's sent: `["warning", "critical"]`, the default, or one of them, as in [which channels hear what](alerts.md#which-channels-hear-what) |
 
 Email and Resend channels have `mail`:
@@ -45,6 +46,14 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
        "credential": "Authorization: Bearer abc123",
        "request": {"method": "POST", "content_type": "application/json",
                    "body": "{\"title\": \"{{ alert.rule_name }} on {{ alert.hostname }}\", \"status\": \"{{ event }}\"}"}}' \
+  "$MAXNINES_URL/api/v1/notification-channels"
+```
+
+```sh
+curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "On call", "kind": "pagerduty",
+       "target": "abcdefghijklmnopqrstuvwxyz012345", "region": "eu"}' \
   "$MAXNINES_URL/api/v1/notification-channels"
 ```
 

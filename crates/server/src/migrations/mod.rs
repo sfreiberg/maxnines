@@ -1060,6 +1060,8 @@ impl MigrationTrait for CreateTables {
             .col(ColumnDef::new(NotificationChannels::RequestMethod).string_len(8))
             .col(ColumnDef::new(NotificationChannels::RequestContentType).string_len(255))
             .col(ColumnDef::new(NotificationChannels::RequestBody).text())
+            // A PagerDuty channel's service region, us or eu.
+            .col(ColumnDef::new(NotificationChannels::Region).string_len(8))
             .col(moment(backend, NotificationChannels::DeletedAt))
             .to_owned();
         live_names(manager, channels, "notification_channels").await?;
@@ -2480,6 +2482,7 @@ enum NotificationChannels {
     RequestMethod,
     RequestContentType,
     RequestBody,
+    Region,
     DeletedAt,
 }
 

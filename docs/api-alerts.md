@@ -134,7 +134,9 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `POST /api/v1/alerts/{id}/acknowledge`
 
-Says someone is dealing with it, which shows on the Alerts page and stops its reminders.
+Says someone is dealing with it, which shows on the Alerts page and stops its reminders,
+and acknowledges its incident in PagerDuty and SIGNL4, as in
+[acknowledging and silencing](notifications.md#acknowledging-and-silencing).
 The first to acknowledge stays on it. Through the API, `acknowledged_by` is the email of the key's owner. Returns
 `204`, or `404` if it isn't firing.
 
@@ -142,4 +144,5 @@ The first to acknowledge stays on it. Through the API, `acknowledged_by` is the 
 
 `POST /api/v1/alerts/{id}/unacknowledge`
 
+This only applies inside MaxNines: an on-call service keeps its incident acknowledged.
 Returns `204`, or `404` if it isn't firing.

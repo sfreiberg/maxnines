@@ -68,6 +68,12 @@ pub trait ChannelType: Send + Sync {
         false
     }
 
+    /// Whether the service can be told an alert is acknowledged, which stops it
+    /// paging people about it. Only an on-call service is ever told.
+    fn acknowledges(&self) -> bool {
+        false
+    }
+
     /// Whether it sends email, so it has a from address and maybe a mail server.
     fn sends_mail(&self) -> bool {
         false

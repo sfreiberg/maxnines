@@ -223,7 +223,8 @@ The token works like a password, so it can't be read back once saved.
 ## On-call services
 
 Alerts can open incidents in PagerDuty, AlertOps and SIGNL4, and close them again when
-they resolve. Each alert is one incident.
+they resolve. Each alert is one incident. PagerDuty and SIGNL4 are also told when it's
+acknowledged, as described [below](#acknowledging-and-silencing).
 
 Set them up in the web interface: go to Settings, then notification channels, add a
 channel of that type, then add the channel to the alert rules that should use it. The
@@ -237,6 +238,9 @@ is on call. Keys and URLs work like passwords, so they can't be read back once s
 1. In PagerDuty, open the service that should get the alerts, then its Integrations tab.
 2. Add an integration, choose Events API V2, and copy its Integration Key.
 3. Use that key as the channel's destination.
+4. Choose the service region your account is in: EU if its address ends in
+   `eu.pagerduty.com`, and US, the default, otherwise. Events go to
+   `events.pagerduty.com` or `events.eu.pagerduty.com` to match.
 
 An alert's severity, warning or critical, carries over.
 
@@ -276,3 +280,38 @@ mapping to do. Custom integrations may depend on your AlertOps plan.
 
 Use `https://connect.signl4.com/webhook/` followed by your SIGNL4 team or integration
 secret as the channel's destination.
+
+### Acknowledging and silencing
+
+When an alert is acknowledged in MaxNines, on the pages, through the API, from Slack's
+buttons, or by an app or AI assistant, each on-call channel that was told it started is
+told it's acknowledged, which stops the service escalating it. So is one whose incident is
+already open when a silence starts covering the alert, whether it's a silence, maintenance
+started from a host's page, or a maintenance window coming round. A silence acknowledges an
+incident once, and never resolves it, as the problem isn't fixed. An alert that starts
+during a silence opens no incident, so there's nothing to acknowledge.
+
+| Service | Acknowledging or a silence starting | Undoing an acknowledgement | A silence ending |
+| --- | --- | --- | --- |
+| PagerDuty | `event_action` `acknowledge`, with the incident's `dedup_key` | Nothing | Stays acknowledged |
+| SIGNL4 | `X-S4-Status` `acknowledged`, with the alert's `X-S4-ExternalID` | Nothing | Stays acknowledged |
+| AlertOps | Nothing | Nothing | Keeps escalating, as before |
+
+- **AlertOps** has no acknowledge that stops escalation: an inbound integration can only
+  open, update and close an alert. Its alert keeps escalating until someone takes it in
+  AlertOps, and closes when the alert resolves.
+- **Undoing an acknowledgement** only applies inside MaxNines. Neither PagerDuty nor
+  SIGNL4 has a way to take an acknowledgement back through what MaxNines sends them, and
+  sending the alert again doesn't: PagerDuty adds a repeat to an acknowledged incident's
+  log without notifying anyone. Acknowledging it again in MaxNines tells them again.
+- **When a silence ends**, MaxNines sends what it held back, as for any channel. For an
+  incident a silence acknowledged, that's only a change of severity during the silence,
+  which updates the incident but leaves it acknowledged. If the problem's still there, it
+  stays acknowledged until it resolves, someone deals with it in the service, or the
+  service's own timeout brings it back: a PagerDuty service with an acknowledgement
+  timeout triggers it again once that runs out.
+- **Getting worse** clears the acknowledgement in MaxNines, and sends the incident its
+  new severity, but the service keeps it acknowledged, for the same reason.
+
+What's sent shows with other notifications that haven't arrived, as the event
+`acknowledged`, until it does.

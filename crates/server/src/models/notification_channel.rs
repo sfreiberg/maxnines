@@ -23,6 +23,8 @@ pub struct Model {
     pub request_method: Option<String>,
     pub request_content_type: Option<String>,
     pub request_body: Option<String>,
+    /// A PagerDuty channel's service region, `us` or `eu`. Nothing for other kinds.
+    pub region: Option<String>,
     /// When it was deleted. Its notifications keep pointing at it.
     pub deleted_at: Option<DateTimeUtc>,
 }

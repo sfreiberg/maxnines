@@ -24,8 +24,8 @@ use super::{
 use crate::actions::{ActionRun, RuleAction, RunOn};
 use crate::alerting::{
     Alert, AlertRule, AlertRuleInput, Channel, ChannelInput, ChannelKind, Delivery,
-    DeliveryProblem, Event, Mail, MailSecurity, MailServer, NameTaken, NewAlert, RULE_GONE_REASON,
-    Severity, SeverityChange, TemplateLink, WebhookMethod, WebhookRequest,
+    DeliveryProblem, Event, Mail, MailSecurity, MailServer, NameTaken, NewAlert, PagerDutyRegion,
+    RULE_GONE_REASON, Severity, SeverityChange, TemplateLink, WebhookMethod, WebhookRequest,
 };
 use crate::audit::{Action, Kind, Record, Snapshot, Subject};
 use crate::calculations::Calculation;
@@ -37,6 +37,19 @@ const SENT: &str = "sent";
 pub(super) const FAILED: &str = "failed";
 /// Kept back by a silence.
 pub(super) const HELD: &str = "held";
+
+/// What opens an incident in an on-call service, or updates one that's open.
+const OPENING: [Event; 3] = [Event::Firing, Event::Escalated, Event::Eased];
+
+/// How far news of an alert starting has got to a channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Told {
+    Yes,
+    /// It's waiting to go, or a silence is holding it back.
+    NotYet,
+    /// It never got there, or was never going to.
+    Never,
+}
 
 fn to_alert_rule(
     row: alert_rule::Model,
@@ -150,6 +163,8 @@ fn channel_row(input: &ChannelInput) -> notification_channel::ActiveModel {
         request_method: Set(request.map(|request| request.method.as_str().to_string())),
         request_content_type: Set(request.map(|request| request.content_type.trim().to_string())),
         request_body: Set(request.map(|request| request.body.clone())),
+        region: Set((input.kind == ChannelKind::PagerDuty)
+            .then(|| input.region.unwrap_or_default().as_str().to_string())),
         ..Default::default()
     }
 }
@@ -213,6 +228,11 @@ fn to_channel(row: notification_channel::Model) -> Result<Channel> {
             .collect(),
             mail,
             request,
+            region: row
+                .region
+                .as_deref()
+                .map(PagerDutyRegion::parse)
+                .transpose()?,
         },
     })
 }
@@ -547,6 +567,62 @@ pub(super) async fn queue_action_output<C: ConnectionTrait>(
             .context("queueing notifications")?;
     }
     Ok(())
+}
+
+/// The on-call channels with an incident for each alert whose notifications `about`
+/// picks, in services that can acknowledge one. A channel only has an incident once
+/// it's been told the alert started, in one of `told`, such as only `sent`. With
+/// `once`, those that have been asked to acknowledge it already are left out. A
+/// deleted channel hears nothing more.
+async fn incidents<C: ConnectionTrait>(
+    connection: &C,
+    about: sea_orm::sea_query::SimpleExpr,
+    told: &[&str],
+    once: bool,
+) -> Result<BTreeMap<i64, BTreeSet<i64>>> {
+    let kinds = channels::ALL
+        .into_iter()
+        .filter(|kind| kind.acknowledges())
+        .map(ChannelKind::as_str);
+    let acknowledging = Query::select()
+        .column(notification_channel::Column::Id)
+        .from(notification_channel::Entity)
+        .and_where(notification_channel::Column::Kind.is_in(kinds))
+        .and_where(notification_channel::Column::DeletedAt.is_null())
+        .to_owned();
+    let events = OPENING
+        .into_iter()
+        .chain([Event::Acknowledged])
+        .map(Event::as_str);
+    let rows: Vec<(i64, i64, String, String)> = notification::Entity::find()
+        .select_only()
+        .column(notification::Column::AlertId)
+        .column(notification::Column::ChannelId)
+        .column(notification::Column::Event)
+        .column(notification::Column::State)
+        .filter(about)
+        .filter(notification::Column::ChannelId.in_subquery(acknowledging))
+        .filter(notification::Column::Event.is_in(events))
+        .into_tuple()
+        .all(connection)
+        .await
+        .context("loading notifications")?;
+    let mut opened = BTreeSet::new();
+    let mut acknowledged = BTreeSet::new();
+    for (alert_id, channel_id, event, state) in rows {
+        if event == Event::Acknowledged.as_str() {
+            if once {
+                acknowledged.insert((alert_id, channel_id));
+            }
+        } else if told.contains(&state.as_str()) {
+            opened.insert((alert_id, channel_id));
+        }
+    }
+    let mut incidents: BTreeMap<i64, BTreeSet<i64>> = BTreeMap::new();
+    for (alert_id, channel_id) in opened.difference(&acknowledged) {
+        incidents.entry(*alert_id).or_default().insert(*channel_id);
+    }
+    Ok(incidents)
 }
 
 impl Database {
@@ -1081,6 +1157,7 @@ fn channel_snapshot(channel: &Channel) -> Snapshot {
         "severities": severities,
         "mail": input.mail,
         "request": input.request,
+        "region": input.region,
     });
     let snapshot =
         Snapshot::new(input.name.clone(), fields).with_secrets(&["credential", "app_token"]);
@@ -1688,6 +1765,15 @@ impl Database {
             let subject = alert_subject(&transaction, firing).await?;
             let entry = Record::new(Action::Acknowledged, subject);
             record(&transaction, entry).await?;
+            // An on-call service that will hear the alert started, once a silence
+            // lets it, hears this after. One acknowledged before hears it again, as
+            // someone picking the alert up again after it got worse, or after it
+            // was unacknowledged, may be answering the service paging them again.
+            let about = notification::Column::AlertId.eq(id);
+            let told = [SENT, PENDING, HELD];
+            let incidents = incidents(&transaction, about, &told, false).await?;
+            let channels = incidents.into_values().flatten();
+            queue_for_live_channels(&transaction, id, channels, Event::Acknowledged, now).await?;
         }
         transaction.commit().await.context("saving alert")?;
         Ok(true)
@@ -1857,6 +1943,104 @@ impl Database {
         }
         transaction.commit().await.context("queueing reminders")?;
         Ok(())
+    }
+
+    /// Open alerts with an incident in an on-call service that can acknowledge it,
+    /// opened and never acknowledged, with the channels it's open in.
+    pub async fn unacknowledged_incidents(&self) -> Result<Vec<(Alert, BTreeSet<i64>)>> {
+        let open = Query::select()
+            .column(alert::Column::Id)
+            .from(alert::Entity)
+            .and_where(alert::Column::ResolvedAt.is_null())
+            .to_owned();
+        let about = notification::Column::AlertId.in_subquery(open);
+        let mut incidents = incidents(&self.connection, about, &[SENT], true).await?;
+        if incidents.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = alert::Entity::find()
+            .filter(alert::Column::Id.is_in(incidents.keys().copied()))
+            .all(&self.connection)
+            .await
+            .context("loading alerts")?;
+        let alerts = to_alerts(&self.connection, rows).await?;
+        Ok(alerts
+            .into_iter()
+            .filter_map(|alert| {
+                let channels = incidents.remove(&alert.id)?;
+                Some((alert, channels))
+            })
+            .collect())
+    }
+
+    /// Queues an acknowledgement of each alert's incident for its channels. Only
+    /// alerts still open are: they're locked first, so one ending meanwhile is waited
+    /// for and left out, and one ending after waits, so its incident is resolved
+    /// after it's acknowledged.
+    pub async fn acknowledge_incidents(
+        &self,
+        incidents: &[(i64, BTreeSet<i64>)],
+        now: Timestamp,
+    ) -> Result<()> {
+        if incidents.is_empty() {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("queueing acknowledgements")?;
+        let still: BTreeSet<i64> = alert::Entity::find()
+            .select_only()
+            .column(alert::Column::Id)
+            .filter(alert::Column::Id.is_in(incidents.iter().map(|(id, _)| *id)))
+            .filter(alert::Column::ResolvedAt.is_null())
+            .lock_shared()
+            .into_tuple()
+            .all(&transaction)
+            .await
+            .context("loading alerts")?
+            .into_iter()
+            .collect();
+        for (alert_id, channels) in incidents {
+            if still.contains(alert_id) {
+                let channels = channels.iter().copied();
+                queue_for_live_channels(
+                    &transaction,
+                    *alert_id,
+                    channels,
+                    Event::Acknowledged,
+                    now,
+                )
+                .await?;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .context("queueing acknowledgements")?;
+        Ok(())
+    }
+
+    /// How far news of an alert starting has got to a channel.
+    pub async fn told_started(&self, alert_id: i64, channel_id: i64) -> Result<Told> {
+        let states: Vec<String> = notification::Entity::find()
+            .select_only()
+            .column(notification::Column::State)
+            .filter(notification::Column::AlertId.eq(alert_id))
+            .filter(notification::Column::ChannelId.eq(channel_id))
+            .filter(notification::Column::Event.is_in(OPENING.map(Event::as_str)))
+            .into_tuple()
+            .all(&self.connection)
+            .await
+            .context("loading notifications")?;
+        Ok(if states.iter().any(|state| state == SENT) {
+            Told::Yes
+        } else if states.iter().any(|state| state == PENDING || state == HELD) {
+            Told::NotYet
+        } else {
+            Told::Never
+        })
     }
 
     /// Forgets a notification that no longer has anything to say.

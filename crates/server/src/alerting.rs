@@ -787,6 +787,11 @@ impl ChannelKind {
         channels::of(self).is_on_call()
     }
 
+    /// Whether it's told when an alert is acknowledged, to stop paging people.
+    pub fn acknowledges(self) -> bool {
+        channels::of(self).acknowledges()
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Webhook => "webhook",
@@ -849,6 +854,37 @@ pub struct ChannelInput {
     /// `credential`, as they usually hold a token.
     #[serde(default)]
     pub request: Option<WebhookRequest>,
+    /// Which of PagerDuty's service regions its account is in. Only PagerDuty
+    /// channels have one, and leaving it out means the US.
+    #[serde(default)]
+    pub region: Option<PagerDutyRegion>,
+}
+
+/// Where a PagerDuty account lives, which decides where its events are sent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PagerDutyRegion {
+    #[default]
+    Us,
+    Eu,
+}
+
+impl PagerDutyRegion {
+    pub const ALL: [Self; 2] = [Self::Us, Self::Eu];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Us => "us",
+            Self::Eu => "eu",
+        }
+    }
+
+    pub fn parse(text: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|region| region.as_str() == text)
+            .with_context(|| format!("unknown PagerDuty region {text:?}, which should be us or eu"))
+    }
 }
 
 /// What a custom webhook sends, apart from its headers.
@@ -969,6 +1005,10 @@ pub fn check_channel(channel: &ChannelInput) -> Result<()> {
         "only custom webhooks have a request to send"
     );
     ensure!(
+        channel.region.is_none() || channel.kind == ChannelKind::PagerDuty,
+        "only PagerDuty channels have a region"
+    );
+    ensure!(
         channel.name.len() <= MAX_NAME_LEN,
         "the channel name is too long"
     );
@@ -1053,6 +1093,9 @@ pub enum Event {
     Resolved,
     /// What one of the alert's actions printed.
     Action,
+    /// Someone said they're dealing with it, or a silence started covering it,
+    /// which an on-call service hears so it stops paging people.
+    Acknowledged,
     Test,
 }
 
@@ -1065,6 +1108,7 @@ impl Event {
             Self::Reminder => "reminder",
             Self::Resolved => "resolved",
             Self::Action => "action",
+            Self::Acknowledged => "acknowledged",
             Self::Test => "test",
         }
     }
@@ -1077,6 +1121,7 @@ impl Event {
             "reminder" => Ok(Self::Reminder),
             "resolved" => Ok(Self::Resolved),
             "action" => Ok(Self::Action),
+            "acknowledged" => Ok(Self::Acknowledged),
             other => bail!("unknown event {other:?}"),
         }
     }
@@ -1528,6 +1573,7 @@ mod tests {
             severities: every_severity(),
             mail: None,
             request: None,
+            region: None,
         }
     }
 
@@ -1761,6 +1807,7 @@ mod tests {
             severities: every_severity(),
             mail: None,
             request: None,
+            region: None,
         }
     }
 

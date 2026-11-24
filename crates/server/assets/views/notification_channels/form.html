@@ -51,6 +51,15 @@
     <small>{% if channel.preview %}Leave empty to keep what's saved, which isn't shown because it can work like a password.{% else %}<span class="for-webhook">Where each alert is posted as JSON.</span><span class="for-custom_webhook">Where the request below is sent.</span><span class="for-discord">From the Discord channel's settings, under Integrations, then Webhooks.</span><span class="for-teams">The URL the Teams workflow gives, as described below.</span><span class="for-mail">The addresses to send to, separated by commas.</span><span class="for-slack">Such as <code>#alerts</code>, or a channel's ID.</span><span class="for-pagerduty">From an Events API V2 integration on a PagerDuty service, as described below.</span><span class="for-alertops">The URL of the AlertOps integration, as described below.</span><span class="for-signl4">The SIGNL4 webhook URL, as described below.</span><span class="for-telegram">The chat or group to message, as a number.</span>{% endif %}</small>
   </label>
 
+  <label class="for-pagerduty">Service region
+    <select name="region">
+      {% for region in regions %}
+      <option value="{{ region }}"{% if channel.region == region %} selected{% endif %}>{% if region == "eu" %}EU{% else %}US{% endif %}</option>
+      {% endfor %}
+    </select>
+    <small>EU if your PagerDuty address ends in <code>eu.pagerduty.com</code>, and US otherwise.</small>
+  </label>
+
   <details class="for-pagerduty">
     <summary>How to get a PagerDuty integration key</summary>
     <ol>
@@ -58,7 +67,7 @@
       <li>Add an integration, and choose Events API V2.</li>
       <li>Copy its Integration Key into the box above.</li>
     </ol>
-    <p class="note">Sending a test opens an incident on that service and resolves it straight away, which can notify whoever is on call.</p>
+    <p class="note">Acknowledging an alert in MaxNines, or silencing one that's firing, acknowledges its incident too, which stops PagerDuty escalating it. Sending a test opens an incident on that service and resolves it straight away, which can notify whoever is on call.</p>
   </details>
 
   <details class="for-alertops">
@@ -76,6 +85,7 @@
       <li>Map <code>subject</code> and <code>message</code> to the text fields you want, and <code>link</code> to Source URL.</li>
       <li>Leave the authorization header off, then copy the integration's URL into the box above. Do this last, as changing its source changes the URL.</li>
     </ol>
+    <p class="note">AlertOps has no acknowledge that stops escalation, so acknowledging or silencing an alert in MaxNines doesn't reach it. Its alert keeps escalating until someone takes it in AlertOps, and closes when the alert resolves.</p>
     <p class="note">Sending a test opens an alert and closes it straight away, which can notify whoever is on call.</p>
   </details>
 
@@ -93,6 +103,7 @@
   <details class="for-signl4">
     <summary>How to get a SIGNL4 webhook URL</summary>
     <p>Put <code>https://connect.signl4.com/webhook/</code> followed by your SIGNL4 team or integration secret in the box above.</p>
+    <p class="note">Acknowledging an alert in MaxNines, or silencing one that's firing, acknowledges it in SIGNL4 too.</p>
     <p class="note">Sending a test opens an alert and resolves it straight away, which can notify whoever is on call.</p>
   </details>
 

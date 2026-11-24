@@ -256,6 +256,7 @@ fn channel(kind: ChannelKind, target: &str, credential: Option<&str>) -> Channel
         severities: every_severity(),
         mail: None,
         request: None,
+        region: None,
     }
 }
 

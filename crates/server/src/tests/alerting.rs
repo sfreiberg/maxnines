@@ -3008,6 +3008,7 @@ fn webhook_channel(url: &str) -> ChannelInput {
         severities: crate::alerting::every_severity(),
         mail: None,
         request: None,
+        region: None,
     }
 }
 
@@ -3088,6 +3089,7 @@ async fn a_discord_channel_gets_discords_message_format() {
         severities: crate::alerting::every_severity(),
         mail: None,
         request: None,
+        region: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3432,6 +3434,7 @@ async fn firing_on(
         severities: crate::alerting::every_severity(),
         mail: None,
         request: None,
+        region: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3533,6 +3536,7 @@ async fn a_test_opens_an_incident_and_closes_it_again_on_every_service() {
                 severities: crate::alerting::every_severity(),
                 mail: None,
                 request: None,
+                region: None,
             },
         };
 
@@ -3721,6 +3725,7 @@ async fn a_pagerduty_test_opens_an_incident_and_closes_it_again() {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         },
     };
     let senders = Senders {
@@ -3781,6 +3786,296 @@ async fn a_pagerduty_key_has_to_look_like_one() {
     }
 }
 
+/// A channel of `kind` on a stand-in for its service, with an alert firing on it.
+async fn firing_on_service(
+    test: &mut Harness,
+    kind: ChannelKind,
+    service: &FakeOnCall,
+) -> Notifier {
+    let url = service.start().await;
+    match kind {
+        ChannelKind::PagerDuty => {
+            let senders = Senders {
+                pagerduty_url: Some(url),
+                ..Senders::default()
+            };
+            firing_on(test, kind, PAGERDUTY_KEY, senders).await
+        }
+        _ => firing_on(test, kind, &url, Senders::default()).await,
+    }
+}
+
+/// What each service that can acknowledge calls it: the field saying what to do,
+/// what it says to acknowledge, and the field naming the incident.
+const ACKNOWLEDGING: [(ChannelKind, &str, &str, &str); 2] = [
+    (
+        ChannelKind::PagerDuty,
+        "event_action",
+        "acknowledge",
+        "dedup_key",
+    ),
+    (
+        ChannelKind::Signl4,
+        "X-S4-Status",
+        "acknowledged",
+        "X-S4-ExternalID",
+    ),
+];
+
+fn every_alert_for_an_hour() -> crate::silences::SilenceInput {
+    crate::silences::SilenceInput {
+        rule_id: None,
+        filter: None,
+        series: None,
+        all_alerts: true,
+        reason: "Upgrading".to_string(),
+        duration: TimeDelta::hours(1),
+    }
+}
+
+#[tokio::test]
+async fn acknowledging_an_alert_acknowledges_its_incident() {
+    for (kind, action, acknowledge, id) in ACKNOWLEDGING {
+        let mut test = Harness::start().await;
+        let service = FakeOnCall::default();
+        let notifier = firing_on_service(&mut test, kind, &service).await;
+        notifier.deliver_due(test.now).await.unwrap();
+        let alert = test.open().await[0].id;
+
+        let acknowledged = test
+            .database()
+            .acknowledge_alert(alert, "sam", test.now + MINUTE)
+            .await;
+        assert!(acknowledged.unwrap());
+        notifier.deliver_due(test.now + MINUTE).await.unwrap();
+        notifier.deliver_due(test.now + MINUTE * 2).await.unwrap();
+
+        let events = service.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1][action], acknowledge, "{events:?}");
+        assert_eq!(events[1][id], events[0][id], "{events:?}");
+        assert!(
+            test.database()
+                .delivery_problems(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // It stays open until the alert resolves.
+        test.cpu(MINUTE * 3, 10.0).await;
+        notifier.deliver_due(test.now + MINUTE * 3).await.unwrap();
+        let events = service.events();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(["resolve", "resolved"].contains(&events[2][action].as_str().unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn acknowledging_an_alert_tells_alertops_nothing_as_it_cannot_be_told() {
+    let mut test = Harness::start().await;
+    let alertops = FakeOnCall::default();
+    let notifier = firing_on_service(&mut test, ChannelKind::AlertOps, &alertops).await;
+    notifier.deliver_due(test.now).await.unwrap();
+    let alert = test.open().await[0].id;
+
+    let acknowledged = test
+        .database()
+        .acknowledge_alert(alert, "sam", test.now + MINUTE)
+        .await;
+    assert!(acknowledged.unwrap());
+    let silence = every_alert_for_an_hour();
+    test.database()
+        .create_silence(&silence, "sam", test.now + MINUTE)
+        .await
+        .unwrap();
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
+
+    assert_eq!(alertops.events().len(), 1, "{:?}", alertops.events());
+}
+
+#[tokio::test]
+async fn silencing_a_firing_alert_acknowledges_its_incident_once() {
+    for (kind, action, acknowledge, id) in ACKNOWLEDGING {
+        let mut test = Harness::start().await;
+        let service = FakeOnCall::default();
+        let notifier = firing_on_service(&mut test, kind, &service).await;
+        notifier.deliver_due(test.now).await.unwrap();
+
+        let silence = every_alert_for_an_hour();
+        test.database()
+            .create_silence(&silence, "sam", test.now + MINUTE)
+            .await
+            .unwrap();
+        for pass in 1..4 {
+            notifier
+                .deliver_due(test.now + MINUTE * pass)
+                .await
+                .unwrap();
+        }
+
+        let events = service.events();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[1][action], acknowledge, "{events:?}");
+        assert_eq!(events[1][id], events[0][id], "{events:?}");
+        // Silencing isn't acknowledging, in MaxNines.
+        assert_eq!(test.open().await[0].acknowledged_at, None);
+
+        // The silence ending, with nothing held back, sends nothing more.
+        notifier
+            .deliver_due(test.now + TimeDelta::hours(2))
+            .await
+            .unwrap();
+        assert_eq!(service.events().len(), 2, "{:?}", service.events());
+    }
+}
+
+#[tokio::test]
+async fn an_alert_starting_under_a_silence_still_sends_nothing_to_an_on_call_service() {
+    let mut test = Harness::start().await;
+    let silence = every_alert_for_an_hour();
+    test.database()
+        .create_silence(&silence, "sam", test.now)
+        .await
+        .unwrap();
+    let pagerduty = FakeOnCall::default();
+    let notifier = firing_on_service(&mut test, ChannelKind::PagerDuty, &pagerduty).await;
+
+    for pass in 0..3 {
+        notifier
+            .deliver_due(test.now + MINUTE * pass)
+            .await
+            .unwrap();
+    }
+    assert!(pagerduty.events().is_empty(), "{:?}", pagerduty.events());
+
+    // Once it ends, the incident opens, and has had no acknowledgement.
+    notifier
+        .deliver_due(test.now + TimeDelta::hours(2))
+        .await
+        .unwrap();
+    notifier
+        .deliver_due(test.now + TimeDelta::hours(2) + MINUTE)
+        .await
+        .unwrap();
+    let events = pagerduty.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0]["event_action"], "trigger");
+}
+
+/// Acknowledged while a silence holds back its start, an alert's incident is opened
+/// when the silence ends, and acknowledged after, never before.
+#[tokio::test]
+async fn an_acknowledgement_waits_for_the_incident_a_silence_is_holding_back() {
+    let mut test = Harness::start().await;
+    let silence = every_alert_for_an_hour();
+    let silence = test
+        .database()
+        .create_silence(&silence, "sam", test.now)
+        .await
+        .unwrap();
+    let pagerduty = FakeOnCall::default();
+    let notifier = firing_on_service(&mut test, ChannelKind::PagerDuty, &pagerduty).await;
+    notifier.deliver_due(test.now).await.unwrap();
+    let alert = test.open().await[0].id;
+    let acknowledged = test
+        .database()
+        .acknowledge_alert(alert, "sam", test.now + MINUTE)
+        .await;
+    assert!(acknowledged.unwrap());
+    notifier.deliver_due(test.now + MINUTE).await.unwrap();
+    assert!(pagerduty.events().is_empty(), "{:?}", pagerduty.events());
+
+    let ended = test
+        .database()
+        .end_silence(silence, test.now + MINUTE * 2)
+        .await;
+    assert!(ended.unwrap());
+    for pass in 2..5 {
+        notifier
+            .deliver_due(test.now + MINUTE * pass)
+            .await
+            .unwrap();
+    }
+
+    let events = pagerduty.events();
+    let actions: Vec<&str> = events
+        .iter()
+        .map(|event| event["event_action"].as_str().unwrap())
+        .collect();
+    assert_eq!(actions, ["trigger", "acknowledge"]);
+    assert_eq!(events[0]["dedup_key"], events[1]["dedup_key"]);
+}
+
+#[tokio::test]
+async fn an_eu_pagerduty_channel_sends_to_the_eu_address() {
+    let (us, eu) = (FakeOnCall::default(), FakeOnCall::default());
+    let senders = Senders {
+        pagerduty_url: Some(us.start().await),
+        pagerduty_eu_url: Some(eu.start().await),
+        ..Senders::default()
+    };
+    let channel = Channel {
+        id: 1,
+        channel: ChannelInput {
+            name: "On call".to_string(),
+            kind: ChannelKind::PagerDuty,
+            target: PAGERDUTY_KEY.to_string(),
+            credential: None,
+            app_token: None,
+            severities: crate::alerting::every_severity(),
+            mail: None,
+            request: None,
+            region: Some(crate::alerting::PagerDutyRegion::Eu),
+        },
+    };
+
+    crate::notifier::send(channel, Notice::test(), None, senders)
+        .await
+        .unwrap();
+
+    assert!(us.events().is_empty(), "{:?}", us.events());
+    let events = eu.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0]["routing_key"], PAGERDUTY_KEY);
+}
+
+#[tokio::test]
+async fn a_pagerduty_channel_keeps_its_region() {
+    let server = start().await;
+    let mut ids = Vec::new();
+    for (name, region, expected) in [("US", None, "us"), ("EU", Some("eu"), "eu")] {
+        let mut body = json!({ "name": name, "kind": "pagerduty", "target": PAGERDUTY_KEY });
+        if let Some(region) = region {
+            body["region"] = json!(region);
+        }
+        let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+        assert_eq!(status, 201, "{made}");
+        let id = made["id"].as_i64().unwrap();
+        let path = format!("/api/v1/notification-channels/{id}");
+        let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
+        assert_eq!(shown["region"], expected, "{shown}");
+        ids.push(id);
+    }
+
+    let mut browser = Browser::default();
+    let edit = browser
+        .get(&server, &format!("/alerts/channels/{}/edit", ids[1]))
+        .await;
+    assert!(
+        edit.body.contains(r#"<option value="eu" selected>"#),
+        "{}",
+        edit.body
+    );
+
+    let body = json!({
+        "name": "Ops", "kind": "webhook", "target": "https://hooks.example.com/x",
+        "region": "eu",
+    });
+    let (status, answer) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 422, "{answer}");
+}
+
 const TELEGRAM_TOKEN: &str = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
 /// A stand-in for Telegram's bot API. It keeps the path and body of each call,
@@ -3838,6 +4133,7 @@ async fn firing_on_telegram(test: &mut Harness, telegram: &FakeTelegram) -> Noti
         severities: crate::alerting::every_severity(),
         mail: None,
         request: None,
+        region: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -3950,6 +4246,7 @@ async fn not_reaching_telegram_says_so_without_the_token() {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         },
     };
     let senders = Senders {
@@ -4042,6 +4339,7 @@ async fn firing_on_slack_app(
         severities: crate::alerting::every_severity(),
         mail: None,
         request: None,
+        region: None,
     };
     let channel = test.database().create_channel(&channel).await.unwrap();
     let rule = AlertRuleInput {
@@ -4337,6 +4635,7 @@ async fn a_slack_test_says_when_the_app_level_token_is_wrong() {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         },
     };
     let senders = Senders {
@@ -4550,6 +4849,7 @@ async fn not_reaching_slack_says_so_without_any_detail() {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         },
     };
     let senders = Senders {
@@ -4752,6 +5052,7 @@ async fn a_channel_that_is_down_does_not_hold_up_the_others() {
         severities: crate::alerting::every_severity(),
         mail: None,
         request: None,
+        region: None,
     };
     let dead = test
         .database()
@@ -5076,6 +5377,7 @@ fn mail_channel(port: u16) -> ChannelInput {
             }),
         }),
         request: None,
+        region: None,
     }
 }
 
@@ -5235,6 +5537,7 @@ fn resend_channel() -> ChannelInput {
             server: None,
         }),
         request: None,
+        region: None,
     }
 }
 
@@ -5795,6 +6098,7 @@ async fn a_channel_can_take_warnings_critical_alerts_or_both_from_the_form_and_t
         ("name", "Pager"),
         ("kind", "pagerduty"),
         ("target", PAGERDUTY_KEY),
+        ("region", "eu"),
         ("sends_critical", "on"),
     ];
     let page = browser
@@ -5805,6 +6109,10 @@ async fn a_channel_can_take_warnings_critical_alerts_or_both_from_the_form_and_t
     assert_eq!(
         channel.channel.severities,
         std::collections::BTreeSet::from([Severity::Critical])
+    );
+    assert_eq!(
+        channel.channel.region,
+        Some(crate::alerting::PagerDutyRegion::Eu)
     );
 
     let list = browser.get(&server, "/alerts/channels").await;
@@ -7917,6 +8225,7 @@ mod reminders {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         };
         let channel = test.database().create_channel(&channel).await.unwrap();
         let rule = AlertRuleInput {
@@ -9276,6 +9585,7 @@ mod charts {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         };
         let channel = server
             .state
@@ -9318,6 +9628,7 @@ mod charts {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         };
         let channel = server
             .state
@@ -9377,6 +9688,7 @@ mod charts {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         };
         let channel = server
             .state
@@ -9441,6 +9753,7 @@ mod charts {
             severities: crate::alerting::every_severity(),
             mail: None,
             request: None,
+            region: None,
         };
         let channel = server
             .state

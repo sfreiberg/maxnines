@@ -2,7 +2,7 @@
 //! between sending and saving sends it again, so webhooks carry an ID to spot that.
 //! What each kind of channel does is in [`crate::channels`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -20,9 +20,9 @@ use tracing::{error, info, warn};
 
 use crate::actions::ActionRun;
 use crate::alert_charts::ChartSources;
-use crate::alerting::{Alert, Channel, Delivery, Event, Severity};
+use crate::alerting::{Alert, Channel, Delivery, Event, PagerDutyRegion, Severity};
 use crate::channels::{self, pagerduty, resend, telegram};
-use crate::models::Database;
+use crate::models::{Database, Told};
 use crate::silences::ActiveSilences;
 use crate::times::Timestamp;
 
@@ -255,6 +255,7 @@ impl Notice {
             (Event::Reminder, _) => "STILL FIRING".to_string(),
             (Event::Resolved, _) => "RESOLVED".to_string(),
             (Event::Action, _) => "ACTION".to_string(),
+            (Event::Acknowledged, _) => "ACKNOWLEDGED".to_string(),
             _ => "TEST".to_string(),
         }
     }
@@ -291,9 +292,12 @@ pub struct Senders {
     /// Where to find a stand-in for Slack.
     #[cfg(test)]
     pub slack_api_url: Option<String>,
-    /// Where to find a stand-in for PagerDuty.
+    /// Where to find a stand-in for PagerDuty's US service region.
     #[cfg(test)]
     pub pagerduty_url: Option<String>,
+    /// Where to find a stand-in for PagerDuty's EU service region.
+    #[cfg(test)]
+    pub pagerduty_eu_url: Option<String>,
     /// Where to find a stand-in for Telegram.
     #[cfg(test)]
     pub telegram_api_url: Option<String>,
@@ -310,6 +314,8 @@ impl Senders {
             slack_api_url: None,
             #[cfg(test)]
             pagerduty_url: None,
+            #[cfg(test)]
+            pagerduty_eu_url: None,
             #[cfg(test)]
             telegram_api_url: None,
             #[cfg(test)]
@@ -340,15 +346,17 @@ impl Senders {
     }
 
     #[cfg(not(test))]
-    pub(crate) fn pagerduty_url(&self) -> &str {
-        pagerduty::EVENTS_URL
+    pub(crate) fn pagerduty_url(&self, region: PagerDutyRegion) -> &str {
+        pagerduty::events_url(region)
     }
 
     #[cfg(test)]
-    pub(crate) fn pagerduty_url(&self) -> &str {
-        self.pagerduty_url
-            .as_deref()
-            .unwrap_or(pagerduty::EVENTS_URL)
+    pub(crate) fn pagerduty_url(&self, region: PagerDutyRegion) -> &str {
+        let stand_in = match region {
+            PagerDutyRegion::Us => &self.pagerduty_url,
+            PagerDutyRegion::Eu => &self.pagerduty_eu_url,
+        };
+        stand_in.as_deref().unwrap_or(pagerduty::events_url(region))
     }
 }
 
@@ -510,12 +518,33 @@ impl Notifier {
         self.database.queue_reminders(&alerts, now).await
     }
 
+    /// Acknowledges the incidents of alerts a silence has started covering, as that
+    /// is what stops an on-call service paging people. It isn't resolved, as the
+    /// problem isn't fixed. Each pass compares the silences running with the open
+    /// alerts anyway, so this is where one starting covering an alert is noticed,
+    /// whether it was just added or is a maintenance window coming round.
+    async fn acknowledge_silenced(&self, silences: &ActiveSilences, now: Timestamp) -> Result<()> {
+        if silences.is_empty() {
+            return Ok(());
+        }
+        let incidents: Vec<(i64, BTreeSet<i64>)> = self
+            .database
+            .unacknowledged_incidents()
+            .await?
+            .into_iter()
+            .filter(|(alert, _)| silences.covering(alert).is_some())
+            .map(|(alert, channels)| (alert.id, channels))
+            .collect();
+        self.database.acknowledge_incidents(&incidents, now).await
+    }
+
     /// Sends what's due, and saves how each one went. Someone who was told an alert
     /// started always hears that it ended, or an on-call incident would stay open.
     pub async fn deliver_due(&self, now: Timestamp) -> Result<()> {
         let silences = ActiveSilences::load(&self.database, now).await?;
         self.release_held(&silences, now).await?;
         self.queue_reminders(&silences, now).await?;
+        self.acknowledge_silenced(&silences, now).await?;
         let due = self.database.due_deliveries(now, BATCH_SIZE).await?;
 
         let mut sends = JoinSet::new();
@@ -534,6 +563,26 @@ impl Notifier {
             if delivery.event == Event::Reminder && Self::reminder_is_stale(&delivery, &silences) {
                 self.database.drop_delivery(delivery.id).await?;
                 continue;
+            }
+            // An incident can only be acknowledged once it's open. One whose
+            // opening a silence is holding back waits with it, and one that never
+            // opened has nothing to acknowledge.
+            if delivery.event == Event::Acknowledged {
+                let told = self
+                    .database
+                    .told_started(delivery.alert.id, delivery.channel.id)
+                    .await?;
+                match told {
+                    Told::Yes => {}
+                    Told::NotYet => {
+                        self.database.hold_delivery(&delivery).await?;
+                        continue;
+                    }
+                    Told::Never => {
+                        self.database.drop_delivery(delivery.id).await?;
+                        continue;
+                    }
+                }
             }
             let chart = if shows_chart(&delivery) {
                 let key = (delivery.alert.id, delivery.event);

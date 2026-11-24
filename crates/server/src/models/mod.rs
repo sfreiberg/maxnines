@@ -95,7 +95,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
-pub use self::alerting::HeldLevel;
+pub use self::alerting::{HeldLevel, Told};
 pub use self::app_sign_ins::{AppSignIn, AppTokens, Refreshed};
 use self::audit::record_change;
 pub use self::built_in_rules::same_rule;
@@ -2594,6 +2594,7 @@ mod tests {
                 severities: crate::alerting::every_severity(),
                 mail: None,
                 request: None,
+                region: None,
             })
             .await
             .unwrap();

@@ -1,5 +1,7 @@
 //! What PagerDuty, AlertOps and SIGNL4 share: each alert is an incident that opens
-//! when it fires and closes when it ends, and they repeat for themselves.
+//! when it fires and closes when it ends, and they repeat for themselves until
+//! someone acknowledges it. Those that can be told are acknowledged along with the
+//! alert, or when a silence starts covering it.
 
 use anyhow::{Result, anyhow, ensure};
 use axum::http::Uri;
@@ -14,6 +16,8 @@ const TEST_INCIDENT_ID: &str = "maxnines-test";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Incident {
     Open,
+    /// Someone's on it, so the service stops paging people. It stays open.
+    Acknowledge,
     Close,
 }
 
@@ -23,6 +27,7 @@ pub fn steps(notice: &Notice) -> &'static [Incident] {
     match notice.event {
         // Sent again with the same ID, which updates the incident's severity.
         Event::Firing | Event::Escalated | Event::Eased => &[Incident::Open],
+        Event::Acknowledged => &[Incident::Acknowledge],
         Event::Resolved => &[Incident::Close],
         Event::Test => &[Incident::Open, Incident::Close],
         // They repeat for themselves, and what an action printed would only page
@@ -89,6 +94,10 @@ mod tests {
             assert_eq!(id(&notice), "maxnines-alert-7");
         }
         assert_eq!(steps(&notice(Event::Reminder, alert())), []);
+        assert_eq!(
+            steps(&notice(Event::Acknowledged, alert())),
+            [Incident::Acknowledge]
+        );
         assert_eq!(steps(&Notice::test()), [Incident::Open, Incident::Close]);
     }
 }

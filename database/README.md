@@ -436,6 +436,7 @@ erDiagram
         string request_method
         string request_content_type
         text request_body
+        string region "PagerDuty's service region, us or eu"
         timestamp deleted_at "kept so notifications can name it"
     }
     alert_rule_channels {
@@ -472,8 +473,8 @@ erDiagram
         int id PK
         int alert_id FK
         int channel_id FK
-        string event
-        string state "pending, sent or failed"
+        string event "firing, escalated, eased, reminder, resolved, action or acknowledged"
+        string state "pending, held, sent or failed"
         int attempts
         timestamp next_attempt_at
         text last_error

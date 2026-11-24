@@ -263,6 +263,11 @@ impl ActiveSilences {
         Ok(Self { quiet, facts })
     }
 
+    /// Whether nothing is being held back at all.
+    pub fn is_empty(&self) -> bool {
+        self.quiet.is_empty()
+    }
+
     /// Whatever holds back every alert about a host for longest, whichever rule
     /// it's from.
     pub fn covering_host(&self, host_id: &str, hostname: &str) -> Option<Cover> {
