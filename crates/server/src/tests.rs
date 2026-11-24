@@ -1822,7 +1822,9 @@ async fn a_hosts_page_says_why_collectors_are_left_out() {
     let page = browser.get(&server, &path).await;
     assert!(
         page.body.contains("left out of this agent's config, as")
-            && page.body.contains("this version of the agent can't run them. Upgrade it to"),
+            && page
+                .body
+                .contains("this version of the agent can't run them. Upgrade it to"),
         "{}",
         page.body
     );
