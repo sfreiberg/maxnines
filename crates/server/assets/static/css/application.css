@@ -417,6 +417,9 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .chart-summary { font-size: 13px; }
 .chart-summary th, .chart-summary td { padding: 4px 0; border-bottom: 0; overflow-wrap: anywhere; }
 .chart-summary td.number { font-size: 13px; }
+/* A chart's numbers on its data page, under it until someone asks for them. */
+.numbers summary { cursor: pointer; font-weight: 500; }
+.numbers[open] summary, .numbers .hint { margin-bottom: 12px; }
 .key-swatch { display: inline-block; width: 12px; height: 3px; margin-right: 8px; border-radius: 2px; vertical-align: middle; }
 
 /* The map. The outline is drawn once and scaled; markers are redrawn at each zoom so

@@ -14,7 +14,7 @@ use super::host_list::{HostSearch, address, page_number, paginate};
 use super::{Page, fleet, local_time, server_error, viewer_zone};
 use crate::app_state::AppState;
 use crate::events::TimelineEvent;
-use crate::metric_charts::{self, Chart, MAX_SERIES};
+use crate::metric_charts::{self, Chart, Frame, MAX_SERIES};
 use std::sync::Arc;
 
 use crate::metrics::{Metric, SeriesResult, ShowChart, TimeRange, Unit};
@@ -523,7 +523,24 @@ async fn show(
         .render()
 }
 
-/// A chart's numbers as a table, for anyone who can't use the chart.
+/// A chart's data page has it alone, as wide as the narrow page so its text is the
+/// size it is on the host pages, and taller than they draw it.
+const DATA_FRAME: Frame = Frame {
+    width: 812.0,
+    height: 400.0,
+};
+
+/// A link for choosing a chart's range on its data page, which keeps the series it
+/// was asked for.
+#[derive(Serialize)]
+struct DataRangeLink {
+    href: String,
+    label: &'static str,
+    selected: bool,
+}
+
+/// One chart, larger, for any range, with its numbers under it for anyone who can't
+/// use the chart.
 async fn data(
     State(state): State<AppState>,
     Path((id, name)): Path<(String, String)>,
@@ -542,29 +559,56 @@ async fn data(
         return not_found(&state, &token);
     };
 
+    let result = match &params.series {
+        Some(series) => one_series(&state, &host.id, metric, series, range).await,
+        None => {
+            state
+                .metrics
+                .series(&host.id, metric, range, MAX_SERIES)
+                .await
+        }
+    };
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => return server_error(&error),
+    };
     let zone = viewer_zone();
-    let chart = match &params.series {
-        Some(series) => one_series(&state, &host.id, metric, series, range)
-            .await
-            .map(|result| metric_charts::build(metric, &result, range, zone)),
-        None => chart(&state, &host.id, metric, range, zone).await,
-    };
-    let failed = if metric.name == FAILED_SERVICES {
-        failed_services(&state, &host.id).await
-    } else {
-        Ok(None)
-    };
-    match chart.and_then(|chart| Ok((chart, failed?))) {
-        Ok((chart, failed_services)) => Page::new(&state, &token, "metrics/data.html")
-            .with("host_id", &host.id)
-            .with("hostname", &host.hostname)
-            .with("chart", &chart)
-            .with("failed_services", &failed_services)
-            .with("range", selected)
-            .with("range_label", label)
-            .render(),
-        Err(error) => server_error(&error),
+    let title = &metric.title;
+    let mut chart =
+        metric_charts::build_as(metric, metric.unit, title, DATA_FRAME, &result, range, zone);
+    // What happened to the host is marked on it, as on the host's charts.
+    match state.timeline(&host.id, range.from, range.to).await {
+        Ok(events) => metric_charts::mark(&mut chart, &events, range, zone),
+        Err(error) => return server_error(&error),
     }
+    let failed_services = if metric.name == FAILED_SERVICES {
+        match failed_services(&state, &host.id).await {
+            Ok(failed) => failed,
+            Err(error) => return server_error(&error),
+        }
+    } else {
+        None
+    };
+
+    let path = format!("/hosts/{}/metrics/{}", host.id, metric.name);
+    let series = params.series.as_deref().unwrap_or_default();
+    let ranges: Vec<DataRangeLink> = RANGES
+        .into_iter()
+        .map(|(key, label, _)| DataRangeLink {
+            href: address(&path, &[("range", key), ("series", series)]),
+            label,
+            selected: key == selected,
+        })
+        .collect();
+    Page::new(&state, &token, "metrics/data.html")
+        .with("host_id", &host.id)
+        .with("hostname", &host.hostname)
+        .with("chart", &chart)
+        .with("failed_services", &failed_services)
+        .with("ranges", &ranges)
+        .with("range", selected)
+        .with("range_label", label)
+        .render()
 }
 
 #[cfg(test)]

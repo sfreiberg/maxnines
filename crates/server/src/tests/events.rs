@@ -490,6 +490,13 @@ async fn a_note_from_the_host_page_shows_in_its_events() {
     assert!(shown.body.contains(r#"<circle class="event-dot k-deploy""#));
     assert!(!shown.body.contains("<b>nginx"));
     assert!(shown.has_only_our_scripts());
+
+    // And on a chart's own data page.
+    let data = format!("/hosts/{}/metrics/cpu.usage?range=6h", host.id());
+    let data = browser.get(&server, &data).await;
+    assert!(data.body.contains(r#"<circle class="event-dot k-deploy""#));
+    assert!(data.body.contains("Rolled back &lt;b&gt;nginx&lt;/b&gt;"));
+    assert!(!data.body.contains("<b>nginx"));
 }
 
 #[tokio::test]

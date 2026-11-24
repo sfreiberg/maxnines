@@ -3979,6 +3979,56 @@ async fn a_charts_numbers_can_be_read_as_a_table() {
         page.body
     );
     assert!(page.body.contains("The last 6 hours"), "{}", page.body);
+
+    // The chart is drawn larger above them, which stay folded away until asked for.
+    let chart = page.body.find("<svg class=\"chart\"").expect("a chart");
+    let numbers = page
+        .body
+        .find("<details class=\"numbers\">")
+        .expect("numbers");
+    assert!(chart < numbers, "{}", page.body);
+    assert!(
+        page.body.contains("viewBox=\"0 0 812.0 400.0\""),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("<summary>Show the numbers</summary>"));
+}
+
+#[tokio::test]
+async fn a_charts_data_page_chooses_its_range_and_keeps_its_series() {
+    let server = start_with_metrics().await;
+    let (host, _client) = report_samples(&server, "/data").await;
+    let path = format!("/hosts/{}/metrics/disk.usage", host.id());
+    let mut browser = Browser::default();
+
+    let page = browser.get(&server, &format!("{path}?range=7d")).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    assert_eq!(page.body.matches("class=\"selected\"").count(), 1);
+    let chosen = format!("href=\"{path}?range=7d\" class=\"selected\"");
+    assert!(page.body.contains(&chosen), "{}", page.body);
+    for range in ["1h", "6h", "24h", "30d"] {
+        let link = format!("href=\"{path}?range={range}\"");
+        assert!(page.body.contains(&link), "{range}: {}", page.body);
+    }
+    assert!(page.body.contains("The last 7 days"), "{}", page.body);
+    assert!(
+        page.body.contains("<td class=\"number\">60%</td>"),
+        "{}",
+        page.body
+    );
+
+    // One series stays one series whichever range is chosen.
+    let page = browser
+        .get(&server, &format!("{path}?range=1h&series=%2Fdata"))
+        .await;
+    let link = format!("href=\"{path}?range=24h&amp;series=%2Fdata\"");
+    assert!(page.body.contains(&link), "{}", page.body);
+
+    // Anything else is the shortest.
+    let page = browser.get(&server, &format!("{path}?range=1y")).await;
+    let chosen = format!("href=\"{path}?range=1h\" class=\"selected\"");
+    assert!(page.body.contains(&chosen), "{}", page.body);
 }
 
 #[tokio::test]
