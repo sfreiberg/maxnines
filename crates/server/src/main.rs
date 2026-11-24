@@ -43,6 +43,7 @@ mod passwords;
 mod places;
 mod presence;
 mod proxies;
+mod readings;
 mod registration;
 mod remote_checks;
 mod roles;

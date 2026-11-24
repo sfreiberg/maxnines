@@ -7,7 +7,8 @@ refreshed. It's on for every host, from the built-in **Host** template's setting
 the built-in **Updates** template alerts on what it reads.
 
 Each host is asked every hour, and first within two minutes of the agent starting. The
-host's page shows what was found under **Updates**.
+host's page shows what was found under **Updates**, and the
+[API](api-host-readings.md#get-a-hosts-updates) gives it too.
 
 ## How each system is read
 

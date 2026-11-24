@@ -236,7 +236,8 @@ stopped with an error. Many of Windows' own stop by design once they've done the
 job, and those stop cleanly, so they don't count. macOS and FreeBSD have no such
 state. The host's page lists them by name under **Failed services**, as do the
 **Failed services** chart and its data, or says none have failed. The agent names up
-to 32 of them, and counts the rest.
+to 32 of them, and counts the rest. The [API](api-host-readings.md#get-a-hosts-services) gives
+both these and the watched services.
 
 | Metric | Unit | Series | What it is |
 | --- | --- | --- | --- |

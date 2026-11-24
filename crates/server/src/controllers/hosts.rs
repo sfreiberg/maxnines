@@ -25,6 +25,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::models::ConfigStatus;
 use crate::presence::Reach;
+use crate::readings::{Drive, Drives, FailedServices, Updates};
 use crate::registration::{HostRecord, HostState, Upgrade, short_id};
 use crate::rule_engine::Host;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
@@ -579,15 +580,17 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .as_ref()
         .and_then(|agent| agent["memory_bytes"].as_f64());
     let own_uptime = own.as_ref().and_then(uptime_of);
-    let (drives, drives_problem) = match state.metrics.latest_output(&id, "smart", now).await {
-        Ok(output) => drives_of(output.as_ref()),
+    let drives = match Drives::load(&state.metrics, &id, now).await {
+        Ok(drives) => drives,
         Err(error) => return server_error(&error),
     };
-    let updates = match state.metrics.latest_output(&id, "updates", now).await {
-        Ok(output) => output.as_ref().and_then(updates_of),
+    let drives_problem = drives.problem.clone();
+    let drives: Vec<DriveRow> = drives.drives.iter().map(DriveRow::of).collect();
+    let updates = match Updates::load(&state.metrics, &id, now).await {
+        Ok(updates) => updates.map(UpdatesCard::of),
         Err(error) => return server_error(&error),
     };
-    let failed_services = match super::metrics::failed_services(&state, &id).await {
+    let failed_services = match FailedServices::load(&state.metrics, &id, now).await {
         Ok(failed) => failed,
         Err(error) => return server_error(&error),
     };
@@ -703,38 +706,26 @@ struct DriveRow {
     note: Option<String>,
 }
 
-/// Each drive the smart collector last read, and why it couldn't read any.
-fn drives_of(output: Option<&Value>) -> (Vec<DriveRow>, Option<String>) {
-    let mut drives = Vec::new();
-    let mut problem = None;
-    for item in output.and_then(Value::as_array).into_iter().flatten() {
-        if let Some(said) = item["problem"].as_str() {
-            problem = Some(said.to_string());
-            continue;
-        }
-        let asleep = item["asleep"].as_f64().is_some_and(|asleep| asleep >= 1.0);
-        let note = match item["note"].as_str() {
-            _ if asleep => Some("Asleep, so not asked. This is what it last said.".to_string()),
-            Some(note) if !note.is_empty() => Some(note.to_string()),
-            _ => None,
+impl DriveRow {
+    fn of(drive: &Drive) -> Self {
+        let note = if drive.asleep {
+            Some("Asleep, so not asked. This is what it last said.".to_string())
+        } else {
+            drive.note.clone()
         };
-        // A drive smartctl couldn't read is named by its device alone.
-        let named = item["model"].is_string() || item["serial"].is_string();
-        drives.push(DriveRow {
-            name: item["name"].as_str().filter(|_| named).map(str::to_string),
-            device: item["device"].as_str().unwrap_or_default().to_string(),
-            healthy: item["healthy"].as_f64().map(|healthy| healthy >= 1.0),
-            temperature: item["temperature_celsius"]
-                .as_f64()
+        Self {
+            name: drive.name.clone(),
+            device: drive.device.clone(),
+            healthy: drive.healthy,
+            temperature: drive
+                .temperature_celsius
                 .map(|celsius| format_value(Unit::Celsius, celsius)),
             note,
-        });
+        }
     }
-    (drives, problem)
 }
 
-/// Whether a host is up to date, from the updates collector's newest reading, in
-/// words for its page.
+/// Whether a host is up to date, in words for its page.
 #[derive(Debug, PartialEq, Serialize)]
 struct UpdatesCard {
     /// What was asked, such as apt.
@@ -751,45 +742,26 @@ struct UpdatesCard {
     note: Option<String>,
 }
 
-fn updates_of(output: &Value) -> Option<UpdatesCard> {
-    if !output.is_object() {
-        return None;
+impl UpdatesCard {
+    fn of(updates: Updates) -> Self {
+        let waiting = updates.pending.map(|pending| match updates.security {
+            Some(security) => format!("{pending}, {security} for security"),
+            None => pending.to_string(),
+        });
+        Self {
+            manager: updates.manager,
+            waiting,
+            vulnerable: updates.vulnerable.map(|count| format!("{count} packages")),
+            reboot: updates
+                .reboot_required
+                .map(|reboot| if reboot { "Yes" } else { "No" }),
+            lists_age: updates
+                .lists_age_secs
+                .map(|secs| format_value(Unit::Seconds, secs as f64)),
+            problem: updates.problem,
+            note: updates.note,
+        }
     }
-    let text = |name: &str| {
-        output[name]
-            .as_str()
-            .filter(|text| !text.is_empty())
-            .map(str::to_string)
-    };
-    // The store keeps each number's newest value, so after a problem the numbers
-    // it last read are still there, and aren't what's true now.
-    let problem = text("problem");
-    let fresh = problem.is_none();
-    let count = |name: &str| {
-        output[name]
-            .as_f64()
-            .filter(|_| fresh)
-            .map(|count| count as u64)
-    };
-    let waiting = count("pending").map(|pending| match count("security") {
-        Some(security) => format!("{pending}, {security} for security"),
-        None => pending.to_string(),
-    });
-    Some(UpdatesCard {
-        manager: text("manager"),
-        waiting,
-        vulnerable: count("vulnerable").map(|count| format!("{count} packages")),
-        reboot: output["reboot_required"]
-            .as_f64()
-            .filter(|_| fresh)
-            .map(|reboot| if reboot >= 1.0 { "Yes" } else { "No" }),
-        lists_age: output["lists_age_secs"]
-            .as_f64()
-            .filter(|_| fresh)
-            .map(|secs| format_value(Unit::Seconds, secs)),
-        problem,
-        note: text("note"),
-    })
 }
 
 /// How long maintenance can be started for from a host's page, with what the page

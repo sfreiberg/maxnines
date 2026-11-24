@@ -266,6 +266,78 @@ async fn what_a_responder_does_over_mcp_is_recorded_as_theirs() {
 }
 
 #[tokio::test]
+async fn get_host_says_which_drives_pass_and_which_services_failed() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "nas-1").await;
+    let id = host.id();
+    let readings = BTreeMap::from([
+        (
+            "smart".to_string(),
+            json!([
+                { "name": "WDC WD40EFRX WD-1", "device": "/dev/sda", "model": "WDC WD40EFRX",
+                  "healthy": 0, "temperature_celsius": 38.0, "asleep": 0, "note": "" },
+            ]),
+        ),
+        (
+            "updates".to_string(),
+            json!({ "manager": "apt", "pending": 4, "security": 1, "reboot_required": 0,
+                    "lists_age_secs": 600, "problem": "", "note": "" }),
+        ),
+        (
+            "services".to_string(),
+            json!([{ "name": "nginx.service", "running": 0, "state": "failed" }]),
+        ),
+        (
+            "system".to_string(),
+            json!({ "processes": 90, "failed_services": 1,
+                    "failed_service_names": "nginx.service" }),
+        ),
+    ]);
+    let sample = Sample {
+        time: crate::times::now(),
+        metrics: readings,
+    };
+    send(&mut client, &AgentMessage::Sample(sample)).await;
+    let key = key_with(&server, Role::Viewer).await;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let host = loop {
+        let result = call_tool(&server, &key, "get_host", json!({ "host_id": id })).await;
+        assert_ne!(result["isError"], true, "{result}");
+        let host = result["structuredContent"].clone();
+        if host["services"]["failed"].is_object() && host["drives"]["total"] == 1 {
+            break host;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sample never arrived: {host}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    assert_eq!(host["drives"]["drives"][0]["healthy"], false, "{host}");
+    assert_eq!(host["drives"]["drives"][0]["device"], "/dev/sda", "{host}");
+    assert_eq!(host["drives"]["problem"], Value::Null, "{host}");
+    assert_eq!(host["drives"]["cut_short"], false, "{host}");
+    assert_eq!(host["updates"]["pending"], 4, "{host}");
+    assert_eq!(host["updates"]["reboot_required"], false, "{host}");
+    assert_eq!(
+        host["services"]["watched"][0],
+        json!({ "name": "nginx.service", "running": false, "state": "failed" }),
+        "{host}"
+    );
+    assert_eq!(
+        host["services"]["failed"]["names"],
+        json!(["nginx.service"]),
+        "{host}"
+    );
+    assert_eq!(host["host"]["hostname"], "nas-1", "{host}");
+    assert!(host["facts"].is_object(), "{host}");
+}
+
+#[tokio::test]
 async fn every_read_tool_answers() {
     let server = start().await;
     let host = host_without_agent(&server, "db-1.example.com").await;
@@ -292,6 +364,13 @@ async fn every_read_tool_answers() {
         assert_ne!(result["isError"], true, "{name}: {result}");
         assert!(result["structuredContent"].is_object(), "{name}: {result}");
     }
+
+    // A host that hasn't read anything has nothing to say about them.
+    let result = call_tool(&server, &key, "get_host", json!({ "host_id": host })).await;
+    let shown = &result["structuredContent"];
+    assert_eq!(shown["drives"]["total"], 0, "{shown}");
+    assert_eq!(shown["updates"], Value::Null, "{shown}");
+    assert_eq!(shown["services"]["failed"], Value::Null, "{shown}");
 
     let result = call_tool(&server, &key, "list_metrics", json!({ "search": "cpu" })).await;
     let metrics = &result["structuredContent"]["metrics"];

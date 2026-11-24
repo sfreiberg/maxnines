@@ -1641,6 +1641,9 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
     for path in [
         format!("/api/v1/hosts/{id}/facts"),
         format!("/api/v1/hosts/{id}/facts/history"),
+        format!("/api/v1/hosts/{id}/drives"),
+        format!("/api/v1/hosts/{id}/updates"),
+        format!("/api/v1/hosts/{id}/services"),
     ] {
         let response = server.http("GET", &path, None).await;
         assert!(response.starts_with("HTTP/1.1 401"), "{response}");
@@ -1648,6 +1651,9 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
     for path in [
         "/api/v1/hosts/nope/facts",
         "/api/v1/hosts/nope/facts/history",
+        "/api/v1/hosts/nope/drives",
+        "/api/v1/hosts/nope/updates",
+        "/api/v1/hosts/nope/services",
     ] {
         let response = server.http("GET", path, Some(&server.api_key)).await;
         assert!(response.starts_with("HTTP/1.1 404"), "{response}");
@@ -3651,6 +3657,20 @@ async fn watched_services_are_listed_with_what_their_service_manager_says() {
         );
     }
     assert!(!page.contains(r#"<span class="note">active</span>"#));
+
+    // The API says the same.
+    let path = format!("/api/v1/hosts/{}/services", host.id());
+    let services = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(
+        services["watched"],
+        json!([
+            { "name": "sshd.service", "running": true, "state": null },
+            { "name": "nginx.service", "running": false, "state": "failed" },
+            { "name": "ngnix.service", "running": false, "state": "not found" },
+        ]),
+        "{services}"
+    );
+    assert_eq!(services["failed"], Value::Null, "{services}");
 }
 
 #[tokio::test]
@@ -4649,6 +4669,26 @@ async fn each_drive_gets_series_by_model_and_serial_and_the_host_page_lists_them
     assert!(page.body.contains("Unknown USB bridge"));
     assert!(page.body.contains("Asleep, so not asked"));
 
+    // The API gives the same drives, as they were read.
+    let path = format!("/api/v1/hosts/{id}/drives");
+    let drives = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(drives["problem"], Value::Null, "{drives}");
+    assert_eq!(
+        drives["drives"][0],
+        json!({
+            "name": "WDC WD40EFRX WD-WCC7K1", "device": "/dev/sda", "healthy": false,
+            "temperature_celsius": 38.0, "asleep": false, "note": null,
+        }),
+        "{drives}"
+    );
+    assert_eq!(drives["drives"][1]["healthy"], true, "{drives}");
+    assert_eq!(drives["drives"][2]["name"], Value::Null, "{drives}");
+    assert_eq!(drives["drives"][2]["asleep"], true, "{drives}");
+    assert_eq!(
+        drives["drives"][3]["note"], "Unknown USB bridge",
+        "{drives}"
+    );
+
     // smartctl missing leaves nothing but what to do about it.
     let rows = json!([{
         "name": "smartctl",
@@ -4665,6 +4705,15 @@ async fn each_drive_gets_series_by_model_and_serial_and_the_host_page_lists_them
         let page = browser.get(&server, &format!("/hosts/{id}")).await;
         if page.body.contains("brew install smartmontools") {
             assert!(!page.body.contains("Unknown USB bridge"), "{}", page.body);
+            let path = format!("/api/v1/hosts/{id}/drives");
+            let drives = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+            assert!(
+                drives["problem"]
+                    .as_str()
+                    .is_some_and(|problem| problem.contains("brew install smartmontools")),
+                "{drives}"
+            );
+            assert_eq!(drives["drives"], json!([]), "{drives}");
             break;
         }
         assert!(Instant::now() < deadline, "{}", page.body);
@@ -4721,6 +4770,16 @@ async fn a_hosts_updates_are_metrics_and_its_page_says_what_is_waiting() {
     assert!(page.body.contains("Refreshed 2 h ago"), "{}", page.body);
     assert!(page.body.contains("Read with apt every hour"));
 
+    let path = format!("/api/v1/hosts/{id}/updates");
+    let updates = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(
+        updates,
+        json!({
+            "manager": "apt", "pending": 12, "security": 3, "vulnerable": null,
+            "reboot_required": true, "lists_age_secs": 7200, "problem": null, "note": null,
+        })
+    );
+
     // checkupdates missing leaves nothing but what to do about it.
     let row = json!({
         "manager": "pacman",
@@ -4737,6 +4796,11 @@ async fn a_hosts_updates_are_metrics_and_its_page_says_what_is_waiting() {
         let page = browser.get(&server, &format!("/hosts/{id}")).await;
         if page.body.contains("pacman -S pacman-contrib") {
             assert!(!page.body.contains("3 for security"), "{}", page.body);
+            let path = format!("/api/v1/hosts/{id}/updates");
+            let updates = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+            assert_eq!(updates["manager"], "pacman", "{updates}");
+            assert_eq!(updates["pending"], Value::Null, "{updates}");
+            assert_eq!(updates["security"], Value::Null, "{updates}");
             break;
         }
         assert!(Instant::now() < deadline, "{}", page.body);
@@ -4785,6 +4849,14 @@ async fn a_hosts_failed_services_are_named_wherever_they_are_counted() {
         );
     };
     named(&page.body);
+    let api = format!("/api/v1/hosts/{id}/services");
+    let services = json_body(&server.http("GET", &api, Some(&server.api_key)).await);
+    assert_eq!(
+        services["failed"],
+        json!({ "count": 2, "names": ["Spooler", "WSearch"], "unnamed": 0 }),
+        "{services}"
+    );
+    assert_eq!(services["watched"], json!([]), "{services}");
 
     // Its chart and the chart's numbers say which they are too.
     let metrics = browser.get(&server, &format!("/hosts/{id}/metrics")).await;

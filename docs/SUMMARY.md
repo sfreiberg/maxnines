@@ -38,6 +38,7 @@
 - [MCP server](mcp.md)
 - [API](api.md)
   - [Hosts](api-hosts.md)
+  - [Host readings](api-host-readings.md)
   - [Metrics pages](api-metrics-pages.md)
   - [Filters](api-filters.md)
   - [Metrics](api-metrics.md)

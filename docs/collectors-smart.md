@@ -32,7 +32,8 @@ brew install smartmontools         # macOS
 
 The agent's Linux packages recommend smartmontools, so `apt` and `dnf` install it with
 the agent unless told not to. On a host without it, or with an older one, the host's
-page says so under **Drives**, with how to install it, and no drive is read.
+page says so under **Drives**, with how to install it, and no drive is read. The
+[API](api-host-readings.md#get-a-hosts-drives) gives the same.
 
 ### Root
 

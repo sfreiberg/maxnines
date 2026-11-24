@@ -38,6 +38,7 @@ use crate::models::User;
 use crate::models::{ConfigStatus, MAX_TIMELINE, RuleInput, UserChange, check_new_user, is_theme};
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
+use crate::readings::{Drives, FailedServices, Updates, WatchedService};
 use crate::registration::{HostRecord, HostState, Upgrade};
 use crate::remote_checks::{LatestResults, RemoteCheck, RemoteCheckInput, SignInWith};
 use crate::roles::Role;
@@ -105,6 +106,9 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/hosts/{id}/facts", get(facts))
         .route("/hosts/{id}/facts/history", get(facts_history))
         .route("/hosts/{id}/config", get(agent_config))
+        .route("/hosts/{id}/drives", get(host_drives))
+        .route("/hosts/{id}/updates", get(host_updates))
+        .route("/hosts/{id}/services", get(host_services))
         .route("/hosts/{id}/metrics/{metric}", get(host_metric))
         .route("/metrics", get(metric_catalog))
         .route("/metrics/current", get(current_metrics))
@@ -900,6 +904,54 @@ async fn agent_config(State(state): State<AppState>, UrlPath(id): UrlPath<String
     };
     match state.database.config_status(&id).await {
         Ok(reported) => Json(AgentConfigView { desired, reported }).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Each drive a host's SMART collector last read, and why it couldn't read any, as
+/// the host's page shows them.
+async fn host_drives(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match Drives::load(&state.metrics, &id, times::now()).await {
+        Ok(drives) => Json(drives).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Whether a host is up to date, as its page shows it, or null if it hasn't said.
+async fn host_updates(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match Updates::load(&state.metrics, &id, times::now()).await {
+        Ok(updates) => Json(updates).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// A host's services as its pages show them.
+#[derive(Serialize)]
+struct ServicesView {
+    /// Those it's been set to watch, as its service manager last described them.
+    watched: Vec<WatchedService>,
+    /// Those that stopped with an error, on a system that counts them.
+    failed: Option<FailedServices>,
+}
+
+async fn host_services(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let now = times::now();
+    let services = async {
+        let watched = WatchedService::load(&state.metrics, &id, now).await?;
+        let failed = FailedServices::load(&state.metrics, &id, now).await?;
+        anyhow::Ok(ServicesView { watched, failed })
+    };
+    match services.await {
+        Ok(services) => Json(services).into_response(),
         Err(error) => server_error(&error),
     }
 }

@@ -251,8 +251,11 @@ static TOOLS: [Spec; 14] = [
     Spec {
         name: "get_host",
         title: "Get a host",
-        description: "One host: whether it's online, its health, and the facts its agent \
-            reports, such as its operating system, hardware, addresses and disks.",
+        description: "One host: whether it's online, its health, the facts its agent \
+            reports, such as its operating system, hardware, addresses and disks, and what \
+            its newest readings say: whether each drive passes its own SMART check, the \
+            updates waiting and whether it needs a reboot, the services it watches and \
+            whether they're running, and the services that failed.",
         args: &[HOST_ID],
         method: Method::GET,
         route: "/hosts/{id}",
@@ -780,7 +783,26 @@ impl Call {
                 let facts = self
                     .get(&format!("/hosts/{}/facts", host()), NO_HOST)
                     .await?;
-                Ok(json!({ "host": shown, "facts": facts }))
+                let mut drives = self
+                    .get(&format!("/hosts/{}/drives", host()), NO_HOST)
+                    .await?;
+                let updates = self
+                    .get(&format!("/hosts/{}/updates", host()), NO_HOST)
+                    .await?;
+                let mut services = self
+                    .get(&format!("/hosts/{}/services", host()), NO_HOST)
+                    .await?;
+                let mut drives_listed = rows("drives", drives["drives"].take(), MAX_ROWS);
+                drives_listed["problem"] = drives["problem"].take();
+                let mut watched = rows("watched", services["watched"].take(), MAX_ROWS);
+                watched["failed"] = services["failed"].take();
+                Ok(json!({
+                    "host": shown,
+                    "facts": facts,
+                    "drives": drives_listed,
+                    "updates": updates,
+                    "services": watched,
+                }))
             }
             "list_alerts" => {
                 let mut alerts = self.get("/alerts", "").await?;
