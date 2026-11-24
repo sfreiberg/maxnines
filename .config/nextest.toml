@@ -1,0 +1,33 @@
+# Which tests CI runs on every pull request, and which wait for a release.
+#
+# Unit tests run in the test's own process and touch nothing outside it: no server
+# started, no socket, fake server or real database, no child process and no waiting.
+# CI runs only these, with `cargo nextest run --workspace --profile unit`.
+#
+# Everything else is an integration test, run with the whole suite (`cargo test
+# --workspace`) before every release and by hand from the CI workflow's Run
+# workflow button. A test is an integration test when it's:
+#
+# - in a crate's top-level tests module (src/tests.rs, src/tests/ or a `mod tests`
+#   in main.rs or lib.rs), where end-to-end tests go;
+# - in a tests/ folder;
+# - in one of the modules listed below, whose own tests open sockets, start
+#   programs or read real databases.
+#
+# A module's own tests are unit tests unless their module is listed here. If one
+# of them needs a socket, a program or a wait, list its module, or put the test in
+# the crate's tests module.
+
+[profile.unit]
+fail-fast = false
+default-filter = '''
+not (
+    kind(test)
+    | test(/^tests::/)
+    | (package(=maxnines-agent) & test(/^(websocket|checks|background|status_pages|openmetrics|connections|spool|actions|builtin_actions|commands|custom)::/))
+    | (package(=maxnines-checks) & test(/^(sign_in|ftp|mail|memcached|unifi|rdap|ping|templates::privileges|templates::reader|databases)::/))
+    | (package(=maxnines-cli) & test(/^signin::/))
+    | (package(=maxnines-collectors) & test(/^(host|tcp)::/))
+    | (package(=maxnines-server) & test(/^(store|models|tls|config|csrf)::/))
+)
+'''

@@ -1,11 +1,12 @@
-# Checks formatting, runs clippy and runs every test, on each system the agent
-# and server are built for. Much of the agent only compiles on one system, so each
+# Checks formatting, runs clippy and runs the tests, on each system the agent and
+# server are built for. Much of the agent only compiles on one system, so each
 # gets its own clippy and tests.
 #
-# It runs for pull requests, for pushes to main, and by hand from the Actions tab.
-# A branch's commits are checked through its pull request, so each runs once. The
-# release workflow runs this too, for the tagged commit, and publishes nothing
-# unless it passes.
+# Pull requests and pushes to main run only the unit tests, which take seconds;
+# .config/nextest.toml says which tests those are. The whole suite, integration
+# tests included, runs when the release workflow calls this for a tagged commit,
+# which publishes nothing unless it passes, and when it's run by hand from the
+# Actions tab, which runs the whole suite unless told not to.
 name: CI
 
 on:
@@ -13,7 +14,17 @@ on:
   push:
     branches: [main]
   workflow_call:
+    inputs:
+      all-tests:
+        description: Run the integration tests too, not just the unit tests
+        type: boolean
+        default: true
   workflow_dispatch:
+    inputs:
+      all-tests:
+        description: Run the integration tests too, not just the unit tests
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -59,8 +70,18 @@ jobs:
           workspaces: ". -> target.nosync"
           cache-on-failure: true
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      # Every crate's tests run, so one run shows every failure.
-      - run: cargo test --workspace --locked --no-fail-fast
+      # Every crate's tests run, so one run shows every failure. A pull request or
+      # push runs no inputs, so it gets the unit tests alone.
+      - if: ${{ !inputs.all-tests }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - name: Unit tests
+        if: ${{ !inputs.all-tests }}
+        run: cargo nextest run --workspace --locked --profile unit
+      - name: All tests
+        if: ${{ inputs.all-tests }}
+        run: cargo test --workspace --locked --no-fail-fast
       # Windows only runs a program whose DLLs it can find. These are on every
       # Windows machine, so anything else, such as the Visual C++ runtime, means the
       # programs won't start where it isn't installed.
