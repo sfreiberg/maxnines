@@ -1,0 +1,3 @@
+# Captured program output is compared byte for byte, so checkouts must never change
+# its line endings, as Windows ones otherwise do.
+crates/agent/fixtures/** -text
