@@ -3,10 +3,11 @@
 //! wearing out.
 //!
 //! On Linux, macOS and FreeBSD it's read with smartctl, from smartmontools 7.0 or
-//! later, which prints JSON and knows how thousands of drive models report. smartctl
-//! needs root to open drives, so an agent that gave root up asks for it through
-//! `sudo -n`, under a sudoers rule root wrote, as actions do. The helper that keeps
-//! root never starts a program, so it isn't asked.
+//! later, which prints JSON and knows how thousands of drive models report. On Linux
+//! and FreeBSD smartctl needs root to open drives, so an agent that gave root up asks
+//! for it through `sudo -n`, under a sudoers rule root wrote, as actions do. The
+//! helper that keeps root never starts a program, so it isn't asked. macOS lets any
+//! user read a drive's SMART health, so there it's run as the agent's own user.
 //!
 //! On Windows it's read from Windows' own storage counters, with nothing to install.
 //!
@@ -162,8 +163,12 @@ mod smartctl {
     /// Where each system's packages put smartctl.
     #[cfg(target_os = "linux")]
     const PLACES: &[&str] = &["/usr/sbin/smartctl", "/usr/local/sbin/smartctl"];
+    /// Homebrew's, on Apple silicon and on Intel Macs.
     #[cfg(target_os = "macos")]
-    const PLACES: &[&str] = &["/opt/homebrew/sbin/smartctl", "/usr/local/sbin/smartctl"];
+    const PLACES: &[&str] = &["/opt/homebrew/bin/smartctl", "/usr/local/bin/smartctl"];
+
+    /// Whether opening drives takes root, which macOS doesn't ask of SMART.
+    const NEEDS_ROOT: bool = !cfg!(target_os = "macos");
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     const PLACES: &[&str] = &["/usr/local/sbin/smartctl", "/usr/sbin/smartctl"];
 
@@ -198,10 +203,11 @@ mod smartctl {
             },
         }
 
-        // Root reads drives itself; anyone else asks sudo, never for a password.
-        let root = nix::unistd::geteuid().is_root();
-        let sudo = if root { None } else { first_of(SUDO) };
-        if !root && sudo.is_none() {
+        // Root, or anyone on macOS, reads drives itself; anyone else asks sudo, never
+        // for a password.
+        let itself = !NEEDS_ROOT || nix::unistd::geteuid().is_root();
+        let sudo = if itself { None } else { first_of(SUDO) };
+        if !itself && sudo.is_none() {
             return Round::Problem(needs_root(smartctl, "sudo isn't installed, so"));
         }
         let ask = move |arguments: Vec<String>| async move {
@@ -718,6 +724,21 @@ mod tests {
         assert_eq!(row["critical_warning"], 0.0);
         assert_eq!(row["temperature_celsius"], 41.0);
         assert!(row.get("reallocated").is_none());
+    }
+
+    /// What smartctl 7.5 from Homebrew printed for a Mac's own SSD, run as an
+    /// ordinary user, with its serial number replaced: it exits 4, as the SSD
+    /// doesn't give its error log, but everything else is there.
+    #[test]
+    fn a_macs_own_ssd_is_read_without_root() {
+        let json = include_bytes!("../fixtures/smart/macos-apple-ssd.json");
+        let row = row(parse_drive("disk0", json));
+        assert_eq!(row["name"], "APPLE SSD AP1024Z 0ba0000000000001");
+        assert_eq!(row["healthy"], 1);
+        assert_eq!(row["used_percent"], 6.0);
+        assert_eq!(row["media_errors"], 0.0);
+        assert_eq!(row["unsafe_shutdowns"], 11.0);
+        assert_eq!(row["temperature_celsius"], 36.0);
     }
 
     #[test]

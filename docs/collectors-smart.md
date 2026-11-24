@@ -14,7 +14,7 @@ page says it's asleep.
 | System | Reads with | Needs |
 | --- | --- | --- |
 | Linux | `smartctl` | smartmontools 7.0 or later, and root |
-| macOS | `smartctl` | smartmontools 7.0 or later, and root |
+| macOS | `smartctl` | smartmontools 7.0 or later, from Homebrew |
 | FreeBSD | `smartctl` | smartmontools 7.0 or later, and root |
 | Windows | Windows' own storage counters | Nothing to install |
 
@@ -36,7 +36,7 @@ page says so under **Drives**, with how to install it, and no drive is read.
 
 ### Root
 
-smartctl needs root to open drives. An agent started as root [gives that
+On Linux and FreeBSD, smartctl needs root to open drives. An agent started as root [gives that
 up](agents.md#running-as-root-and-giving-it-up) and runs as the `maxnines` user, so it asks for
 root through `sudo -n`, as [actions](agents.md#actions-that-need-root) do, and never for a password.
 Until sudo allows it, the host's page says so under **Drives**, with the rule to add.
@@ -47,8 +47,8 @@ Allow exactly the two ways the agent runs smartctl, with a rule in a file such a
 maxnines ALL=(root) NOPASSWD: /usr/sbin/smartctl --scan-open -j, /usr/sbin/smartctl -j -a -n standby -d *
 ```
 
-smartctl is in `/usr/sbin` on Linux, `/usr/local/sbin` on FreeBSD and Intel Macs, and
-`/opt/homebrew/sbin` on Apple silicon Macs, where it's looked for in that order. The
+smartctl is in `/usr/sbin` on Linux and `/usr/local/sbin` on FreeBSD, where it's
+looked for first. The
 `*` lets the agent name the drive, and sudo lets anything follow it, so the agent's
 user could ask smartctl for more than a reading, such as starting a self-test or
 changing a drive's settings. That's no more than the agent's user can do with any rule
@@ -56,6 +56,11 @@ that runs smartctl as root.
 
 An agent that runs as root, such as one started as root on a host with no `maxnines`
 user, runs smartctl itself, with no rule.
+
+macOS lets any user read a drive's SMART health, so there the agent runs smartctl as
+its own user, with no sudo and no rule. It looks for Homebrew's, in `/opt/homebrew/bin`
+on Apple silicon Macs and `/usr/local/bin` on Intel Macs. A Mac's own SSD doesn't give
+its error log, but everything else is read.
 
 ### Windows
 
