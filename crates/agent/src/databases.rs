@@ -1,29 +1,19 @@
-//! The databases collector: health, load and replication read from databases
-//! the agent's own config defines. How each kind is read is in
-//! [`maxnines_checks::databases`], which the server shares. A kind that's read only
-//! by templates, such as PostgreSQL, is left to them, as [`crate::templates`] reads
-//! every database the config defines whether a rule picks it or not.
+//! The databases the agent's own config defines, which the built-in templates read,
+//! as [`crate::templates`] does for every database the config defines. How each
+//! kind is read is in [`maxnines_checks::templates`], which the server shares.
 //!
-//! A `database` block holds where a database is and how to sign in, and a config
-//! rule picks which to read by name, and what extras to read from each. So a
-//! login never comes from the server, never goes to it, and is only ever sent to
-//! the address beside it.
+//! A `database` block holds where a database is and how to sign in, so a login
+//! never comes from the server, never goes to it, and is only ever sent to the
+//! address beside it.
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{Database, Reader, Settle, TIMEOUT, by_kind, is_database};
-use maxnines_protocol::{Check, CheckKind, DatabaseChoice, is_page_name};
+use maxnines_checks::databases::{Database, is_database};
+use maxnines_protocol::{Check, CheckKind, is_page_name};
 use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::sync::Mutex;
-
-use crate::background::Background;
-use crate::collector::Collector;
 
 /// How many databases the agent's config can define.
 const MAX_DEFINED: usize = 64;
@@ -125,84 +115,8 @@ pub fn check_database_definitions(definitions: &DatabaseDefinitions) -> Result<(
     Ok(())
 }
 
-pub struct DatabaseCollector {
-    background: Background,
-}
-
-impl DatabaseCollector {
-    pub fn new(
-        chosen: &[DatabaseChoice],
-        definitions: &DatabaseDefinitions,
-        interval: Duration,
-    ) -> Result<Self> {
-        let mut background = Background::new();
-        let limit = interval.min(TIMEOUT);
-        for choice in chosen {
-            let name = &choice.name;
-            let found = definitions
-                .get(name)
-                .context("the agent's config has no database by that name")
-                .and_then(|definition| definition.database(name));
-            match found {
-                Ok(database) => {
-                    // Templates read it, and nothing here can.
-                    let Some(reader) = Reader::new(name, database, &choice.extras) else {
-                        continue;
-                    };
-                    // Rounds never overlap, so it keeps its connection between them.
-                    let reader = Arc::new(Mutex::new(reader));
-                    // Its running totals become changes as it's read.
-                    let mut settle = Settle::default();
-                    background.repeat(
-                        interval,
-                        None,
-                        move || {
-                            let reader = reader.clone();
-                            async move { reader.lock().await.read(limit).await }
-                        },
-                        move |rows| Value::Array(settle.settle(rows.unwrap_or_default())),
-                    )?;
-                }
-                Err(error) => {
-                    // Under its kind, if it says a real one.
-                    let kind = definitions
-                        .get(name)
-                        .and_then(|definition| CheckKind::parse(&definition.kind))
-                        .filter(|kind| is_database(*kind))
-                        .map(CheckKind::as_str);
-                    // Says so with every sample.
-                    background.constant(json!({
-                        "name": name,
-                        "kind": kind,
-                        "up": 0,
-                        "error": format!("{error:#}"),
-                    }));
-                }
-            }
-        }
-        Ok(Self { background })
-    }
-}
-
-impl Collector for DatabaseCollector {
-    fn name(&self) -> &'static str {
-        "databases"
-    }
-
-    fn collect(&mut self) -> Result<Value> {
-        Ok(match self.background.rows() {
-            Value::Array(rows) => by_kind(rows),
-            // Nothing has been read yet.
-            waiting => waiting,
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::thread;
-    use std::time::Instant;
-
     use super::*;
 
     fn defined(kind: &str, target: &str) -> DatabaseDefinition {
@@ -261,40 +175,5 @@ mod tests {
             assert!(error.contains(why), "{name}: {error}");
         }
         assert!(!format!("{:?}", defined("postgres", "a:1")).contains("s3cret"));
-    }
-
-    #[test]
-    fn a_rule_reads_the_databases_the_config_defines_and_only_those() {
-        let definitions = DatabaseDefinitions::from([
-            ("orders".to_string(), defined("mongodb", "127.0.0.1:0")),
-            // Never connected to here, as only their templates read them.
-            ("ledger".to_string(), defined("postgres", "127.0.0.1:1")),
-            ("shop".to_string(), defined("mysql", "127.0.0.1:1")),
-        ]);
-        let chosen = ["orders", "ledger", "shop", "nowhere"].map(|name| DatabaseChoice {
-            name: name.to_string(),
-            extras: Vec::new(),
-        });
-        let mut collector =
-            DatabaseCollector::new(&chosen, &definitions, Duration::from_millis(100)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let output = loop {
-            let output = collector.collect().unwrap();
-            if output["mongodb"].is_array() {
-                break output;
-            }
-            assert!(Instant::now() < deadline, "no rows");
-            thread::sleep(Duration::from_millis(10));
-        };
-        // Each under its kind, so its values are its kind's own.
-        assert_eq!(output["mongodb"][0]["name"], "orders");
-        assert_eq!(output["mongodb"][0]["up"], 0, "{output}");
-        assert_eq!(
-            output["unknown"][0],
-            json!({ "name": "nowhere", "up": 0, "error": "the agent's config has no database by that name" })
-        );
-        // PostgreSQL and MySQL are their templates' to read.
-        assert!(output.get("postgres").is_none(), "{output}");
-        assert!(output.get("mysql").is_none(), "{output}");
     }
 }

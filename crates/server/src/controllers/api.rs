@@ -2049,8 +2049,6 @@ struct RemoteCheckView {
     grace_secs: Option<u64>,
     enabled: bool,
     read_stats: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    extras: Vec<String>,
     /// How it signs in: `none`, `password` or `key`.
     sign_in: SignInWith,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2095,7 +2093,6 @@ impl RemoteCheckView {
             grace_secs: input.grace.map(|grace| grace.as_secs()),
             enabled: input.enabled,
             read_stats: input.read_stats,
-            extras: input.extras,
             sign_in: sign_in.with(),
             has_password: sign_in.password.is_some(),
             has_private_key: sign_in.private_key.is_some(),

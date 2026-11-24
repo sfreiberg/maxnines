@@ -2549,7 +2549,6 @@ mod tests {
             interval: std::time::Duration::from_secs(60),
             enabled: true,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: Default::default(),
             grace: None,
         };

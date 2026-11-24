@@ -153,42 +153,6 @@ fn command_row(item: &Value) -> Option<CommandRow> {
     })
 }
 
-/// A database's latest state, from its own row. Rows for what it has several
-/// of, such as standbys, are charted instead.
-#[derive(Serialize)]
-struct DatabaseRow {
-    name: String,
-    up: bool,
-    role: Option<String>,
-    version: Option<String>,
-    /// Why it couldn't be read, or what of it couldn't be.
-    note: Option<String>,
-}
-
-/// Each value is stored under the database's kind, such as `mysql.up`, so the
-/// kind comes from whichever says whether it's up. A database the agent doesn't
-/// have is under `unknown`.
-fn database_row(item: &Value) -> Option<DatabaseRow> {
-    let fields = item.as_object()?;
-    let (kind, up) = fields
-        .iter()
-        .find_map(|(key, value)| Some((key.strip_suffix(".up")?, value.as_u64()?)))?;
-    let text = |key: &str| {
-        fields
-            .get(&format!("{kind}.{key}"))?
-            .as_str()
-            .map(String::from)
-    };
-    Some(DatabaseRow {
-        name: item["name"].as_str()?.to_string(),
-        up: up == 1,
-        role: text("role"),
-        version: text("version"),
-        note: text("error")
-            .or_else(|| text("missing").map(|missing| format!("Couldn't read {missing}"))),
-    })
-}
-
 fn custom_row(metric: &Value) -> Option<CustomRow> {
     Some(CustomRow {
         name: metric["name"].as_str()?.to_string(),
@@ -477,14 +441,6 @@ async fn show(
     };
     let latest = state
         .metrics
-        .latest_output(&host.id, "databases", times::now());
-    let databases: Vec<DatabaseRow> = match latest.await {
-        Ok(Some(Value::Array(items))) => items.iter().filter_map(database_row).collect(),
-        Ok(_) => Vec::new(),
-        Err(error) => return server_error(&error),
-    };
-    let latest = state
-        .metrics
         .latest_output(&host.id, "services", times::now());
     let services: Vec<ServiceRow> = match latest.await {
         Ok(Some(Value::Array(items))) => items.iter().filter_map(service_row).collect(),
@@ -496,7 +452,6 @@ async fn show(
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
         .with("commands", &commands)
-        .with("databases", &databases)
         .with("counters", &counters)
         .with("services", &services)
         .with("is_local", &host.is_local())

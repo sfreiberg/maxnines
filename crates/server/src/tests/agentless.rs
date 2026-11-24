@@ -1306,52 +1306,41 @@ async fn a_check_added_from_the_checks_page_makes_its_own_host() {
 }
 
 #[tokio::test]
-async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
+async fn only_a_database_check_reads_stats() {
     let server = start().await;
     let id = add_host(&server, "orders-db").await;
-    let request = |kind: &str, target: &str, more: Value| {
-        let mut request = json!({
+    let request = |kind: &str, target: &str| {
+        json!({
             "host_id": id,
             "check": { "name": "orders", "kind": kind, "target": target },
             "interval_secs": 60,
             "username": "maxnines",
-        });
-        for (key, value) in more.as_object().unwrap() {
-            request[key] = value.clone();
-        }
-        request
+            "read_stats": true,
+            "password": "s3cret",
+        })
     };
-    for refused in [
-        request("tcp", "db:27017", json!({ "read_stats": true })),
-        request("mongodb", "db:27017", json!({ "extras": ["sizes"] })),
-        request(
-            "mongodb",
-            "db:27017",
-            json!({ "read_stats": true, "extras": ["tables"] }),
-        ),
-        // Its template reads PostgreSQL, with queries of its own to turn on.
-        request(
-            "postgres",
-            "db:5432",
-            json!({ "read_stats": true, "extras": ["sizes"] }),
-        ),
-    ] {
-        let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &refused).await;
-        assert_eq!(status, 422, "{refused}: {body}");
-    }
-    let wanted = request(
-        "mongodb",
-        "db:27017",
-        json!({ "read_stats": true, "extras": ["sizes"], "password": "s3cret" }),
-    );
-    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &wanted).await;
+    let (status, body) = api(
+        &server,
+        "POST",
+        "/api/v1/remote-checks",
+        &request("tcp", "db:27017"),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    // MongoDB is read by its template, as every kind of database is.
+    let (status, added) = api(
+        &server,
+        "POST",
+        "/api/v1/remote-checks",
+        &request("mongodb", "db:27017"),
+    )
+    .await;
     assert_eq!(status, 201, "{added}");
     let path = format!("/api/v1/remote-checks/{}", added["id"]);
     let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
     assert_eq!(shown["read_stats"], true);
-    assert_eq!(shown["extras"], json!(["sizes"]));
 
-    // The form keeps them too.
+    // The form keeps it too.
     let form = Browser::default()
         .get(&server, &format!("/checks/{}/edit", added["id"]))
         .await;
@@ -1360,32 +1349,6 @@ async fn only_a_database_check_reads_stats_and_only_extras_there_are() {
             .contains(r#"<input type="checkbox" name="read_stats" checked>"#),
         "{}",
         form.body
-    );
-    assert!(
-        form.body
-            .contains(r#"<input type="checkbox" name="extra_sizes" checked>"#)
-    );
-
-    // And the form refuses what the API does, rather than saving without it.
-    let fields = [
-        ("name", "orders"),
-        ("kind", "postgres"),
-        ("target", "db:5432"),
-        ("interval_secs", "60"),
-        ("enabled", "on"),
-        ("sign_in", "password"),
-        ("username", "maxnines"),
-        ("read_stats", "on"),
-        ("extra_sizes", "on"),
-    ];
-    let refused = Browser::default()
-        .submit(&server, "/checks/new", "/checks", &fields)
-        .await;
-    assert_ne!(refused.status, 303, "{}", refused.body);
-    assert!(
-        refused.body.contains("postgres has no extras"),
-        "{}",
-        refused.body
     );
 }
 

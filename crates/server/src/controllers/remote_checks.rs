@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use chrono::TimeDelta;
 use maxnines_checks::databases::is_database;
-use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS};
+use maxnines_protocol::{Check, CheckKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -77,9 +77,8 @@ struct CheckForm {
     host_key: String,
     /// Website checks look up when their domain expires unless this is off.
     domain_expiry: bool,
-    /// Database checks: whether to read its stats too, and which extras.
+    /// Database checks: whether to read its stats too.
     read_stats: bool,
-    extras: Vec<String>,
     /// How it signs in: none, password or key. Only that one's boxes count.
     sign_in: String,
     username: String,
@@ -151,7 +150,6 @@ impl CheckForm {
             host_key: text(&check.host_key),
             domain_expiry: check.domain_expiry != Some(false),
             read_stats: input.read_stats,
-            extras: input.extras.clone(),
             sign_in: input.sign_in.with().as_str().to_string(),
             username: text(&input.sign_in.username),
             password: String::new(),
@@ -187,11 +185,6 @@ impl CheckForm {
             host_key: text("host_key"),
             domain_expiry: fields.contains_key("domain_expiry"),
             read_stats: fields.contains_key("read_stats"),
-            extras: DATABASE_EXTRAS
-                .iter()
-                .filter(|extra| fields.contains_key(&format!("extra_{extra}")))
-                .map(|extra| (*extra).to_string())
-                .collect(),
             sign_in: text("sign_in"),
             username: text("username"),
             password: text("password"),
@@ -222,7 +215,6 @@ impl CheckForm {
                 grace: number(&self.grace_secs, "the grace time")?.map(Duration::from_secs),
                 enabled: self.enabled,
                 read_stats: false,
-                extras: Vec::new(),
                 sign_in: SignIn::default(),
             };
             return Ok((input, SignInWith::None));
@@ -273,13 +265,6 @@ impl CheckForm {
             grace: None,
             enabled: self.enabled,
             read_stats,
-            // Ticked for a kind only templates read, they're refused as the API
-            // refuses them, saying to turn on its template's queries instead.
-            extras: if read_stats {
-                self.extras.clone()
-            } else {
-                Vec::new()
-            },
             sign_in,
         };
         Ok((input, with))
@@ -413,7 +398,6 @@ async fn form_page(
         .with("new_host_name", &new_host_placeholder(form))
         .with("back", &back)
         .with("kinds", &kinds)
-        .with("database_extras", &DATABASE_EXTRAS)
         .with("env_prefix", crate::metrics_pages::ENV_PREFIX)
         .with("error", &error);
     match error {
@@ -1254,7 +1238,6 @@ mod tests {
             interval: Duration::from_secs(120),
             enabled: false,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: SignIn::default(),
             grace: None,
         }
@@ -1277,7 +1260,6 @@ mod tests {
             interval: Duration::from_secs(60),
             enabled: true,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: SignIn::default(),
             grace: None,
         };

@@ -8,9 +8,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use maxnines_protocol::{
-    COLLECTORS, Check, CheckKind, DATABASE_EXTRAS, DatabaseChoice, LocalCheck, default_status_page,
-};
+use maxnines_protocol::{COLLECTORS, Check, CheckKind, LocalCheck, default_status_page};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -59,7 +57,6 @@ struct RuleForm {
     openmetrics_local: String,
     checks: String,
     local_checks: String,
-    databases: String,
     collectors: Vec<CollectorChoice>,
     operating_systems: Vec<SystemChoice>,
     /// Whether it comes with MaxNines, so only turning it on or off is allowed.
@@ -158,7 +155,6 @@ impl RuleForm {
             openmetrics_local: lines(&rule.settings["collectors"]["openmetrics"]["local_pages"]),
             checks: check_lines(&rule.settings["collectors"]["checks"]["checks"]),
             local_checks: local_check_lines(&rule.settings["collectors"]["checks"]["local_checks"]),
-            databases: database_lines(&rule.settings["collectors"]["databases"]["databases"]),
             collectors: choices(|name| {
                 match rule.settings["collectors"][name]["enabled"].as_bool() {
                     Some(true) => "on",
@@ -238,7 +234,6 @@ impl RuleForm {
             openmetrics_local: text("openmetrics_local"),
             checks: text("checks"),
             local_checks: text("local_checks"),
-            databases: text("databases"),
             collectors: choices(|name| text(&format!("collector_{name}"))),
             operating_systems: systems(|key| fields.contains_key(&format!("os_{key}"))),
             built_in: false,
@@ -310,12 +305,6 @@ impl RuleForm {
                 let local = parse_local_checks(&self.local_checks)?;
                 if !local.is_empty() {
                     fields.insert("local_checks".to_string(), json!(local));
-                }
-            }
-            if collector.name == "databases" {
-                let databases = parse_databases(&self.databases)?;
-                if !databases.is_empty() {
-                    fields.insert("databases".to_string(), json!(databases));
                 }
             }
             if !fields.is_empty() {
@@ -504,37 +493,6 @@ fn parse_local_checks(text: &str) -> Result<Vec<LocalCheck>> {
             Ok(check)
         })
         .collect()
-}
-
-/// Databases an agent's own config defines are typed one per line, by name,
-/// with any extras to read after it, such as `orders sizes`.
-fn parse_databases(text: &str) -> Result<Vec<DatabaseChoice>> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let mut words = line.split_whitespace().map(str::to_string);
-            let name = words.next().unwrap_or_default();
-            Ok(DatabaseChoice {
-                name,
-                extras: words.collect(),
-            })
-        })
-        .collect()
-}
-
-fn database_lines(value: &Value) -> String {
-    let databases: Vec<DatabaseChoice> = serde_json::from_value(value.clone()).unwrap_or_default();
-    let lines: Vec<String> = databases
-        .iter()
-        .map(|database| {
-            std::iter::once(database.name.as_str())
-                .chain(database.extras.iter().map(String::as_str))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .collect();
-    lines.join("\n")
 }
 
 fn local_check_lines(value: &Value) -> String {
@@ -726,13 +684,8 @@ async fn form_view<'a>(
             .unwrap_or_default();
         allowed.insert(list, names);
     }
-    // Databases are named with their kind, `{"orders": "postgres"}`.
-    let databases = state.database.keyed_by_agents("agent.databases").await;
-    allowed.insert("databases", databases.unwrap_or_default());
-
     Page::new(state, token, "rules/form.html")
         .with("allowed", &allowed)
-        .with("database_extras", &DATABASE_EXTRAS)
         .with("id", &id)
         .with("rule", form)
         .with("operators", &operators())
@@ -962,15 +915,6 @@ mod tests {
             enabled: false,
             settings,
         }
-    }
-
-    #[test]
-    fn databases_are_named_with_their_extras() {
-        let databases = parse_databases("orders sizes\n\n  cache  ").unwrap();
-        assert_eq!(databases[0].name, "orders");
-        assert_eq!(databases[0].extras, ["sizes"]);
-        assert!(databases[1].extras.is_empty());
-        assert_eq!(database_lines(&json!(databases)), "orders sizes\ncache");
     }
 
     #[test]

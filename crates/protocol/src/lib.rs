@@ -93,7 +93,7 @@ impl Protocols {
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 22] = [
+pub const COLLECTORS: [&str; 21] = [
     "apache",
     "checks",
     "commands",
@@ -101,7 +101,6 @@ pub const COLLECTORS: [&str; 22] = [
     "counters",
     "cpu",
     "custom",
-    "databases",
     "disk",
     "files",
     "gpu",
@@ -308,10 +307,6 @@ pub struct CollectorSettings {
     /// how they sign in, by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_pages: Option<Vec<String>>,
-    /// Databases collector only: databases the agent's own config defines, by
-    /// name, with what to read from each beyond the usual.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub databases: Option<Vec<DatabaseChoice>>,
     /// Apache, nginx and PHP-FPM collectors only: the status pages to read. Without
     /// any, the collector reads [`default_status_page`]. For the OpenMetrics collector
     /// they're the metrics pages to read, and it has no usual one.
@@ -390,23 +385,6 @@ fn validate_check_timing(
     Ok(())
 }
 
-/// What can be read from a database beyond what always is, each costing more:
-/// sizes on disk. Kinds read by templates have queries of their own to turn on
-/// instead.
-pub const DATABASE_EXTRAS: [&str; 1] = ["sizes"];
-
-/// How many databases one agent can be asked to read.
-const MAX_DATABASES: usize = 16;
-
-/// A database the agent's own config defines, which a rule asks it to read.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DatabaseChoice {
-    pub name: String,
-    /// From [`DATABASE_EXTRAS`].
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extras: Vec<String>,
-}
-
 /// Whether an OpenMetrics page the agent's config defines could be called this.
 /// Its series are named by it, then a space, then the metric.
 pub fn is_page_name(name: &str) -> bool {
@@ -471,7 +449,6 @@ pub fn check_metrics_pages(urls: &[String], names: &[String]) -> Result<()> {
         checks: None,
         local_checks: None,
         local_pages: None,
-        databases: None,
         urls: Some(urls.to_vec()),
     };
     settings.validate("openmetrics", Checking::Saved)
@@ -1111,31 +1088,6 @@ impl CollectorSettings {
                 .find(|other| collector == "openmetrics" && metrics_page_name(other) == name);
             if let Some(other) = same {
                 anyhow::bail!("{other:?} and {url:?} would both be called {name:?}");
-            }
-        }
-
-        let databases = self.databases.as_deref().unwrap_or_default();
-        ensure!(
-            databases.len() <= MAX_DATABASES,
-            "a collector can read at most {MAX_DATABASES} databases"
-        );
-        for (index, database) in databases.iter().enumerate() {
-            let name = &database.name;
-            ensure!(
-                is_page_name(name),
-                "{name:?} isn't the name of a database in the agent's config, which has \
-                 no spaces"
-            );
-            ensure!(
-                !databases[..index].iter().any(|other| &other.name == name),
-                "the database {name:?} is listed twice"
-            );
-            for extra in &database.extras {
-                ensure!(
-                    DATABASE_EXTRAS.contains(&extra.as_str()),
-                    "{extra:?} isn't something that can be read from a database, which are: {}",
-                    DATABASE_EXTRAS.join(", ")
-                );
             }
         }
 
@@ -1829,14 +1781,13 @@ mod tests {
         assert!(config.remove_unknown_collectors().is_empty());
     }
 
-    /// Both are sent inside a config, so a field a newer server adds to either
-    /// mustn't turn the whole of it down.
+    /// It's sent inside a config, so a field a newer server adds to it mustn't
+    /// turn the whole of it down.
     #[test]
-    fn local_checks_and_databases_take_fields_from_a_newer_server() {
+    fn local_checks_take_fields_from_a_newer_server() {
         let config: AgentConfig = serde_json::from_value(json!({
             "collectors": {
                 "checks": { "local_checks": [{ "name": "db", "retries": 3 }] },
-                "databases": { "databases": [{ "name": "orders", "sample_rate": 0.5 }] },
             },
         }))
         .unwrap();

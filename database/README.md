@@ -564,7 +564,6 @@ erDiagram
         string private_key_env "the server's variable holding it"
         boolean domain_expiry "http: false to not look it up"
         boolean read_stats "databases: read health and replication too"
-        string extras "what else to read, comma-separated"
         int grace_secs "heartbeat: how late a ping can be"
         string ping_token UK "heartbeat: in the address it's pinged at"
     }

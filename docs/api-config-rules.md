@@ -32,11 +32,10 @@ Rules of the same priority apply built-in rules first.
 | `paths` | `files` | The files and folders to watch |
 | `checks` | `checks` | What to try reaching, as in [remote checks](api-remote-checks.md), each with its own `interval_secs` if it should run less often than every sample. These never sign in, and can't be heartbeats, which only the server watches |
 | `local_pages` | `openmetrics` | Pages the agent's own config defines, which sign in, by name. The agent lists the ones it has in its `agent.openmetrics` fact. See [pages that need signing in](openmetrics.md#pages-that-need-signing-in) |
-| `databases` | `databases` | Databases the agent's own config defines, by name, each with any extras to read, as `{"name": "orders", "extras": ["sizes"]}`. The agent lists the ones it has, each with its kind, in its `agent.databases` fact, as `{"orders": "postgres"}`. Only MongoDB databases need listing, as the built-in PostgreSQL, MySQL and ClickHouse templates read every one of theirs. See [database stats](database-stats.md) |
 | `local_checks` | `checks` | Checks the agent's own config defines, which sign in, as `{"name": "bastion", "interval_secs": 300, "timeout_secs": 5}` with the times optional. The agent lists the ones it has in its `agent.checks` fact. See [signing in on an agent](checks.md#on-an-agent) |
 | `urls` | `apache`, `nginx`, `php_fpm`, `openmetrics` | The status pages to read. Leave it out for the usual page on the host itself. For `openmetrics` they're the [metrics pages](openmetrics.md) to read, which have no usual address |
 
-The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `databases`, `disk`, `files`, `gpu`, `host`,
+The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `gpu`, `host`,
 `memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `processes`, `sensors`, `services`,
 `system` and `top_processes`.
 

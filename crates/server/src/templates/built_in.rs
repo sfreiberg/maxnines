@@ -139,6 +139,8 @@ mod tests {
                     .into_iter()
                     .filter(|column| !query.labels.contains(column))
                     .chain(query.metrics.iter().map(|metric| metric.key.clone()))
+                    // Only there to work others out, so not a metric.
+                    .filter(|key| !maxnines_protocol::templates::is_helper(key))
                     .map(move |key| (key, query))
             });
             for (key, query) in metrics {
@@ -161,6 +163,7 @@ mod tests {
             catalog.find("clickhouse.up").unwrap().title,
             "ClickHouse up"
         );
+        assert_eq!(catalog.find("mongodb.up").unwrap().title, "MongoDB up");
     }
 
     #[test]

@@ -322,7 +322,6 @@ mod tests {
                 interval: Duration::from_secs(period),
                 enabled: true,
                 read_stats: false,
-                extras: Vec::new(),
                 sign_in: Default::default(),
                 grace: Some(Duration::from_secs(grace)),
             },

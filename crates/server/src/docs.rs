@@ -890,7 +890,6 @@ mod tests {
         ("collectors-apache", &["apache"]),
         ("collectors-nginx", &["nginx"]),
         ("collectors-php-fpm", &["php_fpm"]),
-        ("collectors-mongodb", &["databases"]),
         ("database-stats", &["database_accounts"]),
     ];
 
@@ -900,6 +899,7 @@ mod tests {
         ("collectors-postgresql", "postgres"),
         ("collectors-mysql", "mysql"),
         ("collectors-clickhouse", "clickhouse"),
+        ("collectors-mongodb", "mongodb"),
     ];
 
     /// Collectors whose metrics are described elsewhere, without a table of every

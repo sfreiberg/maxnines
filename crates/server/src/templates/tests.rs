@@ -189,27 +189,9 @@ fn the_catalog_has_the_metrics_of_templates_that_are_on() {
     assert!(checked.find("pg.size").is_some(), "every part counts");
 }
 
-/// MaxNines reads MongoDB itself, under names a template keyed `mongodb` would give
-/// its metrics too, so one is refused.
+/// A template's metric can't have the name of one MaxNines has built in.
 #[test]
 fn a_metric_with_a_built_in_metrics_name_is_refused() {
-    let found = problems(
-        r#"template "mongodb" {
-             name     = "MongoDB"
-             database = "mongodb"
-             query "server" {
-               command = "{ \"serverStatus\": 1 }"
-               columns = { connections = "connections.current", spare = "connections.available", uptime = "uptime" }
-             }
-           }"#,
-    );
-    assert_eq!(
-        found,
-        [
-            r#"template "mongodb": its metric mongodb.up would have the name of one MaxNines has built in: give the template another key"#,
-            r#"template "mongodb", query "server": its metrics mongodb.connections, mongodb.uptime would have the names of ones MaxNines has built in: give the columns other names, or the template another key"#,
-        ]
-    );
     // The built-in PostgreSQL template's are its own, and under another key it
     // has nothing wrong with it either.
     assert_eq!(problems(&postgres_as_pg()), Vec::<String>::new());

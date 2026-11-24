@@ -11,8 +11,8 @@ use std::time::Duration;
 use anyhow::{Result, bail, ensure};
 use chrono::TimeDelta;
 use maxnines_checks::Credentials;
-use maxnines_checks::databases::{self as stats, Reader, Settle, by_kind, has_reader, is_database};
-use maxnines_protocol::{Check, CheckKind, DATABASE_EXTRAS, Sample};
+use maxnines_checks::databases::is_database;
+use maxnines_protocol::{Check, CheckKind, Sample};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -85,13 +85,11 @@ pub struct RemoteCheckInput {
     pub grace: Option<Duration>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// For a database: also read its health and replication, as an agent reads
-    /// a database its config defines, saved as samples from the check's host.
+    /// For a database: also read its health and replication with its kind's
+    /// template, as an agent reads a database its config defines, saved as samples
+    /// from the check's host.
     #[serde(default)]
     pub read_stats: bool,
-    /// What else to read from a database, beyond the usual.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extras: Vec<String>,
     /// How a check that signs in does so. Its secrets can be set, but are never
     /// shown or given back.
     #[serde(flatten)]
@@ -323,26 +321,6 @@ pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
         !input.read_stats || is_database(input.check.kind),
         "only database checks can read a database's stats"
     );
-    ensure!(
-        input.read_stats || input.extras.is_empty(),
-        "extras are only read along with a database's stats"
-    );
-    ensure!(
-        input.extras.is_empty() || has_reader(input.check.kind),
-        "{} has no extras: turn on its template's queries on the template's page instead",
-        input.check.kind.as_str()
-    );
-    for (index, extra) in input.extras.iter().enumerate() {
-        ensure!(
-            DATABASE_EXTRAS.contains(&extra.as_str()),
-            "{extra:?} isn't something that can be read from a database, which are: {}",
-            DATABASE_EXTRAS.join(", ")
-        );
-        ensure!(
-            !input.extras[..index].contains(extra),
-            "{extra:?} is given twice"
-        );
-    }
     Ok(())
 }
 
@@ -397,15 +375,6 @@ impl LatestResults {
     }
 }
 
-/// A database's stats, read alongside its check. The reader keeps its
-/// connection between runs, so it's only made again when what it reads, or how
-/// it signs in, changes.
-struct StatsReader {
-    input: RemoteCheckInput,
-    credentials: Option<Credentials>,
-    reader: Arc<tokio::sync::Mutex<(Reader, Settle)>>,
-}
-
 pub struct Scheduler {
     database: Database,
     writer: mpsc::Sender<WriterCommand>,
@@ -416,8 +385,6 @@ pub struct Scheduler {
     /// When each check is next due, by ID, and how it was then. A check that's been
     /// changed since is run at once, with its new interval from then on.
     next_run: HashMap<i64, (Timestamp, RemoteCheckInput)>,
-    /// For each check that reads a database's stats, by ID.
-    readers: HashMap<i64, StatsReader>,
     /// What templates have read through those checks.
     templates: AgentlessTemplates,
     /// Each heartbeat that's on, by ID.
@@ -458,7 +425,6 @@ impl Scheduler {
             results,
             slots: Arc::new(Semaphore::new(MAX_RUNNING)),
             next_run: HashMap::new(),
-            readers: HashMap::new(),
             templates: AgentlessTemplates::default(),
             watched: HashMap::new(),
             started_at: times::now(),
@@ -488,7 +454,6 @@ impl Scheduler {
         let ids: BTreeSet<i64> = checks.iter().map(|check| check.id).collect();
         self.results.keep_only(&ids);
         self.next_run.retain(|id, _| ids.contains(id));
-        self.keep_readers(&checks);
         let watching: BTreeSet<i64> = checks
             .iter()
             .filter(|check| is_heartbeat(check) && check.input.enabled)
@@ -611,46 +576,6 @@ impl Scheduler {
         .await;
     }
 
-    /// A reader for each enabled check that reads stats of a kind read here rather
-    /// than only by templates, made again when its check or login changes, and
-    /// dropped, closing its connection, when it goes.
-    fn keep_readers(&mut self, checks: &[RemoteCheck]) {
-        let wanted: HashMap<i64, &RemoteCheck> = checks
-            .iter()
-            .filter(|check| check.input.enabled && check.input.read_stats)
-            .map(|check| (check.id, check))
-            .collect();
-        self.readers.retain(|id, _| wanted.contains_key(id));
-        for (id, check) in wanted {
-            // A login that can't be had now is tried again with the next tick.
-            let credentials = check.input.sign_in.credentials().ok().flatten();
-            let current = self
-                .readers
-                .get(&id)
-                .is_some_and(|kept| kept.input == check.input && kept.credentials == credentials);
-            if current {
-                continue;
-            }
-            let database = stats::Database {
-                check: check.input.check.clone(),
-                credentials: credentials.clone().unwrap_or_default(),
-            };
-            // Templates read it, and nothing here can.
-            let Some(reader) = Reader::new(&check.input.check.name, database, &check.input.extras)
-            else {
-                continue;
-            };
-            self.readers.insert(
-                id,
-                StatsReader {
-                    input: check.input.clone(),
-                    credentials,
-                    reader: Arc::new(tokio::sync::Mutex::new((reader, Settle::default()))),
-                },
-            );
-        }
-    }
-
     /// Runs a check, holding one of the slots until it's done.
     fn start(
         &self,
@@ -660,15 +585,11 @@ impl Scheduler {
     ) -> JoinHandle<()> {
         let writer = self.writer.clone();
         let (results, presence) = (self.results.clone(), self.presence.clone());
-        let reader = self.readers.get(&check.id).map(|kept| kept.reader.clone());
         let templates = self.templates.reads(check.id);
         let database = self.database.clone();
         tokio::spawn(async move {
             let _slot = slot;
             run(&check, hostname.clone(), &writer, &results, &presence).await;
-            if let Some(reader) = reader {
-                read_stats(&check, hostname.clone(), &writer, &reader).await;
-            }
             if let Some(templates) = templates {
                 let to = Saving {
                     database: &database,
@@ -680,21 +601,6 @@ impl Scheduler {
             }
         })
     }
-}
-
-/// Reads a database's stats and saves them as its host's, as an agent's would be.
-async fn read_stats(
-    check: &RemoteCheck,
-    hostname: String,
-    writer: &mpsc::Sender<WriterCommand>,
-    reader: &tokio::sync::Mutex<(Reader, Settle)>,
-) {
-    let limit = maxnines_checks::limit(&check.input.check).min(stats::TIMEOUT);
-    let mut reading = reader.lock().await;
-    let (reader, settle) = &mut *reading;
-    let rows = settle.settle(reader.read(limit).await);
-    let host_id = check.input.host_id.clone();
-    save(writer, host_id, hostname, "databases", by_kind(rows)).await;
 }
 
 /// Runs a check once and keeps what it found: as its latest result, as what's
@@ -775,7 +681,6 @@ mod tests {
             interval,
             enabled: true,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: Default::default(),
             grace: None,
         }

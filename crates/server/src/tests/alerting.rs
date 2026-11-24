@@ -1245,6 +1245,13 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Galera node not in the primary component",
             "Host offline",
             "Host sending no metrics",
+            "MongoDB connections running out",
+            "MongoDB down",
+            "MongoDB oplog window short",
+            "MongoDB replica lagging",
+            "MongoDB replica set has no primary",
+            "MongoDB replica set member unhealthy",
+            "MongoDB replication stopped",
             "MySQL connections running out",
             "MySQL down",
             "MySQL group member offline",
@@ -6430,7 +6437,6 @@ mod remote {
             interval: Duration::from_secs(60),
             enabled: true,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: Default::default(),
             grace: None,
         }
@@ -8160,7 +8166,6 @@ mod pages {
             interval: Duration::from_secs(60),
             enabled: true,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: Default::default(),
             grace: None,
         };
@@ -8478,7 +8483,6 @@ mod pages {
             interval: Duration::from_secs(60),
             enabled,
             read_stats: false,
-            extras: Vec::new(),
             sign_in: Default::default(),
             grace: None,
         };

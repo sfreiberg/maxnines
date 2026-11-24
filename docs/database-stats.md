@@ -10,9 +10,8 @@ with how to turn it on, the account to sign in as, and every metric it reports:
 - **[MongoDB](collectors-mongodb.md)**
 - **[ClickHouse](collectors-clickhouse.md)**
 
-PostgreSQL, MySQL and MariaDB, and ClickHouse are read by their built-in
-[templates](templates.md), which read every database of their kind with no config rule
-needed. MongoDB is read by MaxNines itself, once a config rule picks it.
+Each is read by its built-in [template](templates.md), which reads every database of its
+kind with no config rule needed.
 
 ## The database block
 
@@ -45,7 +44,8 @@ databases its config allows, and nothing else.
 The agent keeps one connection to each database open between samples, and opens a new
 one if that stops working. Each of its reads has a 5 second limit, so a busy server is
 never held up by it, and its session is read only. A database that doesn't answer is
-tried again after 5 seconds, then waits doubling to a minute.
+tried again after 5 seconds, then waits doubling to a minute. MongoDB has no read-only
+sessions, so there what's read is up to its account.
 
 ## Hosts without an agent
 
@@ -68,10 +68,10 @@ database, and is 1 if it may and 0 if not:
 | Metric | Unit | Series | What it is |
 | --- | --- | --- | --- |
 | `database_account.overprivileged` | 1 or 0 | Each database | Whether it may do any of the below |
-| `database_account.superuser` | 1 or 0 | Each database | Whether it may do anything: a PostgreSQL superuser, MySQL's `SUPER` or every privilege on `*.*`, or ClickHouse's `ALL` on everything |
-| `database_account.writes` | 1 or 0 | Each database | Whether it may change data or tables anywhere: insert, update, delete, truncate, create, alter, drop, or add triggers, routines or events, including through a role or only some columns |
-| `database_account.manages` | 1 or 0 | Each database | Whether it may manage accounts or the server: create accounts, roles or databases, pass its privileges on (`WITH GRANT OPTION`, `WITH ADMIN OPTION`), replicate, or, on MySQL and MariaDB, `RELOAD`, `SHUTDOWN` or any admin privilege |
-| `database_account.server_files` | 1 or 0 | Each database | Whether it may read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE`. On ClickHouse, `FILE`, `URL`, `REMOTE`, `S3` and the other table functions that reach outside it, and `BACKUP` |
+| `database_account.superuser` | 1 or 0 | Each database | Whether it may do anything: a PostgreSQL superuser, MySQL's `SUPER` or every privilege on `*.*`, ClickHouse's `ALL` on everything, or MongoDB's `root` or `anyAction` |
+| `database_account.writes` | 1 or 0 | Each database | Whether it may change data or tables anywhere: insert, update, delete, truncate, create, alter, drop, or add triggers, routines or events, including through a role or only some columns. On MongoDB, an action such as `insert`, `update`, `remove`, `createCollection` or `dropDatabase` anywhere |
+| `database_account.manages` | 1 or 0 | Each database | Whether it may manage accounts or the server: create accounts, roles or databases, pass its privileges on (`WITH GRANT OPTION`, `WITH ADMIN OPTION`), replicate, or, on MySQL and MariaDB, `RELOAD`, `SHUTDOWN` or any admin privilege. On MongoDB, the actions that manage users, roles, the replica set, shards or the server, such as `createUser`, `grantRole`, `replSetConfigure`, `setParameter`, `shutdown` or `killop` |
+| `database_account.server_files` | 1 or 0 | Each database | Whether it may read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE`. On ClickHouse, `FILE`, `URL`, `REMOTE`, `S3` and the other table functions that reach outside it, and `BACKUP`. MongoDB has no way to reach them but being a superuser |
 
 MaxNines only ever reads, in sessions that can't write, but an account that can do more
 is one a template's SQL, or anyone who learns its password, could misuse, so the

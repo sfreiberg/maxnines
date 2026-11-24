@@ -230,28 +230,6 @@ fn describe_changes(before: &ResolvedConfig, after: &ResolvedConfig) -> Vec<Stri
                     describe_list(now.local_pages.as_ref())
                 ));
             }
-            let old_databases = was.and_then(|settings| settings.databases.as_ref());
-            if old_databases != now.databases.as_ref() {
-                let named = |databases: Option<&Vec<maxnines_protocol::DatabaseChoice>>| {
-                    let names = databases.map(|databases| {
-                        databases
-                            .iter()
-                            .map(|database| {
-                                std::iter::once(database.name.clone())
-                                    .chain(database.extras.iter().cloned())
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            })
-                            .collect()
-                    });
-                    describe_list(names.as_ref())
-                };
-                changes.push(format!(
-                    "{name} reads: {} → {}",
-                    named(old_databases),
-                    named(now.databases.as_ref())
-                ));
-            }
             let old_local = was.and_then(|settings| settings.local_checks.as_ref());
             if old_local != now.local_checks.as_ref() {
                 let named = |checks: Option<&Vec<maxnines_protocol::LocalCheck>>| {

@@ -39,6 +39,7 @@ shown afterwards is written out from the parts.
 | **Host** | Every host, with an agent or only checks: whether it's online and sending metrics, its disks, clock, services and containers, and whether templates read its databases with accounts that can do more than read. It has the nine [built-in alert rules](alerts.md#the-built-in-rules), and the [agent settings](#agent-settings) every host gets |
 | **macOS** | Macs: the agent settings they get beyond every host's, which read the GPU |
 | **ClickHouse** | Each ClickHouse database: its load against its limits, inserts and parts, memory, merges and background pools, mutations, error codes worth knowing about, disks, replication, Keeper and Distributed tables, with 8 alerts. Its database sizes and query times ship turned off, as they cost more. What it reads is listed on the [ClickHouse](collectors-clickhouse.md) page |
+| **MongoDB** | Each MongoDB database: its connections, operations and how long they take, work waiting, WiredTiger's cache, and its replica set as each member sees it, read with MongoDB's own commands, with 7 alerts, one of them off until its oplog has filled. Its database sizes ship turned off. What it reads is listed on the [MongoDB](collectors-mongodb.md) page |
 | **MySQL** | Each MySQL or MariaDB database: its load, InnoDB, transactions and queries, replication into it, read through `SHOW`, semi-synchronous replication, Group Replication and Galera, with 7 alerts. MySQL's and MariaDB's differences are queries of their own, picked by what discovery finds. Its database and binary log sizes ship turned off. What it reads is listed on the [MySQL and MariaDB](collectors-mysql.md) page |
 | **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed on the [PostgreSQL](collectors-postgresql.md) page |
 
@@ -49,10 +50,8 @@ shown afterwards is written out from the parts.
   every statement is a GET, which it only lets read, and its account's own profile
   sets its time limit.
 - **Windows:** performance counters and registry values, on hosts with an agent.
-- **What MaxNines reads itself:** PostgreSQL, MySQL and MariaDB, and ClickHouse are
-  read by their built-in templates. MaxNines still reads [MongoDB](collectors-mongodb.md)
-  itself, under its own metric names, such as `mongodb.connections`, so a template
-  can't use those names.
+- **Every database** MaxNines reads, PostgreSQL, MySQL and MariaDB, MongoDB and
+  ClickHouse, is read by its built-in template.
 
 Where a template is read, and how, is the same on an agent and on the server for a
 [host without an agent](#hosts-without-an-agent-and-maxnines-own-database).
@@ -88,7 +87,7 @@ The **key**, `myapp`, starts the names of the template's metrics, so the column
 `connections` is the metric `myapp.connections`. It's lowercase letters, digits and
 underscores, starting with a letter, and no two templates share one. So are the keys of
 the blocks inside it, such as `sessions` and `busy`. A template whose metric would
-have the name of one MaxNines has built in, such as `mongodb.connections`, is refused:
+have the name of one MaxNines has built in, such as `cpu.usage`, is refused:
 give it another key.
 
 An agent is sent what it reads all at once, so a template can have up to 64 discover
@@ -522,7 +521,8 @@ MaxNines only ever reads, but a template's SQL runs as whatever account the agen
 the database check signs in as, so what that account may do is what a template could
 do. Give it an account of its own that can read what monitoring needs and change
 nothing: each database's page gives one, for [PostgreSQL](collectors-postgresql.md#the-account-to-sign-in-as),
-[MySQL and MariaDB](collectors-mysql.md#the-account-to-sign-in-as) and
+[MySQL and MariaDB](collectors-mysql.md#the-account-to-sign-in-as),
+[MongoDB](collectors-mongodb.md#the-account-to-sign-in-as) and
 [ClickHouse](collectors-clickhouse.md#the-account-to-sign-in-as). Whenever it connects,
 and every 5 minutes, MaxNines reads [what the account may
 do](database-stats.md#what-the-account-may-do) beyond reading, and the built-in

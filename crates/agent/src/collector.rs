@@ -21,7 +21,7 @@ pub use maxnines_collectors::{Collector, WARMUP};
 use crate::checks::{CheckCollector, CheckDefinitions};
 use crate::commands::{CheckCommands, CommandCollector};
 use crate::custom::{CustomCollector, Definitions};
-use crate::databases::{DatabaseCollector, DatabaseDefinitions};
+use crate::databases::DatabaseDefinitions;
 use crate::files::FileCollector;
 use crate::openmetrics::{OpenMetricsCollector, PageDefinitions};
 use crate::services::ServiceCollector;
@@ -238,10 +238,6 @@ fn build(
         "apache" => status_pages(Software::Apache, config, interval)?,
         "nginx" => status_pages(Software::Nginx, config, interval)?,
         "php_fpm" => status_pages(Software::PhpFpm, config, interval)?,
-        "databases" => {
-            let chosen = config.databases.as_deref().unwrap_or_default();
-            Box::new(DatabaseCollector::new(chosen, local.databases, interval)?)
-        }
         "openmetrics" => {
             let urls = config.urls.clone().unwrap_or_default();
             let chosen = config.local_pages.as_deref().unwrap_or_default();

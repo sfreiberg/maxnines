@@ -84,14 +84,8 @@
     <legend>Database stats</legend>
     <label class="checkbox">
       <input type="checkbox" name="read_stats"{% if check.read_stats %} checked{% endif %}> Read its health and replication
-      <small>As an agent reads a database it's allowed, using the login below, and charted on the host's metrics page. PostgreSQL, MySQL and ClickHouse are read by their built-in templates. See <a href="/docs/database-stats">Database stats</a> for what's read and the account it needs.</small>
+      <small>With its kind's built-in template, as an agent reads a database it's allowed, using the login below, and charted on the host's metrics page. To read sizes too, turn on the template's <code>sizes</code> query. See <a href="/docs/database-stats">Database stats</a> for what's read and the account it needs.</small>
     </label>
-    {% for extra in database_extras %}
-    <label class="checkbox">
-      <input type="checkbox" name="extra_{{ extra }}"{% if extra in check.extras %} checked{% endif %}> Also read {% if extra == "sizes" %}sizes{% else %}{{ extra }}{% endif %}
-      {% if extra == "sizes" %}<small>Each database's size on disk, which costs more to read. MongoDB only: turn on the PostgreSQL, MySQL and ClickHouse templates' <code>sizes</code> query instead.</small>{% endif %}
-    </label>
-    {% endfor %}
   </fieldset>
 
   <label class="checkbox for-tls-option">

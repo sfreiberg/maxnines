@@ -1911,7 +1911,6 @@ impl MigrationTrait for CreateTables {
                             .not_null()
                             .default(false),
                     )
-                    .col(ColumnDef::new(RemoteChecks::Extras).string_len(255))
                     .col(ColumnDef::new(RemoteChecks::GraceSecs).big_integer())
                     .col(ColumnDef::new(RemoteChecks::PingToken).string_len(64))
                     .foreign_key(
@@ -2585,7 +2584,6 @@ enum RemoteChecks {
     PrivateKeyEnv,
     DomainExpiry,
     ReadStats,
-    Extras,
     GraceSecs,
     PingToken,
 }

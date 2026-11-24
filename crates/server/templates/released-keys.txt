@@ -7,3 +7,4 @@ postgres
 clickhouse
 mysql
 macos
+mongodb
