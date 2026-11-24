@@ -163,7 +163,9 @@ A rule can have a warning condition, a critical condition, or both. With both, t
 one alert for each thing it watches, at the worse of the two: a disk at 85% is a
 warning, and the same alert becomes critical when the disk passes 90%. Each condition has
 to be true for the rule's **For at least** time to count, and stops counting the moment
-it isn't.
+it isn't. How long each has been true is kept in the database, so a restart of the server
+doesn't start a long wait again: a condition that's still true when the server is back
+counts from when it first became true, and one that cleared meanwhile starts over.
 
 - **Getting worse** sends a **Now critical** notification to every channel that heard
   the alert start, and clears any acknowledgement, so someone has to pick it up again.

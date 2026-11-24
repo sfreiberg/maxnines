@@ -1103,6 +1103,71 @@ async fn a_restart_does_not_repeat_an_open_alert() {
 }
 
 #[tokio::test]
+async fn a_long_wait_carries_on_through_a_restart() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        hold: TimeDelta::hours(1),
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(TimeDelta::zero(), 95.0).await;
+    test.cpu(MINUTE * 30, 95.0).await;
+    assert_eq!(test.database().alert_holds().await.unwrap().len(), 1);
+
+    test.evaluator = evaluator(&test.server, test.now + MINUTE * 35);
+    test.cpu(MINUTE * 40, 95.0).await;
+    assert!(test.open().await.is_empty(), "not an hour yet");
+    test.cpu(MINUTE * 61, 95.0).await;
+    let open = test.open().await;
+    assert_eq!(
+        open.len(),
+        1,
+        "an hour since it began, counting before the restart"
+    );
+    assert_eq!(open[0].breached_at, test.now);
+}
+
+#[tokio::test]
+async fn a_wait_whose_problem_cleared_meanwhile_starts_over_after_a_restart() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        hold: TimeDelta::hours(1),
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(TimeDelta::zero(), 95.0).await;
+
+    test.evaluator = evaluator(&test.server, test.now + MINUTE * 45);
+    test.cpu(MINUTE * 50, 10.0).await;
+    assert!(test.database().alert_holds().await.unwrap().is_empty());
+    test.cpu(MINUTE * 55, 95.0).await;
+    test.cpu(MINUTE * 70, 95.0).await;
+    assert!(test.open().await.is_empty(), "only 15 minutes of this one");
+    test.cpu(MINUTE * 116, 95.0).await;
+    assert_eq!(test.open().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_wait_for_a_rule_deleted_while_the_server_was_down_is_dropped() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        hold: TimeDelta::hours(1),
+        ..cpu_rule()
+    };
+    let id = test.database().create_alert_rule(&rule).await.unwrap();
+    test.cpu(TimeDelta::zero(), 95.0).await;
+    assert_eq!(test.database().alert_holds().await.unwrap().len(), 1);
+
+    test.database()
+        .delete_alert_rule(id, test.now + MINUTE)
+        .await
+        .unwrap();
+    test.evaluator = evaluator(&test.server, test.now + MINUTE * 2);
+    test.cpu(MINUTE * 3, 95.0).await;
+    assert!(test.database().alert_holds().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn names_agents_choose_are_cleaned_before_they_are_kept() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {

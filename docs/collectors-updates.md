@@ -96,5 +96,5 @@ The built-in **Updates** template brings these:
 | **Packages with known vulnerabilities** | FreeBSD's `pkg audit` has listed vulnerable packages for a day | Warning |
 
 The waits leave time for automatic updates, or a weekly patch day, to get there first.
-Each can be changed or turned off on the template's page. A wait is counted while the
-server runs, so restarting the server starts it again.
+Each can be changed or turned off on the template's page. A wait carries on through a
+restart of the server.

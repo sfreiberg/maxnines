@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chrono::TimeDelta;
-use sea_orm::sea_query::{Alias, Expr, ExprTrait, Order, Query, SelectStatement};
+use sea_orm::sea_query::{Alias, Expr, ExprTrait, OnConflict, Order, Query, SelectStatement};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
     QuerySelect, Set, TransactionTrait,
@@ -17,8 +17,8 @@ use serde_json::json;
 use super::actions::to_run;
 use super::audit::{record, record_change};
 use super::{
-    Database, action_run, alert, alert_rule, alert_rule_action, alert_rule_channel, host,
-    maintenance_window, name_key, name_taken_or, notification, notification_channel, silence,
+    Database, action_run, alert, alert_hold, alert_rule, alert_rule_action, alert_rule_channel,
+    host, maintenance_window, name_key, name_taken_or, notification, notification_channel, silence,
     template,
 };
 use crate::actions::{ActionRun, RuleAction, RunOn};
@@ -1175,6 +1175,82 @@ async fn tell_of_ending<C: ConnectionTrait>(
         .order_by(notification::Column::Id, Order::Asc)
         .to_owned();
     queue_selected(connection, told, Event::Resolved, now).await
+}
+
+/// Since when one level of a rule has been crossed for a host and series.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HeldLevel {
+    pub rule_id: i64,
+    pub host_id: String,
+    /// None for the host as a whole.
+    pub series: Option<String>,
+    pub severity: Severity,
+    pub since: Timestamp,
+}
+
+impl Database {
+    /// Every level kept as crossed, as the last check before a restart left them.
+    pub async fn alert_holds(&self) -> Result<Vec<HeldLevel>> {
+        let rows = alert_hold::Entity::find()
+            .all(&self.connection)
+            .await
+            .context("loading alert holds")?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(HeldLevel {
+                    rule_id: row.rule_id,
+                    host_id: row.host_id,
+                    series: (!row.series.is_empty()).then_some(row.series),
+                    severity: Severity::parse(&row.severity)?,
+                    since: row.breached_since,
+                })
+            })
+            .collect()
+    }
+
+    /// Forgets the levels no longer crossed and keeps those that are, together.
+    pub async fn save_alert_holds(&self, ended: &[HeldLevel], held: &[HeldLevel]) -> Result<()> {
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("saving alert holds")?;
+        for level in ended {
+            alert_hold::Entity::delete_many()
+                .filter(alert_hold::Column::RuleId.eq(level.rule_id))
+                .filter(alert_hold::Column::HostId.eq(&level.host_id))
+                .filter(alert_hold::Column::Series.eq(level.series.as_deref().unwrap_or_default()))
+                .filter(alert_hold::Column::Severity.eq(level.severity.as_str()))
+                .exec(&transaction)
+                .await
+                .context("forgetting an alert hold")?;
+        }
+        for level in held {
+            let row = alert_hold::ActiveModel {
+                rule_id: Set(level.rule_id),
+                host_id: Set(level.host_id.clone()),
+                series: Set(level.series.clone().unwrap_or_default()),
+                severity: Set(level.severity.as_str().to_string()),
+                breached_since: Set(level.since),
+                ..Default::default()
+            };
+            alert_hold::Entity::insert(row)
+                .on_conflict(
+                    OnConflict::columns([
+                        alert_hold::Column::RuleId,
+                        alert_hold::Column::HostId,
+                        alert_hold::Column::Series,
+                        alert_hold::Column::Severity,
+                    ])
+                    .update_column(alert_hold::Column::BreachedSince)
+                    .to_owned(),
+                )
+                .exec(&transaction)
+                .await
+                .context("keeping an alert hold")?;
+        }
+        transaction.commit().await.context("saving alert holds")
+    }
 }
 
 impl Database {

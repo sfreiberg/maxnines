@@ -38,7 +38,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::{
     self, INSTANCE_LABEL, Metric, Metrics, NewestReading, TimeRange, Trend, series_values,
 };
-use crate::models::Database;
+use crate::models::{Database, HeldLevel};
 use crate::presence::Presence;
 use crate::registration::{HostRecord, HostState, Registry};
 use crate::remote_checks::{FLEET_HOST_ID, FLEET_HOSTNAME};
@@ -163,6 +163,11 @@ type Stamp = (Timestamp, bool, bool);
 pub(crate) struct Tracker {
     /// One for each level, mildest first.
     holds: Vec<Hold>,
+    /// Which level each of `holds` is.
+    severities: Vec<Severity>,
+    /// Since when each level was crossed before the server restarted, until the
+    /// first check after it says whether it still is.
+    restored: BTreeMap<Severity, Timestamp>,
     /// Each sample is only counted once, as checks run more often than some
     /// agents report.
     last_stamp: Option<Stamp>,
@@ -176,6 +181,20 @@ impl Tracker {
             .iter()
             .filter_map(|hold| hold.breached_since)
             .min()
+    }
+
+    /// Since when each level has been crossed, for keeping through a restart.
+    fn held(&self) -> impl Iterator<Item = (Severity, Timestamp)> + '_ {
+        let crossed = self
+            .severities
+            .iter()
+            .zip(&self.holds)
+            .filter_map(|(severity, hold)| Some((*severity, hold.breached_since?)));
+        crossed.chain(
+            self.restored
+                .iter()
+                .map(|(severity, since)| (*severity, *since)),
+        )
     }
 
     /// Takes whether each of a rule's levels is crossed now, mildest first, and
@@ -206,6 +225,16 @@ impl Tracker {
         open: Option<Severity>,
     ) -> Option<Change> {
         self.holds.resize_with(levels.len(), Hold::default);
+        self.severities = levels.iter().map(|(severity, _)| *severity).collect();
+        // Carried on from before a restart, and kept only if it still holds now.
+        if !self.restored.is_empty() {
+            for (hold, (severity, _)) in self.holds.iter_mut().zip(levels) {
+                if let Some(since) = self.restored.remove(severity) {
+                    hold.breached_since = Some(since);
+                }
+            }
+            self.restored.clear();
+        }
         for ((level, (_, breached)), began) in self.holds.iter_mut().zip(levels).zip(began) {
             level.observe(*breached, *began);
         }
@@ -571,6 +600,11 @@ pub struct Evaluator {
     /// Whether `silences` has been given those of the alerts open as the server
     /// started.
     silences_restored: bool,
+    /// Whether `trackers` has been given the levels kept as crossed before the
+    /// server started.
+    holds_restored: bool,
+    /// The levels as last saved, so only what changed is written.
+    saved_holds: HashSet<HeldLevel>,
 }
 
 impl Evaluator {
@@ -590,6 +624,8 @@ impl Evaluator {
             newest_samples: HashMap::new(),
             silences: HashMap::new(),
             silences_restored: false,
+            holds_restored: false,
+            saved_holds: HashSet::new(),
         }
     }
 
@@ -1042,6 +1078,9 @@ impl Evaluator {
     }
 
     pub async fn evaluate(&mut self, now: Timestamp) -> Result<()> {
+        if !self.holds_restored {
+            self.restore_holds().await?;
+        }
         let open_alerts = self.database.open_alerts().await?;
         let mut open: HashMap<Key, Alert> = open_alerts
             .into_iter()
@@ -1080,11 +1119,72 @@ impl Evaluator {
 
         self.actions.give_up_on_unanswered(now).await?;
         self.trackers.retain(|key, _| checked.contains(key));
+        self.save_holds().await?;
         let firing = self.database.open_alert_count().await?;
         self.status
             .firing
             .store(usize::try_from(firing)?, Ordering::Relaxed);
         self.status.alert_pass_finished(now);
+        Ok(())
+    }
+
+    /// Carries on the waits that were going on when the server stopped, so a rule
+    /// that waits days isn't started over by a restart. Each one is only kept if
+    /// its level is still crossed when it's next checked, and one for a rule, host
+    /// or series that's gone is dropped after the first pass, as it isn't checked.
+    async fn restore_holds(&mut self) -> Result<()> {
+        let held = self.database.alert_holds().await?;
+        for level in &held {
+            let key = Key {
+                rule_id: level.rule_id,
+                host_id: level.host_id.clone(),
+                series: level.series.clone(),
+            };
+            let tracker = self.trackers.entry(key).or_default();
+            tracker.restored.insert(level.severity, level.since);
+        }
+        self.saved_holds = held.into_iter().collect();
+        self.holds_restored = true;
+        Ok(())
+    }
+
+    /// Writes down which levels are crossed and since when, as far as that has
+    /// changed since the last pass.
+    async fn save_holds(&mut self) -> Result<()> {
+        let held: HashSet<HeldLevel> = self
+            .trackers
+            .iter()
+            .flat_map(|(key, tracker)| {
+                tracker.held().map(|(severity, since)| HeldLevel {
+                    rule_id: key.rule_id,
+                    host_id: key.host_id.clone(),
+                    series: key.series.clone(),
+                    severity,
+                    since,
+                })
+            })
+            .collect();
+        if held == self.saved_holds {
+            return Ok(());
+        }
+        let place = |level: &HeldLevel| {
+            (
+                level.rule_id,
+                level.host_id.clone(),
+                level.series.clone(),
+                level.severity,
+            )
+        };
+        let still: HashSet<_> = held.iter().map(place).collect();
+        let ended: Vec<HeldLevel> = self
+            .saved_holds
+            .iter()
+            .filter(|level| !still.contains(&place(level)))
+            .cloned()
+            .collect();
+        let changed: Vec<HeldLevel> = held.difference(&self.saved_holds).cloned().collect();
+        self.database.save_alert_holds(&ended, &changed).await?;
+        self.saved_holds = held;
         Ok(())
     }
 

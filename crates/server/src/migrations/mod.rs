@@ -1553,6 +1553,49 @@ impl MigrationTrait for CreateTables {
             }
             manager.create_index(index).await?;
         }
+        // Since when each level of a rule has been crossed for a host and series,
+        // so a rule that waits days before alerting carries on waiting through a
+        // restart. Only crossings still going on are kept.
+        manager
+            .create_table(
+                Table::create()
+                    .table(AlertHolds::Table)
+                    .col(id(AlertHolds::Id))
+                    .col(ColumnDef::new(AlertHolds::RuleId).big_integer().not_null())
+                    .col(ColumnDef::new(AlertHolds::HostId).string_len(32).not_null())
+                    .col(
+                        ColumnDef::new(AlertHolds::Series)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(AlertHolds::Severity)
+                            .string_len(16)
+                            .not_null(),
+                    )
+                    .col(moment(backend, AlertHolds::BreachedSince).not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alert_holds_rule_id")
+                            .from(AlertHolds::Table, AlertHolds::RuleId)
+                            .to(AlertRules::Table, AlertRules::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_alert_holds_host_id")
+                            .from(AlertHolds::Table, AlertHolds::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        let (name, columns) = (
+            "idx_alert_holds_level",
+            "rule_id, host_id, series, severity",
+        );
+        index_of(manager, Unique, name, "alert_holds", columns, None).await?;
         manager
             .create_table(
                 Table::create()
@@ -2639,6 +2682,17 @@ enum RemoteChecks {
 }
 
 #[derive(Iden)]
+enum AlertHolds {
+    Table,
+    Id,
+    RuleId,
+    HostId,
+    Series,
+    Severity,
+    BreachedSince,
+}
+
+#[derive(Iden)]
 enum UnifiDevices {
     Table,
     Id,
@@ -2965,13 +3019,14 @@ mod tests {
     }
 
     /// Every table a host or user has rows in.
-    const KEPT_ABOUT_THEM: [&str; 12] = [
+    const KEPT_ABOUT_THEM: [&str; 13] = [
         "host_facts",
         "host_config_status",
         "host_boots",
         "metrics_pages",
         "remote_checks",
         "alerts",
+        "alert_holds",
         "action_runs",
         "user_sessions",
         "api_keys",
@@ -3013,6 +3068,10 @@ mod tests {
             format!(
                 "INSERT INTO alerts (rule_id, severity, host_id, summary, started_at, breached_at)
                  VALUES (1, 'critical', 'h1', 'web is offline', {AT}, {AT})"
+            ),
+            format!(
+                "INSERT INTO alert_holds (rule_id, host_id, series, severity, breached_since)
+                 VALUES (1, 'h1', '', 'critical', {AT})"
             ),
             format!(
                 "INSERT INTO action_runs (host_id, alert_id, action, run_on, variables,

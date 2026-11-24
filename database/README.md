@@ -42,7 +42,7 @@ case and the spaces around them, as people read them. Each of those tables has a
 keeps unique, comparing it exactly on every database, so they all agree.
 
 What a row goes with is the database's to say. Deleting a host deletes its facts,
-config status, boot time, metrics pages, checks, alerts and action runs; deleting a
+config status, boot time, metrics pages, checks, alerts, alert holds and action runs; deleting a
 user deletes their sessions, keys, app sign-ins, recovery codes and sign-in
 challenges; deleting an alert deletes its notifications and action runs, and deleting
 an action run the notifications of what it printed. Alert rules, channels and templates
@@ -91,6 +91,8 @@ erDiagram
     template_metrics ||--o{ template_metric_states : "says"
     template_counters |o--o{ template_metrics : "gives"
     alert_rules ||--o{ alerts : "raised"
+    alert_rules ||--o{ alert_holds : "waiting on"
+    hosts ||--o{ alert_holds : "crossed on"
     alert_rules ||--o{ alert_rule_channels : "tells"
     notification_channels ||--o{ alert_rule_channels : "told by"
     alert_rules ||--o{ alert_rule_actions : "runs"
@@ -407,6 +409,14 @@ erDiagram
         text resolved_summary
         string acknowledged_by
         timestamp acknowledged_at
+    }
+    alert_holds {
+        int id PK
+        int rule_id FK
+        string host_id FK
+        string series "empty for the host as a whole"
+        string severity "which of the rule's levels"
+        timestamp breached_since "unique by rule, host, series and level"
     }
     notification_channels {
         int id PK

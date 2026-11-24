@@ -5,6 +5,7 @@
 mod action_run;
 mod actions;
 mod alert;
+mod alert_hold;
 mod alert_rule;
 mod alert_rule_action;
 mod alert_rule_channel;
@@ -94,6 +95,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
+pub use self::alerting::HeldLevel;
 pub use self::app_sign_ins::{AppSignIn, AppTokens, Refreshed};
 use self::audit::record_change;
 pub use self::built_in_rules::same_rule;

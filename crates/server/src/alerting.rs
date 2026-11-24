@@ -41,7 +41,7 @@ pub const DEFAULT_FORECAST_WINDOW: TimeDelta = TimeDelta::hours(6);
 const MIN_FORECAST_WINDOW: TimeDelta = TimeDelta::hours(1);
 
 /// Mildest first, so the worse of two is the greater.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Severity {
     Warning,
