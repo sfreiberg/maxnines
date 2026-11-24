@@ -48,7 +48,7 @@
 {% endif %}
 
 {% if waiting > 0 %}
-<p class="notice"><a href="/hosts">{{ waiting }} host{% if waiting != 1 %}s are{% else %} is{% endif %} waiting for approval.</a></p>
+<p class="notice warn"><a href="/hosts">{{ waiting }} host{% if waiting != 1 %}s are{% else %} is{% endif %} waiting for approval.</a></p>
 {% endif %}
 
 <section>
