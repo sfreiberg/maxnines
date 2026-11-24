@@ -9,6 +9,7 @@
   - [Operating system](collectors-operating-system.md)
   - [Containers](collectors-containers.md)
   - [Windows performance counters](collectors-windows-counters.md)
+  - [Drives](collectors-smart.md)
   - [Apache](collectors-apache.md)
   - [nginx](collectors-nginx.md)
   - [PHP-FPM](collectors-php-fpm.md)

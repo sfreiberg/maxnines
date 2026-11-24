@@ -117,6 +117,7 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
         keys,
         [
             "clickhouse",
+            "drives",
             "host",
             "macos",
             "mongodb",

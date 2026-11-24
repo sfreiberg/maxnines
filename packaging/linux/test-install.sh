@@ -98,6 +98,14 @@ status=0
 MAXNINES_CONFIG_DIR=$(mktemp -d) maxnines get hosts || status=$?
 test "$status" = 4
 
+# The agent recommends smartmontools, which reads drives' SMART health, as a weak
+# dependency the package manager installs unless told not to.
+if command -v apt-get >/dev/null; then
+  dpkg-query -W -f='${Recommends}' maxnines-agent | grep -qw smartmontools
+else
+  rpm -q --recommends maxnines-agent | grep -qw smartmontools
+fi
+
 # Upgrading keeps an edited config without asking: Debian doesn't track it at all,
 # and RPM keeps it as noreplace.
 for config in server agent; do

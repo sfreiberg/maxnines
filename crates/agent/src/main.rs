@@ -27,6 +27,7 @@ mod own_usage;
 mod privileges;
 mod saved_config;
 mod services;
+mod smart;
 mod spool;
 mod status_pages;
 mod system_collector;

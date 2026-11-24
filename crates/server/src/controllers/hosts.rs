@@ -579,6 +579,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .as_ref()
         .and_then(|agent| agent["memory_bytes"].as_f64());
     let own_uptime = own.as_ref().and_then(uptime_of);
+    let (drives, drives_problem) = match state.metrics.latest_output(&id, "smart", now).await {
+        Ok(output) => drives_of(output.as_ref()),
+        Err(error) => return server_error(&error),
+    };
     let uptime = match state.metrics.latest_output(&id, "host", now).await {
         Ok(output) => output.as_ref().and_then(uptime_of),
         Err(error) => return server_error(&error),
@@ -636,6 +640,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("checks", &checks)
         .with("runs", &runs)
         .with("more_runs", &more_runs)
+        .with("drives", &drives)
+        .with("drives_problem", &drives_problem)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)
@@ -672,6 +678,49 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("reported", &reported)
         .with("history", &changes)
         .render()
+}
+
+/// One drive on a host's page, from its newest SMART reading.
+#[derive(Debug, PartialEq, Serialize)]
+struct DriveRow {
+    /// Its model and serial number, which its series are called.
+    name: Option<String>,
+    device: String,
+    /// Whether it passes its own assessment, if it says.
+    healthy: Option<bool>,
+    temperature: Option<String>,
+    /// Why there's nothing to show, or that it's asleep.
+    note: Option<String>,
+}
+
+/// Each drive the smart collector last read, and why it couldn't read any.
+fn drives_of(output: Option<&Value>) -> (Vec<DriveRow>, Option<String>) {
+    let mut drives = Vec::new();
+    let mut problem = None;
+    for item in output.and_then(Value::as_array).into_iter().flatten() {
+        if let Some(said) = item["problem"].as_str() {
+            problem = Some(said.to_string());
+            continue;
+        }
+        let asleep = item["asleep"].as_f64().is_some_and(|asleep| asleep >= 1.0);
+        let note = match item["note"].as_str() {
+            _ if asleep => Some("Asleep, so not asked. This is what it last said.".to_string()),
+            Some(note) if !note.is_empty() => Some(note.to_string()),
+            _ => None,
+        };
+        // A drive smartctl couldn't read is named by its device alone.
+        let named = item["model"].is_string() || item["serial"].is_string();
+        drives.push(DriveRow {
+            name: item["name"].as_str().filter(|_| named).map(str::to_string),
+            device: item["device"].as_str().unwrap_or_default().to_string(),
+            healthy: item["healthy"].as_f64().map(|healthy| healthy >= 1.0),
+            temperature: item["temperature_celsius"]
+                .as_f64()
+                .map(|celsius| format_value(Unit::Celsius, celsius)),
+            note,
+        });
+    }
+    (drives, problem)
 }
 
 /// How long maintenance can be started for from a host's page, with what the page

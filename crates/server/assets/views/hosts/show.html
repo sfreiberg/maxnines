@@ -168,6 +168,30 @@
 </section>
 {% endif %}
 
+{% if drives or drives_problem %}
+<section class="card">
+  <h2>Drives</h2>
+  {% if drives_problem %}<p class="notice">{{ drives_problem }}</p>{% endif %}
+  {% if drives %}
+  <div class="table-scroll"><table>
+    <thead>
+    <tr><th>Drive</th><th>Health</th><th>Temperature</th></tr>
+    </thead>
+    <tbody>
+    {% for drive in drives %}
+    <tr>
+      <td><strong>{% if drive.name %}{{ drive.name }}{% else %}{{ drive.device }}{% endif %}</strong>{% if drive.name %}<code class="under">{{ drive.device }}</code>{% endif %}</td>
+      <td>{% if drive.healthy == true %}<span class="badge good">Passes</span>{% elif drive.healthy == false %}<span class="badge bad">Failing</span>{% else %}<span class="badge neutral">Unknown</span>{% endif %}{% if drive.note %}<span class="under">{{ drive.note }}</span>{% endif %}</td>
+      <td class="nowrap">{% if drive.temperature %}{{ drive.temperature }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  <p class="hint">Each drive's own SMART assessment, read every 15 minutes. See <a href="/docs/collectors-smart">Drives</a> for what's read and its alerts.</p>
+</section>
+{% endif %}
+
 {% if runs %}
 <section class="card">
   <h2>Templates</h2>

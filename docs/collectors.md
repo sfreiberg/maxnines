@@ -10,6 +10,8 @@ each collector reads, how to turn it on, and every metric it reports:
 - **[Containers](collectors-containers.md):** Docker and Podman containers on Linux.
 - **[Windows performance counters](collectors-windows-counters.md):** any counter
   Windows or the software on it publishes.
+- **[Drives](collectors-smart.md):** each drive's SMART health, with smartctl or
+  Windows' own counters.
 - **Web servers:** [Apache](collectors-apache.md), [nginx](collectors-nginx.md) and
   [PHP-FPM](collectors-php-fpm.md).
 - **Databases:** [PostgreSQL](collectors-postgresql.md), [MySQL and
@@ -30,7 +32,7 @@ turns that collector on too, unless the rule sets it to **Off**.
 
 | Collector | On by default | Systems |
 | --- | --- | --- |
-| `cpu`, `memory`, `disk`, `network`, `host`, `system` | Yes | All |
+| `cpu`, `memory`, `disk`, `network`, `host`, `system`, `smart` | Yes | All |
 | `gpu` | On Macs | macOS |
 | `processes`, `services`, `files` | Once a rule lists what to watch | All |
 | `top_processes`, `sensors` | No | All |

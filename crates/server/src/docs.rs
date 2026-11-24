@@ -887,6 +887,7 @@ mod tests {
         ),
         ("collectors-containers", &["containers"]),
         ("collectors-windows-counters", &["counters"]),
+        ("collectors-smart", &["smart"]),
         ("collectors-apache", &["apache"]),
         ("collectors-nginx", &["nginx"]),
         ("collectors-php-fpm", &["php_fpm"]),

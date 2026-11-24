@@ -18,6 +18,7 @@ template "host" {
       disk    = { enabled = true }
       network = { enabled = true }
       system  = { enabled = true }
+      smart   = { enabled = true }
     }
   }
 

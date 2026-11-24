@@ -71,8 +71,9 @@ license-file = ["../../LICENSE", "0"]
 extended-description = "Reports how a host is doing to a MaxNines server. What it watches is set on\nthe server, and it keeps its key and unsent samples in /var/lib/maxnines-agent."
 section = "admin"
 priority = "optional"
-# Fully static, so it needs nothing else.
+# Fully static, so it needs nothing else. smartctl reads drives' SMART health.
 depends = ""
+recommends = "smartmontools"
 assets = [
   ["target/release/maxnines-agent", "usr/bin/", "755"],
   # Only the default. postinst copies it to /etc/maxnines when there's no config,
@@ -99,3 +100,7 @@ post_install_script = "../../packaging/linux/rpm/agent-post.sh"
 pre_uninstall_script = "../../packaging/linux/rpm/agent-preun.sh"
 post_uninstall_script = "../../packaging/linux/rpm/agent-postun.sh"
 auto-req = "no"
+
+# A weak dependency, installed with the agent unless dnf is told not to.
+[package.metadata.generate-rpm.recommends]
+smartmontools = "*"

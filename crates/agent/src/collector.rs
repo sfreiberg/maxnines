@@ -205,6 +205,7 @@ fn build(
             config.names.clone().unwrap_or_default(),
         )),
         "sensors" => Box::new(SensorCollector::new()?),
+        "smart" => Box::new(crate::smart::SmartCollector::new()?),
         #[cfg(target_os = "macos")]
         "gpu" => Box::new(maxnines_collectors::gpu::GpuCollector),
         "system" => Box::new(SystemCollector::new(interval)?),

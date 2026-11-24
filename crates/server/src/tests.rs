@@ -19,7 +19,7 @@ mod two_factor;
 mod unifi;
 mod users;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1725,8 +1725,9 @@ async fn an_approved_agent_is_sent_the_default_config() {
 
     assert_eq!(version, config.version().unwrap());
     assert_eq!(config.interval, Duration::from_secs(15));
-    assert_eq!(config.collectors.len(), 6);
+    assert_eq!(config.collectors.len(), 7);
     assert!(config.collectors["system"].enabled);
+    assert!(config.collectors["smart"].enabled);
 }
 
 #[tokio::test]
@@ -4453,6 +4454,105 @@ async fn web_server_status_pages_become_charts() {
         .filter_map(|line| line["name"].as_str())
         .collect();
     assert_eq!(names.len(), 2, "{up}");
+}
+
+#[tokio::test]
+async fn each_drive_gets_series_by_model_and_serial_and_the_host_page_lists_them() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "nas-1").await;
+    let id = host.id();
+    let rows = json!([
+        {
+            "name": "WDC WD40EFRX WD-WCC7K1", "device": "/dev/sda", "model": "WDC WD40EFRX",
+            "serial": "WD-WCC7K1", "protocol": "ATA", "healthy": 0, "temperature_celsius": 38.0,
+            "power_on_secs": 3600.0, "reallocated": 1872.0, "pending": 24.0,
+            "asleep": 0, "note": ""
+        },
+        {
+            "name": "Samsung SSD 980 PRO S5GX", "device": "/dev/nvme0", "model": "Samsung SSD 980 PRO",
+            "serial": "S5GX", "protocol": "NVMe", "healthy": 1, "temperature_celsius": 41.0,
+            "used_percent": 3.0, "spare_percent": 100.0, "spare_threshold_percent": 10.0,
+            "asleep": 0, "note": ""
+        },
+        { "name": "/dev/sdc", "device": "/dev/sdc", "asleep": 1, "note": "" },
+        { "name": "/dev/sdd", "device": "/dev/sdd", "asleep": 0, "note": "Unknown USB bridge" },
+    ]);
+    let message = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("smart".to_string(), rows)]),
+    });
+    send(&mut client, &message).await;
+
+    let path = format!("/api/v1/hosts/{id}/metrics/smart.temperature?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let temperature = loop {
+        let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| lines.len() == 2)
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sample never arrived: {body}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    let names: BTreeSet<&str> = temperature["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line["name"].as_str())
+        .collect();
+    assert_eq!(
+        names,
+        BTreeSet::from(["WDC WD40EFRX WD-WCC7K1", "Samsung SSD 980 PRO S5GX"])
+    );
+    let path = format!("/api/v1/hosts/{id}/metrics/smart.pending?range=1h");
+    let pending = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(pending["series"][0]["points"][0]["avg"], 24.0, "{pending}");
+
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(page.body.contains("<h2>Drives</h2>"), "{}", page.body);
+    assert!(
+        page.body
+            .contains(r#"<span class="badge bad">Failing</span>"#)
+    );
+    assert!(
+        page.body
+            .contains(r#"<span class="badge good">Passes</span>"#)
+    );
+    assert!(page.body.contains("Unknown USB bridge"));
+    assert!(page.body.contains("Asleep, so not asked"));
+
+    // smartctl missing leaves nothing but what to do about it.
+    let rows = json!([{
+        "name": "smartctl",
+        "problem": "smartctl isn't installed. Install smartmontools 7.0 or later: brew install smartmontools",
+        "drives": 0
+    }]);
+    let message = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("smart".to_string(), rows)]),
+    });
+    send(&mut client, &message).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = browser.get(&server, &format!("/hosts/{id}")).await;
+        if page.body.contains("brew install smartmontools") {
+            assert!(!page.body.contains("Unknown USB bridge"), "{}", page.body);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    }
 }
 
 #[tokio::test]

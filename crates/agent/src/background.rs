@@ -39,10 +39,10 @@ static RUNTIME: Mutex<Option<Handle>> = Mutex::new(None);
 /// agent or across a fleet.
 pub use maxnines_checks::jitter;
 
-/// Every `every`, first at a random point in the first one. After running late, the
+/// Every `every`, first at a random point in `first_within`. After running late, the
 /// next goes at once, and the ones after it keep to the same schedule.
-fn schedule(every: Duration) -> Interval {
-    let mut schedule = interval_at(Instant::now() + jitter(every), every);
+fn schedule(first_within: Duration, every: Duration) -> Interval {
+    let mut schedule = interval_at(Instant::now() + jitter(first_within), every);
     schedule.set_missed_tick_behavior(MissedTickBehavior::Skip);
     schedule
 }
@@ -101,6 +101,27 @@ impl Background {
         &mut self,
         every: Duration,
         limit: Option<Duration>,
+        round: Round,
+        publish: Publish,
+    ) -> Result<()>
+    where
+        Round: FnMut() -> Work + Send + 'static,
+        Work: Future<Output = Found> + Send + 'static,
+        Found: Send + 'static,
+        Publish: FnMut(Option<Found>) -> Value + Send + 'static,
+    {
+        self.repeat_from(every, every, limit, round, publish)
+    }
+
+    /// As [`Self::repeat`], but the first round comes at a random point in
+    /// `first_within` rather than in the first `every`, for work done so seldom
+    /// that waiting a whole `every` for the first result would leave a new agent,
+    /// or one whose config changed, with nothing to show for too long.
+    pub fn repeat_from<Found, Round, Work, Publish>(
+        &mut self,
+        first_within: Duration,
+        every: Duration,
+        limit: Option<Duration>,
         mut round: Round,
         mut publish: Publish,
     ) -> Result<()>
@@ -118,7 +139,7 @@ impl Background {
         };
         let results = self.results.clone();
         let task = runtime.spawn(async move {
-            let mut schedule = schedule(every);
+            let mut schedule = schedule(first_within, every);
             loop {
                 schedule.tick().await;
                 let found = match catch_unwind(AssertUnwindSafe(&mut round)) {
@@ -398,7 +419,7 @@ mod tests {
     async fn an_item_keeps_to_its_schedule_when_a_round_runs_late() {
         let every = Duration::from_secs(60);
         let started = Instant::now();
-        let mut schedule = schedule(every);
+        let mut schedule = schedule(every, every);
         schedule.tick().await;
         let first = started.elapsed();
         assert!(first < every, "{first:?}");
@@ -411,6 +432,19 @@ mod tests {
         assert_eq!(started.elapsed(), late);
         schedule.tick().await;
         assert_eq!(started.elapsed(), first + every * 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_first_round_can_come_sooner_than_the_interval() {
+        let every = Duration::from_secs(900);
+        let first_within = Duration::from_secs(60);
+        let started = Instant::now();
+        let mut schedule = schedule(first_within, every);
+        schedule.tick().await;
+        let first = started.elapsed();
+        assert!(first < first_within, "{first:?}");
+        schedule.tick().await;
+        assert_eq!(started.elapsed(), first + every);
     }
 
     #[test]

@@ -1242,6 +1242,12 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Disk filling up",
             "Disk running out of inodes",
             "Disk will be full soon",
+            "Drive failing",
+            "Drive has reallocated sectors",
+            "Drive has unreadable sectors",
+            "Drive nearly worn out",
+            "Drive running out of spare",
+            "Drive too hot",
             "Galera node not in the primary component",
             "Host offline",
             "Host sending no metrics",
@@ -1370,6 +1376,30 @@ async fn a_failing_container_alerts_after_a_minute() {
     let open = test.open().await;
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].series.as_deref(), Some("web"));
+    assert_eq!(open[0].severity, Severity::Critical);
+}
+
+#[tokio::test]
+async fn a_drive_failing_its_own_assessment_is_critical_after_a_minute() {
+    let mut test = Harness::start().await;
+    let rule = built_in("Drive failing").await;
+    assert_eq!(rule.critical.as_deref(), Some("smart.healthy < 1"));
+    check_rule(&rule).unwrap();
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    for minute in [0, 5] {
+        let offset = MINUTE * minute;
+        let readings = vec![
+            test.reading("WDC WD40EFRX WD-1", test.now + offset, 0.0),
+            test.reading("Samsung SSD 980 S5G", test.now + offset, 1.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(offset).await;
+    }
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].series.as_deref(), Some("WDC WD40EFRX WD-1"));
     assert_eq!(open[0].severity, Severity::Critical);
 }
 
