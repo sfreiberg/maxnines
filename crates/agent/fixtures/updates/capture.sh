@@ -66,16 +66,16 @@ rocky | almalinux | rhel | centos | fedora)
   add_user
   cap dnf-check-update /usr/bin/dnf -C -q check-update
   cap dnf-security /usr/bin/dnf -C -q updateinfo list --security
-  # Without root, as the agent's user would be before asking sudo.
+  # Without root, as the agent's user runs them.
   as_user dnf-check-update-user /usr/bin/dnf -C -q check-update
-  as_user dnf-sudo-refused /usr/bin/sudo -n /usr/bin/dnf -C -q check-update
+  as_user dnf-security-user /usr/bin/dnf -C -q updateinfo list --security
   if [ -x /usr/bin/needs-restarting ]; then
     cap needs-restarting /usr/bin/needs-restarting -r
   fi
   ;;
 opensuse-leap | opensuse-tumbleweed | sles)
   zypper --non-interactive --quiet refresh >/dev/null
-  zypper --non-interactive --quiet install shadow >/dev/null 2>&1 || true
+  zypper --non-interactive --quiet install shadow findutils >/dev/null 2>&1 || true
   # Leap's image is often current, so curl from the release's own repository,
   # older than its updates, when nothing is waiting.
   if ! zypper --non-interactive --no-refresh --xmlout list-updates | grep -q '<update '; then
@@ -115,4 +115,6 @@ find /var/lib/apt/periodic /var/lib/apt/lists /var/cache/dnf /var/cache/libdnf5 
   /var/cache/yum /var/cache/zypp/raw /var/lib/pacman/sync /var/cache/apk -maxdepth 4 \
   \( -name '*Release' -o -name repomd.xml -o -name '*.db' -o -name 'APKINDEX*' \
   -o -name last_makecache -o -name update-success-stamp \) >"$out/lists" 2>/dev/null
+# Where zypper keeps what it fetched, as its folders differ between releases.
+ls -laR /var/cache/zypp >"$out/zypp-cache" 2>&1 || true
 exit 0
