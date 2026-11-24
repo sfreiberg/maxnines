@@ -3980,18 +3980,40 @@ async fn a_charts_numbers_can_be_read_as_a_table() {
     );
     assert!(page.body.contains("The last 6 hours"), "{}", page.body);
 
+    // The page is as wide as the others, not narrowed.
+    assert!(!page.body.contains("class=\"narrow\""), "{}", page.body);
+
     // The chart is drawn larger above them, which stay folded away until asked for.
-    let chart = page.body.find("<svg class=\"chart\"").expect("a chart");
+    // It's drawn twice, wide and narrower, for the screen to show one, with its
+    // summary once under both.
+    let wide = page
+        .body
+        .find("<div class=\"drawing-wide\">")
+        .expect("wide");
+    let narrow = page
+        .body
+        .find("<div class=\"drawing-narrow\">")
+        .expect("narrow");
+    let summary = page
+        .body
+        .find("<table class=\"chart-summary\">")
+        .expect("a summary");
     let numbers = page
         .body
         .find("<details class=\"numbers\">")
         .expect("numbers");
-    assert!(chart < numbers, "{}", page.body);
-    assert!(
-        page.body.contains("viewBox=\"0 0 812.0 400.0\""),
-        "{}",
-        page.body
+    assert!(wide < narrow && narrow < summary, "{}", page.body);
+    assert!(summary < numbers, "{}", page.body);
+    assert_eq!(page.body.matches("<svg class=\"chart\"").count(), 2);
+    assert_eq!(
+        page.body.matches("<table class=\"chart-summary\">").count(),
+        1
     );
+    let drawings = [&page.body[wide..narrow], &page.body[narrow..summary]];
+    for (drawing, frame) in drawings.into_iter().zip(["1400.0 460.0", "812.0 400.0"]) {
+        let view = format!("viewBox=\"0 0 {frame}\"");
+        assert!(drawing.contains(&view), "{frame}: {}", page.body);
+    }
     assert!(page.body.contains("<summary>Show the numbers</summary>"));
 }
 

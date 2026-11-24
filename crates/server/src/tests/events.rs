@@ -491,10 +491,11 @@ async fn a_note_from_the_host_page_shows_in_its_events() {
     assert!(!shown.body.contains("<b>nginx"));
     assert!(shown.has_only_our_scripts());
 
-    // And on a chart's own data page.
+    // And on a chart's own data page, on both its drawings.
     let data = format!("/hosts/{}/metrics/cpu.usage?range=6h", host.id());
     let data = browser.get(&server, &data).await;
-    assert!(data.body.contains(r#"<circle class="event-dot k-deploy""#));
+    let dots = data.body.matches(r#"<circle class="event-dot k-deploy""#);
+    assert_eq!(dots.count(), 2, "{}", data.body);
     assert!(data.body.contains("Rolled back &lt;b&gt;nginx&lt;/b&gt;"));
     assert!(!data.body.contains("<b>nginx"));
 }

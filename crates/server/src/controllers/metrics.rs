@@ -523,9 +523,19 @@ async fn show(
         .render()
 }
 
-/// A chart's data page has it alone, as wide as the narrow page so its text is the
-/// size it is on the host pages, and taller than they draw it.
-const DATA_FRAME: Frame = Frame {
+/// A chart's data page has it alone, across the whole page and taller than the host
+/// pages draw it. A drawing's text scales with it, so one frame can't suit every
+/// screen: the page draws the chart twice and shows one. This one is about as wide
+/// as the page gets, so on a wide screen its text is about the size it is on the
+/// host pages.
+const DATA_FRAME_WIDE: Frame = Frame {
+    width: 1400.0,
+    height: 460.0,
+};
+
+/// The data page's chart on a narrower screen, where the wide one's text would be
+/// too small to read. It scales down to a phone as the alert page's chart does.
+const DATA_FRAME_NARROW: Frame = Frame {
     width: 812.0,
     height: 400.0,
 };
@@ -574,11 +584,16 @@ async fn data(
     };
     let zone = viewer_zone();
     let title = &metric.title;
-    let mut chart =
-        metric_charts::build_as(metric, metric.unit, title, DATA_FRAME, &result, range, zone);
-    // What happened to the host is marked on it, as on the host's charts.
+    let build =
+        |frame| metric_charts::build_as(metric, metric.unit, title, frame, &result, range, zone);
+    let mut wide_chart = build(DATA_FRAME_WIDE);
+    let mut narrow_chart = build(DATA_FRAME_NARROW);
+    // What happened to the host is marked on both, as on the host's charts.
     match state.timeline(&host.id, range.from, range.to).await {
-        Ok(events) => metric_charts::mark(&mut chart, &events, range, zone),
+        Ok(events) => {
+            metric_charts::mark(&mut wide_chart, &events, range, zone);
+            metric_charts::mark(&mut narrow_chart, &events, range, zone);
+        }
         Err(error) => return server_error(&error),
     }
     let failed_services = if metric.name == FAILED_SERVICES {
@@ -603,7 +618,8 @@ async fn data(
     Page::new(&state, &token, "metrics/data.html")
         .with("host_id", &host.id)
         .with("hostname", &host.hostname)
-        .with("chart", &chart)
+        .with("wide_chart", &wide_chart)
+        .with("narrow_chart", &narrow_chart)
         .with("failed_services", &failed_services)
         .with("ranges", &ranges)
         .with("range", selected)

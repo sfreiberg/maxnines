@@ -419,6 +419,9 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .chart-summary td.number { font-size: 13px; }
 /* A chart's numbers on its data page, under it until someone asks for them. */
 .numbers summary { cursor: pointer; font-weight: 500; }
+/* The data page draws its chart twice, as a drawing's text scales with it, and shows
+   the wide one on a wide screen and the narrower one below that. */
+.drawing-narrow { display: none; }
 .numbers[open] summary, .numbers .hint { margin-bottom: 12px; }
 .key-swatch { display: inline-block; width: 12px; height: 3px; margin-right: 8px; border-radius: 2px; vertical-align: middle; }
 
@@ -547,6 +550,11 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .code .hl-string { color: var(--code-string); }
 .code .hl-constant { color: var(--code-number); }
 .code .hl-entity, .code .hl-support { color: var(--code-name); }
+
+@media (max-width: 80rem) {
+  .drawing-wide { display: none; }
+  .drawing-narrow { display: block; }
+}
 
 @media (max-width: 60rem) {
   .map-layout, .location-layout, .docs-layout { grid-template-columns: minmax(0, 1fr); }
