@@ -92,7 +92,9 @@ pub enum Made {
     Settings {
         name: String,
         settings: Box<CollectorSettings>,
-        interval: Duration,
+        /// The interval, for a collector that runs on it, so only those are built
+        /// again when it changes. See [`runs_on_interval`].
+        interval: Option<Duration>,
     },
     /// What templates have it read, which a new config changes in place.
     Templates,
@@ -100,8 +102,40 @@ pub enum Made {
     OwnUsage,
 }
 
+impl Made {
+    /// The collector's name, for the log.
+    pub fn name(&self) -> &str {
+        match self {
+            Made::Settings { name, .. } => name,
+            Made::Templates => "templates",
+            Made::OwnUsage => "own usage",
+        }
+    }
+}
+
 /// The collectors that share the process list, which are made again together.
 const SHARE_PROCESSES: [&str; 2] = ["processes", "top_processes"];
+
+/// Whether a collector is built with the sample interval, such as one that runs
+/// something on a schedule of its own or works out rates per interval. The rest
+/// carry on when only the interval changes. [`build`] is given the interval only
+/// for these, so one missing from here can't be built at all.
+fn runs_on_interval(name: &str) -> bool {
+    matches!(
+        name,
+        "system"
+            | "checks"
+            | "custom"
+            | "commands"
+            | "services"
+            | "containers"
+            | "files"
+            | "apache"
+            | "nginx"
+            | "php_fpm"
+            | "openmetrics"
+    )
+}
 
 /// Everything a config turns on, in order, each with what it's made from, and
 /// built only if `keeping`, what the collectors running now were made from, has
@@ -130,7 +164,7 @@ pub fn build_all(config: &AgentConfig, local: Local<'_>, keeping: &[Made]) -> Re
         .map(|(name, settings)| Made::Settings {
             name: name.clone(),
             settings: Box::new(settings.clone()),
-            interval,
+            interval: runs_on_interval(name).then_some(interval),
         })
         .collect();
     // Those sharing the process list share one, so they're kept only together.
@@ -142,12 +176,17 @@ pub fn build_all(config: &AgentConfig, local: Local<'_>, keeping: &[Made]) -> Re
     let mut plan: Plan = Vec::with_capacity(made.len() + 1);
     for made in made {
         let kept = keeping.contains(&made) && (!sharing(&made) || keep_shared);
-        let Made::Settings { name, settings, .. } = &made else {
+        let Made::Settings {
+            name,
+            settings,
+            interval,
+        } = &made
+        else {
             continue;
         };
         let built = match kept {
             true => None,
-            false => Some(build(name, settings, local, interval, &mut processes)?),
+            false => Some(build(name, settings, local, *interval, &mut processes)?),
         };
         plan.push((made, built));
     }
@@ -183,13 +222,18 @@ impl Processes {
     }
 }
 
+/// Builds one collector. `interval` is the sample interval for one that
+/// [`runs_on_interval`], and None for the rest.
 fn build(
     name: &str,
     config: &CollectorSettings,
     local: Local<'_>,
-    interval: Duration,
+    interval: Option<Duration>,
     processes: &mut Processes,
 ) -> Result<Box<dyn Collector + Send>> {
+    let every = || {
+        interval.ok_or_else(|| anyhow::anyhow!("{name} runs on the interval but wasn't given it"))
+    };
     Ok(match name {
         "host" => Box::new(HostCollector),
         "cpu" => Box::new(CpuCollector::new()?),
@@ -209,44 +253,48 @@ fn build(
         "updates" => Box::new(crate::updates::UpdatesCollector::new()?),
         #[cfg(target_os = "macos")]
         "gpu" => Box::new(maxnines_collectors::gpu::GpuCollector),
-        "system" => Box::new(SystemCollector::new(interval)?),
+        "system" => Box::new(SystemCollector::new(every()?)?),
         "checks" => {
             let checks = config.checks.clone().unwrap_or_default();
             let chosen = config.local_checks.as_deref().unwrap_or_default();
-            Box::new(CheckCollector::new(checks, chosen, local.checks, interval)?)
+            Box::new(CheckCollector::new(checks, chosen, local.checks, every()?)?)
         }
         "custom" => {
             let names = config.names.clone().unwrap_or_default();
-            Box::new(CustomCollector::new(names, local.custom_metrics, interval)?)
+            Box::new(CustomCollector::new(names, local.custom_metrics, every()?)?)
         }
         "commands" => {
             let names = config.names.clone().unwrap_or_default();
             Box::new(CommandCollector::new(
                 names,
                 local.check_commands,
-                interval,
+                every()?,
             )?)
         }
         "services" => {
             let names = config.names.clone().unwrap_or_default();
-            Box::new(ServiceCollector::new(names, interval)?)
+            Box::new(ServiceCollector::new(names, every()?)?)
         }
         #[cfg(target_os = "linux")]
-        "containers" => Box::new(crate::containers::ContainerCollector::new(interval)?),
+        "containers" => Box::new(crate::containers::ContainerCollector::new(every()?)?),
         "files" => {
             let paths = config.paths.clone().unwrap_or_default();
-            Box::new(FileCollector::new(paths, interval)?)
+            Box::new(FileCollector::new(paths, every()?)?)
         }
-        "apache" => status_pages(Software::Apache, config, interval)?,
-        "nginx" => status_pages(Software::Nginx, config, interval)?,
-        "php_fpm" => status_pages(Software::PhpFpm, config, interval)?,
+        "apache" => status_pages(Software::Apache, config, every()?)?,
+        "nginx" => status_pages(Software::Nginx, config, every()?)?,
+        "php_fpm" => status_pages(Software::PhpFpm, config, every()?)?,
         "openmetrics" => {
             let urls = config.urls.clone().unwrap_or_default();
             let chosen = config.local_pages.as_deref().unwrap_or_default();
             let wanted = config.names.as_deref().unwrap_or_default();
             let pages = local.metrics_pages;
             Box::new(OpenMetricsCollector::new(
-                urls, chosen, wanted, pages, interval,
+                urls,
+                chosen,
+                wanted,
+                pages,
+                every()?,
             )?)
         }
         other => bail!("unknown collector {other:?}"),
@@ -607,11 +655,53 @@ mod tests {
             ),
             ["processes", "top_processes"]
         );
-        // A new interval builds everything again, as they run on it.
-        let mut slower = config(json!({ "cpu": {} }));
+        // A new collector is the only one built.
+        assert_eq!(
+            built(
+                json!({ "cpu": {}, "disk": { "mount_points": ["/"] }, "processes": {}, "memory": {} })
+            ),
+            ["memory"]
+        );
+    }
+
+    #[test]
+    fn a_new_interval_builds_again_only_what_runs_on_it() {
+        let before = config(json!({ "cpu": {}, "files": {}, "services": {} }));
+        let keeping: Vec<Made> = build_all(&before, Local::none(), &[])
+            .unwrap()
+            .into_iter()
+            .map(|(made, _)| made)
+            .collect();
+        let mut slower = before.clone();
         slower.interval = Duration::from_secs(60);
-        let plan = build_all(&slower, Local::none(), &keeping).unwrap();
-        assert!(plan[0].1.is_some());
+        let rebuilt: Vec<String> = build_all(&slower, Local::none(), &keeping)
+            .unwrap()
+            .into_iter()
+            .filter(|(_, built)| built.is_some())
+            .filter_map(|(made, _)| match made {
+                Made::Settings { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(rebuilt, ["files", "services"]);
+    }
+
+    #[test]
+    fn only_collectors_that_run_on_the_interval_are_given_it() {
+        for name in supported() {
+            let built = build(
+                name,
+                &serde_json::from_value::<CollectorSettings>(json!({})).unwrap(),
+                Local::none(),
+                None,
+                &mut Processes {
+                    table: None,
+                    files: false,
+                },
+            );
+            assert_eq!(built.is_err(), runs_on_interval(name), "{name}");
+        }
     }
 
     fn process(name: &str, exe: Option<&str>) -> RunningProcess {

@@ -77,7 +77,8 @@ When what an agent's sent changes, it changes only what's different: a collector
 whose settings are the same carries on with what it holds, such as connections and
 running totals, and each database a template reads keeps its connection, what
 discovery found, and the totals of each query that's the same. A changed interval
-starts every collector again.
+starts again only the collectors that run on it, such as checks, services, files and
+metrics pages, and samples keep to their schedule while collectors come and go.
 
 ### Built-in rules
 

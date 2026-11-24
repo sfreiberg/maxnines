@@ -472,7 +472,19 @@ struct Monitoring {
     /// as a panic may have left them broken.
     broken: Vec<Made>,
     period: Duration,
+    /// When the first sample was due. Samples fall due every period from it.
+    origin: Instant,
     ticker: Interval,
+}
+
+/// When the next sample is due on a schedule that began at `origin`.
+fn next_due(origin: Instant, period: Duration, now: Instant) -> Instant {
+    if now <= origin {
+        return origin;
+    }
+    let period_nanos = period.as_nanos().max(1);
+    let periods = (now - origin).as_nanos().div_ceil(period_nanos);
+    origin + Duration::from_nanos(u64::try_from(periods * period_nanos).unwrap_or(u64::MAX))
 }
 
 impl Monitoring {
@@ -491,8 +503,22 @@ impl Monitoring {
             made,
             broken: Vec::new(),
             period,
+            origin: first,
             ticker,
         }
+    }
+
+    /// Keeps the schedule for collectors new to it, which need [`collector::WARMUP`]
+    /// before their first sample: the next sample is when it was due, or that long
+    /// from now if it was due sooner. Starting the schedule afresh would wait up to
+    /// a whole period longer, leaving a gap in every collector's samples.
+    fn keep_schedule_for_new(&mut self) {
+        let now = Instant::now();
+        let due = next_due(self.origin, self.period, now).max(now + collector::WARMUP);
+        self.ticker = interval_at(due, self.period);
+        self.ticker
+            .set_missed_tick_behavior(MissedTickBehavior::Skip);
+        self.origin = due;
     }
 
     fn collector_count(&self) -> usize {
@@ -695,6 +721,12 @@ async fn apply(
         .plan
         .iter()
         .any(|(made, built)| built.is_some() && matches!(made, Made::Settings { .. }));
+    let mut rebuilt: Vec<String> = built
+        .plan
+        .iter()
+        .filter(|(_, built)| built.is_some())
+        .map(|(made, _)| made.name().to_string())
+        .collect();
     let skipped_collectors = built.skipped_collectors.clone();
     let running = match monitoring.as_mut() {
         Some(active) => active.take_back().await.map(|(running, finished)| {
@@ -723,14 +755,16 @@ async fn apply(
     }
     let started = match assembled {
         Some((collectors, made)) => {
-            // Unchanged, the samples keep to their schedule, unless something new
-            // has to warm up first.
-            let same_schedule = !fresh
-                && monitoring
-                    .as_ref()
-                    .is_some_and(|active| active.period == period);
+            // With the same interval, the samples keep to their schedule, giving
+            // anything new time to warm up first.
+            let same_schedule = monitoring
+                .as_ref()
+                .is_some_and(|active| active.period == period);
             match (monitoring.take(), same_schedule) {
                 (Some(mut active), true) => {
+                    if fresh {
+                        active.keep_schedule_for_new();
+                    }
                     active.version = update.version.clone();
                     active.collecting = Collecting::Ready(collectors);
                     active.made = made;
@@ -747,6 +781,11 @@ async fn apply(
                 Ok(built) => built,
                 Err(error) => return rejected(error),
             };
+            rebuilt = built
+                .plan
+                .iter()
+                .map(|(made, _)| made.name().to_string())
+                .collect();
             match assemble_apart(built.plan, Vec::new(), &update, config).await {
                 (Some((collectors, made)), _) => {
                     Monitoring::new(update.version.clone(), collectors, made, period)
@@ -759,6 +798,7 @@ async fn apply(
         version = update.version,
         collectors = started.collector_count(),
         interval_secs = period.as_secs(),
+        started = rebuilt.join(", "),
         "config applied"
     );
     *monitoring = Some(started);
@@ -1036,6 +1076,45 @@ mod tests {
         // One that isn't running any more can't be kept.
         let built = build(&after, Local::none(), &keeping).unwrap();
         assert!(assemble(built.plan, &mut Vec::new(), &after, Local::none()).is_none());
+    }
+
+    #[test]
+    fn samples_fall_due_every_period_from_the_first() {
+        let origin = Instant::now();
+        let period = Duration::from_secs(10);
+        let at = |secs: u64| origin + Duration::from_secs(secs);
+
+        assert_eq!(next_due(origin, period, origin), origin);
+        assert_eq!(
+            next_due(origin + Duration::from_secs(5), period, origin),
+            at(5)
+        );
+        assert_eq!(next_due(origin, period, at(1)), at(10));
+        assert_eq!(next_due(origin, period, at(10)), at(10));
+        assert_eq!(next_due(origin, period, at(25)), at(30));
+    }
+
+    /// Collectors new to a config don't restart the schedule, so the others' samples
+    /// carry on without a gap, but they're given time to warm up.
+    #[tokio::test]
+    async fn new_collectors_keep_to_the_schedule() {
+        let mut monitoring = Monitoring::new(
+            "v1".to_string(),
+            Vec::new(),
+            Vec::new(),
+            Duration::from_secs(60),
+        );
+        // Not due yet: still due when it was.
+        let due = monitoring.origin;
+        monitoring.keep_schedule_for_new();
+        assert_eq!(monitoring.origin, due);
+
+        // Due sooner than a collector can warm up: put off only long enough for it.
+        monitoring.origin = Instant::now() - Duration::from_secs(60) + collector::WARMUP / 2;
+        let now = Instant::now();
+        monitoring.keep_schedule_for_new();
+        assert!(monitoring.origin >= now + collector::WARMUP);
+        assert!(monitoring.origin < now + collector::WARMUP + Duration::from_secs(1));
     }
 
     /// A config that can't be put together leaves what was running as it was, so the
