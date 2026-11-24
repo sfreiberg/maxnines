@@ -1806,6 +1806,47 @@ async fn an_agent_is_only_sent_collectors_it_supports() {
 }
 
 #[tokio::test]
+async fn a_hosts_page_says_why_collectors_are_left_out() {
+    let server = start().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "web-1").await;
+    TestServer::next_config(&mut client).await;
+    let path = format!("/hosts/{}", host.id());
+    let mut browser = Browser::default();
+
+    let older = AgentMessage::Facts {
+        facts: json!({ "agent": { "version": "0.0.1", "collectors": ["cpu", "memory"] } }),
+    };
+    send(&mut client, &older).await;
+    TestServer::next_config(&mut client).await;
+    let page = browser.get(&server, &path).await;
+    assert!(
+        page.body.contains("left out of this agent's config, as")
+            && page.body.contains("this version of the agent can't run them. Upgrade it to"),
+        "{}",
+        page.body
+    );
+
+    let current = AgentMessage::Facts {
+        facts: json!({
+            "agent": {
+                "version": crate::agent_versions::NEWEST_AGENT_VERSION,
+                "collectors": ["cpu"],
+            },
+            "os": { "long_version": "Plan 9 4" },
+        }),
+    };
+    send(&mut client, &current).await;
+    TestServer::next_config(&mut client).await;
+    let page = browser.get(&server, &path).await;
+    assert!(
+        page.body.contains("they don't run on Plan 9 4."),
+        "{}",
+        page.body
+    );
+}
+
+#[tokio::test]
 async fn an_agents_config_result_is_recorded_and_shown() {
     let server = start().await;
     let host = identity();
@@ -1885,8 +1926,8 @@ async fn collectors_an_agent_does_not_know_are_kept_and_shown() {
     let page = browser.get(&server, &format!("/hosts/{id}")).await;
     assert!(
         page.body.contains(
-            "This agent doesn't know gpu, sensors, which are newer, so it needs upgrading to \
-             run them."
+            "This agent doesn't know <code>gpu</code> and <code>sensors</code>, which are \
+             newer, so it needs upgrading to run them."
         ),
         "{}",
         page.body
