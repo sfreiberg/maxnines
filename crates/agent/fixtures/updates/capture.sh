@@ -40,16 +40,20 @@ add_user() {
 case "$ID" in
 ubuntu | debian)
   apt-get update -qq
-  # The release's own openssl, so its security fixes are waiting.
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades \
-    "openssl/$VERSION_CODENAME" >/dev/null 2>&1 || true
+  # The release's own openssl, so its security fixes are waiting. Its library is
+  # libssl3t64 from Ubuntu 24.04 on, and libssl3 before.
+  for library in libssl3t64 libssl3; do
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades \
+      "openssl/$VERSION_CODENAME" "$library/$VERSION_CODENAME" >/dev/null 2>&1 && break
+  done
   add_user
   cap apt /usr/bin/apt-get -s -o Debug::NoLocking=true dist-upgrade
   as_user apt-user /usr/bin/apt-get -s -o Debug::NoLocking=true dist-upgrade
   ;;
 rocky | almalinux | rhel | centos | fedora)
   dnf -y -q makecache >/dev/null
-  dnf -y -q install sudo >/dev/null 2>&1 || true
+  # su comes with util-linux, which Fedora's image leaves out.
+  dnf -y -q install sudo util-linux >/dev/null 2>&1 || true
   if [ "$ID" = fedora ]; then
     dnf -y -q install dnf5-plugins >/dev/null 2>&1 || true
   else
@@ -72,6 +76,12 @@ rocky | almalinux | rhel | centos | fedora)
 opensuse-leap | opensuse-tumbleweed | sles)
   zypper --non-interactive --quiet refresh >/dev/null
   zypper --non-interactive --quiet install shadow >/dev/null 2>&1 || true
+  # Leap's image is often current, so curl from the release's own repository,
+  # older than its updates, when nothing is waiting.
+  if ! zypper --non-interactive --no-refresh --xmlout list-updates | grep -q '<update '; then
+    release=$(zypper --xmlout repos | sed -n 's/.*alias="\([^"]*\)".*/\1/p' | grep -iv update | grep -i oss | head -1)
+    zypper --non-interactive --quiet install --oldpackage --force --repo "$release" curl libcurl4 >/dev/null 2>&1 || true
+  fi
   add_user
   cap zypper-updates /usr/bin/zypper --non-interactive --no-refresh --xmlout list-updates
   cap zypper-security /usr/bin/zypper --non-interactive --no-refresh --xmlout list-patches --category security
@@ -83,6 +93,9 @@ arch)
   # what the image is behind by stays waiting.
   pacman -Sy --noconfirm --needed pacman-contrib >/dev/null
   add_user
+  # checkupdates needs fakeroot, which pacman-contrib doesn't bring.
+  cap checkupdates-no-fakeroot /usr/bin/checkupdates --nosync
+  pacman -S --noconfirm --needed fakeroot >/dev/null
   cap checkupdates /usr/bin/checkupdates --nosync
   as_user checkupdates-user /usr/bin/checkupdates --nosync
   ;;

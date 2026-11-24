@@ -29,6 +29,7 @@ jobs:
           - rockylinux:9
           - fedora:latest
           - opensuse/leap:latest
+          - opensuse/tumbleweed:latest
           - archlinux:latest
           - alpine:latest
     steps:
