@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use anyhow::{Result, anyhow};
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{
@@ -70,10 +70,12 @@ struct ChannelForm {
 }
 
 impl ChannelForm {
-    fn blank() -> Self {
+    /// A new channel of `kind`, which decides which alerts it takes to start with.
+    fn blank(kind: ChannelKind) -> Self {
+        let severities = kind.default_severities();
         Self {
             name: String::new(),
-            kind: ChannelKind::Webhook.as_str().to_string(),
+            kind: kind.as_str().to_string(),
             target: String::new(),
             preview: None,
             credential: String::new(),
@@ -81,8 +83,8 @@ impl ChannelForm {
             app_token: String::new(),
             has_app_token: false,
             remove_app_token: false,
-            sends_warnings: true,
-            sends_critical: true,
+            sends_warnings: severities.contains(&Severity::Warning),
+            sends_critical: severities.contains(&Severity::Critical),
             mail_from: String::new(),
             mail_hostname: String::new(),
             mail_port: String::new(),
@@ -102,7 +104,7 @@ impl ChannelForm {
         let hidden = channels::of(channel.kind).hides_target();
         let mail = channel.mail.as_ref();
         let server = mail.and_then(|mail| mail.server.as_ref());
-        let blank = Self::blank();
+        let blank = Self::blank(channel.kind);
         let request = channel.request.as_ref();
         let custom = channel.kind == ChannelKind::CustomWebhook;
         Self {
@@ -435,8 +437,25 @@ fn form_page_with(
     }
 }
 
-async fn new(State(state): State<AppState>, token: CsrfToken) -> Response {
-    form_page(&state, &token, None, &ChannelForm::blank(), None)
+/// What the add page can start from.
+#[derive(Deserialize)]
+struct NewChannel {
+    kind: Option<String>,
+}
+
+/// The form for a new channel, of the kind asked for if it's one there is. Choosing
+/// another kind on the page fetches this again for its alerts to send, which start
+/// as that kind's.
+async fn new(
+    State(state): State<AppState>,
+    Query(asked): Query<NewChannel>,
+    token: CsrfToken,
+) -> Response {
+    let kind = asked
+        .kind
+        .and_then(|kind| ChannelKind::parse(&kind).ok())
+        .unwrap_or(ChannelKind::Webhook);
+    form_page(&state, &token, None, &ChannelForm::blank(kind), None)
 }
 
 fn not_found(state: &AppState, token: &CsrfToken) -> Response {
@@ -853,7 +872,7 @@ mod tests {
 
     #[test]
     fn a_new_custom_webhook_starts_with_an_example_and_others_send_no_request() {
-        let mut form = ChannelForm::blank();
+        let mut form = ChannelForm::blank(ChannelKind::Webhook);
         assert_eq!(form.request_body, custom_webhook::EXAMPLE_BODY);
         assert_eq!(form.request_content_type, "application/json");
         assert_eq!(form.to_channel(None).unwrap().request, None);
@@ -872,6 +891,12 @@ mod tests {
 
     #[test]
     fn a_new_channel_has_nothing_to_keep() {
-        assert_eq!(ChannelForm::blank().to_channel(None).unwrap().target, "");
+        assert_eq!(
+            ChannelForm::blank(ChannelKind::Webhook)
+                .to_channel(None)
+                .unwrap()
+                .target,
+            ""
+        );
     }
 }

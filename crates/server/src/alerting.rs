@@ -792,6 +792,17 @@ impl ChannelKind {
         channels::of(self).acknowledges()
     }
 
+    /// Which alerts a new channel of this kind takes unless it's told otherwise: only
+    /// critical ones for an on-call service, as warnings usually belong in chat or
+    /// email and an on-call service pages someone, and both for the rest.
+    pub fn default_severities(self) -> BTreeSet<Severity> {
+        if self.is_on_call() {
+            BTreeSet::from([Severity::Critical])
+        } else {
+            every_severity()
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Webhook => "webhook",
@@ -825,6 +836,7 @@ pub struct Channel {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(from = "ChannelFields")]
 pub struct ChannelInput {
     pub name: String,
     pub kind: ChannelKind,
@@ -835,29 +847,56 @@ pub struct ChannelInput {
     /// Slack's or Telegram's bot token, a mail server's password, Resend's API key,
     /// or a custom webhook's headers. Like a webhook's URL, it can be set but not
     /// read back.
-    #[serde(default)]
     pub credential: Option<String>,
     /// A Slack app's own token, so the server hears its buttons being pressed.
     /// Write-only too.
-    #[serde(default)]
     pub app_token: Option<String>,
     /// Which alerts it's sent, so warnings can stay off a pager. A channel hears of
     /// an alert once it reaches one of these, and then of every change until it
-    /// resolves.
-    #[serde(default = "every_severity")]
+    /// resolves. Left out, it's [`ChannelKind::default_severities`].
     pub severities: BTreeSet<Severity>,
     /// Who email comes from, and for an email channel, the mail server it goes
     /// through. Only email and Resend channels have it.
-    #[serde(default)]
     pub mail: Option<Mail>,
     /// The request a custom webhook sends. Its headers are the channel's
     /// `credential`, as they usually hold a token.
-    #[serde(default)]
     pub request: Option<WebhookRequest>,
     /// Which of PagerDuty's service regions its account is in. Only PagerDuty
     /// channels have one, and leaving it out means the US.
-    #[serde(default)]
     pub region: Option<PagerDutyRegion>,
+}
+
+/// A channel as it's sent in, where which alerts it takes can be left out, as what
+/// that means depends on its kind.
+#[derive(Deserialize)]
+struct ChannelFields {
+    name: String,
+    kind: ChannelKind,
+    target: String,
+    credential: Option<String>,
+    app_token: Option<String>,
+    severities: Option<BTreeSet<Severity>>,
+    mail: Option<Mail>,
+    request: Option<WebhookRequest>,
+    region: Option<PagerDutyRegion>,
+}
+
+impl From<ChannelFields> for ChannelInput {
+    fn from(fields: ChannelFields) -> Self {
+        Self {
+            severities: fields
+                .severities
+                .unwrap_or_else(|| fields.kind.default_severities()),
+            name: fields.name,
+            kind: fields.kind,
+            target: fields.target,
+            credential: fields.credential,
+            app_token: fields.app_token,
+            mail: fields.mail,
+            request: fields.request,
+            region: fields.region,
+        }
+    }
 }
 
 /// Where a PagerDuty account lives, which decides where its events are sent.

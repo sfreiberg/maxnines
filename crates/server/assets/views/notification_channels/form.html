@@ -222,7 +222,7 @@
   </details>
 
 
-  <fieldset>
+  <fieldset id="severities"{% if not id %} hx-get="/alerts/channels/new" hx-trigger="change from:[name=kind]" hx-include="[name=kind]" hx-select="#severities" hx-swap="outerHTML"{% endif %}>
     <legend>Alerts to send</legend>
     <label class="checkbox">
       <input type="checkbox" name="sends_warnings"{% if channel.sends_warnings %} checked{% endif %}> Warnings
@@ -231,6 +231,7 @@
       <input type="checkbox" name="sends_critical"{% if channel.sends_critical %} checked{% endif %}> Critical alerts
     </label>
     <small class="hint">Leave warnings off to keep them off a pager. The channel hears of an alert once it reaches one of these, then of every change until it resolves.</small>
+    <small class="hint for-on-call">A new on-call channel takes critical alerts only, as warnings usually belong in chat or email, and critical alerts page someone. A warning that becomes critical still opens an incident here then, and pages.</small>
   </fieldset>
 
   <div class="actions">

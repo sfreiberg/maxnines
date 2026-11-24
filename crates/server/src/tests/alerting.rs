@@ -4076,6 +4076,94 @@ async fn a_pagerduty_channel_keeps_its_region() {
     assert_eq!(status, 422, "{answer}");
 }
 
+#[tokio::test]
+async fn an_on_call_channel_takes_critical_alerts_only_unless_told_otherwise() {
+    let server = start().await;
+    let mut taken = Vec::new();
+    for body in [
+        json!({ "name": "Pager", "kind": "pagerduty", "target": PAGERDUTY_KEY }),
+        json!({
+            "name": "Chat", "kind": "slack", "target": "#alerts", "credential": "xoxb-1",
+        }),
+        json!({
+            "name": "Everything", "kind": "pagerduty", "target": PAGERDUTY_KEY,
+            "severities": ["warning", "critical"],
+        }),
+    ] {
+        let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+        assert_eq!(status, 201, "{made}");
+        let path = format!("/api/v1/notification-channels/{}", made["id"]);
+        let (_, shown) = api(&server, "GET", &path, &Value::Null).await;
+        taken.push(shown["severities"].clone());
+    }
+    assert_eq!(
+        taken,
+        [
+            json!(["critical"]),
+            json!(["warning", "critical"]),
+            json!(["warning", "critical"]),
+        ]
+    );
+
+    let body = json!({
+        "name": "Nothing", "kind": "pagerduty", "target": PAGERDUTY_KEY, "severities": [],
+    });
+    let (status, answer) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 422, "{answer}");
+}
+
+#[tokio::test]
+async fn the_add_form_starts_an_on_call_channel_with_critical_alerts_only() {
+    let server = start().await;
+    let mut browser = Browser::default();
+    let warnings = r#"name="sends_warnings" checked"#;
+    let critical = r#"name="sends_critical" checked"#;
+    for kind in ["pagerduty", "alertops", "signl4"] {
+        let page = browser
+            .get(&server, &format!("/alerts/channels/new?kind={kind}"))
+            .await;
+        assert!(
+            page.body.contains(&format!(r#"value="{kind}" selected"#)),
+            "{kind}"
+        );
+        assert!(!page.body.contains(warnings), "{kind}: {}", page.body);
+        assert!(page.body.contains(critical), "{kind}: {}", page.body);
+    }
+    for path in [
+        "/alerts/channels/new",
+        "/alerts/channels/new?kind=slack",
+        "/alerts/channels/new?kind=nonsense",
+    ] {
+        let page = browser.get(&server, path).await;
+        assert!(page.body.contains(warnings), "{path}: {}", page.body);
+        assert!(page.body.contains(critical), "{path}: {}", page.body);
+    }
+
+    // Choosing a kind fetches its alerts to send, which a saved channel never does.
+    let page = browser.get(&server, "/alerts/channels/new").await;
+    assert!(
+        page.body.contains(r#"hx-get="/alerts/channels/new""#),
+        "{}",
+        page.body
+    );
+    let (_, made) = api(
+        &server,
+        "POST",
+        "/api/v1/notification-channels",
+        &json!({ "name": "Pager", "kind": "pagerduty", "target": PAGERDUTY_KEY }),
+    )
+    .await;
+    let edit = browser
+        .get(&server, &format!("/alerts/channels/{}/edit", made["id"]))
+        .await;
+    assert!(
+        !edit.body.contains(r#"hx-get="/alerts/channels/new""#),
+        "{}",
+        edit.body
+    );
+    assert!(!edit.body.contains(warnings), "{}", edit.body);
+}
+
 const TELEGRAM_TOKEN: &str = "123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw";
 
 /// A stand-in for Telegram's bot API. It keeps the path and body of each call,

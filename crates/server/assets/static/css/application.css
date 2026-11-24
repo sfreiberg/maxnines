@@ -643,6 +643,7 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .channel:not(:has(option[value="pagerduty"]:checked)) .for-pagerduty { display: none; }
 .channel:not(:has(option[value="alertops"]:checked)) .for-alertops { display: none; }
 .channel:not(:has(option[value="signl4"]:checked)) .for-signl4 { display: none; }
+.channel:not(:has(option[value="pagerduty"]:checked)):not(:has(option[value="alertops"]:checked)):not(:has(option[value="signl4"]:checked)) .for-on-call { display: none; }
 .channel:not(:has(option[value="teams"]:checked)) .for-teams { display: none; }
 .channel:not(:has(option[value="custom_webhook"]:checked)) .for-custom_webhook { display: none; }
 .channel:not(:has(option[value="webhook"]:checked)) .for-webhook { display: none; }

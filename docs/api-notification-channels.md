@@ -14,7 +14,7 @@ and Telegram tokens, mail server passwords and Resend API keys can be set but ne
 | `request` | Custom webhooks only, and required for them. See below |
 | `app_token` | Optional, Slack only. The app-level token, starting `xapp-`, that adds Acknowledge and Silence buttons |
 | `region` | PagerDuty only. The service region its account is in: `us`, the default, or `eu` for an account whose address ends in `eu.pagerduty.com` |
-| `severities` | Which alerts it's sent: `["warning", "critical"]`, the default, or one of them, as in [which channels hear what](alerts.md#which-channels-hear-what) |
+| `severities` | Which alerts it's sent: `["warning", "critical"]` or one of them, as in [which channels hear what](alerts.md#which-channels-hear-what). Left out, it's `["critical"]` for `pagerduty`, `alertops` and `signl4`, as in [paging on critical](notifications.md#paging-on-critical), and both for the rest |
 
 Email and Resend channels have `mail`:
 

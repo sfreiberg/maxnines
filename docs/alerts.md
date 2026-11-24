@@ -187,7 +187,9 @@ then on of every change until it resolves:
   on the same incident. One that eases before the pager was sent it isn't sent at all.
 - **Warnings only**, for email or chat: a warning is sent, and so is it becoming
   critical. An alert that's critical from the start isn't sent.
-- **Both**, the default: everything.
+- **Both**, the default for every kind of channel but an on-call service: everything.
+  PagerDuty, AlertOps and SIGNL4 channels start with critical alerts only, as in
+  [paging on critical](notifications.md#paging-on-critical).
 
 A resolved notification says where things stand as the problem cleared rather than
 repeating what was wrong, like `High CPU on web-1: CPU usage is now 42%` or

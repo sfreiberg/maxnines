@@ -233,6 +233,15 @@ form has these steps too.
 Sending a test opens an incident and closes it straight away, which can notify whoever
 is on call. Keys and URLs work like passwords, so they can't be read back once saved.
 
+### Paging on critical
+
+A new PagerDuty, AlertOps or SIGNL4 channel takes critical alerts only, unless Warnings is
+ticked too under **Alerts to send** on its form, or the API is given `severities`.
+Warnings usually belong in chat or email, where someone gets to them in working hours,
+and a critical alert is what should page someone. A disk filling up over the weekend can
+wait until Monday as a warning, but if it becomes critical, the on-call channel hears of
+it starting then, which opens an incident and pages whoever is on call.
+
 ### PagerDuty
 
 1. In PagerDuty, open the service that should get the alerts, then its Integrations tab.
