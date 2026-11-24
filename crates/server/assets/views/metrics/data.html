@@ -6,6 +6,12 @@
 <p class="breadcrumb"><a href="/hosts/{{ host_id }}/metrics?range={{ range }}">{{ hostname }}</a></p>
 <h1>{{ chart.title }}</h1>
 <p class="hint">The last {{ range_label }}, as shown on the chart. Each value is an average for that period.</p>
+{% if failed_services %}
+<section>
+<h2>Failed now</h2>
+{% include "metrics/_failed_services.html" %}
+</section>
+{% endif %}
 {% if chart.has_data %}
 <div class="tablebox"><table>
   <thead>

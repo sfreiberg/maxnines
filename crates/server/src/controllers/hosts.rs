@@ -587,6 +587,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(output) => output.as_ref().and_then(updates_of),
         Err(error) => return server_error(&error),
     };
+    let failed_services = match super::metrics::failed_services(&state, &id).await {
+        Ok(failed) => failed,
+        Err(error) => return server_error(&error),
+    };
     let uptime = match state.metrics.latest_output(&id, "host", now).await {
         Ok(output) => output.as_ref().and_then(uptime_of),
         Err(error) => return server_error(&error),
@@ -647,6 +651,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("drives", &drives)
         .with("drives_problem", &drives_problem)
         .with("updates", &updates)
+        .with("failed_services", &failed_services)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
         .with("alerts", &alerts)

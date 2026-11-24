@@ -234,7 +234,9 @@ default, without being named first: on Linux, the units systemd says have failed
 `systemctl --failed` lists them, and on Windows, services that start automatically and
 stopped with an error. Many of Windows' own stop by design once they've done their
 job, and those stop cleanly, so they don't count. macOS and FreeBSD have no such
-state.
+state. The host's page lists them by name under **Failed services**, as do the
+**Failed services** chart and its data, or says none have failed. The agent names up
+to 32 of them, and counts the rest.
 
 | Metric | Unit | Series | What it is |
 | --- | --- | --- | --- |

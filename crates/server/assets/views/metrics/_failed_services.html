@@ -1,0 +1,18 @@
+{% if failed_services.count == 0 %}
+<p class="empty">No services have failed.</p>
+{% else %}
+<div class="table-scroll"><table{% if compact %} class="chart-summary"{% endif %}>
+  <thead>
+    <tr><th>Failed service</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    {% for name in failed_services.names %}
+    <tr>
+      <td>{{ name }}</td>
+      <td><span class="badge bad">Failed</span></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% if failed_services.unnamed > 0 %}<p class="hint">And {{ failed_services.unnamed }} more, which the agent doesn't name, as it names no more than 32.</p>{% endif %}
+{% endif %}

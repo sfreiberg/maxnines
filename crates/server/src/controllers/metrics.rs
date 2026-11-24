@@ -121,6 +121,59 @@ fn service_row(service: &Value) -> Option<ServiceRow> {
     })
 }
 
+/// The metric counting a host's failed services, whose chart lists them by name.
+const FAILED_SERVICES: &str = "system.failed_services";
+
+/// The services a host last said had stopped with an error, by name, so a count of
+/// them always comes with which they are.
+#[derive(Debug, PartialEq, Serialize)]
+pub(super) struct FailedServices {
+    count: u64,
+    names: Vec<String>,
+    /// How many failed past the names the agent sends, which it caps.
+    unnamed: u64,
+}
+
+/// From the system collector's newest reading, which only counts them on systems
+/// that have such a state, so on others there's nothing to say.
+fn failed_services_of(output: &Value) -> Option<FailedServices> {
+    let count = output["failed_services"].as_f64()? as u64;
+    // The agent joins them as `a, b and 3 more`.
+    let listed = output["failed_service_names"].as_str().unwrap_or_default();
+    let listed = match listed.rsplit_once(" and ") {
+        Some((named, more))
+            if more
+                .strip_suffix(" more")
+                .is_some_and(|more| more.parse::<u64>().is_ok()) =>
+        {
+            named
+        }
+        _ => listed,
+    };
+    let names: Vec<String> = listed
+        .split(", ")
+        .filter(|name| !name.is_empty())
+        .map(String::from)
+        .collect();
+    Some(FailedServices {
+        count,
+        unnamed: count.saturating_sub(names.len() as u64),
+        names,
+    })
+}
+
+/// A host's failed services, if its agent counts them.
+pub(super) async fn failed_services(
+    state: &AppState,
+    host_id: &str,
+) -> anyhow::Result<Option<FailedServices>> {
+    let output = state
+        .metrics
+        .latest_output(host_id, "system", times::now())
+        .await?;
+    Ok(output.as_ref().and_then(failed_services_of))
+}
+
 /// A check command's latest result. Agents send this, so it's treated the same
 /// way as a check's.
 #[derive(Serialize)]
@@ -447,6 +500,10 @@ async fn show(
         Ok(_) => Vec::new(),
         Err(error) => return server_error(&error),
     };
+    let failed_services = match failed_services(&state, &host.id).await {
+        Ok(failed) => failed,
+        Err(error) => return server_error(&error),
+    };
 
     Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
@@ -454,6 +511,7 @@ async fn show(
         .with("commands", &commands)
         .with("counters", &counters)
         .with("services", &services)
+        .with("failed_services", &failed_services)
         .with("is_local", &host.is_local())
         .with("host_id", &host.id)
         .with("hostname", &host.hostname)
@@ -491,11 +549,17 @@ async fn data(
             .map(|result| metric_charts::build(metric, &result, range, zone)),
         None => chart(&state, &host.id, metric, range, zone).await,
     };
-    match chart {
-        Ok(chart) => Page::new(&state, &token, "metrics/data.html")
+    let failed = if metric.name == FAILED_SERVICES {
+        failed_services(&state, &host.id).await
+    } else {
+        Ok(None)
+    };
+    match chart.and_then(|chart| Ok((chart, failed?))) {
+        Ok((chart, failed_services)) => Page::new(&state, &token, "metrics/data.html")
             .with("host_id", &host.id)
             .with("hostname", &host.hostname)
             .with("chart", &chart)
+            .with("failed_services", &failed_services)
             .with("range", selected)
             .with("range_label", label)
             .render(),
@@ -505,6 +569,8 @@ async fn data(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn params(range: Option<&str>) -> RangeParams {
@@ -529,6 +595,32 @@ mod tests {
         assert_eq!(range_reaching(now - hours(20), now), "7d");
         assert_eq!(range_reaching(now - days(3), now), "7d");
         assert_eq!(range_reaching(now - days(90), now), "30d");
+    }
+
+    #[test]
+    fn failed_services_are_named_with_how_many_went_unnamed() {
+        let failed = |count: u64, names: &str| {
+            let output = json!({ "failed_services": count, "failed_service_names": names });
+            failed_services_of(&output).unwrap()
+        };
+        let named = failed(2, "backup.timer, nginx.service");
+        assert_eq!(named.names, ["backup.timer", "nginx.service"]);
+        assert_eq!(named.unnamed, 0);
+
+        let capped = failed(5, "a.service, b.service and 3 more");
+        assert_eq!(capped.names, ["a.service", "b.service"]);
+        assert_eq!(capped.unnamed, 3);
+
+        // A name that only looks like the end of the list is still a name.
+        let odd = failed(1, "Backup and more");
+        assert_eq!(odd.names, ["Backup and more"]);
+
+        let none = failed(0, "");
+        assert!(none.names.is_empty());
+        assert_eq!(none.count, 0);
+
+        // Systems with no such state don't count them.
+        assert_eq!(failed_services_of(&json!({ "processes": 3 })), None);
     }
 
     #[test]

@@ -4675,6 +4675,80 @@ async fn a_hosts_updates_are_metrics_and_its_page_says_what_is_waiting() {
 }
 
 #[tokio::test]
+async fn a_hosts_failed_services_are_named_wherever_they_are_counted() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "wintest").await;
+    let id = host.id();
+    let failed = |count: u64, names: &str| {
+        let system =
+            json!({ "processes": 90, "failed_services": count, "failed_service_names": names });
+        AgentMessage::Sample(Sample {
+            time: crate::times::now(),
+            metrics: BTreeMap::from([("system".to_string(), system)]),
+        })
+    };
+    send(&mut client, &failed(2, "Spooler, WSearch")).await;
+
+    let mut browser = Browser::default();
+    let path = format!("/hosts/{id}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let page = loop {
+        let page = browser.get(&server, &path).await;
+        if page.body.contains("<h2>Failed services</h2>") {
+            break page;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    let named = |body: &str| {
+        for name in ["Spooler", "WSearch"] {
+            assert!(body.contains(&format!("<td>{name}</td>")), "{name}: {body}");
+        }
+        assert!(
+            body.contains(r#"<span class="badge bad">Failed</span>"#),
+            "{body}"
+        );
+    };
+    named(&page.body);
+
+    // Its chart and the chart's numbers say which they are too.
+    let metrics = browser.get(&server, &format!("/hosts/{id}/metrics")).await;
+    assert!(
+        metrics.body.contains("<h2>Failed services</h2>"),
+        "{}",
+        metrics.body
+    );
+    named(&metrics.body);
+    let data = format!("/hosts/{id}/metrics/system.failed_services");
+    let data = browser.get(&server, &data).await;
+    assert_eq!(data.status, 200, "{}", data.body);
+    named(&data.body);
+    // Any other chart's numbers don't.
+    let other = browser
+        .get(&server, &format!("/hosts/{id}/metrics/system.sessions"))
+        .await;
+    assert!(!other.body.contains("Spooler"), "{}", other.body);
+
+    // None failing says so, rather than listing nothing.
+    send(&mut client, &failed(0, "")).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = browser.get(&server, &path).await;
+        if page.body.contains("No services have failed.") {
+            assert!(!page.body.contains("Spooler"), "{}", page.body);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    }
+}
+
+#[tokio::test]
 async fn check_commands_report_their_status_message_and_values() {
     let server = start_with_metrics().await;
     let host = identity();

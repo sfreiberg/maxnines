@@ -209,6 +209,14 @@
 </section>
 {% endif %}
 
+{% if failed_services %}
+<section class="card">
+  <h2>Failed services</h2>
+  {% include "metrics/_failed_services.html" %}
+  <p class="hint">{% if os_family == "windows" %}Services that start automatically and stopped with an error. Many of Windows' own stop by design once they've done their job, and those stop cleanly, so they don't count.{% else %}The units systemd says have failed, as <code>systemctl --failed</code> lists them.{% endif %} See <a href="/docs/collectors-operating-system#services">Services</a> to watch services by name, with an alert when one stops.</p>
+</section>
+{% endif %}
+
 {% if runs %}
 <section class="card">
   <h2>Templates</h2>
