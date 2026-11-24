@@ -220,6 +220,7 @@ fn form_page(
             &format!("/templates/{}/{segment}/{key}", stored.id),
         )
         .with("form", form)
+        .with("mongodb", &as_run.is_mongodb())
         .with("part_only", &true)
         .with("errors", &field_errors(problems))
         .with("problem_count", &problems.len())

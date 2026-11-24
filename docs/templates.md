@@ -44,12 +44,10 @@ shown afterwards is written out from the parts.
 
 ## What templates can read so far
 
-- **Databases:** PostgreSQL, MySQL and MariaDB, and ClickHouse, with SQL. ClickHouse
-  is read over its HTTP interface, where every statement is a GET, which it only lets
-  read, and its account's own profile sets its time limit. Templates can't read
-  MongoDB: a template for it says so under **Where it runs**, as `connecting`, and
-  reads nothing. MongoDB isn't SQL, so it needs a way of its own to be written in a
-  template, which isn't decided yet.
+- **Databases:** PostgreSQL, MySQL and MariaDB, and ClickHouse, with SQL, and MongoDB
+  with [commands](#mongodb-commands). ClickHouse is read over its HTTP interface, where
+  every statement is a GET, which it only lets read, and its account's own profile
+  sets its time limit.
 - **Windows:** performance counters and registry values, on hosts with an agent.
 - **What MaxNines reads itself:** PostgreSQL, MySQL and MariaDB, and ClickHouse are
   read by their built-in templates. MaxNines still reads [MongoDB](collectors-mongodb.md)
@@ -115,7 +113,8 @@ One field says what a template is for, and it runs once for each match on a host
 | none | Once on every host, agentless ones too |
 
 Only a template for a database has SQL, its `query` blocks and the `sql` of its
-discover blocks, as there's nothing else to run SQL on. The others read Windows
+discover blocks, as there's nothing else to run SQL on. A template for MongoDB has
+a `command` in their place. The others read Windows
 performance counters and the registry, so they run only on Windows hosts with an
 agent, and a template for `os` has to list `windows` to read them. A database's
 template can't read them, as they're the host's: read them in a template for the
@@ -149,6 +148,8 @@ changes quickly can be looked at often and what hardly changes rarely:
 
 - `sql`: each column of the first row, by its name. A column called `version` is
   read as a version, from the first number in it, so `16.4 (Debian 16.4-1)` is 16.4;
+- `command` and `columns`, for MongoDB: each field `columns` names in the reply, by
+  its name, as a [query's](#mongodb-commands) are read;
 - `registry "<key>" { name = "Value" }`: Windows registry values, each by its name.
   Only keys under `HKLM` (`HKEY_LOCAL_MACHINE`) are read, as the agent runs as a
   service with no user's settings. Text is read as text and numbers as numbers, and
@@ -191,7 +192,11 @@ alerts with `when` or `since` are checked on the hosts where what was found fits
 - `labels = ["slot"]` names the text columns that tell rows apart, one series per row.
   No label can be called `instance`, in any template, as that's the database a series
   is from;
-- a NULL gives no sample, rather than zero.
+- a NULL gives no sample, rather than zero;
+- a column whose name starts with `_`, which only a SHOW statement's or MongoDB's
+  `columns` can name, is only there to work other metrics out with `value`, and isn't
+  kept. `metrics` can say one is a running total, `_reads = { total = true }`, so
+  `rate(_reads)` works.
 
 `metrics = { … }` only says what can't be worked out from the column: `total = true`
 for a running total, which is kept as a rate; a `unit`, which is `%`, `s`, `bytes`,
@@ -287,6 +292,60 @@ query "replication" {
 A column's `Yes` or `No`, `ON` or `OFF`, is read as yes or no, with `Connecting` as no,
 and a number written as text as a number. Rows with the same labels add up, so
 `SHOW BINARY LOGS` with no labels gives the size of every binary log together.
+
+#### MongoDB commands
+
+MongoDB isn't SQL, so a template for it, `database = "mongodb"`, asks it with one
+[database command](https://www.mongodb.com/docs/manual/reference/command/) for each
+discover block and query, written as JSON, as MongoDB's own documents write one, in
+`command` rather than `sql`. It runs on the `admin` database unless its `$db` says
+another, and MongoDB stops it after 5 seconds unless it gives a `maxTimeMS` of its
+own. Saving and the agent check it's one command, named by its first field. MongoDB
+has no read-only sessions, so what a command may do is up to the account it signs in
+as: give MaxNines a [read-only account](#read-only-database-accounts), such as one with
+only the `clusterMonitor` role.
+
+A reply isn't columns, so `columns` names each field read, as a metric or a label, and
+where it is: a field's name, or names down through documents, as `connections.current`.
+In a path:
+
+- a list is read as how many it holds, so `members` is how many members there are;
+- `[field=value]` after a list's name keeps only the documents in it whose `field` is
+  `value`, so `members[health=1]` is how many are healthy;
+- going on past a list reads the first document it kept, so
+  `members[state=1].optimeDate` is the primary's;
+- dates and MongoDB's timestamps are read as seconds since 1970, to work lengths of time
+  out from with `value`.
+
+A reply is one row, or with a cursor, as `aggregate` and `find` give, a row for each
+document of its first batch. `rows` says where else its rows are: a list, each of whose
+items is a row, or a document, each of whose fields is a row of its name, `k`, and its
+value, `v`, as MongoDB's `$objectToArray` has them. In a query with rows, a path is in
+each row, and one starting `$.` is in the whole reply:
+
+```hcl
+query "members" {
+  command = <<-JSON
+    { "replSetGetStatus": 1 }
+  JSON
+  rows   = "members"
+  labels = ["member"]
+  columns = {
+    member  = "name"
+    _health = "health"
+    _state  = "state"
+    _optime = "optimeDate"
+    _leader = "$.members[state=1].optimeDate"
+  }
+  metrics = {
+    member_healthy = { value = "_health == 1" }
+    member_lag     = { value = "_state == 2 ? _leader - _optime : null", unit = "s" }
+  }
+}
+```
+
+A field that isn't there gives no sample. A `value` that comes to `null` gives none
+either.
 
 ### Performance counters
 

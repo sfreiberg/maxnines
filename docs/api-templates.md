@@ -59,7 +59,7 @@ Everything listed, with:
 | Field | Description |
 | --- | --- |
 | `hcl` | The template, written out from its parts, leaving out a built-in template's `config` block, whose settings are its [built-in config rule](agents.md#built-in-rules), and which `template` still has |
-| `template` | The template read, field by field, as the HCL has it |
+| `template` | The template read, field by field, as the HCL has it, but for a MongoDB discover block's or query's `command`, which is its `sql` |
 | `metrics` | Its own metrics, each with its full `name`, the `title` charts call it, its `kind`, which is `number`, `seconds`, `flag` for yes or no, or `unknown` for a column whose type only the database knows, and its `labels` |
 | `alerts` | Each of its alerts, by `key`, with the `rule` in use, as [alert rules](api-alert-rules.md) are given, and where that's your own copy of a built-in template's, the built-in one as `built_in_rule`, `null` otherwise |
 | `choices` | Each discover block, query or counters block you've changed or turned on or off: its `kind`, `discover`, `query` or `counters`, its `key`, whether you have your own copy of it, `copied`, `enabled_choice`, and `original_changed_at`, when a newer version changed the template's own under your copy |
@@ -112,7 +112,8 @@ your own, gives `422`, as anything wrong with the template does.
 With `"dry_run": true` nothing is saved, and the answer is what importing would do:
 the `outcome`, or `null` with the `problems` stopping it; its `key`, `name`,
 `description` and `target` in words; its `metrics` and `alerts`; every statement of
-`sql` it would run, by query, with each version's fills filled in; the `counters` it
+`sql` it would run, by query, with each version's fills filled in, which for MongoDB
+are its commands; the `counters` it
 would read; and for an update, the `changes`, a part to a line.
 
 ```sh

@@ -4,11 +4,24 @@
     <input type="text" name="{{ p }}key" value="{{ query.key }}"{% if part_only %} readonly{% endif %} spellcheck="false">
     {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
+  {% if mongodb %}
+  <label>Command
+    <textarea name="{{ p }}sql" rows="5" spellcheck="false" placeholder='{ "serverStatus": 1 }'>{{ query.sql }}</textarea>
+    <small>One MongoDB command, as JSON, run on <code>admin</code> unless its <code>$db</code> says.</small>
+    {% set e = errors | get(key=p ~ "command", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Rows
+    <input type="text" name="{{ p }}rows" value="{{ query.rows }}" spellcheck="false" placeholder="members">
+    <small>Where in the reply its rows are: a list, each of whose items is a row, or a document, each of whose fields is a row of <code>k</code> and <code>v</code>. Without it, a cursor's documents are the rows, or the reply is one row.</small>
+    {% set e = errors | get(key=p ~ "rows", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  {% else %}
   <label>SQL
     <textarea name="{{ p }}sql" rows="5" spellcheck="false">{{ query.sql }}</textarea>
     <small>Name every column, with <code>AS</code> where it isn't a column of its own. <code>{{ '{{' }} name }}</code> is filled in by version, from a fill below.</small>
     {% set e = errors | get(key=p ~ "sql", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
+  {% endif %}
   <label>Labels
     <input type="text" name="{{ p }}labels" value="{{ query.labels }}" spellcheck="false" placeholder="slot">
     <small>Text columns that tell rows apart, comma separated.</small>
@@ -16,7 +29,7 @@
   </label>
   <label>Columns
     <textarea name="{{ p }}columns" rows="2" spellcheck="false" placeholder="lag = Seconds_Behind_Source">{{ query.columns }}</textarea>
-    <small>Only for a SHOW statement, whose columns aren't known until it runs: a name for each column read, one to a line.</small>
+    <small>{% if mongodb %}A name for each field read, and where in a row it is, one to a line, such as <code>connections = connections.current</code>. A name starting <code>_</code> is only for working out others.{% else %}Only for a SHOW statement, whose columns aren't known until it runs: a name for each column read, one to a line.{% endif %}</small>
     {% set e = errors | get(key=p ~ "columns", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
   <div class="field-row">

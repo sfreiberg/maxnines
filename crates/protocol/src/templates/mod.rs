@@ -142,8 +142,13 @@ pub struct Discover {
     pub key: String,
     /// How often it runs, or [`DEFAULT_DISCOVERY_INTERVAL`].
     pub interval: Option<String>,
-    /// Its columns each become something to look at, by their names.
+    /// Its columns each become something to look at, by their names. For MongoDB
+    /// it's a command, as JSON, written `command` in HCL.
     pub sql: Option<String>,
+    /// For MongoDB, whose replies aren't columns: what each field it reads is
+    /// found as, and where in the reply it is, such as `version = "version"`.
+    #[serde(default)]
+    pub columns: IndexMap<String, String>,
     /// Windows registry values, each named by what it becomes.
     #[serde(default)]
     pub registry: Vec<RegistryRead>,
@@ -167,11 +172,19 @@ pub struct Notice {
     pub text: String,
 }
 
-/// SQL whose columns become metrics.
+/// SQL whose columns become metrics, or for MongoDB, a command whose reply's
+/// fields do.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Query {
     pub key: String,
+    /// The SQL, or for MongoDB its command, as JSON, written `command` in HCL.
     pub sql: String,
+    /// For MongoDB: where in the reply its rows are, a list each of whose items is
+    /// a row, or a document each of whose fields is, as `k` and `v`. Without it, a
+    /// reply with a cursor has a row for each document of its first batch, and any
+    /// other is one row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<String>,
     pub interval: Option<String>,
     pub since: Option<String>,
     pub when: Option<String>,
@@ -182,7 +195,9 @@ pub struct Query {
     pub labels: Vec<String>,
     /// For a SHOW statement, whose columns aren't known until it runs: the name
     /// each column it reads is given, as a metric or a label, and the column, such
-    /// as `lag = "Seconds_Behind_Source"`. No other column is read.
+    /// as `lag = "Seconds_Behind_Source"`. For MongoDB, the field each is read
+    /// from, as a [`Path`]. No other column is read. One whose name starts with `_`
+    /// is only for working other metrics out, and isn't kept.
     #[serde(default)]
     pub columns: IndexMap<String, String>,
     #[serde(default)]
@@ -221,6 +236,144 @@ pub fn first_keyword(sql: &str) -> String {
 /// Whether a statement is a SHOW, whose columns aren't known until it runs.
 pub fn is_show(sql: &str) -> bool {
     first_keyword(sql) == "SHOW"
+}
+
+/// The kind of database whose queries are commands rather than SQL.
+pub const MONGODB: &str = "mongodb";
+
+/// The database a MongoDB command runs on, unless it says otherwise with `$db`.
+pub const COMMAND_DATABASE: &str = "admin";
+
+/// Whether a query's text is a MongoDB command, written as JSON, rather than SQL.
+pub fn is_command(text: &str) -> bool {
+    text.trim_start().starts_with('{')
+}
+
+/// A MongoDB command, written as JSON, as MongoDB's own documents write one: one
+/// command, named by its first field, such as `{ "serverStatus": 1 }`, and the
+/// database it runs on, `$db`, or `admin` without one. It gives the command's name
+/// and that database. Nothing else starting with `$` can be given, as the driver
+/// gives the rest itself.
+pub fn check_command(text: &str) -> Result<(String, String), String> {
+    let fields: IndexMap<String, serde_json::Value> =
+        serde_json::from_str(text).map_err(|error| {
+            format!("isn't one command written as JSON, like {{ \"serverStatus\": 1 }}: {error}")
+        })?;
+    let mut database = COMMAND_DATABASE.to_string();
+    let mut name = None;
+    for (field, value) in &fields {
+        if field == "$db" {
+            match value.as_str() {
+                Some(db) if !db.trim().is_empty() => database = db.to_string(),
+                _ => return Err("$db is the name of the database it runs on".to_string()),
+            }
+        } else if field.starts_with('$') {
+            return Err(format!(
+                "can't give {field}: only $db, the database it runs on, can be given"
+            ));
+        } else if name.is_none() {
+            name = Some(field.clone());
+        }
+    }
+    let name = name.ok_or("needs a command, like { \"serverStatus\": 1 }")?;
+    Ok((name, database))
+}
+
+/// Where a field is in a MongoDB reply, as a MongoDB query column says: a field's
+/// name, or names down through documents, as `connections.current`. A list is
+/// read as how many it holds, and `[field=value]` after a list's name keeps only
+/// the documents in it whose `field` is `value`, so `members[health=1]` is how
+/// many members are healthy. Going on past a list reads the first document it
+/// keeps: `members[state=1].optimeDate` is the primary's. In a query whose rows
+/// are a list's items, a path is in each row, and one starting `$.` is in the
+/// whole reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Path {
+    /// Whether it's in the whole reply rather than the row.
+    pub from_reply: bool,
+    pub steps: Vec<Step>,
+}
+
+/// One field of a [`Path`], and which documents of a list it keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub field: String,
+    /// `[field=value]`: only the documents whose `field` is `value`.
+    pub only: Option<(String, String)>,
+}
+
+/// Reads a [`Path`], or says what's wrong with it.
+pub fn parse_path(text: &str) -> Result<Path, String> {
+    let text = text.trim();
+    let (from_reply, rest) = match text.strip_prefix("$.") {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    if rest.is_empty() {
+        return Err("needs the field it's read from, like connections.current".to_string());
+    }
+    let mut steps = Vec::new();
+    let mut segment = String::new();
+    let mut in_brackets = false;
+    let mut segments = Vec::new();
+    for c in rest.chars() {
+        match c {
+            '[' if !in_brackets => in_brackets = true,
+            ']' if in_brackets => in_brackets = false,
+            '.' if !in_brackets => {
+                segments.push(std::mem::take(&mut segment));
+                continue;
+            }
+            _ => {}
+        }
+        segment.push(c);
+    }
+    if in_brackets {
+        return Err(format!("{text:?} has a [ with no ]"));
+    }
+    segments.push(segment);
+    for segment in segments {
+        let (field, only) = match segment.split_once('[') {
+            Some((field, filter)) => {
+                let Some(filter) = filter.strip_suffix(']') else {
+                    return Err(format!(
+                        "{text:?} has something after a ]: start another field with ."
+                    ));
+                };
+                let Some((on, value)) = filter.split_once('=') else {
+                    return Err(format!(
+                        "{text:?} keeps documents with [field=value], like [state=1]"
+                    ));
+                };
+                if on.trim().is_empty() {
+                    return Err(format!("{text:?} needs a field to keep documents by"));
+                }
+                (
+                    field,
+                    Some((on.trim().to_string(), value.trim().to_string())),
+                )
+            }
+            None => (segment.as_str(), None),
+        };
+        if field.is_empty() {
+            return Err(format!("{text:?} has a field with no name"));
+        }
+        if field.contains(']') {
+            return Err(format!("{text:?} has a ] with no ["));
+        }
+        steps.push(Step {
+            field: field.to_string(),
+            only,
+        });
+    }
+    Ok(Path { from_reply, steps })
+}
+
+/// Whether a column's name is one only for working other metrics out, which
+/// isn't kept: `_` and then what a key can be, but for what says which query a row
+/// is from.
+pub fn is_helper(name: &str) -> bool {
+    name.strip_prefix('_').is_some_and(is_key) && name != work::QUERY_FIELD
 }
 
 /// A piece of SQL picked by version, filling `{{ key }}` in a query.
@@ -694,6 +847,7 @@ impl Template {
             Place::Discover,
             &mut say,
         );
+        let mongodb = self.is_mongodb();
         // What every discover block finds is looked at together, by name.
         let mut found = BTreeSet::new();
         for (index, discover) in self.discover.iter().enumerate() {
@@ -774,6 +928,28 @@ impl Template {
                     say(place, "counter_sets", format!("{name:?} is found twice"));
                 }
             }
+            if !discover.columns.is_empty() && !mongodb {
+                say(
+                    place,
+                    "columns",
+                    "are only for MongoDB: name SQL's columns with AS".to_string(),
+                );
+            }
+            if discover.columns.len() > work::MAX_COLUMNS {
+                say(
+                    place,
+                    "columns",
+                    format!("can be up to {}", work::MAX_COLUMNS),
+                );
+            }
+            for (name, path) in &discover.columns {
+                if !is_key(name) {
+                    say(place, "columns", format!("{name:?} {KEY_RULE}"));
+                }
+                if let Err(message) = parse_path(path) {
+                    say(place, "columns", message);
+                }
+            }
         }
 
         check_keys(self.notices.iter().map(|n| &n.key), Place::Notice, &mut say);
@@ -832,7 +1008,7 @@ impl Template {
         }
         check_keys(self.queries.iter().map(|q| &q.key), Place::Query, &mut say);
         for (index, query) in self.queries.iter().enumerate() {
-            check_query(index, query, &mut say);
+            check_query(index, query, mongodb, &mut say);
         }
 
         check_keys(
@@ -868,6 +1044,11 @@ impl Template {
             }
         }
         problems
+    }
+
+    /// Whether it's for MongoDB, whose queries are commands rather than SQL.
+    pub fn is_mongodb(&self) -> bool {
+        matches!(&self.target, Some(Target::Database(kind)) if kind == MONGODB)
     }
 
     /// Its metrics' keys, each once, in the order they're written.
@@ -999,8 +1180,22 @@ fn check_metric(
     }
 }
 
-fn check_query(index: usize, query: &Query, say: &mut dyn FnMut(Place, &str, String)) {
+fn check_query(
+    index: usize,
+    query: &Query,
+    mongodb: bool,
+    say: &mut dyn FnMut(Place, &str, String),
+) {
     let place = Place::Query(index);
+    match (&query.rows, mongodb) {
+        (Some(rows), true) => {
+            if let Err(message) = parse_path(rows) {
+                say(place, "rows", message);
+            }
+        }
+        (Some(_), false) => say(place, "rows", "are only for MongoDB".to_string()),
+        (None, _) => {}
+    }
     if query.sql.trim().is_empty() {
         say(place, "sql", "can't be empty".to_string());
     }
@@ -1035,14 +1230,29 @@ fn check_query(index: usize, query: &Query, say: &mut dyn FnMut(Place, &str, Str
         );
     }
     for (name, column) in &query.columns {
-        if !is_key(name) {
-            say(place, "columns", format!("{name:?} {KEY_RULE}"));
+        if !is_key(name) && !is_helper(name) {
+            say(
+                place,
+                "columns",
+                format!(
+                    "{name:?} {KEY_RULE}, or _ and then those for one that's only for working others out"
+                ),
+            );
         }
         if column.trim().is_empty() {
             say(
                 place,
                 "columns",
                 format!("{name:?} needs the column it's read from"),
+            );
+        } else if mongodb && let Err(message) = parse_path(column) {
+            say(place, "columns", message);
+        }
+        if is_helper(name) && query.labels.contains(name) {
+            say(
+                place,
+                "labels",
+                format!("{name:?} is only for working others out, so it can't label rows"),
             );
         }
     }
@@ -1097,13 +1307,29 @@ fn check_query(index: usize, query: &Query, say: &mut dyn FnMut(Place, &str, Str
         }
     }
 
-    check_keys(
-        query.metrics.iter().map(|m| &m.key),
-        |metric| Place::QueryMetric(index, metric),
-        say,
-    );
+    // A column only for working others out can be said to be a running total, so
+    // rates can be worked out from it.
+    let mut seen = BTreeSet::new();
     for (number, metric) in query.metrics.iter().enumerate() {
-        check_metric(Place::QueryMetric(index, number), metric, false, say);
+        let place = Place::QueryMetric(index, number);
+        let key = &metric.key;
+        if is_helper(key) && query.columns.contains_key(key) {
+            if metric.value.is_some() {
+                say(
+                    place,
+                    "value",
+                    format!(
+                        "{key:?} is a column only for working others out, so it isn't worked out itself"
+                    ),
+                );
+            }
+        } else if !is_key(key) {
+            say(place, "key", format!("{key:?} {KEY_RULE}"));
+        }
+        if !seen.insert(key) {
+            say(place, "key", format!("{key:?} is used twice"));
+        }
+        check_metric(place, metric, false, say);
     }
 }
 

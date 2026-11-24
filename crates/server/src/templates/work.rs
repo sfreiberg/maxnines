@@ -14,6 +14,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
 use maxnines_protocol::templates::work::{
@@ -277,6 +278,7 @@ pub fn host_work(template: &Template, found: Option<&Map<String, Value>>) -> Tem
             key: discover.key.clone(),
             interval: discover_interval(discover.interval.as_ref()),
             sql: None,
+            columns: IndexMap::new(),
             registry: discover
                 .registry
                 .iter()
@@ -310,6 +312,7 @@ fn discover_work(template: &Template) -> Vec<DiscoverWork> {
                 key: discover.key.clone(),
                 interval: discover_interval(discover.interval.as_ref()),
                 sql: Some(discover.sql.clone()?),
+                columns: discover.columns.clone(),
                 registry: Vec::new(),
                 counter_sets: BTreeMap::new(),
             })
@@ -385,6 +388,7 @@ fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<Qu
         .map(|query| QueryWork {
             key: query.key.clone(),
             sql: fill(query, version.as_ref()),
+            rows: query.rows.clone(),
             interval: seconds(query.interval.as_ref()),
             labels: query.labels.clone(),
             columns: query.columns.clone(),

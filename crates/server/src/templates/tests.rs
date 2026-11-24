@@ -197,7 +197,10 @@ fn a_metric_with_a_built_in_metrics_name_is_refused() {
         r#"template "mongodb" {
              name     = "MongoDB"
              database = "mongodb"
-             query "server" { sql = "SELECT 1 AS connections, 2 AS spare, 3 AS uptime" }
+             query "server" {
+               command = "{ \"serverStatus\": 1 }"
+               columns = { connections = "connections.current", spare = "connections.available", uptime = "uptime" }
+             }
            }"#,
     );
     assert_eq!(
@@ -682,5 +685,93 @@ fn a_templates_config_is_checked_as_a_rules_settings_and_kept_in_hcl() {
     assert!(
         wrong.iter().any(|problem| problem.contains("config")),
         "{wrong:#?}"
+    );
+}
+
+/// A template for MongoDB, which isn't SQL: one command each, with the fields read
+/// from its reply named.
+const DOCS: &str = r#"
+template "docs" {
+  name     = "Documents"
+  database = "mongodb"
+
+  discover "role" {
+    command = "{ \"hello\": 1 }"
+    columns = { primary = "isWritablePrimary", replica_set = "setName" }
+  }
+
+  query "members" {
+    when    = "replica_set != null"
+    command = "{ \"replSetGetStatus\": 1 }"
+    rows    = "members"
+    labels  = ["member"]
+    columns = {
+      member  = "name"
+      _health = "health"
+      _state  = "state"
+      _optime = "optimeDate"
+      _leader = "$.members[state=1].optimeDate"
+    }
+    metrics = {
+      healthy = { value = "_health == 1" }
+      lag     = { value = "_state == 2 ? _leader - _optime : null", unit = "s" }
+    }
+  }
+
+  alert "unhealthy" {
+    name    = "Member unhealthy"
+    warning = "!healthy"
+    summary = "{{ labels.member }} isn't healthy"
+  }
+}
+"#;
+
+#[test]
+fn mongodb_is_asked_with_commands_whose_fields_become_metrics() {
+    assert_eq!(problems(DOCS), Vec::<String>::new());
+    let template = parse(DOCS).unwrap();
+    assert_eq!(discovered_names(&template), ["primary", "replica_set"]);
+    // What's only for working others out isn't a metric.
+    let metrics: Vec<(String, Kind)> = metrics_of(&template)
+        .into_iter()
+        .map(|(metric, _)| (metric.name, metric.kind))
+        .collect();
+    assert_eq!(
+        metrics,
+        [
+            ("docs.up".to_string(), Kind::Flag),
+            ("docs.healthy".to_string(), Kind::Flag),
+            ("docs.lag".to_string(), Kind::Seconds),
+        ]
+    );
+
+    // A command has to be one, and its fields named.
+    let found = problems(&DOCS.replace("{ \\\"hello\\\": 1 }", "hello"));
+    assert!(
+        found
+            .iter()
+            .any(|p| p
+                .starts_with(r#"template "docs", discover "role", command: isn't one command"#)),
+        "{found:?}"
+    );
+    let found = problems(&DOCS.replace(
+        "columns = { primary = \"isWritablePrimary\", replica_set = \"setName\" }",
+        "",
+    ));
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains(r#"discover "role", columns: has to name what it finds"#)),
+        "{found:?}"
+    );
+    let found = problems(&DOCS.replace(
+        "\"{ \\\"replSetGetStatus\\\": 1 }\"",
+        "\"{ \\\"replSetGetStatus\\\": 1, \\\"$out\\\": 1 }\"",
+    ));
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains(r#"query "members", command: can't give $out"#)),
+        "{found:?}"
     );
 }

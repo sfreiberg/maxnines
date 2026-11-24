@@ -233,6 +233,7 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
         .col(key())
         .col(position())
         .col(part("sql").text().not_null())
+        .col(part("rows_path").text())
         .col(part("interval_secs").big_integer())
         .col(part("since").string_len(64))
         .col(part("when_condition").text())
@@ -322,6 +323,13 @@ async fn template_parts(manager: &SchemaManager<'_>) -> Result<(), DbErr> {
             "template_discoveries",
             "key",
             Some("counter_set"),
+        ),
+        (
+            "template_discovery_columns",
+            "discovery_id",
+            "template_discoveries",
+            "name",
+            Some("source"),
         ),
         (
             "template_registry_values",

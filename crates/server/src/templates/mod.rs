@@ -26,7 +26,8 @@ use sqlparser::dialect::{
 use sqlparser::parser::Parser;
 
 use maxnines_protocol::templates::{
-    Alert, Place, Problem, Problems, Target, Template, filled_sql, is_key, is_show, parse_duration,
+    Alert, Place, Problem, Problems, Target, Template, check_command, filled_sql, is_key, is_show,
+    parse_duration,
 };
 
 use crate::alert_conditions::{Names, Variable};
@@ -103,7 +104,6 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
         say(Place::Template, "config", format!("{error:#}"));
     }
 
-    let dialect = dialect_for(template.target.as_ref());
     // SQL runs on a database, so only a template for a kind of database has any.
     if !matches!(template.target, Some(Target::Database(_))) {
         const NO_DATABASE: &str =
@@ -121,19 +121,15 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
     // The format checks registry values and counter sets against each other, so here
     // it's columns against each other and against those.
     let mut found: Vec<(String, usize, bool)> = Vec::new();
+    let statement = statement_field(template);
     for (index, discover) in template.discover.iter().enumerate() {
         let place = Place::Discover(index);
-        let columns = match discover
-            .sql
-            .as_deref()
-            .map(|sql| columns(dialect.as_ref(), sql))
-        {
-            Some(Ok(columns)) => columns,
-            Some(Err(message)) => {
-                problems.push(Problem::new(place, "sql", message));
+        let columns = match discover_columns(template, discover) {
+            Ok(columns) => columns,
+            Err((field, message)) => {
+                problems.push(Problem::new(place, field, message));
                 Vec::new()
             }
-            None => Vec::new(),
         };
         let others = discover
             .registry
@@ -145,9 +141,9 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
                     .keys()
                     .map(|name| (name, "counter_sets")),
             );
-        let named = columns.iter().map(|name| (name, "sql")).chain(others);
+        let named = columns.iter().map(|name| (name, statement)).chain(others);
         for (name, field) in named {
-            let column = field == "sql";
+            let column = field == statement;
             let earlier = found
                 .iter()
                 .find(|(seen, _, seen_column)| seen == name && (column || *seen_column));
@@ -163,10 +159,10 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
     }
     for (index, query) in template.queries.iter().enumerate() {
         let place = Place::Query(index);
-        let columns = match query_columns(dialect.as_ref(), query) {
+        let columns = match query_columns(template, query) {
             Ok(columns) => columns,
-            Err(message) => {
-                problems.push(Problem::new(place, "sql", message));
+            Err((field, message)) => {
+                problems.push(Problem::new(place, field, message));
                 continue;
             }
         };
@@ -326,18 +322,43 @@ fn dialect_for(target: Option<&Target>) -> Box<dyn Dialect> {
     }
 }
 
-/// What a template's discovery finds, by the names `when` uses: its SQL's columns,
-/// its registry values and its counter sets.
+/// What the field holding a template's statements is called: `command` for
+/// MongoDB's, and `sql` for the rest.
+pub fn statement_field(template: &Template) -> &'static str {
+    match template.is_mongodb() {
+        true => "command",
+        false => "sql",
+    }
+}
+
+/// What a discover block's statement finds, by name: its SQL's columns, or the
+/// fields its MongoDB command's `columns` name. What's wrong says which field.
+fn discover_columns(
+    template: &Template,
+    discover: &maxnines_protocol::templates::Discover,
+) -> Result<Vec<String>, (&'static str, String)> {
+    let Some(sql) = discover.sql.as_deref() else {
+        return Ok(Vec::new());
+    };
+    if template.is_mongodb() {
+        check_command(sql).map_err(|message| ("command", message))?;
+        if discover.columns.is_empty() {
+            return Err((
+                "columns",
+                "has to name what it finds in the reply, such as version = \"version\"".to_string(),
+            ));
+        }
+        return Ok(discover.columns.keys().cloned().collect());
+    }
+    columns(dialect_for(template.target.as_ref()).as_ref(), sql).map_err(|message| ("sql", message))
+}
+
+/// What a template's discovery finds, by the names `when` uses: its SQL's columns
+/// or MongoDB's fields, its registry values and its counter sets.
 pub fn discovered_names(template: &Template) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for discover in &template.discover {
-        names.extend(
-            discover
-                .sql
-                .as_deref()
-                .and_then(|sql| columns(dialect_for(template.target.as_ref()).as_ref(), sql).ok())
-                .unwrap_or_default(),
-        );
+        names.extend(discover_columns(template, discover).unwrap_or_default());
         names.extend(
             discover
                 .registry
@@ -354,13 +375,33 @@ pub fn query_columns_of(
     template: &Template,
     query: &maxnines_protocol::templates::Query,
 ) -> Vec<String> {
-    query_columns(dialect_for(template.target.as_ref()).as_ref(), query).unwrap_or_default()
+    query_columns(template, query).unwrap_or_default()
 }
 
 /// The columns of a query, with each version's fills filled in, each once. A SHOW
 /// statement's are the names its `columns` gives them, as what it gives isn't known
-/// until it runs.
+/// until it runs, as are a MongoDB command's. What's wrong says which field.
 fn query_columns(
+    template: &Template,
+    query: &maxnines_protocol::templates::Query,
+) -> Result<Vec<String>, (&'static str, String)> {
+    if template.is_mongodb() {
+        for command in filled_sql(query) {
+            check_command(&command).map_err(|message| ("command", message))?;
+        }
+        if query.columns.is_empty() {
+            return Err((
+                "columns",
+                "has to name the fields it reads from the reply, such as connections = \"connections.current\"".to_string(),
+            ));
+        }
+        return Ok(query.columns.keys().cloned().collect());
+    }
+    sql_columns(dialect_for(template.target.as_ref()).as_ref(), query)
+        .map_err(|message| ("sql", message))
+}
+
+fn sql_columns(
     dialect: &dyn Dialect,
     query: &maxnines_protocol::templates::Query,
 ) -> Result<Vec<String>, String> {
@@ -457,25 +498,33 @@ pub fn columns(dialect: &dyn Dialect, sql: &str) -> Result<Vec<String>, String> 
     Ok(names)
 }
 
-/// What a metric's `value` gives, tried on a sample: true or false, or a number.
-fn kind_of_value(value: &str) -> Kind {
+/// What a metric's `value` gives, tried on a sample of `names`, each a number:
+/// true or false, or a number.
+fn kind_of_value(value: &str, names: &[String]) -> Kind {
     let Ok(program) = Program::compile(value) else {
         return Kind::Number;
     };
     let mut context = CelContext::default();
     context.add_variable_from_value("value", CelValue::Float(50.0));
+    for name in names {
+        context.add_variable_from_value(name.as_str(), CelValue::Float(50.0));
+    }
     match program.execute(&context) {
         Ok(CelValue::Bool(_)) => Kind::Flag,
         _ => Kind::Number,
     }
 }
 
-fn kind_of(metric: &maxnines_protocol::templates::Metric, column: bool) -> Kind {
+fn kind_of(
+    metric: &maxnines_protocol::templates::Metric,
+    column: bool,
+    columns: &[String],
+) -> Kind {
     if metric.unit.as_deref() == Some("s") {
         return Kind::Seconds;
     }
     if let Some(value) = &metric.value {
-        return kind_of_value(value);
+        return kind_of_value(value, columns);
     }
     if !metric.states.is_empty() || metric.total || metric.unit.is_some() || !column {
         return Kind::Number;
@@ -586,10 +635,9 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
             on: template.enabled,
         });
     }
-    let dialect = dialect_for(template.target.as_ref());
     for query in &template.queries {
         let on = template.enabled && query.enabled;
-        let columns = query_columns(dialect.as_ref(), query).unwrap_or_default();
+        let columns = query_columns(template, query).unwrap_or_default();
         let metrics = columns
             .iter()
             .filter(|column| !query.labels.contains(column))
@@ -606,7 +654,7 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
             add(Found {
                 key: key.clone(),
                 title: detail.and_then(|metric| metric.title.clone()),
-                kind: detail.map_or(Kind::Unknown, |metric| kind_of(metric, column)),
+                kind: detail.map_or(Kind::Unknown, |metric| kind_of(metric, column, &columns)),
                 unit: unit_of(detail),
                 description: detail.and_then(|metric| metric.description.clone()),
                 total: detail.is_some_and(|metric| metric.total),
@@ -621,7 +669,7 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
             add(Found {
                 key: metric.key.clone(),
                 title: metric.title.clone(),
-                kind: kind_of(metric, false),
+                kind: kind_of(metric, false, &[]),
                 unit: unit_of(Some(metric)),
                 description: metric.description.clone(),
                 total: metric.total,
@@ -665,9 +713,8 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
 
 /// Where a template gives a metric whose name is taken, and what to do about it.
 fn taken_place(template: &Template, short: &str) -> (Place, &'static str) {
-    let dialect = dialect_for(template.target.as_ref());
     for (index, query) in template.queries.iter().enumerate() {
-        let columns = query_columns(dialect.as_ref(), query).unwrap_or_default();
+        let columns = query_columns(template, query).unwrap_or_default();
         if columns.iter().any(|column| column == short)
             || query.metrics.iter().any(|metric| metric.key == short)
         {

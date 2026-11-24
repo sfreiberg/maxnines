@@ -146,6 +146,7 @@ mod tests {
                 key: "server".to_string(),
                 interval: Duration::from_secs(3600),
                 sql: Some("SELECT 1 AS one".to_string()),
+                columns: Default::default(),
                 registry: Vec::new(),
                 counter_sets: Default::default(),
             }],

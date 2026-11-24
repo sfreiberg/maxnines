@@ -222,8 +222,9 @@ impl LastSent {
     }
 }
 
-/// Takes out what each of a template's rows says of its query, once it's been used,
-/// so it isn't stored.
+/// Takes out what each of a template's rows says of its query, and the columns only
+/// there for working others out, whose names start with `_`, once they've been
+/// used, so they aren't stored.
 pub fn strip_queries(sample: &mut Sample) {
     for (collector, rows) in sample.metrics.iter_mut() {
         if !collector.starts_with("template.") {
@@ -231,7 +232,8 @@ pub fn strip_queries(sample: &mut Sample) {
         }
         for row in rows.as_array_mut().into_iter().flatten() {
             if let Some(row) = row.as_object_mut() {
-                row.remove(QUERY_FIELD);
+                // What it's from starts with `_` too.
+                row.retain(|name, _| !name.starts_with('_'));
             }
         }
     }
@@ -318,6 +320,7 @@ mod tests {
         let query = |key: &str, omit: &[&str]| QueryWork {
             key: key.to_string(),
             sql: "SELECT".to_string(),
+            rows: None,
             interval: None,
             labels: Vec::new(),
             columns: Default::default(),

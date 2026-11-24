@@ -13,6 +13,12 @@
 //! `;` anywhere but at the end. ClickHouse takes one statement at a time anyway.
 //! What the account may read is up to whoever gave it to MaxNines.
 //!
+//! MongoDB isn't SQL, so a template asks it with one command, written as JSON,
+//! run on the database its `$db` says, or `admin`, with the same time limit, and a
+//! cursor it leaves open closed. Its reply is read by [`from_reply`]: the fields
+//! each column names, from each of the rows the query says it has. MongoDB has no
+//! read-only sessions, so what a command may do is the account's to say.
+//!
 //! What the account it signs in as may do is read as [`Privileges`], so an account
 //! that can change things can be reported, though it's still used.
 //!
@@ -25,9 +31,10 @@ use std::error::Error;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use indexmap::IndexMap;
 use maxnines_protocol::CheckKind;
-use maxnines_protocol::templates::is_show;
 use maxnines_protocol::templates::work::{QUERY_FIELD, QueryWork};
+use maxnines_protocol::templates::{Path, check_command, is_show, parse_path};
 use maxnines_protocol::totals::change;
 use serde_json::{Map, Value, json};
 use tokio::task::JoinHandle;
@@ -35,7 +42,9 @@ use tokio::time::timeout;
 use tokio_postgres::types::{FromSql, Type};
 
 use crate::databases::Database;
-use crate::sign_in::{mysql_connection, pg_short, postgres_client, short};
+use crate::sign_in::{
+    mongodb_client, mongodb_error, mysql_connection, pg_short, postgres_client, short,
+};
 
 mod privileges;
 pub mod reader;
@@ -56,8 +65,10 @@ pub enum Cell {
     /// A length of time, such as a PostgreSQL interval or a MySQL time.
     Seconds(f64),
     Text(String),
-    /// Anything else, such as a date, which a template can't use.
+    /// Anything else, such as a date from SQL, which a template can't use.
     Other,
+    /// A MongoDB command's whole reply, which [`from_reply`] reads the columns of.
+    Reply(Box<mongodb::bson::Document>),
 }
 
 /// A row's columns, by name, in order.
@@ -76,6 +87,7 @@ enum Open {
     /// Over its HTTP interface, where every statement is a GET, which ClickHouse
     /// only lets read.
     Clickhouse(Box<crate::databases::clickhouse::Clickhouse>),
+    Mongodb(mongodb::Client),
 }
 
 impl Drop for Open {
@@ -161,7 +173,17 @@ impl Session {
                 connection.ping().await.is_ok()
             }
             Some(Open::Clickhouse(clickhouse)) => clickhouse.ping().await.is_ok(),
+            Some(Open::Mongodb(client)) => mongodb_ping(client).await.is_ok(),
             None => false,
+        }
+    }
+
+    /// Sees that it still answers, in `limit` at most, as a statement that reads
+    /// nothing would: `SELECT 1`, or MongoDB's `ping`.
+    pub async fn ping(&mut self, limit: Duration) -> Result<()> {
+        match self.database.check.kind {
+            CheckKind::Mongodb => self.run(r#"{ "ping": 1 }"#, limit).await.map(drop),
+            _ => self.run("SELECT 1", limit).await.map(drop),
         }
     }
 
@@ -207,6 +229,12 @@ impl Session {
                 clickhouse.limit_statements(STATEMENT_LIMIT).await?;
                 Ok(Open::Clickhouse(Box::new(clickhouse)))
             }
+            CheckKind::Mongodb => {
+                let client = mongodb_client(check, Some(credentials))?;
+                // The driver connects on first use, so this is where it signs in.
+                mongodb_ping(&client).await?;
+                Ok(Open::Mongodb(client))
+            }
             other => bail!("templates can't read {} yet", other.as_str()),
         }
     }
@@ -220,8 +248,220 @@ impl Session {
             Some(Open::Postgres { client, .. }) => run_postgres(client, sql).await,
             Some(Open::Mysql { connection, .. }) => run_mysql(connection, sql).await,
             Some(Open::Clickhouse(clickhouse)) => clickhouse.typed_rows(sql).await,
+            Some(Open::Mongodb(client)) => run_mongodb(client, sql).await,
             None => bail!("not connected"),
         }
+    }
+}
+
+async fn mongodb_ping(client: &mongodb::Client) -> Result<()> {
+    use mongodb::bson::doc;
+    client
+        .database("admin")
+        .run_command(doc! { "ping": 1 })
+        .await
+        .map_err(|error| mongodb_error(&error))?;
+    Ok(())
+}
+
+/// What one MongoDB command, written as JSON, gives: its whole reply, as one row of
+/// one cell, for [`from_reply`] to read. It runs on the database its `$db` says,
+/// and MongoDB stops it after [`STATEMENT_LIMIT`] unless it gives a limit of its
+/// own. A cursor it leaves open, as one with more than a batch does, is closed.
+async fn run_mongodb(client: &mongodb::Client, text: &str) -> Result<Vec<Row>> {
+    use mongodb::bson::{Bson, Document, doc};
+    let (_, database) = check_command(text).map_err(|error| anyhow!("the command {error}"))?;
+    // Read in the order it's written, as a command's name comes first.
+    let mut command: Document = serde_json::from_str(text)?;
+    command.remove("$db");
+    if !command.contains_key("maxTimeMS") {
+        let limit = i64::try_from(STATEMENT_LIMIT.as_millis()).unwrap_or(i64::MAX);
+        command.insert("maxTimeMS", limit);
+    }
+    let database = client.database(&database);
+    let reply = database
+        .run_command(command)
+        .await
+        .map_err(|error| mongodb_error(&error))?;
+    let cursor = reply.get_document("cursor").ok();
+    let open = cursor.and_then(|cursor| match cursor.get("id") {
+        Some(Bson::Int64(id)) if *id != 0 => Some(*id),
+        _ => None,
+    });
+    let collection = cursor
+        .and_then(|cursor| cursor.get_str("ns").ok())
+        .and_then(|ns| ns.split_once('.'))
+        .map(|(_, collection)| collection.to_string());
+    if let (Some(id), Some(collection)) = (open, collection) {
+        // Nothing reads the rest, which the server would keep until it timed out.
+        let _ = database
+            .run_command(doc! { "killCursors": collection, "cursors": [id] })
+            .await;
+    }
+    Ok(vec![vec![(
+        REPLY.to_string(),
+        Cell::Reply(Box::new(reply)),
+    )]])
+}
+
+/// What the one cell of a MongoDB command's rows is called.
+const REPLY: &str = "reply";
+
+/// A MongoDB command's rows as a template reads them: the fields each column
+/// names, by its [`Path`], in each row the query has, which `rows` says, or each
+/// document of a cursor's first batch, or the whole reply. A list's items are
+/// rows, and a document's fields each a row of its name, `k`, and its value, `v`,
+/// as MongoDB's own `$objectToArray` has them. Rows that aren't a reply's are as
+/// they are.
+pub fn from_reply(
+    rows: Vec<Row>,
+    columns: &IndexMap<String, String>,
+    rows_at: Option<&str>,
+) -> Vec<Row> {
+    use mongodb::bson::{Bson, Document, doc};
+    let reply = match rows.as_slice() {
+        [row] => match row.as_slice() {
+            [(_, Cell::Reply(reply))] => reply,
+            _ => return rows,
+        },
+        _ => return rows,
+    };
+    let owned: Vec<Document>;
+    let documents: Vec<&Document> = match rows_at.map(parse_path) {
+        Some(Ok(path)) => match at(reply, reply, &path) {
+            Some(At::Value(Bson::Array(items))) => {
+                owned = items
+                    .iter()
+                    .map(|item| match item {
+                        Bson::Document(document) => document.clone(),
+                        other => doc! { "v": other.clone() },
+                    })
+                    .collect();
+                owned.iter().collect()
+            }
+            Some(At::Value(Bson::Document(document))) => {
+                owned = document
+                    .iter()
+                    .map(|(name, value)| doc! { "k": name, "v": value.clone() })
+                    .collect();
+                owned.iter().collect()
+            }
+            Some(At::Kept(kept)) => kept,
+            _ => Vec::new(),
+        },
+        Some(Err(_)) => Vec::new(),
+        None => match reply
+            .get_document("cursor")
+            .ok()
+            .and_then(|cursor| cursor.get_array("firstBatch").ok())
+        {
+            Some(batch) => batch.iter().filter_map(Bson::as_document).collect(),
+            None => vec![reply.as_ref()],
+        },
+    };
+    let paths: Vec<(&String, Option<Path>)> = columns
+        .iter()
+        .map(|(name, path)| (name, parse_path(path).ok()))
+        .collect();
+    documents
+        .into_iter()
+        .map(|document| {
+            paths
+                .iter()
+                .map(|(name, path)| {
+                    let cell = path
+                        .as_ref()
+                        .and_then(|path| at(document, reply, path))
+                        .map_or(Cell::Null, At::cell);
+                    ((*name).clone(), cell)
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Where a [`Path`] leads in a MongoDB reply.
+enum At<'a> {
+    Document(&'a mongodb::bson::Document),
+    Value(&'a mongodb::bson::Bson),
+    /// The documents of a list that `[field=value]` kept.
+    Kept(Vec<&'a mongodb::bson::Document>),
+}
+
+impl At<'_> {
+    /// What a column reads there: a list is how many it holds, and a date or a
+    /// MongoDB timestamp the seconds since 1970, to work lengths of time out from.
+    fn cell(self) -> Cell {
+        use mongodb::bson::Bson;
+        let value = match self {
+            Self::Kept(kept) => return Cell::Number(kept.len() as f64),
+            Self::Document(_) => return Cell::Other,
+            Self::Value(value) => value,
+        };
+        match value {
+            Bson::Null | Bson::Undefined => Cell::Null,
+            Bson::Boolean(yes) => Cell::Bool(*yes),
+            Bson::Int32(number) => Cell::Number(f64::from(*number)),
+            Bson::Int64(number) => Cell::Number(*number as f64),
+            Bson::Double(number) => Cell::Number(*number),
+            Bson::Decimal128(number) => {
+                number.to_string().parse().map_or(Cell::Other, Cell::Number)
+            }
+            Bson::String(text) => Cell::Text(text.clone()),
+            Bson::DateTime(time) => Cell::Number(time.timestamp_millis() as f64 / 1000.0),
+            Bson::Timestamp(stamp) => Cell::Number(f64::from(stamp.time)),
+            Bson::Array(items) => Cell::Number(items.len() as f64),
+            _ => Cell::Other,
+        }
+    }
+}
+
+/// Follows a path from a row, or from the whole reply for one starting `$.`.
+fn at<'a>(
+    row: &'a mongodb::bson::Document,
+    reply: &'a mongodb::bson::Document,
+    path: &Path,
+) -> Option<At<'a>> {
+    use mongodb::bson::Bson;
+    let mut here = At::Document(if path.from_reply { reply } else { row });
+    for step in &path.steps {
+        let document = match here {
+            At::Document(document) | At::Value(Bson::Document(document)) => document,
+            At::Kept(kept) => *kept.first()?,
+            At::Value(_) => return None,
+        };
+        let value = document.get(&step.field)?;
+        here = match &step.only {
+            None => At::Value(value),
+            Some((field, wanted)) => {
+                let Bson::Array(items) = value else {
+                    return None;
+                };
+                At::Kept(
+                    items
+                        .iter()
+                        .filter_map(Bson::as_document)
+                        .filter(|item| item.get(field).is_some_and(|value| is(value, wanted)))
+                        .collect(),
+                )
+            }
+        };
+    }
+    Some(here)
+}
+
+/// Whether a field is what `[field=value]` says: the same text, yes or no, or
+/// number.
+fn is(value: &mongodb::bson::Bson, wanted: &str) -> bool {
+    use mongodb::bson::Bson;
+    let number = |number: f64| wanted.parse::<f64>().is_ok_and(|wanted| wanted == number);
+    match value {
+        Bson::String(text) => text == wanted,
+        Bson::Boolean(yes) => wanted.parse::<bool>().is_ok_and(|wanted| wanted == *yes),
+        Bson::Int32(n) => number(f64::from(*n)),
+        Bson::Int64(n) => number(*n as f64),
+        Bson::Double(n) => number(*n),
+        _ => false,
     }
 }
 
@@ -446,6 +686,9 @@ fn mysql_time(text: &str) -> Option<f64> {
 /// written as text as numbers, and rows with the same labels added up, such as
 /// every binary log's size. Any other statement's rows are as they are.
 pub fn picked(rows: Vec<Row>, query: &QueryWork) -> Vec<Row> {
+    if is_reply(&rows) {
+        return from_reply(rows, &query.columns, query.rows.as_deref());
+    }
     if query.columns.is_empty() {
         return rows;
     }
@@ -490,6 +733,11 @@ pub fn picked(rows: Vec<Row>, query: &QueryWork) -> Vec<Row> {
     picked
 }
 
+/// Whether rows are a MongoDB command's reply.
+pub fn is_reply(rows: &[Row]) -> bool {
+    matches!(rows, [row] if matches!(row.as_slice(), [(_, Cell::Reply(_))]))
+}
+
 /// What a SHOW statement says in words as a template can read it: yes or no, or a
 /// number. A replica's connection still being made isn't one that's up.
 fn shown_as_value(cell: Cell) -> Cell {
@@ -515,7 +763,7 @@ pub fn discovered(rows: &[Row]) -> Map<String, Value> {
                 Cell::Bool(yes) => json!(yes),
                 Cell::Number(number) | Cell::Seconds(number) => json!(number),
                 Cell::Text(text) => json!(text),
-                Cell::Other => return None,
+                Cell::Other | Cell::Reply(_) => return None,
             };
             Some((name.clone(), value))
         })
@@ -627,6 +875,7 @@ mod tests {
         QueryWork {
             key: "q".to_string(),
             sql: "SELECT".to_string(),
+            rows: None,
             interval: None,
             labels: labels.iter().map(|l| (*l).to_string()).collect(),
             columns: Default::default(),
@@ -688,6 +937,201 @@ mod tests {
             json!({ "version": "16.4", "replica": false })
         );
         assert!(discovered(&[]).is_empty());
+    }
+
+    /// A MongoDB reply, as a command's rows hold it.
+    fn reply(document: mongodb::bson::Document) -> Vec<Row> {
+        vec![vec![(REPLY.to_string(), Cell::Reply(Box::new(document)))]]
+    }
+
+    fn named(pairs: &[(&str, &str)]) -> IndexMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, path)| (name.to_string(), path.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_mongodb_reply_is_read_as_its_columns_say() {
+        use mongodb::bson::{DateTime, Timestamp, doc};
+        let at = |secs: i64| DateTime::from_millis(secs * 1000);
+        let status = doc! {
+            "connections": { "current": 3, "available": 97_i64 },
+            "repl": { "secondary": false, "setName": "rs0" },
+            "mem": { "resident": 2.5 },
+            "oplog": { "latestOptime": Timestamp { time: 1_000, increment: 1 } },
+            "opcounters": { "insert": 5, "query": 7 },
+            "members": [
+                { "name": "a:1", "state": 1, "health": 1.0, "optimeDate": at(100), "self": true },
+                { "name": "b:1", "state": 2, "health": 1.0, "optimeDate": at(90) },
+                { "name": "c:1", "state": 8, "health": 0.0, "optimeDate": at(0) },
+            ],
+        };
+        // One row, the whole reply.
+        let rows = from_reply(
+            reply(status.clone()),
+            &named(&[
+                ("connections", "connections.current"),
+                ("available", "connections.available"),
+                ("replica", "repl.secondary"),
+                ("set", "repl.setName"),
+                ("_resident", "mem.resident"),
+                ("latest", "oplog.latestOptime"),
+                ("members", "members"),
+                ("healthy", "members[health=1]"),
+                ("primaries", "members[state=1]"),
+                ("leader", "members[state=1].optimeDate"),
+                ("me", "members[self=true].name"),
+                ("missing", "connections.rejected"),
+                ("nested", "connections"),
+            ]),
+            None,
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                ("connections".to_string(), Cell::Number(3.0)),
+                ("available".to_string(), Cell::Number(97.0)),
+                ("replica".to_string(), Cell::Bool(false)),
+                ("set".to_string(), Cell::Text("rs0".to_string())),
+                ("_resident".to_string(), Cell::Number(2.5)),
+                ("latest".to_string(), Cell::Number(1000.0)),
+                ("members".to_string(), Cell::Number(3.0)),
+                ("healthy".to_string(), Cell::Number(2.0)),
+                ("primaries".to_string(), Cell::Number(1.0)),
+                ("leader".to_string(), Cell::Number(100.0)),
+                ("me".to_string(), Cell::Text("a:1".to_string())),
+                ("missing".to_string(), Cell::Null),
+                ("nested".to_string(), Cell::Other),
+            ]]
+        );
+
+        // A row for each of a list's items, with the whole reply under `$.`.
+        let members = from_reply(
+            reply(status.clone()),
+            &named(&[
+                ("member", "name"),
+                ("optime", "optimeDate"),
+                ("leader", "$.members[state=1].optimeDate"),
+            ]),
+            Some("members"),
+        );
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[1][0].1, Cell::Text("b:1".to_string()));
+        assert_eq!(members[1][1].1, Cell::Number(90.0));
+        assert_eq!(members[1][2].1, Cell::Number(100.0));
+        // Or only the items kept.
+        let secondaries = from_reply(
+            reply(status.clone()),
+            &named(&[("member", "name")]),
+            Some("members[state=2]"),
+        );
+        assert_eq!(
+            secondaries,
+            vec![vec![("member".to_string(), Cell::Text("b:1".to_string()))]]
+        );
+        // A row for each of a document's fields.
+        let operations = from_reply(
+            reply(status),
+            &named(&[("operation", "k"), ("count", "v")]),
+            Some("opcounters"),
+        );
+        assert_eq!(
+            operations,
+            vec![
+                vec![
+                    ("operation".to_string(), Cell::Text("insert".to_string())),
+                    ("count".to_string(), Cell::Number(5.0))
+                ],
+                vec![
+                    ("operation".to_string(), Cell::Text("query".to_string())),
+                    ("count".to_string(), Cell::Number(7.0))
+                ],
+            ]
+        );
+        // A cursor's first batch is its rows.
+        let cursor = doc! { "cursor": { "id": 0_i64, "ns": "admin.$cmd.aggregate", "firstBatch": [{ "oldest": 4 }, { "oldest": 9 }] }, "ok": 1.0 };
+        let oldest = from_reply(reply(cursor), &named(&[("oldest", "oldest")]), None);
+        assert_eq!(oldest.len(), 2);
+        assert_eq!(oldest[1][0].1, Cell::Number(9.0));
+        // Rows that aren't a reply's are left as they are.
+        let sql = vec![vec![("one".to_string(), Cell::Number(1.0))]];
+        assert_eq!(
+            from_reply(sql.clone(), &named(&[("one", "two")]), None),
+            sql
+        );
+    }
+
+    /// A real MongoDB, from `MAXNINES_TEST_CHECK_MONGODB`, as `host:port [username
+    /// password]`, which the tests read and never change.
+    fn real_mongodb() -> Option<Session> {
+        let value = std::env::var("MAXNINES_TEST_CHECK_MONGODB").ok()?;
+        let mut words = value.split_whitespace();
+        Some(Session::new(Database {
+            check: maxnines_protocol::Check::new("real", CheckKind::Mongodb, words.next()?),
+            credentials: Credentials {
+                username: words.next().map(String::from),
+                password: words.next().map(String::from),
+                private_key: None,
+            },
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_real_mongodb_is_asked_commands() {
+        let Some(mut session) = real_mongodb() else {
+            return;
+        };
+        let rows = session.run(r#"{ "buildInfo": 1 }"#, LIMIT).await.unwrap();
+        let found = discovered(&from_reply(rows, &named(&[("version", "version")]), None));
+        assert!(found["version"].is_string(), "{found:?}");
+        assert_eq!(session.connections(), 1);
+
+        // A command whose cursor is left open, which is closed, as nothing reads
+        // the rest of it.
+        let rows = session
+            .run(
+                r#"{ "aggregate": 1, "$db": "admin", "pipeline": [{ "$currentOp": { "idleConnections": true } }], "cursor": { "batchSize": 1 } }"#,
+                LIMIT,
+            )
+            .await
+            .unwrap();
+        let [row] = rows.as_slice() else {
+            panic!("{rows:?}");
+        };
+        let Cell::Reply(reply) = &row[0].1 else {
+            panic!("{row:?}");
+        };
+        let id = reply.get_document("cursor").unwrap().get_i64("id").unwrap();
+        assert_ne!(id, 0, "{reply:?}");
+        let more = session
+            .run(
+                &format!(r#"{{ "getMore": {{ "$numberLong": "{id}" }}, "collection": "$cmd.aggregate" }}"#),
+                LIMIT,
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{more}").contains("cursor"), "{more}");
+
+        // MongoDB stops one that runs too long, and says why.
+        let error = session
+            .run(
+                r#"{ "aggregate": 1, "pipeline": [{ "$currentOp": {} }], "cursor": {}, "maxTimeMS": 1 }"#,
+                LIMIT,
+            )
+            .await;
+        if let Err(error) = error {
+            assert!(!format!("{error}").is_empty());
+        }
+        // What isn't a command isn't run.
+        let error = session.run("SELECT 1", LIMIT).await.unwrap_err();
+        assert!(format!("{error}").contains("isn't one command"), "{error}");
+        session.ping(LIMIT).await.unwrap();
+        assert_eq!(session.connections(), 1);
+
+        let privileges = session.privileges().await.unwrap();
+        // Whatever the account is, a superuser may do anything.
+        assert!(!privileges.superuser || privileges.writes && privileges.manages);
     }
 
     /// A real server, from `MAXNINES_TEST_CHECK_POSTGRES` or `_MYSQL`, as

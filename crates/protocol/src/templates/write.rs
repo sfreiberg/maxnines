@@ -130,14 +130,19 @@ fn template_block(template: &Template) -> Block {
         }
         block = block.add_block(settings.block("config", None).build());
     }
+    // MongoDB is asked with commands rather than SQL, which HCL says.
+    let statement = match template.is_mongodb() {
+        true => "command",
+        false => "sql",
+    };
     for discover in &template.discover {
-        block = block.add_block(discover_block(discover));
+        block = block.add_block(discover_block(discover, statement));
     }
     for notice in &template.notices {
         block = block.add_block(notice_block(notice));
     }
     for query in &template.queries {
-        block = block.add_block(query_block(query));
+        block = block.add_block(query_block(query, statement));
     }
     for counters in &template.counters {
         block = block.add_block(counters_block(counters));
@@ -148,10 +153,11 @@ fn template_block(template: &Template) -> Block {
     block.build()
 }
 
-fn discover_block(discover: &Discover) -> Block {
+fn discover_block(discover: &Discover, statement: &str) -> Block {
     let mut attributes = Attributes::new();
     attributes.text("interval", discover.interval.as_ref());
-    attributes.text("sql", discover.sql.as_ref());
+    attributes.text(statement, discover.sql.as_ref());
+    attributes.map("columns", &discover.columns);
     attributes.map("counter_sets", &discover.counter_sets);
     let mut block = attributes.block("discover", Some(&discover.key));
     for read in &discover.registry {
@@ -216,13 +222,14 @@ fn metrics(metrics: &[Metric]) -> Expression {
     Expression::Object(object)
 }
 
-fn query_block(query: &Query) -> Block {
+fn query_block(query: &Query, statement: &str) -> Block {
     let mut attributes = Attributes::new();
     attributes.off(query.enabled);
     attributes.text("when", query.when.as_ref());
     attributes.text("since", query.since.as_ref());
     attributes.text("interval", query.interval.as_ref());
-    attributes.add("sql", text(&query.sql));
+    attributes.add(statement, text(&query.sql));
+    attributes.text("rows", query.rows.as_ref());
     attributes.map("columns", &query.columns);
     attributes.list("labels", &query.labels);
     if !query.metrics.is_empty() {

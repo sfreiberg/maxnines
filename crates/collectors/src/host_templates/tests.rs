@@ -306,6 +306,7 @@ fn this_host_reads_counters_counter_sets_and_the_registry() {
             key: "os".to_string(),
             interval: Duration::from_secs(3600),
             sql: None,
+            columns: Default::default(),
             registry: vec![RegistryWork {
                 key: r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion".to_string(),
                 values: BTreeMap::from([

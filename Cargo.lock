@@ -3979,6 +3979,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "indexmap",
  "maxnines-protocol",
  "mongodb",
  "mysql_async",

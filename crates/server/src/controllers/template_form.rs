@@ -42,7 +42,10 @@ pub struct TemplateForm {
 pub struct DiscoverForm {
     pub key: String,
     pub interval: String,
+    /// The SQL, or for MongoDB its command.
     pub sql: String,
+    /// `name = path` on each line, for MongoDB.
+    pub columns: String,
     /// `name = Counter set` on each line.
     pub counter_sets: String,
     pub registry: Vec<RegistryForm>,
@@ -65,14 +68,17 @@ pub struct NoticeForm {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct QueryForm {
     pub key: String,
+    /// The SQL, or for MongoDB its command.
     pub sql: String,
+    /// For MongoDB, where in the reply its rows are.
+    pub rows: String,
     pub interval: String,
     pub since: String,
     pub when: String,
     pub enabled: bool,
     /// Comma separated.
     pub labels: String,
-    /// `name = Column` on each line, for a SHOW statement.
+    /// `name = Column` on each line, for a SHOW statement or MongoDB.
     pub columns: String,
     pub fills: Vec<FillForm>,
     pub metrics: Vec<MetricForm>,
@@ -269,6 +275,7 @@ impl TemplateForm {
                 key: d.key.clone(),
                 interval: text(&d.interval),
                 sql: text(&d.sql),
+                columns: pairs(&d.columns),
                 counter_sets: pairs(&d.counter_sets),
                 registry: d
                     .registry
@@ -309,6 +316,7 @@ impl TemplateForm {
                 .map(|query| QueryForm {
                     key: query.key.clone(),
                     sql: query.sql.clone(),
+                    rows: text(&query.rows),
                     interval: text(&query.interval),
                     since: text(&query.since),
                     when: text(&query.when),
@@ -411,10 +419,15 @@ impl TemplateForm {
                         }),
                     })
                     .collect();
+                let columns = from_pairs(&form.columns).unwrap_or_else(|message| {
+                    problems.push(Problem::new(place, "columns", message));
+                    IndexMap::new()
+                });
                 Discover {
                     key: form.key.trim().to_string(),
                     interval: optional(&form.interval),
                     sql: long_text(&form.sql),
+                    columns,
                     registry,
                     counter_sets,
                 }
@@ -436,6 +449,7 @@ impl TemplateForm {
             .map(|(index, query)| Query {
                 key: query.key.trim().to_string(),
                 sql: long_text(&query.sql).unwrap_or_default(),
+                rows: optional(&query.rows),
                 interval: optional(&query.interval),
                 since: optional(&query.since),
                 when: optional(&query.when),
@@ -599,6 +613,7 @@ impl TemplateForm {
                         key: get(&format!("{prefix}key")),
                         interval: get(&format!("{prefix}interval")),
                         sql: get(&format!("{prefix}sql")),
+                        columns: get(&format!("{prefix}columns")),
                         counter_sets: get(&format!("{prefix}counter_sets")),
                         registry: (0..rows(&format!("{prefix}registry.")))
                             .map(|number| RegistryForm {
@@ -622,6 +637,7 @@ impl TemplateForm {
                     QueryForm {
                         key: get(&format!("{prefix}key")),
                         sql: get(&format!("{prefix}sql")),
+                        rows: get(&format!("{prefix}rows")),
                         interval: get(&format!("{prefix}interval")),
                         since: get(&format!("{prefix}since")),
                         when: get(&format!("{prefix}when")),
@@ -834,6 +850,7 @@ impl TemplateForm {
             put(format!("{prefix}key"), &discover.key);
             put(format!("{prefix}interval"), &discover.interval);
             put(format!("{prefix}sql"), &discover.sql);
+            put(format!("{prefix}columns"), &discover.columns);
             put(format!("{prefix}counter_sets"), &discover.counter_sets);
             for (number, read) in discover.registry.iter().enumerate() {
                 put(format!("{prefix}registry.{number}.key"), &read.key);
@@ -862,6 +879,7 @@ impl TemplateForm {
             let prefix = format!("query.{index}.");
             put(format!("{prefix}key"), &query.key);
             put(format!("{prefix}sql"), &query.sql);
+            put(format!("{prefix}rows"), &query.rows);
             put(format!("{prefix}interval"), &query.interval);
             put(format!("{prefix}since"), &query.since);
             put(format!("{prefix}when"), &query.when);

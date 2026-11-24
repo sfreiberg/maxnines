@@ -140,6 +140,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
         counters: Vec::new(),
         alerts: Vec::new(),
     };
+    let mongodb = template.is_mongodb();
     for block in blocks {
         match block.identifier.as_str() {
             "config" => {
@@ -154,7 +155,11 @@ fn read_template(key: String, body: Body) -> Result<Template> {
             }
             "discover" => {
                 let key = label_of(&block, "discover")?;
-                let discover = read_discover(key.clone(), block.body)
+                let (discover, _) = read_discover(key.clone(), block.body)
+                    .and_then(|read| match read.0.sql {
+                        Some(_) => asked_as(read, mongodb),
+                        None => Ok(read),
+                    })
                     .with_context(|| format!("discover {key:?}"))?;
                 template.discover.push(discover);
             }
@@ -166,7 +171,8 @@ fn read_template(key: String, body: Body) -> Result<Template> {
             }
             "query" => {
                 let key = label_of(&block, "query")?;
-                let query = read_query(key.clone(), block.body)
+                let (query, _) = read_query(key.clone(), block.body)
+                    .and_then(|read| asked_as(read, mongodb))
                     .with_context(|| format!("query {key:?}"))?;
                 template.queries.push(query);
             }
@@ -195,13 +201,37 @@ fn read_template(key: String, body: Body) -> Result<Template> {
 struct DiscoverFields {
     interval: Option<String>,
     sql: Option<String>,
+    command: Option<String>,
+    #[serde(default)]
+    columns: IndexMap<String, String>,
     #[serde(default)]
     counter_sets: IndexMap<String, String>,
 }
 
-fn read_discover(key: String, body: Body) -> Result<Discover> {
+/// A block's SQL, or its MongoDB command, which it has one of, and whether it's a
+/// command.
+fn statement(sql: Option<String>, command: Option<String>) -> Result<(Option<String>, bool)> {
+    match (sql, command) {
+        (Some(_), Some(_)) => bail!("has sql or a command, not both"),
+        (None, Some(command)) => Ok((Some(command), true)),
+        (sql, None) => Ok((sql, false)),
+    }
+}
+
+/// A block read, if it's written as its template's kind of database is asked:
+/// with a command for MongoDB, and SQL for the rest.
+fn asked_as<T>(read: (T, bool), mongodb: bool) -> Result<(T, bool)> {
+    match (read.1, mongodb) {
+        (true, false) => bail!("a command is only for MongoDB: give SQL as sql"),
+        (false, true) => bail!("MongoDB isn't asked with SQL: give its command as command"),
+        _ => Ok(read),
+    }
+}
+
+fn read_discover(key: String, body: Body) -> Result<(Discover, bool)> {
     let (attributes, blocks) = split(body);
     let fields: DiscoverFields = read_fields(attributes)?;
+    let (sql, command) = statement(fields.sql, fields.command)?;
     let mut registry = Vec::new();
     for block in blocks {
         ensure!(
@@ -216,13 +246,15 @@ fn read_discover(key: String, body: Body) -> Result<Discover> {
             read_fields(attributes).with_context(|| format!("registry {key:?}"))?;
         registry.push(RegistryRead { key, values });
     }
-    Ok(Discover {
+    let discover = Discover {
         key,
         interval: fields.interval,
-        sql: fields.sql,
+        sql,
+        columns: fields.columns,
         registry,
         counter_sets: fields.counter_sets,
-    })
+    };
+    Ok((discover, command))
 }
 
 #[derive(Deserialize)]
@@ -297,7 +329,9 @@ fn read_metrics(metrics: IndexMap<String, Value>) -> Result<Vec<Metric>> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct QueryFields {
-    sql: String,
+    sql: Option<String>,
+    command: Option<String>,
+    rows: Option<String>,
     interval: Option<String>,
     since: Option<String>,
     when: Option<String>,
@@ -319,9 +353,12 @@ struct FillFields {
     older: Option<String>,
 }
 
-fn read_query(key: String, body: Body) -> Result<Query> {
+fn read_query(key: String, body: Body) -> Result<(Query, bool)> {
     let (attributes, blocks) = split(body);
     let fields: QueryFields = read_fields(attributes)?;
+    let (Some(sql), command) = statement(fields.sql, fields.command)? else {
+        bail!("needs its sql, or for MongoDB its command");
+    };
     let mut fills = Vec::new();
     for block in blocks {
         ensure!(
@@ -339,9 +376,10 @@ fn read_query(key: String, body: Body) -> Result<Query> {
             older: fill.older,
         });
     }
-    Ok(Query {
+    let query = Query {
         key,
-        sql: fields.sql,
+        sql,
+        rows: fields.rows,
         interval: fields.interval,
         since: fields.since,
         when: fields.when,
@@ -350,7 +388,8 @@ fn read_query(key: String, body: Body) -> Result<Query> {
         columns: fields.columns,
         fills,
         metrics: read_metrics(fields.metrics)?,
-    })
+    };
+    Ok((query, command))
 }
 
 #[derive(Deserialize)]

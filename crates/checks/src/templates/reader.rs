@@ -36,7 +36,9 @@ use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until};
 use tracing::warn;
 
-use super::{INSTANCE_LABEL, Privileges, Session, Totals, discovered, metric_rows, picked};
+use super::{
+    INSTANCE_LABEL, Privileges, Session, Totals, discovered, from_reply, metric_rows, picked,
+};
 use crate::databases::{Database, TIMEOUT};
 use crate::jitter;
 
@@ -81,8 +83,6 @@ pub const MAX_RETRY: Duration = Duration::from_secs(60);
 pub const FIRST_RETRY: Duration = Duration::from_millis(100);
 #[cfg(test)]
 pub const MAX_RETRY: Duration = Duration::from_millis(400);
-/// What's run to see a database still answers when nothing else has for a while.
-const ALIVE: &str = "SELECT 1";
 /// How often what the account may do is read again while connected, so taking a
 /// privilege away shows within minutes.
 const ACCOUNT_EVERY: Duration = Duration::from_secs(5 * 60);
@@ -485,6 +485,7 @@ async fn run(
                 }
                 match session.run(sql, TIMEOUT).await {
                     Ok(rows) => {
+                        let rows = from_reply(rows, &discover.columns, None);
                         block.found = Some(discovered(&rows));
                         discovered_now = true;
                         errors.remove(&part_name("discover", &discover.key));
@@ -525,7 +526,7 @@ async fn run(
             }
             // Nothing ran for a while, so see that it still answers.
             if now >= check_at && session.is_up() {
-                if let Err(error) = session.run(ALIVE, TIMEOUT).await {
+                if let Err(error) = session.ping(TIMEOUT).await {
                     note(work, &database, CONNECTING, &error, &mut errors);
                 }
                 check_at = now + every;
@@ -662,6 +663,7 @@ mod tests {
                      pg_is_in_recovery() AS replica"
                         .to_string(),
                 ),
+                columns: Default::default(),
                 registry: Vec::new(),
                 counter_sets: Default::default(),
             }],
@@ -670,6 +672,7 @@ mod tests {
                 sql: "SELECT datname AS name, xact_commit AS commits, numbackends AS backends \
                       FROM pg_stat_database WHERE datname = 'postgres'"
                     .to_string(),
+                rows: None,
                 interval: None,
                 labels: vec!["name".to_string()],
                 columns: Default::default(),
@@ -913,6 +916,7 @@ mod tests {
         more.queries.push(QueryWork {
             key: "sessions".to_string(),
             sql: "SELECT count(*) AS sessions FROM pg_stat_activity".to_string(),
+            rows: None,
             interval: None,
             labels: Vec::new(),
             columns: Default::default(),
@@ -952,6 +956,7 @@ mod tests {
             key: "role".to_string(),
             interval: Duration::from_secs(3600),
             sql: Some("SELECT 'primary' AS role".to_string()),
+            columns: Default::default(),
             registry: Vec::new(),
             counter_sets: Default::default(),
         });

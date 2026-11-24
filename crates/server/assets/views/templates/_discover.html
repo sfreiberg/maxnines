@@ -8,11 +8,24 @@
     <input type="text" name="{{ d }}interval" value="{{ discover.interval }}" spellcheck="false" placeholder="1h">
     {% set e = errors | get(key=d ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
+  {% if mongodb %}
+  <label>Command
+    <textarea name="{{ d }}sql" rows="4" spellcheck="false" placeholder='{ "buildInfo": 1 }'>{{ discover.sql }}</textarea>
+    <small>One MongoDB command, as JSON, run on <code>admin</code> unless its <code>$db</code> says.</small>
+    {% set e = errors | get(key=d ~ "command", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Columns
+    <textarea name="{{ d }}columns" rows="2" spellcheck="false" placeholder="version = version">{{ discover.columns }}</textarea>
+    <small>One <code>name = field</code> to a line, each something <code>when</code> can look at by its name, read from where the field is in the reply. A <code>version</code> is read as a version.</small>
+    {% set e = errors | get(key=d ~ "columns", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  {% else %}
   <label>SQL
     <textarea name="{{ d }}sql" rows="4" spellcheck="false">{{ discover.sql }}</textarea>
     <small>Each column becomes something <code>when</code> can look at by its name. A <code>version</code> column is read as a version.</small>
     {% set e = errors | get(key=d ~ "sql", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
+  {% endif %}
   <label>Counter sets
     <textarea name="{{ d }}counter_sets" rows="2" spellcheck="false" placeholder="asp_net = ASP.NET">{{ discover.counter_sets }}</textarea>
     <small>One <code>name = Counter set</code> to a line, each true or false for whether the host has it.</small>

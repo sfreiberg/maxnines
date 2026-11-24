@@ -1,6 +1,7 @@
 use sea_orm::entity::prelude::*;
 
-/// SQL of a template's whose columns become metrics.
+/// SQL of a template's whose columns become metrics, or a MongoDB command whose
+/// reply's fields do.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
 #[sea_orm(table_name = "template_queries")]
 pub struct Model {
@@ -10,6 +11,8 @@ pub struct Model {
     pub key: String,
     pub position: i32,
     pub sql: String,
+    /// For MongoDB, where in the reply its rows are.
+    pub rows_path: Option<String>,
     pub interval_secs: Option<i64>,
     pub since: Option<String>,
     pub when_condition: Option<String>,

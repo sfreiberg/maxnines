@@ -811,6 +811,11 @@ async fn form_page(
     let page = Page::new(state, token, "templates/form.html")
         .with("id", &id)
         .with("form", form)
+        // MongoDB is asked with commands, which the form says rather than SQL.
+        .with(
+            "mongodb",
+            &(form.database.trim() == maxnines_protocol::templates::MONGODB),
+        )
         .with("errors", &errors)
         .with("problem_count", &problems.len())
         .with("operating_systems", &crate::rule_engine::OPERATING_SYSTEMS)

@@ -11,7 +11,9 @@
 //! of the role in use, so each is put in use in turn, and the one in use before is
 //! put back after, so what templates run is run as before. On ClickHouse it's
 //! one query over `system.grants`, for the account and the roles it's been given
-//! and those roles' own, which an account that can read `system.*` can see.
+//! and those roles' own, which an account that can read `system.*` can see. On
+//! MongoDB it's `connectionStatus`, which lists every action the account's roles
+//! allow, its roles' own roles' too.
 
 use anyhow::{Result, bail};
 use maxnines_protocol::CheckKind;
@@ -136,6 +138,107 @@ FROM system.grants
 WHERE is_partial_revoke = 0
   AND (user_name = currentUser() OR has(roles, ifNull(role_name, '')))";
 
+/// MongoDB actions that change data or collections. Ending its own cursors and
+/// changing its own password, which reading needs, aren't counted.
+const MONGODB_WRITES: &[&str] = &[
+    "insert",
+    "update",
+    "remove",
+    "bypassDocumentValidation",
+    "createCollection",
+    "dropCollection",
+    "dropDatabase",
+    "createIndex",
+    "dropIndex",
+    "collMod",
+    "compact",
+    "convertToCapped",
+    "renameCollectionSameDB",
+    "reIndex",
+    "applyOps",
+    "createSearchIndexes",
+    "dropSearchIndex",
+    "updateSearchIndex",
+    "cleanupOrphaned",
+    "enableSharding",
+    "moveChunk",
+    "splitChunk",
+    "refineCollectionShardKey",
+    "reshardCollection",
+];
+
+/// MongoDB actions that manage accounts or the server.
+const MONGODB_MANAGES: &[&str] = &[
+    "createUser",
+    "dropUser",
+    "changePassword",
+    "changeCustomData",
+    "createRole",
+    "dropRole",
+    "grantRole",
+    "revokeRole",
+    "setAuthenticationRestriction",
+    "impersonate",
+    "invalidateUserCache",
+    "shutdown",
+    "replSetConfigure",
+    "replSetStateChange",
+    "resync",
+    "setParameter",
+    "setClusterParameter",
+    "setFeatureCompatibilityVersion",
+    "setDefaultRWConcern",
+    "setUserWriteBlockMode",
+    "addShard",
+    "removeShard",
+    "fsync",
+    "unlock",
+    "logRotate",
+    "killop",
+    "killAnyCursor",
+    "killAnySession",
+    "dropConnections",
+    "closeAllDatabases",
+    "rotateCertificates",
+    "auditConfigure",
+    "enableProfiler",
+    "flushRouterConfig",
+];
+
+/// What a MongoDB account may do beyond reading, from what `connectionStatus` says
+/// with `showPrivileges`: `root`, or any action on any resource, is everything.
+fn mongodb_privileges(reply: &mongodb::bson::Document) -> Privileges {
+    use mongodb::bson::Bson;
+    let info = reply.get_document("authInfo").ok();
+    let roles = info
+        .and_then(|info| info.get_array("authenticatedUserRoles").ok())
+        .into_iter()
+        .flatten()
+        .filter_map(Bson::as_document)
+        .filter_map(|role| role.get_str("role").ok());
+    let root = roles
+        .into_iter()
+        .any(|role| role == "root" || role == "__system");
+    let actions: Vec<&str> = info
+        .and_then(|info| info.get_array("authenticatedUserPrivileges").ok())
+        .into_iter()
+        .flatten()
+        .filter_map(Bson::as_document)
+        .filter_map(|privilege| privilege.get_array("actions").ok())
+        .flatten()
+        .filter_map(Bson::as_str)
+        .collect();
+    let any = |list: &[&str]| actions.iter().any(|action| list.contains(action));
+    let superuser = root || actions.contains(&"anyAction");
+    Privileges {
+        superuser,
+        writes: superuser || any(MONGODB_WRITES),
+        manages: superuser || any(MONGODB_MANAGES),
+        // MongoDB has no way to reach the server's files but being everything.
+        server_files: superuser,
+    }
+}
+
 impl Session {
     /// What the account it signs in as may do beyond reading, connecting first if
     /// it has to.
@@ -177,6 +280,18 @@ impl Session {
                     (false, true) => self.mariadb_role_grants(roles).await?,
                 };
                 Ok(mysql_privileges(grants.iter().chain(&more)))
+            }
+            CheckKind::Mongodb => {
+                let rows = self
+                    .run(
+                        r#"{ "connectionStatus": 1, "showPrivileges": true }"#,
+                        STATEMENT_LIMIT,
+                    )
+                    .await?;
+                match rows.first().and_then(|row| row.first()) {
+                    Some((_, Cell::Reply(reply))) => Ok(mongodb_privileges(reply)),
+                    _ => bail!("MongoDB didn't say what the account may do"),
+                }
             }
             other => bail!("templates can't read {} yet", other.as_str()),
         }
@@ -425,6 +540,37 @@ mod tests {
         );
         let role_admin = of(&["GRANT `writer`@`%` TO `mx`@`%` WITH ADMIN OPTION"]);
         assert!(role_admin.manages);
+    }
+
+    #[test]
+    fn a_mongodb_accounts_actions_say_what_it_may_do() {
+        use mongodb::bson::{Document, doc};
+        let status = |roles: &[&str], actions: &[&str]| -> Document {
+            doc! { "authInfo": {
+                "authenticatedUserRoles": roles.iter().map(|role| doc! { "role": *role, "db": "admin" }).collect::<Vec<_>>(),
+                "authenticatedUserPrivileges": [
+                    { "resource": { "cluster": true }, "actions": ["serverStatus", "inprog"] },
+                    { "resource": { "db": "", "collection": "" }, "actions": actions },
+                ],
+            } }
+        };
+        // What clusterMonitor and read give, ending its own cursors included.
+        let monitor = mongodb_privileges(&status(
+            &["clusterMonitor"],
+            &["find", "killCursors", "listCollections"],
+        ));
+        assert!(!monitor.overprivileged(), "{monitor:?}");
+        let writes = mongodb_privileges(&status(&["readWrite"], &["find", "insert", "update"]));
+        assert!(writes.writes && !writes.manages && !writes.superuser);
+        let manages = mongodb_privileges(&status(
+            &["userAdminAnyDatabase"],
+            &["createUser", "grantRole"],
+        ));
+        assert!(manages.manages && !manages.writes);
+        let root = mongodb_privileges(&status(&["root"], &[]));
+        assert!(root.superuser && root.writes && root.manages && root.server_files);
+        let anything = mongodb_privileges(&status(&["custom"], &["anyAction"]));
+        assert!(anything.superuser);
     }
 
     /// A throwaway server the tests may make accounts on, from

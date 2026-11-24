@@ -420,6 +420,7 @@ async fn read_template<C: ConnectionTrait>(
         discover.push(Discover {
             interval: length(found.interval_secs),
             sql: found.sql,
+            columns: template_items::discovery_columns::read(connection, found.id).await?,
             registry: reads,
             counter_sets: template_items::counter_sets::read(connection, found.id).await?,
             key: found.key,
@@ -486,6 +487,7 @@ async fn read_template<C: ConnectionTrait>(
         queries.push(Query {
             key: query.key,
             sql: query.sql,
+            rows: query.rows_path,
             interval: length(query.interval_secs),
             since: query.since,
             when: query.when_condition,
@@ -753,6 +755,7 @@ async fn write_discover<C: ConnectionTrait>(
     };
     let discovery = put_part!(template_discovery, connection, expected, existing);
     template_items::counter_sets::write(connection, discovery, &discover.counter_sets).await?;
+    template_items::discovery_columns::write(connection, discovery, &discover.columns).await?;
 
     let mut reads: HashMap<String, template_registry_read::Model> =
         template_registry_read::Entity::find()
@@ -797,6 +800,7 @@ async fn write_query<C: ConnectionTrait>(
         key: query.key.clone(),
         position: i32::try_from(position)?,
         sql: query.sql.clone(),
+        rows_path: query.rows.clone(),
         interval_secs: secs(&query.interval)?,
         since: query.since.clone(),
         when_condition: query.when.clone(),

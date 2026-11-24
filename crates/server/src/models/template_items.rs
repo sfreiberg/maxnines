@@ -233,6 +233,14 @@ map_table!(
     counter_set
 );
 map_table!(
+    discovery_columns,
+    "template_discovery_columns",
+    discovery_id,
+    DiscoveryId,
+    name,
+    source
+);
+map_table!(
     query_columns,
     "template_query_columns",
     query_id,

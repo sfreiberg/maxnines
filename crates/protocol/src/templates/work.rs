@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, anyhow, ensure};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -99,8 +99,12 @@ pub struct DiscoverWork {
     pub key: String,
     #[serde(rename = "interval_secs", with = "time::seconds")]
     pub interval: Duration,
+    /// The SQL, or for MongoDB its command, as JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
+    /// For MongoDB, where in the reply each thing it finds is, by its name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub columns: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registry: Vec<RegistryWork>,
     /// Whether the host has each counter set, by the name it's found as.
@@ -187,7 +191,11 @@ pub struct CounterWork {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryWork {
     pub key: String,
+    /// The SQL, or for MongoDB its command, as JSON.
     pub sql: String,
+    /// For MongoDB, where in the reply its rows are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<String>,
     /// How often it runs, if less often than every sample.
     #[serde(
         rename = "interval_secs",
@@ -200,7 +208,8 @@ pub struct QueryWork {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     /// For a SHOW statement, the only columns read, each by the name it's given
-    /// and the column it's from. Rows with the same labels add up.
+    /// and the column it's from, and rows with the same labels add up. For MongoDB,
+    /// each by where in a row it is.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub columns: IndexMap<String, String>,
     /// The columns that are running totals, sent as the change since the last read.
@@ -297,7 +306,13 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
             check_key(&discover.key)?;
             check_interval(&discover.key, Some(discover.interval))?;
             match (&discover.sql, on_database) {
-                (Some(sql), true) => check_sql(&discover.key, sql)?,
+                (Some(sql), true) => {
+                    check_sql(&discover.key, sql)?;
+                    if super::is_command(sql) {
+                        super::check_command(sql)
+                            .map_err(|error| anyhow!("discover {:?} {error}", discover.key))?;
+                    }
+                }
                 (None, false) => {}
                 (Some(_), false) => {
                     anyhow::bail!("{:?} has SQL but no database to run it on", discover.key)
@@ -323,8 +338,18 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
                 .iter()
                 .flat_map(|read| read.values.keys())
                 .chain(discover.counter_sets.keys())
+                .chain(discover.columns.keys())
             {
                 check_key(name)?;
+            }
+            ensure!(
+                discover.columns.len() <= MAX_COLUMNS,
+                "discover {:?} finds too many things",
+                discover.key
+            );
+            for path in discover.columns.values() {
+                super::parse_path(path)
+                    .map_err(|error| anyhow!("discover {:?}: {error}", discover.key))?;
             }
         }
         for query in &one.queries {
@@ -341,7 +366,16 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
             );
             check_statement(&query.key, &query.sql)?;
             for name in query.columns.keys() {
-                check_key(name)?;
+                ensure!(
+                    is_key(name) || super::is_helper(name),
+                    "{name:?} isn't a column's name"
+                );
+            }
+            if super::is_command(&query.sql) {
+                for path in query.columns.values().chain(&query.rows) {
+                    super::parse_path(path)
+                        .map_err(|error| anyhow!("query {:?}: {error}", query.key))?;
+                }
             }
         }
         for counters in &one.counters {
@@ -374,10 +408,14 @@ fn check_sql(key: &str, sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// A statement is one SELECT or one SHOW, which saving checks and is checked again
-/// here, as where it runs is the last place it can be. What it may read is up to
-/// the account it runs as.
+/// A statement is one SELECT or one SHOW, or for MongoDB one command, which saving
+/// checks and is checked again here, as where it runs is the last place it can be.
+/// What it may read is up to the account it runs as.
 pub fn check_statement(key: &str, sql: &str) -> Result<()> {
+    if super::is_command(sql) {
+        super::check_command(sql).map_err(|error| anyhow!("query {key:?} {error}"))?;
+        return Ok(());
+    }
     ensure!(
         matches!(
             super::first_keyword(sql).as_str(),
@@ -437,12 +475,14 @@ mod tests {
                 key: "role".to_string(),
                 interval: Duration::from_secs(10),
                 sql: Some("SELECT 'primary' AS role".to_string()),
+                columns: Default::default(),
                 registry: Vec::new(),
                 counter_sets: BTreeMap::new(),
             }],
             queries: vec![QueryWork {
                 key: "sessions".to_string(),
                 sql: "SELECT count(*) AS connections FROM pg_stat_activity".to_string(),
+                rows: None,
                 interval: None,
                 labels: Vec::new(),
                 columns: Default::default(),
@@ -461,6 +501,7 @@ mod tests {
                 key: "iis".to_string(),
                 interval: Duration::from_secs(3600),
                 sql: None,
+                columns: Default::default(),
                 registry: vec![RegistryWork {
                     key: r"HKLM\SOFTWARE\Microsoft\InetStp".to_string(),
                     values: BTreeMap::from([("version".to_string(), "VersionString".to_string())]),

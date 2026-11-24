@@ -478,10 +478,209 @@ fn a_statement_is_a_select_or_a_show() {
         "WITH a AS (SELECT 1) SELECT * FROM a",
         "SHOW GRANTS",
         "# lag\nSELECT 1 AS lag",
+        r#"{ "serverStatus": 1 }"#,
     ] {
         assert!(work::check_statement("q", fine).is_ok(), "{fine}");
     }
-    for refused in ["DELETE FROM orders", "SET ROLE admin", "CALL rebuild()"] {
+    for refused in [
+        "DELETE FROM orders",
+        "SET ROLE admin",
+        "CALL rebuild()",
+        r#"{ "ping": 1, "$readPreference": {} }"#,
+        "{ not json }",
+    ] {
         assert!(work::check_statement("q", refused).is_err(), "{refused}");
     }
+}
+
+const MONGO: &str = r#"
+template "docs" {
+  name     = "Documents"
+  database = "mongodb"
+
+  discover "server" {
+    command = <<-JSON
+      { "buildInfo": 1 }
+    JSON
+    columns = { version = "version" }
+  }
+
+  query "members" {
+    command = <<-JSON
+      { "replSetGetStatus": 1 }
+    JSON
+    rows   = "members"
+    labels = ["member"]
+    columns = {
+      member  = "name"
+      _health = "health"
+      _leader = "$.members[state=1].optimeDate"
+    }
+    metrics = {
+      _health        = { total = true }
+      member_healthy = { value = "_health == 1" }
+    }
+  }
+}
+"#;
+
+#[test]
+fn mongodb_is_asked_with_commands_whose_replies_columns_name() {
+    let template = parse(MONGO).unwrap();
+    assert!(template.check().is_empty(), "{:?}", template.check());
+    assert!(template.is_mongodb());
+    assert_eq!(
+        template.discover[0].sql.as_deref(),
+        Some("{ \"buildInfo\": 1 }\n")
+    );
+    assert_eq!(template.discover[0].columns["version"], "version");
+    let query = &template.queries[0];
+    assert_eq!(query.rows.as_deref(), Some("members"));
+    assert_eq!(query.columns["_leader"], "$.members[state=1].optimeDate");
+    // Written out as it was read, with command in place of sql.
+    let written = to_hcl(&template);
+    assert!(written.contains("command = <<-EOT"), "{written}");
+    assert!(!written.contains("sql"), "{written}");
+    assert_eq!(parse(&written).unwrap(), template);
+
+    // Each kind of database is asked its own way.
+    let sql_for_mongo = MONGO.replace(
+        "command = <<-JSON\n      { \"buildInfo\": 1 }",
+        "sql = <<-JSON\n      SELECT 1",
+    );
+    let error = format!("{:#}", parse(&sql_for_mongo).unwrap_err());
+    assert!(error.contains("MongoDB isn't asked with SQL"), "{error}");
+    let command_for_postgres = MONGO.replace("\"mongodb\"", "\"postgres\"");
+    let error = format!("{:#}", parse(&command_for_postgres).unwrap_err());
+    assert!(error.contains("a command is only for MongoDB"), "{error}");
+}
+
+#[test]
+fn a_mongodb_command_is_one_command_and_where_it_runs() {
+    assert_eq!(
+        check_command(r#"{ "serverStatus": 1 }"#),
+        Ok(("serverStatus".to_string(), "admin".to_string()))
+    );
+    assert_eq!(
+        check_command(r#"{ "$db": "local", "find": "oplog.rs", "limit": 1 }"#),
+        Ok(("find".to_string(), "local".to_string()))
+    );
+    for (command, why) in [
+        ("serverStatus", "isn't one command written as JSON"),
+        (
+            r#"{ "ping": 1 } { "ping": 1 }"#,
+            "isn't one command written as JSON",
+        ),
+        ("{}", "needs a command"),
+        (r#"{ "ping": 1, "$readPreference": {} }"#, "only $db"),
+        (r#"{ "ping": 1, "$db": 3 }"#, "$db is the name"),
+    ] {
+        let error = check_command(command).unwrap_err();
+        assert!(error.contains(why), "{command}: {error}");
+    }
+    assert!(is_command("  {\"ping\": 1}"));
+    assert!(!is_command("SELECT 1"));
+}
+
+#[test]
+fn a_path_says_where_a_field_is_in_a_reply() {
+    assert_eq!(
+        parse_path("connections.current"),
+        Ok(Path {
+            from_reply: false,
+            steps: vec![
+                Step {
+                    field: "connections".to_string(),
+                    only: None
+                },
+                Step {
+                    field: "current".to_string(),
+                    only: None
+                },
+            ],
+        })
+    );
+    // A value can hold dots, as host names do.
+    let path = parse_path("$.members[name=db1.example.com:27017].optimeDate").unwrap();
+    assert!(path.from_reply);
+    assert_eq!(
+        path.steps[0].only,
+        Some(("name".to_string(), "db1.example.com:27017".to_string()))
+    );
+    assert_eq!(path.steps[1].field, "optimeDate");
+    // Fields can have spaces, as WiredTiger's do.
+    assert_eq!(
+        parse_path("wiredTiger.cache.bytes currently in the cache")
+            .unwrap()
+            .steps[2]
+            .field,
+        "bytes currently in the cache"
+    );
+    for (path, why) in [
+        ("", "needs the field"),
+        ("$.", "needs the field"),
+        ("a..b", "a field with no name"),
+        ("members[state=1", "[ with no ]"),
+        ("members[state]", "[field=value]"),
+        ("members[=1]", "a field to keep documents by"),
+        ("members[state=1]x", "something after a ]"),
+        ("a]", "] with no ["),
+    ] {
+        let error = parse_path(path).unwrap_err();
+        assert!(error.contains(why), "{path:?}: {error}");
+    }
+}
+
+#[test]
+fn a_column_only_for_working_others_out_starts_with_an_underscore() {
+    assert!(is_helper("_leader"));
+    assert!(!is_helper("leader"));
+    assert!(!is_helper("_Leader"));
+    assert!(!is_helper("_"));
+    // That's what says which query a row is from.
+    assert!(!is_helper(work::QUERY_FIELD));
+    let wrong = MONGO.replace("_leader = \"$.members", "_Leader = \"$.members");
+    assert!(
+        problems(&wrong)
+            .iter()
+            .any(|problem| problem.contains("\"_Leader\"")),
+        "{:?}",
+        problems(&wrong)
+    );
+    // Columns and rows are only MongoDB's, and its paths have to be paths.
+    let not_mongo = r#"
+        template "pg" {
+          name     = "PG"
+          database = "postgres"
+          discover "server" {
+            sql     = "SELECT 1 AS one"
+            columns = { one = "one" }
+          }
+          query "q" {
+            sql  = "SELECT 1 AS one"
+            rows = "members"
+          }
+        }
+    "#;
+    let found = problems(not_mongo);
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("columns: are only for MongoDB")),
+        "{found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|p| p.contains("rows: are only for MongoDB")),
+        "{found:?}"
+    );
+    let bad_path = MONGO.replace("rows   = \"members\"", "rows   = \"members[\"");
+    assert!(
+        problems(&bad_path)
+            .iter()
+            .any(|problem| problem.contains("[ with no ]")),
+        "{:?}",
+        problems(&bad_path)
+    );
 }
