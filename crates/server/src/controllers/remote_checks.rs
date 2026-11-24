@@ -86,9 +86,15 @@ struct CheckForm {
     password_env: String,
     private_key: String,
     private_key_env: String,
-    /// Whether a password or key is saved, which leaving the box empty keeps.
+    /// UniFi: the one site to read, and the API key made on the console.
+    site: String,
+    api_key: String,
+    api_key_env: String,
+    /// Whether a password, key or API key is saved, which leaving the box empty
+    /// keeps.
     has_password: bool,
     has_private_key: bool,
+    has_api_key: bool,
 }
 
 /// What's left empty on a form isn't set at all.
@@ -156,8 +162,12 @@ impl CheckForm {
             password_env: text(&input.sign_in.password_env),
             private_key: String::new(),
             private_key_env: text(&input.sign_in.private_key_env),
+            site: text(&check.site),
+            api_key: String::new(),
+            api_key_env: text(&input.sign_in.api_key_env),
             has_password: input.sign_in.password.is_some(),
             has_private_key: input.sign_in.private_key.is_some(),
+            has_api_key: input.sign_in.api_key.is_some(),
         }
     }
 
@@ -191,8 +201,12 @@ impl CheckForm {
             password_env: text("password_env"),
             private_key: text("private_key"),
             private_key_env: text("private_key_env"),
+            site: text("site"),
+            api_key: text("api_key"),
+            api_key_env: text("api_key_env"),
             has_password: saved.is_some_and(|saved| saved.password.is_some()),
             has_private_key: saved.is_some_and(|saved| saved.private_key.is_some()),
+            has_api_key: saved.is_some_and(|saved| saved.api_key.is_some()),
         }
     }
 
@@ -233,7 +247,12 @@ impl CheckForm {
         check.host_key = optional(&self.host_key);
         // Only a website check has a domain to look up, and on is how it starts.
         check.domain_expiry = (kind == CheckKind::Http && !self.domain_expiry).then_some(false);
+        // Only a UniFi check has a site, and it signs in with its API key alone.
+        if kind == CheckKind::Unifi {
+            check.site = optional(&self.site);
+        }
         let with = match self.sign_in.as_str() {
+            _ if kind == CheckKind::Unifi => SignInWith::ApiKey,
             "password" if kind.signs_in() => SignInWith::Password,
             "key" if kind == CheckKind::Ssh => SignInWith::Key,
             _ => SignInWith::None,
@@ -253,6 +272,11 @@ impl CheckForm {
                 // Pasted keys often lose their last line break, which they need.
                 private_key: optional(&self.private_key).map(|key| format!("{key}\n")),
                 private_key_env: optional(&self.private_key_env),
+                ..SignIn::default()
+            },
+            SignInWith::ApiKey => SignIn {
+                api_key: optional(&self.api_key),
+                api_key_env: optional(&self.api_key_env),
                 ..SignIn::default()
             },
         };
@@ -1014,14 +1038,14 @@ async fn run_now(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfF
     let Some(host) = state.agentless_host(&check.input.host_id).await else {
         return not_found(&state, &form.token);
     };
-    crate::remote_checks::run(
-        &check,
-        host.hostname,
-        &state.writer,
-        &state.check_results,
-        &state.presence,
-    )
-    .await;
+    let to = crate::remote_checks::Running {
+        database: &state.database,
+        registry: &state.registry,
+        writer: &state.writer,
+        results: &state.check_results,
+        presence: &state.presence,
+    };
+    crate::remote_checks::run(&check, host.hostname, to).await;
     (form.token, Redirect::to(&format!("/checks/{id}"))).into_response()
 }
 

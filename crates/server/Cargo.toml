@@ -82,6 +82,7 @@ cookie = "0.18"
 totp-rs = { version = "6.0.0", features = ["qr", "gen_secret", "otpauth"] }
 
 [dev-dependencies]
+maxnines-checks = { workspace = true, features = ["fake-unifi"] }
 rcgen = "0.14"
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 tempfile = "3"

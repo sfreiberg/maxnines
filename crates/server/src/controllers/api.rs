@@ -2049,7 +2049,7 @@ struct RemoteCheckView {
     grace_secs: Option<u64>,
     enabled: bool,
     read_stats: bool,
-    /// How it signs in: `none`, `password` or `key`.
+    /// How it signs in: `none`, `password`, `key`, or for UniFi, `api_key`.
     sign_in: SignInWith,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
@@ -2059,6 +2059,9 @@ struct RemoteCheckView {
     has_private_key: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     private_key_env: Option<String>,
+    has_api_key: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_key_env: Option<String>,
     /// How it last went, or nothing if it hasn't run since the server started.
     latest: Option<LatestCheck>,
 }
@@ -2096,6 +2099,8 @@ impl RemoteCheckView {
             sign_in: sign_in.with(),
             has_password: sign_in.password.is_some(),
             has_private_key: sign_in.private_key.is_some(),
+            has_api_key: sign_in.api_key.is_some(),
+            api_key_env: sign_in.api_key_env,
             username: sign_in.username,
             password_env: sign_in.password_env,
             private_key_env: sign_in.private_key_env,

@@ -31,6 +31,9 @@ a ping. Press **Add check** under **Checks** on the host's page, or choose the h
 on any check's form. The check's results are the host's, so its charts are on the
 host's metrics page and an alert about it names the host.
 
+A [UniFi](unifi.md) check also makes a host like this for each device its console
+has adopted, and keeps it online while the console says the device is.
+
 Every check is about a host like this. A check added from the Checks page with
 **New host**, or through the API without a host, gets a host of its own, named
 as you say or after what it reaches, as [Checks](checks.md#a-host-for-each-check)

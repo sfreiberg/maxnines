@@ -23,7 +23,14 @@ use crate::times::Timestamp;
 pub const HIDDEN: &str = "hidden";
 
 /// Words that make a field secret wherever it is.
-const SECRET_WORDS: [&str; 5] = ["password", "secret", "token", "credential", "private_key"];
+const SECRET_WORDS: [&str; 6] = [
+    "password",
+    "secret",
+    "token",
+    "credential",
+    "private_key",
+    "api_key",
+];
 
 /// Who made a change.
 #[derive(Debug, Clone, PartialEq, Eq)]

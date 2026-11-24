@@ -27,6 +27,7 @@
 - [Annotations](annotations.md)
 - [OpenMetrics](openmetrics.md)
 - [Checks](checks.md)
+  - [UniFi](unifi.md)
 - [Check commands](check-commands.md)
 - [Hosts without an agent](agentless-hosts.md)
 - [Map](map.md)

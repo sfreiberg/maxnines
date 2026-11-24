@@ -891,6 +891,7 @@ mod tests {
         ("collectors-nginx", &["nginx"]),
         ("collectors-php-fpm", &["php_fpm"]),
         ("database-stats", &["database_accounts"]),
+        ("unifi", &["unifi"]),
     ];
 
     /// The pages that list a built-in database template's metrics, each with the

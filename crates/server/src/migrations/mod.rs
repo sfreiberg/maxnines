@@ -1905,6 +1905,9 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(RemoteChecks::PrivateKey).text())
                     .col(ColumnDef::new(RemoteChecks::PrivateKeyEnv).string_len(255))
                     .col(ColumnDef::new(RemoteChecks::DomainExpiry).boolean())
+                    .col(ColumnDef::new(RemoteChecks::Site).string_len(64))
+                    .col(ColumnDef::new(RemoteChecks::ApiKey).text())
+                    .col(ColumnDef::new(RemoteChecks::ApiKeyEnv).string_len(255))
                     .col(
                         ColumnDef::new(RemoteChecks::ReadStats)
                             .boolean()
@@ -1929,6 +1932,50 @@ impl MigrationTrait for CreateTables {
         // A heartbeat is found by the token it's pinged with.
         let (name, columns) = ("idx_remote_checks_ping_token", "ping_token");
         index_of(manager, Unique, name, "remote_checks", columns, None).await?;
+        // Each device a UniFi check has found, with the host it was made for, so
+        // a device keeps its host through renames.
+        manager
+            .create_table(
+                Table::create()
+                    .table(UnifiDevices::Table)
+                    .col(id(UnifiDevices::Id))
+                    .col(
+                        ColumnDef::new(UnifiDevices::RemoteCheckId)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UnifiDevices::DeviceId)
+                            .string_len(64)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(UnifiDevices::HostId)
+                            .string_len(32)
+                            .not_null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_unifi_devices_remote_check_id")
+                            .from(UnifiDevices::Table, UnifiDevices::RemoteCheckId)
+                            .to(RemoteChecks::Table, RemoteChecks::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_unifi_devices_host_id")
+                            .from(UnifiDevices::Table, UnifiDevices::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        let (name, columns) = (
+            "idx_unifi_devices_check_device",
+            "remote_check_id, device_id",
+        );
+        index_of(manager, Unique, name, "unifi_devices", columns, None).await?;
         manager
             .create_table(
                 Table::create()
@@ -2586,6 +2633,18 @@ enum RemoteChecks {
     ReadStats,
     GraceSecs,
     PingToken,
+    Site,
+    ApiKey,
+    ApiKeyEnv,
+}
+
+#[derive(Iden)]
+enum UnifiDevices {
+    Table,
+    Id,
+    RemoteCheckId,
+    DeviceId,
+    HostId,
 }
 
 #[derive(Iden)]

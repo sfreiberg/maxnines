@@ -1272,7 +1272,10 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "PostgreSQL subscription stopped",
             "PostgreSQL too few standbys",
             "PostgreSQL transaction IDs running out",
-            "Service stopped"
+            "Service stopped",
+            "UniFi device CPU high",
+            "UniFi device memory high",
+            "UniFi firmware update available"
         ]
     );
 }

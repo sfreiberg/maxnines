@@ -41,6 +41,11 @@ pub struct Model {
     pub grace_secs: Option<i64>,
     /// For a heartbeat: the token in the address it's pinged at.
     pub ping_token: Option<String>,
+    /// For UniFi: the one site to read, if not all.
+    pub site: Option<String>,
+    /// For UniFi: the API key, as it was typed in, when it was.
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

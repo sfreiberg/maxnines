@@ -59,6 +59,8 @@ erDiagram
     hosts ||--o{ metrics_pages : "is read from"
     hosts ||--o{ remote_checks : "is checked by"
     remote_checks ||--o| heartbeats : "pinged with"
+    remote_checks ||--o{ unifi_devices : "found"
+    hosts ||--o| unifi_devices : "kept as"
     hosts ||--o{ alerts : "has"
     templates |o--o{ alert_rules : "alerts as"
     alert_rules |o--o| alert_rules : "copied as"
@@ -566,6 +568,15 @@ erDiagram
         boolean read_stats "databases: read health and replication too"
         int grace_secs "heartbeat: how late a ping can be"
         string ping_token UK "heartbeat: in the address it's pinged at"
+        string site "unifi: the one site to read"
+        text api_key "unifi: as typed, when it was"
+        string api_key_env "the server's variable holding it"
+    }
+    unifi_devices {
+        int id PK
+        int remote_check_id FK "the UniFi check that found it"
+        string device_id "the console's ID for it"
+        string host_id FK "the host without an agent it's kept as"
     }
     heartbeats {
         int remote_check_id PK, FK
@@ -728,6 +739,7 @@ erDiagram
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |
 | `location_rules` | Where hosts are on the map |
 | `remote_checks` | Checks the server runs itself, each about a host without an agent, which is made for it if it's added without one, and with a name no other check about that host has. A host's checks go with it, and a check's host stays when the check goes |
+| `unifi_devices` | Each device a UniFi check has found, with the host without an agent made for it, so a device keeps its host through renames on the console. It goes with its check or its host, and the host stays when the check goes |
 | `heartbeats` | What each heartbeat check was last pinged with, made by its first ping, which is what lets one that's late stay late through a restart. It goes with its check, or when the check stops being a heartbeat |
 | `users`, `user_sessions`, `api_keys`, `recovery_codes`, `sign_in_challenges` | People, how they sign in, and their keys. Each browser session, key and app sign-in keeps where it was last used from, for the list of who's signed in |
 | `app_sign_ins` | Apps people signed in through the browser, such as the command line, with hashes of the tokens each holds. A refresh token that's been swapped is kept a moment, so using it again can be told apart from a lost answer |
@@ -794,6 +806,7 @@ index here starts with.
 | `idx_action_runs_finished` | `action_runs (finished_at)` | Runs still waiting for an answer |
 | `idx_remote_checks_host_name` | `remote_checks (host_id, name_key)`, unique | One check to a name for each host |
 | `idx_remote_checks_ping_token` | `remote_checks (ping_token)`, unique | The heartbeat a ping is for |
+| `idx_unifi_devices_check_device` | `unifi_devices (remote_check_id, device_id)`, unique | One host to a device for each check |
 | `idx_silences_ends` | `silences (ends_at)` | Silences still running |
 | `idx_dashboard_widgets_dashboard` | `dashboard_widgets (dashboard_id)` | A dashboard's widgets |
 | `idx_dashboard_variables_dashboard` | `dashboard_variables (dashboard_id)` | A dashboard's variables |

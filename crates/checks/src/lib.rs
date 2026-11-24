@@ -17,6 +17,7 @@ mod sign_in;
 pub mod templates;
 #[cfg(test)]
 mod test_tls;
+pub mod unifi;
 
 pub use sign_in::Credentials;
 
@@ -37,7 +38,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::client::conn::{http1, http2};
 use hyper::header::{
-    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, HOST, HeaderValue, USER_AGENT,
+    ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, HOST, HeaderName, HeaderValue, USER_AGENT,
 };
 use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -88,7 +89,7 @@ const DNS_BUFFER_BYTES: usize = 4096;
 pub fn host_reached(check: &Check) -> String {
     let target = check.target.as_str();
     let host = match check.kind {
-        CheckKind::Http => Uri::from_str(target)
+        CheckKind::Http | CheckKind::Unifi => Uri::from_str(target)
             .ok()
             .and_then(|uri| uri.host().map(String::from))
             .unwrap_or_else(|| target.to_string()),
@@ -248,6 +249,9 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Heartbeat => Err(anyhow!(
                 "a heartbeat is pinged at the server rather than run"
             )),
+            CheckKind::Unifi => Err(anyhow!(
+                "a UniFi check is read by the server, with its API key"
+            )),
             CheckKind::Unknown => Err(anyhow!(CheckKind::UNKNOWN_MESSAGE)),
         }
     };
@@ -299,7 +303,10 @@ async fn domain_expiry(check: &Check, left: Duration, findings: &mut Findings) {
 
 /// What a page that asks who's reading is sent: a username and password, or a
 /// token, as the header that carries them.
-pub struct Login(HeaderValue);
+pub struct Login {
+    name: HeaderName,
+    value: HeaderValue,
+}
 
 impl Login {
     /// A username and password, sent as basic authentication.
@@ -321,11 +328,25 @@ impl Login {
         Self::header(&format!("Bearer {token}"))
     }
 
+    /// An API key, sent in the `X-API-KEY` header, as UniFi's Network API takes it.
+    pub fn api_key(key: &str) -> Result<Self> {
+        ensure!(
+            !key.is_empty() && key.bytes().all(|byte| byte.is_ascii_graphic()),
+            "an API key can't be empty, or hold spaces or anything but plain letters, \
+             digits and punctuation"
+        );
+        Self::named(HeaderName::from_static("x-api-key"), key)
+    }
+
     fn header(value: &str) -> Result<Self> {
-        let mut header = HeaderValue::from_str(value).map_err(|_| anyhow!("invalid header"))?;
+        Self::named(AUTHORIZATION, value)
+    }
+
+    fn named(name: HeaderName, value: &str) -> Result<Self> {
+        let mut value = HeaderValue::from_str(value).map_err(|_| anyhow!("invalid header"))?;
         // Keeps it out of anything that prints headers.
-        header.set_sensitive(true);
-        Ok(Self(header))
+        value.set_sensitive(true);
+        Ok(Self { name, value })
     }
 }
 
@@ -792,8 +813,8 @@ fn build_request(
         .header(HOST, host_header)
         .header(USER_AGENT, AGENT_NAME)
         .header(ACCEPT_ENCODING, "gzip");
-    if let Some(Login(header)) = login {
-        request = request.header(AUTHORIZATION, header);
+    if let Some(Login { name, value }) = login {
+        request = request.header(name, value);
     }
     request
         .body(Full::new(Bytes::from(body)))

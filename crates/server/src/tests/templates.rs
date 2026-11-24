@@ -121,7 +121,8 @@ async fn a_new_server_gets_the_host_template_and_its_rules_without_a_notice() {
             "macos",
             "mongodb",
             "mysql",
-            "postgres"
+            "postgres",
+            "unifi"
         ]
     );
     for template in &templates {

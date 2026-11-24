@@ -97,6 +97,9 @@ pub enum Reached {
     Page(i64),
     /// A check, by its ID.
     Check(i64),
+    /// A device a UniFi check reads, by the check's ID: online while the console
+    /// says it is.
+    Device(i64),
 }
 
 #[derive(Default)]
@@ -241,7 +244,8 @@ impl Presence {
     pub fn keep_checks(&self, run: &HashMap<i64, String>) {
         self.keep_reached(|host, what| match what {
             Reached::Check(id) => run.get(id).is_some_and(|about| about == host),
-            _ => true,
+            Reached::Device(id) => run.contains_key(id),
+            Reached::Page(_) => true,
         });
     }
 

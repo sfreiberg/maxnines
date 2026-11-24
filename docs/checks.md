@@ -24,6 +24,7 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
 | **FTP or FTPS** (`ftp`) | `host:port` | That it greets as FTP, and its certificate where it offers TLS, or that an account can sign in |
+| **UniFi console** (`unifi`) | The console's address | Every device the console has adopted, each a host of its own, with its CPU, memory, uplink and clients, as [UniFi](unifi.md) describes. Only the server runs these |
 | **Heartbeat** (`heartbeat`) | None | That scheduled work, such as a cron job or a backup, pinged its address in time, or [said it failed](#heartbeats) |
 
 An agent older than a kind of check doesn't know it. It runs the rest of its checks,
@@ -39,7 +40,7 @@ named after what the check reaches, in lower case:
 
 | Kind | Named after | Example target | Host's name |
 |---|---|---|---|
-| `http` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
+| `http`, `unifi` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
 | `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp` | What's before the port | `db1.internal:5432` | `db1.internal` |
 | `dns` | The name it looks up | `example.com` | `example.com` |
 | `heartbeat` | The check's own name | | `nightly backup` |

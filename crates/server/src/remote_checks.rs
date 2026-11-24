@@ -111,6 +111,11 @@ pub struct SignIn {
     pub private_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_key_env: Option<String>,
+    /// For UniFi, the API key made on the console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
 }
 
 impl fmt::Debug for SignIn {
@@ -119,6 +124,7 @@ impl fmt::Debug for SignIn {
             .field("username", &self.username)
             .field("password_env", &self.password_env)
             .field("private_key_env", &self.private_key_env)
+            .field("api_key_env", &self.api_key_env)
             .finish_non_exhaustive()
     }
 }
@@ -130,6 +136,8 @@ pub enum SignInWith {
     None,
     Password,
     Key,
+    /// For UniFi.
+    ApiKey,
 }
 
 impl SignInWith {
@@ -138,6 +146,7 @@ impl SignInWith {
             Self::None => "none",
             Self::Password => "password",
             Self::Key => "key",
+            Self::ApiKey => "api_key",
         }
     }
 }
@@ -150,7 +159,9 @@ const MAX_USERNAME_LEN: usize = 255;
 impl SignIn {
     /// How it signs in, going by what it has.
     pub fn with(&self) -> SignInWith {
-        if self.private_key.is_some() || self.private_key_env.is_some() {
+        if self.api_key.is_some() || self.api_key_env.is_some() {
+            SignInWith::ApiKey
+        } else if self.private_key.is_some() || self.private_key_env.is_some() {
             SignInWith::Key
         } else if self.username.is_some() || self.password.is_some() || self.password_env.is_some()
         {
@@ -171,6 +182,7 @@ impl SignIn {
     pub fn keeping_secrets_of(mut self, saved: &SignIn, asked: Option<SignInWith>) -> Self {
         let gives_password = self.password.is_some() || self.password_env.is_some();
         let gives_key = self.private_key.is_some() || self.private_key_env.is_some();
+        let gives_api_key = self.api_key.is_some() || self.api_key_env.is_some();
         match asked.unwrap_or_else(|| self.with()) {
             SignInWith::Password if !gives_password => {
                 self.password.clone_from(&saved.password);
@@ -180,9 +192,25 @@ impl SignIn {
                 self.private_key.clone_from(&saved.private_key);
                 self.private_key_env.clone_from(&saved.private_key_env);
             }
+            SignInWith::ApiKey if !gives_api_key => {
+                self.api_key.clone_from(&saved.api_key);
+                self.api_key_env.clone_from(&saved.api_key_env);
+            }
             _ => {}
         }
         self
+    }
+
+    /// The API key, read from the environment where it's named, or why it can't
+    /// be had.
+    pub fn api_key(&self) -> Result<Option<String>, String> {
+        match (&self.api_key, &self.api_key_env) {
+            (Some(typed), _) => Ok(Some(typed.clone())),
+            (None, Some(variable)) => std::env::var(variable)
+                .map(Some)
+                .map_err(|_| format!("the environment variable {variable} isn't set")),
+            (None, None) => Ok(None),
+        }
     }
 
     /// The credentials to sign in with, read from the environment where they're
@@ -206,9 +234,16 @@ impl SignIn {
     }
 
     fn validate(&self, kind: CheckKind) -> Result<()> {
+        if kind == CheckKind::Unifi {
+            return self.validate_api_key();
+        }
         if self.is_empty() {
             return Ok(());
         }
+        ensure!(
+            self.with() != SignInWith::ApiKey,
+            "only UniFi checks sign in with an API key"
+        );
         ensure!(
             kind.signs_in(),
             "only database, Redis, SSH, mail and FTP checks sign in"
@@ -281,6 +316,46 @@ impl SignIn {
                 }
             }
             SignInWith::None => bail!("nothing to sign in with"),
+            SignInWith::ApiKey => bail!("only UniFi checks sign in with an API key"),
+        }
+        Ok(())
+    }
+
+    /// A UniFi check signs in with an API key and nothing else.
+    fn validate_api_key(&self) -> Result<()> {
+        ensure!(
+            self.with() == SignInWith::ApiKey,
+            "a UniFi check needs the API key made on the console, or the environment \
+             variable that holds it"
+        );
+        ensure!(
+            self.username.is_none()
+                && self.password.is_none()
+                && self.password_env.is_none()
+                && self.private_key.is_none()
+                && self.private_key_env.is_none(),
+            "a UniFi check signs in with an API key alone"
+        );
+        ensure!(
+            !(self.api_key.is_some() && self.api_key_env.is_some()),
+            "give the API key or the environment variable that holds it, not both"
+        );
+        if let Some(key) = &self.api_key {
+            ensure!(
+                !key.is_empty()
+                    && key.len() <= MAX_PASSWORD_LEN
+                    && key.bytes().all(|byte| byte.is_ascii_graphic()),
+                "the API key has to be plain letters, digits and punctuation, up to \
+                 {MAX_PASSWORD_LEN} characters"
+            );
+        }
+        if let Some(name) = &self.api_key_env {
+            ensure!(
+                crate::metrics_pages::is_secret_variable(name),
+                "the environment variable has to start with {}, followed by capital \
+                 letters, digits or _",
+                crate::metrics_pages::ENV_PREFIX
+            );
         }
         Ok(())
     }
@@ -587,9 +662,17 @@ impl Scheduler {
         let (results, presence) = (self.results.clone(), self.presence.clone());
         let templates = self.templates.reads(check.id);
         let database = self.database.clone();
+        let registry = self.registry.clone();
         tokio::spawn(async move {
             let _slot = slot;
-            run(&check, hostname.clone(), &writer, &results, &presence).await;
+            let to = Running {
+                database: &database,
+                registry: &registry,
+                writer: &writer,
+                results: &results,
+                presence: &presence,
+            };
+            run(&check, hostname.clone(), to).await;
             if let Some(templates) = templates {
                 let to = Saving {
                     database: &database,
@@ -603,16 +686,30 @@ impl Scheduler {
     }
 }
 
+/// What running a check needs, to keep what it found.
+pub struct Running<'a> {
+    pub database: &'a Database,
+    pub registry: &'a Registry,
+    pub writer: &'a mpsc::Sender<WriterCommand>,
+    pub results: &'a LatestResults,
+    pub presence: &'a Presence,
+}
+
 /// Runs a check once and keeps what it found: as its latest result, as what's
 /// known of its host, and in the metrics store. The scheduler does this when a
 /// check is due, and a person can ask for it in between.
-pub async fn run(
-    check: &RemoteCheck,
-    hostname: String,
-    writer: &mpsc::Sender<WriterCommand>,
-    results: &LatestResults,
-    presence: &Presence,
-) {
+pub async fn run(check: &RemoteCheck, hostname: String, to: Running<'_>) {
+    let Running {
+        writer,
+        results,
+        presence,
+        ..
+    } = to;
+    if check.input.check.kind == CheckKind::Unifi {
+        let result = crate::unifi::run(check, &to).await;
+        keep(check, hostname, result, writer, results, presence).await;
+        return;
+    }
     // A password or key named as an environment variable is read each time, so
     // a changed one is used without restarting.
     let result = match check.input.sign_in.credentials() {
@@ -647,7 +744,7 @@ fn is_heartbeat(check: &RemoteCheck) -> bool {
     check.input.check.kind == CheckKind::Heartbeat
 }
 
-async fn save(
+pub async fn save(
     writer: &mpsc::Sender<WriterCommand>,
     host_id: String,
     hostname: String,

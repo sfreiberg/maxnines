@@ -923,6 +923,12 @@ fn new_metrics_read_what_the_agent_sends() {
         },
     ]);
     write_metric(&mut store, "a", 20_000, "checks", checks);
+    let unifi = json!({
+        "up": 1, "state": "ONLINE", "firmware_update": 1, "clients": 4, "uptime_secs": 60,
+        "cpu_percent": 12.5, "memory_percent": 61.0, "uplink_received_bytes": 2000.0,
+        "uplink_sent_bytes": 1000.0, "load_average": { "one": 0.5, "five": 0.25, "fifteen": 0.125 },
+    });
+    write_metric(&mut store, "a", 20_000, "unifi", unifi);
     let services = json!([{ "name": "nginx", "running": 1, "state": "active" }]);
     write_metric(&mut store, "a", 20_000, "services", services);
     let files = json!([
@@ -969,6 +975,15 @@ fn new_metrics_read_what_the_agent_sends() {
     assert_eq!(value("check.memory_used", "cache"), Some(16.0));
     assert_eq!(value("check.memory_usage", "cache"), Some(25.0));
     assert_eq!(value("check.connections", "cache"), Some(7.0));
+    assert_eq!(value("unifi.up", "Up"), Some(1.0));
+    assert_eq!(value("unifi.cpu", "CPU"), Some(12.5));
+    assert_eq!(value("unifi.memory", "Memory"), Some(61.0));
+    assert_eq!(value("unifi.uptime", "Uptime"), Some(60.0));
+    assert_eq!(value("unifi.load", "15 minutes"), Some(0.125));
+    assert_eq!(value("unifi.uplink_received", "Received"), Some(2000.0));
+    assert_eq!(value("unifi.uplink_sent", "Sent"), Some(1000.0));
+    assert_eq!(value("unifi.clients", "Clients"), Some(4.0));
+    assert_eq!(value("unifi.firmware_update", "Update available"), Some(1.0));
     assert_eq!(value("service.running", "nginx"), Some(1.0));
     assert_eq!(value("file.exists", "/b"), Some(1.0));
     assert_eq!(value("file.exists", "/gone"), Some(0.0));

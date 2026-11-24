@@ -549,6 +549,10 @@ pub struct Check {
     /// Defaults to yes; `false` turns it off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain_expiry: Option<bool>,
+    /// unifi: the one site to read, by its name or its internal name, such as
+    /// `default`. Every site the console has without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,6 +577,9 @@ pub enum CheckKind {
     /// Scheduled work pings the server when it finishes, and it's down when it
     /// hasn't in time. Only the server watches these: an agent never runs one.
     Heartbeat,
+    /// A UniFi console's devices, read through its Network API, each a host of
+    /// its own. Only the server reads these: an agent never runs one.
+    Unifi,
     /// A kind this build doesn't know, from a newer server. The server never saves
     /// one, and an agent reports that it can't run it rather than turning down the
     /// whole of its config.
@@ -588,7 +595,7 @@ impl CheckKind {
     /// Every kind this build can run.
     /// In the order people are offered them. `Unknown` stays the last variant, which
     /// a test relies on to check that nothing's missing here.
-    pub const KNOWN: [Self; 17] = [
+    pub const KNOWN: [Self; 18] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -605,6 +612,7 @@ impl CheckKind {
         Self::Imap,
         Self::Pop3,
         Self::Ftp,
+        Self::Unifi,
         Self::Heartbeat,
     ];
 
@@ -627,6 +635,7 @@ impl CheckKind {
             Self::Pop3 => "pop3",
             Self::Ftp => "ftp",
             Self::Heartbeat => "heartbeat",
+            Self::Unifi => "unifi",
             Self::Unknown => "unknown",
         }
     }
@@ -712,6 +721,7 @@ impl Check {
             tls: None,
             host_key: None,
             domain_expiry: None,
+            site: None,
         }
     }
 
@@ -765,6 +775,14 @@ impl Check {
                 target.starts_with("http://") || target.starts_with("https://"),
                 "check {name:?} needs a target starting with http:// or https://"
             ),
+            // The Network API is only ever offered over HTTPS, at the console's
+            // own address, which the API's paths are added to.
+            CheckKind::Unifi => ensure!(
+                target.strip_prefix("https://").is_some_and(|rest| {
+                    !rest.is_empty() && !rest.contains(['/', '?', '#', '@'])
+                }),
+                "check {name:?} needs the console's address, such as https://192.168.1.1"
+            ),
             CheckKind::Dns | CheckKind::Ping => ensure!(
                 is_plain_name(target, ":"),
                 "check {name:?} needs a hostname as its target"
@@ -791,6 +809,7 @@ impl Check {
             "insecure",
             &[
                 CheckKind::Http,
+                CheckKind::Unifi,
                 CheckKind::Tls,
                 CheckKind::Postgres,
                 CheckKind::Mysql,
@@ -831,6 +850,13 @@ impl Check {
             "domain_expiry",
             &[CheckKind::Http],
         )?;
+        only_for(self.site.is_some(), "site", &[CheckKind::Unifi])?;
+        if let Some(site) = &self.site {
+            ensure!(
+                !site.trim().is_empty() && site.len() <= 64 && !site.chars().any(char::is_control),
+                "check {name:?} needs a site name of at most 64 characters"
+            );
+        }
         if let Some(database) = &self.database {
             ensure!(
                 !database.is_empty()
@@ -1101,6 +1127,12 @@ impl CollectorSettings {
             ensure!(
                 check.kind != CheckKind::Heartbeat,
                 "check {:?} is a heartbeat, which the server watches for pings, so an agent \
+                 can't run it",
+                check.name
+            );
+            ensure!(
+                check.kind != CheckKind::Unifi,
+                "check {:?} reads a UniFi console, which only the server does, so an agent \
                  can't run it",
                 check.name
             );
@@ -1709,6 +1741,7 @@ mod tests {
             | CheckKind::Imap
             | CheckKind::Pop3
             | CheckKind::Ftp
+            | CheckKind::Unifi
             | CheckKind::Heartbeat => true,
             CheckKind::Unknown => false,
         };

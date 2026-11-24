@@ -16,6 +16,7 @@ mod template_parts;
 mod template_runs;
 mod templates;
 mod two_factor;
+mod unifi;
 mod users;
 
 use std::collections::{BTreeMap, HashMap};

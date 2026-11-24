@@ -57,6 +57,7 @@ mod text;
 mod times;
 mod tls;
 mod two_factor;
+mod unifi;
 mod views;
 
 #[cfg(test)]

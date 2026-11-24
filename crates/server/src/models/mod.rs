@@ -68,6 +68,8 @@ mod template_query;
 mod template_registry_read;
 mod templates;
 mod two_factor;
+mod unifi_device;
+mod unifi_devices;
 mod user;
 mod user_session;
 mod users;

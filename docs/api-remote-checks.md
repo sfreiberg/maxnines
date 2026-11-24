@@ -18,11 +18,14 @@ that host. A check added without a host gets a new host of its own.
 | `password_env` | Or the server's environment variable that holds it. Its name has to start with `MAXNINES_SECRET_` |
 | `private_key` | For SSH instead of a password: a private key in OpenSSH's format, without a passphrase. It can be set but is never given back |
 | `private_key_env` | Or the server's environment variable that holds it, named as `password_env` is |
-| `sign_in` | How it signs in: `none`, `password` or `key`. Left out, it's worked out from the fields above |
+| `api_key` | For a UniFi check, required: the API key made on the console, as [UniFi](unifi.md#making-an-api-key) says. It can be set but is never given back. Refused for any other kind |
+| `api_key_env` | Or the server's environment variable that holds it, named as `password_env` is |
+| `sign_in` | How it signs in: `none`, `password`, `key` or, for UniFi, `api_key`. Left out, it's worked out from the fields above |
 
-What comes back has `sign_in`, `username`, `password_env` and `private_key_env`, and
-`has_password` and `has_private_key`, which say whether one is saved. A change that
-gives none of a password, its variable, a key or its variable keeps the one saved,
+What comes back has `sign_in`, `username`, `password_env`, `private_key_env` and
+`api_key_env`, and `has_password`, `has_private_key` and `has_api_key`, which say
+whether one is saved. A change that gives none of a password, a key, an API key or
+the variable for one keeps the one saved,
 as long as `sign_in` says, or the fields given show, that it still signs in that way.
 
 It also has `latest`, how the check last went: `up`, `ran_at`, when it ran, and
@@ -32,21 +35,22 @@ started, and a paused check keeps the result from before it was paused.
 | `check` field | For | Description |
 | --- | --- | --- |
 | `name` | All | Required. What it's called on charts and in alerts. Two checks about the same host can't have the same one, which for checks the server runs is ignoring case |
-| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp` or `heartbeat` |
-| `target` | All | Required. An address for http, a host for dns and ping, and `host:port` for the rest, which for clickhouse is its HTTP port. A heartbeat has none, so it's `""` |
+| `kind` | All | Required. `tcp`, `http`, `tls`, `dns`, `ping`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp`, `unifi` or `heartbeat`. Agents never run `unifi` or `heartbeat` |
+| `target` | All | Required. An address for http, a host for dns and ping, the console's address for unifi, such as `https://192.168.1.1`, with nothing after it, and `host:port` for the rest, which for clickhouse is its HTTP port. A heartbeat has none, so it's `""` |
 | `timeout_secs` | All but heartbeat | How long it gets, up to a minute |
 | `interval_secs` | All | For a check an agent runs, how often it runs, up to a day. It runs with every sample without one, and never more often than samples are sent, as it's rounded up to whole samples. Between runs, each sample repeats its last result. A remote check's interval goes beside `check` instead |
 | `method` | http | Defaults to `GET` |
 | `body` | http | What to send, for methods like `POST` |
 | `regex` | http | A regular expression the page has to match |
 | `domain_expiry` | http | `false` stops it looking up when the site's [domain](checks.md#domain-expiry) expires, which it does otherwise |
-| `insecure` | http, tls, postgres, mysql, redis, memcached, mongodb, clickhouse, smtp, imap, pop3, ftp | Measure a server whose certificate can't be verified, without counting that as down. Without it, a check never sends its request, or a password, to a server that fails the certificate check |
+| `insecure` | http, unifi, tls, postgres, mysql, redis, memcached, mongodb, clickhouse, smtp, imap, pop3, ftp | Measure a server whose certificate can't be verified, without counting that as down. Without it, a check never sends its request, or a password, to a server that fails the certificate check |
 | `database` | postgres, mongodb | For postgres, the database to sign in to, defaulting to `postgres`. For mongodb, the database the account was made in, defaulting to `admin` |
 | `tls` | mysql, redis, memcached, mongodb, clickhouse, smtp, imap, pop3, ftp | Connect over TLS from the start, which for clickhouse means HTTPS. PostgreSQL uses TLS whenever the server offers it, mail checks without this upgrade with STARTTLS before signing in, and ftp checks with AUTH TLS |
 | `host_key` | ssh | The server's host key, as `ssh-keygen -l` prints it, such as `SHA256:Dfij…`. Any other key counts as down, and nothing is signed in with |
 | `server` | dns | Ask this server instead of the system's resolver |
 | `record` | dns | The record type to ask for, with `server`. Defaults to `A` |
 | `count` | ping | How many packets to send. Defaults to 1 |
+| `site` | unifi | The one site to read, by its name or its internal name, such as `default`. Left out, every site the console has |
 
 ## List remote checks
 

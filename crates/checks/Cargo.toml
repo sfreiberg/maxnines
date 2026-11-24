@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# A UniFi console of its own, for tests here and in the server.
+rcgen = { version = "0.14", optional = true }
 anyhow.workspace = true
 chrono.workspace = true
 base64 = "0.22"
@@ -52,6 +54,9 @@ async-imap = { version = "0.12.0", default-features = false, features = ["runtim
 # Pinging with Windows' own ICMP functions, which any account may use.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_System_IO"] }
+
+[features]
+fake-unifi = ["dep:rcgen"]
 
 [dev-dependencies]
 rcgen = "0.14"

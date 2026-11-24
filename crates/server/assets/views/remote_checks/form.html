@@ -32,14 +32,14 @@
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
-      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% elif kind == "ftp" %}FTP or FTPS{% else %}Heartbeat (pinged by scheduled work){% endif %}</option>
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% elif kind == "ftp" %}FTP or FTPS{% elif kind == "unifi" %}UniFi console{% else %}Heartbeat (pinged by scheduled work){% endif %}</option>
       {% endfor %}
     </select>
   </label>
 
   <label class="not-for-heartbeat">Target
     <input type="text" name="target" value="{{ check.target }}" maxlength="255" spellcheck="false">
-    <small>A web address for websites, a host name for DNS and ping, and <code>host:port</code> for the rest, such as <code>db.example.com:5432</code>.</small>
+    <small>A web address for websites, a host name for DNS and ping, the console's address for UniFi, such as <code>https://192.168.1.1</code>, and <code>host:port</code> for the rest, such as <code>db.example.com:5432</code>.</small>
   </label>
 
   <label>Run every (seconds)
@@ -92,6 +92,22 @@
     <input type="checkbox" name="tls"{% if check.tls %} checked{% endif %}> Use TLS from the start
     <small>For mail, as on ports 465, 993 and 995, and FTPS on port 990. Otherwise a mail check upgrades with STARTTLS, and an FTP check with AUTH TLS, and neither ever sends a password without TLS. PostgreSQL uses TLS whenever it's offered, and with this ticked, only over TLS.</small>
   </label>
+
+  <fieldset class="for-unifi">
+    <legend>UniFi</legend>
+    <p class="hint">Each device the console has adopted becomes a host of its own. <a href="/docs/unifi">UniFi</a> says how to make an API key that can only look.</p>
+    <label>API key
+      <input type="password" name="api_key" value="" maxlength="1024" autocomplete="new-password"{% if check.has_api_key %} placeholder="Saved. Leave empty to keep it"{% endif %}>
+      <small>Made under Integrations on the console. Kept in the database and never shown again.</small>
+    </label>
+    <label>Or the environment variable that holds it
+      <input type="text" name="api_key_env" value="{{ check.api_key_env }}" maxlength="255" autocomplete="off" spellcheck="false" placeholder="{{ env_prefix }}UNIFI_KEY">
+    </label>
+    <label>Site
+      <input type="text" name="site" value="{{ check.site }}" maxlength="64" spellcheck="false" placeholder="Every site">
+      <small>To read only one of the console's sites, its name, such as <code>Default</code>. Leave empty for all of them.</small>
+    </label>
+  </fieldset>
 
   <label class="checkbox for-certificate">
     <input type="checkbox" name="insecure"{% if check.insecure %} checked{% endif %}> Don't count a bad certificate as down

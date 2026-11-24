@@ -33,6 +33,7 @@ pub(super) fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
     check.tls = row.tls;
     check.host_key = row.host_key;
     check.domain_expiry = row.domain_expiry;
+    check.site = row.site;
     Ok(RemoteCheck {
         id: row.id,
         ping_token: row.ping_token,
@@ -53,6 +54,8 @@ pub(super) fn to_remote_check(row: remote_check::Model) -> Result<RemoteCheck> {
                 password_env: row.password_env,
                 private_key: row.private_key,
                 private_key_env: row.private_key_env,
+                api_key: row.api_key,
+                api_key_env: row.api_key_env,
             },
         },
     })
@@ -93,6 +96,9 @@ fn to_row(input: &RemoteCheckInput) -> Result<remote_check::ActiveModel> {
         password_env: Set(input.sign_in.password_env.clone()),
         private_key: Set(input.sign_in.private_key.clone()),
         private_key_env: Set(input.sign_in.private_key_env.clone()),
+        site: Set(check.site.clone()),
+        api_key: Set(input.sign_in.api_key.clone()),
+        api_key_env: Set(input.sign_in.api_key_env.clone()),
         ..Default::default()
     })
 }
