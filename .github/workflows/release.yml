@@ -64,8 +64,6 @@ jobs:
   tests:
     name: Tests
     uses: ./.github/workflows/ci.yml
-    with:
-      all-tests: true
 
   # Built on Rocky Linux 9, so it runs on any distribution with glibc 2.34 or
   # later: RHEL 9, Ubuntu 22.04 and Debian 12 onwards.
