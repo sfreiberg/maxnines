@@ -34,4 +34,12 @@ The [database design](database/README.md) shows every table and how they connect
 
 If you'd like to help guide the project, we'd love to hear from you. What you need
 from monitoring, what gets in your way today, and what you'd leave out are all
-welcome and genuinely useful. Open an issue or start a discussion here on GitHub.
+welcome and genuinely useful.
+
+- **Questions, ideas and how you're using it:** start a thread in
+  [Discussions](https://github.com/sfreiberg/maxnines/discussions).
+- **Something that's broken:** open an
+  [issue](https://github.com/sfreiberg/maxnines/issues), with the version from
+  `maxnines-server version` or `maxnines-agent version` and what you saw.
+- **A security problem:** email [security@maxnines.com](mailto:security@maxnines.com)
+  rather than posting it in public.

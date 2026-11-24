@@ -18,3 +18,13 @@ Hosts page.
 
 This documentation comes with the server, on its Docs page, so it always describes
 the version you're running.
+
+## Getting help
+
+- **Questions, ideas and how you're using MaxNines:** start a thread in
+  [Discussions](https://github.com/sfreiberg/maxnines/discussions).
+- **Something that's broken:** open an
+  [issue](https://github.com/sfreiberg/maxnines/issues). Say which version you run,
+  which `maxnines-server version` and `maxnines-agent version` print, and what you saw.
+- **A security problem:** email [security@maxnines.com](mailto:security@maxnines.com)
+  rather than posting it in public.
