@@ -5,11 +5,13 @@
 # workflow runs it in a container for each system the packages are meant for.
 set -eu
 
+# Recommended packages are installed as a real system would: container images turn
+# that off to stay small, so it's turned back on here.
 if command -v apt-get >/dev/null; then
   apt-get update -qq
-  apt-get install -y -qq sudo ./packages/*.deb
+  apt-get install -y -qq --install-recommends sudo ./packages/*.deb
 else
-  dnf install -y -q sudo ./packages/*.rpm
+  dnf install -y -q --setopt=install_weak_deps=True sudo ./packages/*.rpm
 fi
 
 id maxnines
@@ -102,9 +104,12 @@ test "$status" = 4
 # dependency the package manager installs unless told not to.
 if command -v apt-get >/dev/null; then
   dpkg-query -W -f='${Recommends}' maxnines-agent | grep -qw smartmontools
+  dpkg -I ./packages/maxnines-agent_*.deb | grep -q '^ Recommends: smartmontools'
 else
   rpm -q --recommends maxnines-agent | grep -qw smartmontools
+  rpm -qp --recommends ./packages/maxnines-agent-*.rpm | grep -qw smartmontools
 fi
+test -x /usr/sbin/smartctl
 
 # Upgrading keeps an edited config without asking: Debian doesn't track it at all,
 # and RPM keeps it as noreplace.
