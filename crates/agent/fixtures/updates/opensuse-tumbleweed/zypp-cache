@@ -1,0 +1,186 @@
+/var/cache/zypp:
+total 28
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Jun 22 15:25 ..
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 geoip.d
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 packages
+drwxr-xr-x 6 root root 4096 Nov 24 05:37 raw
+drwxr-xr-x 7 root root 4096 Nov 24 05:37 solv
+
+/var/cache/zypp/geoip.d:
+total 12
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root   17 Nov 24 05:37 download.opensuse.org
+
+/var/cache/zypp/packages:
+total 12
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 repo-oss
+
+/var/cache/zypp/packages/repo-oss:
+total 16
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .preload
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 x86_64
+
+/var/cache/zypp/packages/repo-oss/.preload:
+total 8
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+
+/var/cache/zypp/packages/repo-oss/x86_64:
+total 8
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+
+/var/cache/zypp/raw:
+total 24
+drwxr-xr-x 6 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 repo-non-oss
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 repo-openh264
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 repo-oss
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 repo-update
+
+/var/cache/zypp/raw/repo-non-oss:
+total 24
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 6 root root 4096 Nov 24 05:37 ..
+lrwxrwxrwx 1 root root    6 Nov 24 05:37 .repo_gpgcheck -> ./true
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 media.1
+-rw-r--r-- 1 root root  709 Nov 24 05:37 mirrorlist
+-rw-r--r-- 1 root root   64 Nov 24 05:37 mirrorlist.cookie
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repodata
+
+/var/cache/zypp/raw/repo-non-oss/media.1:
+total 12
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root  111 Nov 24 05:37 media
+
+/var/cache/zypp/raw/repo-non-oss/repodata:
+total 76
+drwxr-xr-x 2 root root  4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root  4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root 19641 Nov 24 05:37 261b9c0787f5add429a1050d46ef458cf55a0e5b0d9a26d7aa215397255fa28b44e6ae192ac6fddd636febcfa3793c59200dc7a8d5861ed9fccef781e216fd56-primary.xml.zst
+-rw-r--r-- 1 root root  2816 Nov 24 05:37 50cb96cb78a1f33d94378d4a1aaf061bb129169eda3d40009fc3b25710c00fa4955674d7216f0653aed9c147a86a374a3d5cd49d08018b56688ca550c697a79d-appdata.xml.gz
+-rw-r--r-- 1 root root 12655 Nov 24 05:37 5c1bd0ce4a0659c24380308b4bb55c1ea181cc60078304066710cc1284b4fd2342512d77df8baeef36fe93c77cf9e2c28030dc0af5ab28a114a0c7f5e3fa55c4-appdata-icons.tar.gz
+-rw-r--r-- 1 root root  5813 Nov 24 05:37 82dcf4c4966b3e8681b604c7fe73484325153e7494f8852c118126bff0f790f3270ee8c1aa4979ea7ebf854ad20306567b8fab194a158f24fada0d12fb802f19-susedata.xml.zst
+-rw-r--r-- 1 root root 12739 Nov 24 05:37 repomd.xml
+-rw-r--r-- 1 root root   827 Nov 24 05:37 repomd.xml.asc
+
+/var/cache/zypp/raw/repo-openh264:
+total 12
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 6 root root 4096 Nov 24 05:37 ..
+lrwxrwxrwx 1 root root    6 Nov 24 05:37 .repo_gpgcheck -> ./true
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repodata
+
+/var/cache/zypp/raw/repo-openh264/repodata:
+total 48
+drwxr-xr-x 2 root root  4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root  4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root 18967 Nov 24 05:37 6f9782f89218a0c5ca5a3f343f9b29a0c41cf8f8aa2e9371cd87d56ca1adaa939539658534c136a9728d2e2f70e3b4ee9c4ea72a556c3f961ca61426eb8d66c3-filelists-ext.xml.gz
+-rw-r--r-- 1 root root  9745 Nov 24 05:37 ee4e9849d08921f0364aa035450be6a12e9264fd46aecccad9942e94d13fe7c66d170fc56ba05ad0b51264c37d8f8be0feb7f0c433bae4da704ed8cc75bc64e4-primary.xml.gz
+-rw-r--r-- 1 root root  2959 Nov 24 05:37 repomd.xml
+-rw-r--r-- 1 root root   827 Nov 24 05:37 repomd.xml.asc
+
+/var/cache/zypp/raw/repo-oss:
+total 24
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 6 root root 4096 Nov 24 05:37 ..
+lrwxrwxrwx 1 root root    6 Nov 24 05:37 .repo_gpgcheck -> ./true
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 media.1
+-rw-r--r-- 1 root root  677 Nov 24 05:37 mirrorlist
+-rw-r--r-- 1 root root   64 Nov 24 05:37 mirrorlist.cookie
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repodata
+
+/var/cache/zypp/raw/repo-oss/media.1:
+total 12
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root   85 Nov 24 05:37 media
+
+/var/cache/zypp/raw/repo-oss/repodata:
+total 37432
+drwxr-xr-x 2 root root     4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root     4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root    65306 Nov 24 05:37 06a00321035620d2e2b84d18c22921544d3487e86a232dac5ff182e379c619331df2f10bf30c31eef6580bc1e8230d4a57ff2f81b6cce7b3865bbb8936c3fb77-license.tar.zst
+-rw-r--r-- 1 root root 17467619 Nov 24 05:37 4170d3e94e03a166b7ab2182231835e376cd6b783ba8fc7ba7fe209eb1fa5a91b7cea504fc5fd6c49728bfc19f5febe34dfd61ffe3c444bed75ddf6ad0451f86-primary.xml.zst
+-rw-r--r-- 1 root root  9480934 Nov 24 05:37 50a15dafe7cadc6383f6de42be51926c60852cdc2f2aba84d104397be29a308bfa3e6afce77bb074055d3b47d003d04201ca939b706cbc5ce308d4f18c156c7c-appdata.xml.gz
+-rw-r--r-- 1 root root  6058297 Nov 24 05:37 98691dd6e36961dd1418d321a51ad3d3ebc246c5866beaa6f01310f626c4d14010b754d9ca7d89c1b57e1f881fc67ebef6ed1cceac5eced06cd118f8a58ce55e-susedata.xml.zst
+-rw-r--r-- 1 root root  5220131 Nov 24 05:37 a8879cad45f1b6bbd0650d9c74f2b7fed068474a2f0a46045b85858b45e03df5d1c7e00ac5113801b589b19e73100153eac2280404ebeb59a708a61c7aa52cbd-appdata-icons.tar.gz
+-rw-r--r-- 1 root root    14119 Nov 24 05:37 repomd.xml
+-rw-r--r-- 1 root root      827 Nov 24 05:37 repomd.xml.asc
+
+/var/cache/zypp/raw/repo-update:
+total 20
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 6 root root 4096 Nov 24 05:37 ..
+lrwxrwxrwx 1 root root    6 Nov 24 05:37 .repo_gpgcheck -> ./true
+-rw-r--r-- 1 root root  719 Nov 24 05:37 mirrorlist
+-rw-r--r-- 1 root root   64 Nov 24 05:37 mirrorlist.cookie
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repodata
+
+/var/cache/zypp/raw/repo-update/repodata:
+total 748
+drwxr-xr-x 2 root root   4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root   4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root    992 Nov 24 05:37 1c5cd8e33993bd592a2df5af7fc09e11c6a73270afd243b7e780927952a7b0a4d09732f2b97fb5f88cf4045be0d448eed78a91bfa6d6979aa267245d7869f8c8-updateinfo.xml.gz
+-rw-r--r-- 1 root root  85026 Nov 24 05:37 a8856668d4e8c65ea05969034ff61ccc20b2133d29f4c252d98d62055537b0daf303297fb42e173493cdf8c65d60df65b38293941ff938044a35b6a71819dac8-primary.xml.gz
+-rw-r--r-- 1 root root 658042 Nov 24 05:37 c5db4d22d88c51d6d91e4281945b0be9bfd39ce93f884d55c2e05b63f92caf6b0241cdf4fb8293b93115ce40871b31f0f20ebd3457a74f84ea6e154c1f5c361d-filelists-ext.xml.gz
+-rw-r--r-- 1 root root   3603 Nov 24 05:37 repomd.xml
+-rw-r--r-- 1 root root    867 Nov 24 05:37 repomd.xml.asc
+
+/var/cache/zypp/solv:
+total 28
+drwxr-xr-x 7 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 @System
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repo-non-oss
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repo-openh264
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repo-oss
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repo-update
+
+/var/cache/zypp/solv/@System:
+total 780
+drwxr-xr-x 2 root root   4096 Nov 24 05:37 .
+drwxr-xr-x 7 root root   4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root     76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 778559 Nov 24 05:37 solv
+-rw-r--r-- 1 root root   3765 Nov 24 05:37 solv.idx
+
+/var/cache/zypp/solv/repo-non-oss:
+total 52
+drwxr-xr-x 2 root root  4096 Nov 24 05:37 .
+drwxr-xr-x 7 root root  4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root    76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 36649 Nov 24 05:37 solv
+-rw-r--r-- 1 root root  1562 Nov 24 05:37 solv.idx
+
+/var/cache/zypp/solv/repo-openh264:
+total 32
+drwxr-xr-x 2 root root  4096 Nov 24 05:37 .
+drwxr-xr-x 7 root root  4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root    76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 15550 Nov 24 05:37 solv
+-rw-r--r-- 1 root root  2360 Nov 24 05:37 solv.idx
+
+/var/cache/zypp/solv/repo-oss:
+total 29072
+drwxr-xr-x 2 root root     4096 Nov 24 05:37 .
+drwxr-xr-x 7 root root     4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root       76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 27606216 Nov 24 05:37 solv
+-rw-r--r-- 1 root root  2147424 Nov 24 05:37 solv.idx
+
+/var/cache/zypp/solv/repo-update:
+total 144
+drwxr-xr-x 2 root root   4096 Nov 24 05:37 .
+drwxr-xr-x 7 root root   4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root     76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 118883 Nov 24 05:37 solv
+-rw-r--r-- 1 root root  11889 Nov 24 05:37 solv.idx

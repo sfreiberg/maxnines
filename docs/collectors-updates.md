@@ -41,22 +41,11 @@ it all the time without a reboot being needed.
 
 ### What it needs
 
-- **Arch:** `checkupdates` comes with pacman-contrib: `pacman -S pacman-contrib`.
-  Without it, the host's page says so and nothing is read.
-- **dnf and yum need root** to read the system's package lists, as anyone else gets a
-  copy of their own, fetched for them. An agent started as root [gives that
-  up](agents.md#running-as-root-and-giving-it-up) and runs as the `maxnines` user, so it asks for
-  root through `sudo -n`, as it does for [smartctl](collectors-smart.md#root), and
-  never for a password. Until sudo allows it, the host's page says so under
-  **Updates**, with the rule to add, in a file such as `/etc/sudoers.d/maxnines` made
-  with `sudo visudo -f /etc/sudoers.d/maxnines`:
-
-  ```text
-  maxnines ALL=(root) NOPASSWD: /usr/bin/dnf -C -q check-update, /usr/bin/dnf -C -q updateinfo list --security
-  ```
-
-  Use `/usr/bin/yum` instead on a system with only yum.
-- Everything else reads as the agent's own user, with nothing to set up.
+- **Arch:** `checkupdates` comes with pacman-contrib, and needs fakeroot, which it
+  doesn't bring: `pacman -S pacman-contrib fakeroot`. Without either, the host's page
+  says so and nothing is read.
+- Everything reads as the agent's own user, with nothing to set up and no root. dnf and
+  yum read the system's package lists with `-C` whoever runs them.
 
 ### Keeping package lists fresh
 

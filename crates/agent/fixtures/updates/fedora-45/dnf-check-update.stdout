@@ -1,0 +1,22 @@
+Upgrades
+curl.x86_64            8.21.0-9.fc45     updates
+dnf5.x86_64            5.4.8.0-2.fc45    updates
+dnf5-plugins.x86_64    5.4.8.0-2.fc45    updates
+elfutils-libelf.x86_64 0.197-1.fc45      updates
+elfutils-libs.x86_64   0.197-1.fc45      updates
+libcurl.x86_64         8.21.0-9.fc45     updates
+libdnf5.x86_64         5.4.8.0-2.fc45    updates
+libdnf5-cli.x86_64     5.4.8.0-2.fc45    updates
+libmodulemd.x86_64     2.15.4-1.fc45     updates
+libnghttp3.x86_64      1.19.0-1.fc45     updates
+librepo.x86_64         1.22.0-1.fc45     updates
+openldap.x86_64        2.6.16-1.fc45     updates
+p11-kit.x86_64         0.26.6-1.fc45     updates
+p11-kit-trust.x86_64   0.26.6-1.fc45     updates
+pcre2.x86_64           10.49-1.fc45      updates
+pcre2-syntax.noarch    10.49-1.fc45      updates
+sqlite-libs.x86_64     3.54.1-2.fc45     updates
+tpm2-tss.x86_64        4.2.2-1.fc45      updates
+tzdata.noarch          2026f-1.fc45      updates
+vim-data.noarch        2:9.2.1302-2.fc45 updates
+vim-minimal.x86_64     2:9.2.1302-2.fc45 updates

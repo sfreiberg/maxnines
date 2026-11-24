@@ -237,7 +237,7 @@ mod linux {
         Found, age_of_newest, exists, failure, files_in, kernel_needs_reboot, parse_apk, parse_apt,
         parse_checkupdates, parse_dnf_security, parse_dnf_updates, parse_zypper, run,
     };
-    use crate::programs::{first_of, refused_by_sudo};
+    use crate::programs::first_of;
 
     /// Which package manager a distribution uses, from os-release.
     #[derive(Debug, PartialEq)]
@@ -336,62 +336,24 @@ mod linux {
         found
     }
 
-    /// The sudoers rule that lets the agent's user run dnf as it does.
-    fn dnf_rule(dnf: &str) -> String {
-        format!(
-            "maxnines ALL=(root) NOPASSWD: {dnf} -C -q check-update, {dnf} -C -q updateinfo list --security"
-        )
-    }
-
     async fn dnf() -> Found {
         let Some(dnf) = first_of(&["/usr/bin/dnf", "/usr/bin/yum"]) else {
             return Found::problem("dnf", "Neither dnf nor yum is installed");
         };
         let manager = if dnf.ends_with("yum") { "yum" } else { "dnf" };
-        // Only root reads the system's copy of the package lists; anyone else
-        // would get a copy of their own, fetched for them. -C keeps to the copy
-        // there is.
-        let root = nix::unistd::geteuid().is_root();
-        let sudo = if root {
-            None
-        } else {
-            match first_of(&["/usr/bin/sudo"]) {
-                Some(sudo) => Some(sudo),
-                None => {
-                    return Found::problem(
-                        manager,
-                        format!(
-                            "{manager} needs root to read the system's package lists, and sudo isn't installed, so the agent can't ask for it"
-                        ),
-                    );
-                }
-            }
-        };
-        let ask = |arguments: &'static [&'static str]| async move {
-            let mut words = Vec::new();
-            let program = match sudo {
-                Some(sudo) => {
-                    words.extend(["-n", dnf]);
-                    sudo
-                }
-                None => dnf,
-            };
-            words.extend(arguments);
-            run(program, &words).await
-        };
+        // -C keeps to the package lists there are, which anyone may read: dnf and
+        // yum read the system's copy with it whoever runs them, so no root is needed.
+        let ask = |arguments: &'static [&'static str]| run(dnf, arguments);
 
         let mut found = match ask(&["-C", "-q", "check-update"]).await {
-            Err(error) => return Found::problem(manager, error),
-            Ok(ran) if refused_by_sudo(&ran) => {
+            // dnf has no limit of its own on waiting for another one's lock.
+            Err(error) if error.contains("took longer") => {
                 return Found::problem(
                     manager,
-                    format!(
-                        "{manager} needs root to read the system's package lists, and sudo didn't allow it. \
-                         Let the agent's user run it with a sudoers rule such as: {}",
-                        dnf_rule(dnf)
-                    ),
+                    format!("{error}. Another {manager} may be running and holding its lock"),
                 );
             }
+            Err(error) => return Found::problem(manager, error),
             // 100 means there are updates, and 0 that there are none.
             Ok(ran) if ran.code == Some(100) || ran.code == Some(0) => Found {
                 manager,
@@ -491,6 +453,11 @@ mod linux {
                 pending: Some(parse_checkupdates(&ran.stdout)),
                 ..Found::default()
             },
+            // It needs fakeroot, which pacman-contrib doesn't bring with it.
+            Ok(ran) if ran.stderr.contains("fakeroot") => Found::problem(
+                "pacman",
+                "checkupdates needs fakeroot, which isn't installed. Install it with: pacman -S fakeroot",
+            ),
             Ok(ran) => Found::problem("pacman", failure("checkupdates", &ran)),
         };
         found.lists_age_secs = age_of_newest(files_in("/var/lib/pacman/sync", None, |name| {
@@ -709,21 +676,21 @@ fn parse_apt(stdout: &[u8]) -> (u64, u64) {
 
 /// `dnf -q check-update`: `name.arch version repository` for each update, a long
 /// name wrapping its other two onto the next line, then what each obsoletes, which
-/// isn't counted again.
+/// isn't counted again. dnf5 puts an `Upgrades` heading first. Each update is the
+/// line its `name.arch` starts, which headings, notes and wrapped versions don't.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn parse_dnf_updates(stdout: &[u8]) -> u64 {
-    let mut words = 0;
+    let mut updates = 0;
     for line in lines(stdout) {
-        if line.starts_with("Obsoleting") {
+        if line.to_lowercase().starts_with("obsoleting") {
             break;
         }
-        // Notes such as `Security: kernel-… is an installed security update`.
-        if line.contains(": ") {
-            continue;
+        let first = line.split_whitespace().next().unwrap_or_default();
+        if ARCHITECTURES.iter().any(|arch| first.ends_with(arch)) {
+            updates += 1;
         }
-        words += line.split_whitespace().count();
     }
-    (words / 3) as u64
+    updates
 }
 
 /// The architectures a package's full name ends with.
@@ -885,48 +852,108 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 mod tests {
     use super::*;
 
-    /// Ubuntu 22.04 with three upgrades waiting, one of them from the security
-    /// archive and one both an update and a security fix.
-    const APT: &str = "\
-NOTE: This is only a simulation!
-      apt-get needs root privileges for real execution.
-      Keep also in mind that locking is deactivated,
-      so don't depend on the relevance to the real current situation!
-Reading package lists...
-Building dependency tree...
-Reading state information...
-Calculating upgrade...
-The following packages will be upgraded:
-  curl libcurl4 openssl
-3 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
-Inst curl [7.81.0-1ubuntu1.16] (7.81.0-1ubuntu1.18 Ubuntu:22.04/jammy-updates [amd64]) []
-Inst libcurl4 [7.81.0-1ubuntu1.16] (7.81.0-1ubuntu1.18 Ubuntu:22.04/jammy-updates [amd64])
-Inst openssl [3.0.2-0ubuntu1.15] (3.0.2-0ubuntu1.18 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
-Conf curl (7.81.0-1ubuntu1.18 Ubuntu:22.04/jammy-updates [amd64])
-Conf libcurl4 (7.81.0-1ubuntu1.18 Ubuntu:22.04/jammy-updates [amd64])
-Conf openssl (3.0.2-0ubuntu1.18 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
-";
+    /// What a package manager printed, as captured on a real system by
+    /// `fixtures/updates/capture.sh`.
+    macro_rules! captured {
+        ($path:literal) => {
+            include_bytes!(concat!("../fixtures/updates/", $path))
+        };
+    }
 
     #[test]
     fn apt_counts_what_it_would_install_and_which_are_security_fixes() {
-        assert_eq!(parse_apt(APT.as_bytes()), (3, 1));
+        // libc6 and libc-bin come from noble-security too, systemd's two only from
+        // noble-updates.
+        assert_eq!(parse_apt(captured!("ubuntu-24.04/apt.stdout")), (4, 2));
+        // Debian's security archive is Debian-Security:12/oldstable-security.
+        assert_eq!(parse_apt(captured!("debian-12/apt.stdout")), (2, 2));
+        assert_eq!(parse_apt(captured!("ubuntu-22.04/apt.stdout")), (0, 0));
     }
 
     #[test]
-    fn debian_security_archive_counts_as_security() {
-        let debian = "Inst libssl3 [3.0.11-1~deb12u1] (3.0.13-1~deb12u1 Debian-Security:12/stable-security [arm64])\n\
-                      Inst tzdata [2024a-0+deb12u1] (2024b-0+deb12u1 Debian:12.7/stable [all])\n";
-        assert_eq!(parse_apt(debian.as_bytes()), (2, 1));
+    fn apt_reads_the_same_without_root() {
+        assert_eq!(
+            parse_apt(captured!("ubuntu-24.04/apt-user.stdout")),
+            parse_apt(captured!("ubuntu-24.04/apt.stdout"))
+        );
     }
 
     #[test]
-    fn apt_with_nothing_to_do_counts_nothing() {
-        let none = "Reading package lists...\nBuilding dependency tree...\nCalculating upgrade...\n\
-                    0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.\n";
-        assert_eq!(parse_apt(none.as_bytes()), (0, 0));
+    fn dnf_counts_each_update_on_dnf4_and_dnf5() {
+        assert_eq!(
+            parse_dnf_updates(captured!("rocky-9.9/dnf-check-update.stdout")),
+            5
+        );
+        // dnf5 heads its list with `Upgrades`.
+        assert_eq!(
+            parse_dnf_updates(captured!("fedora-45/dnf-check-update.stdout")),
+            21
+        );
     }
 
-    /// Rocky 9's dnf, one name long enough to wrap, then what one obsoletes.
+    #[test]
+    fn dnf_reads_the_systems_lists_without_root() {
+        for (root, user) in [
+            (
+                &captured!("rocky-9.9/dnf-check-update.stdout")[..],
+                &captured!("rocky-9.9/dnf-check-update-user.stdout")[..],
+            ),
+            (
+                &captured!("fedora-45/dnf-check-update.stdout")[..],
+                &captured!("fedora-45/dnf-check-update-user.stdout")[..],
+            ),
+        ] {
+            assert_eq!(parse_dnf_updates(user), parse_dnf_updates(root));
+        }
+    }
+
+    #[test]
+    fn dnf_counts_packages_with_security_advisories_on_dnf4_and_dnf5() {
+        assert_eq!(
+            parse_dnf_security(captured!("rocky-9.9/dnf-security.stdout")),
+            4
+        );
+        assert_eq!(
+            parse_dnf_security(captured!("fedora-45/dnf-security.stdout")),
+            13
+        );
+        // The same without root.
+        assert_eq!(
+            parse_dnf_security(captured!("rocky-9.9/dnf-security-user.stdout")),
+            4
+        );
+        assert_eq!(
+            parse_dnf_security(captured!("fedora-45/dnf-security-user.stdout")),
+            13
+        );
+    }
+
+    #[test]
+    fn zypper_counts_what_tumbleweed_and_leap_said() {
+        let tumbleweed = captured!("opensuse-tumbleweed/zypper-updates.stdout");
+        assert_eq!(parse_zypper(tumbleweed), 1);
+        assert_eq!(
+            parse_zypper(captured!("opensuse-leap-16.1/zypper-updates.stdout")),
+            0
+        );
+        assert_eq!(
+            parse_zypper(captured!("opensuse-leap-16.1/zypper-security.stdout")),
+            0
+        );
+    }
+
+    #[test]
+    fn alpine_and_arch_read_what_they_said() {
+        assert_eq!(parse_apk(captured!("alpine-3.24/apk.stdout")), 3);
+        // Nothing waiting, which checkupdates says by exiting with 2.
+        assert_eq!(parse_checkupdates(captured!("arch/checkupdates.stdout")), 0);
+        assert_eq!(&captured!("arch/checkupdates.code")[..], b"2\n");
+        let no_fakeroot = captured!("arch/checkupdates-no-fakeroot.stderr");
+        assert!(String::from_utf8_lossy(no_fakeroot).contains("fakeroot"));
+    }
+
+    /// Made up, as no system captured had either: dnf4 wrapping a long name, then
+    /// what one obsoletes.
     const DNF: &str = "
 kernel.x86_64                          5.14.0-427.13.1.el9_4      baseos
 openssl.x86_64                         1:3.0.7-27.el9             baseos
@@ -938,22 +965,22 @@ grub2-tools.x86_64                     1:2.06-77.el9              baseos
 ";
 
     #[test]
-    fn dnf_counts_each_update_once_even_wrapped() {
+    fn dnf_counts_a_wrapped_update_once_and_not_what_it_obsoletes() {
         assert_eq!(parse_dnf_updates(DNF.as_bytes()), 3);
         assert_eq!(parse_dnf_updates(b""), 0);
     }
 
+    /// Made up: one package fixed by two advisories, which no capture had.
     #[test]
-    fn dnf_counts_packages_with_security_advisories_once() {
+    fn dnf_counts_a_package_with_two_advisories_once() {
         let dnf4 = "RHSA-2024:3306 Moderate/Sec.  python3-idna-2.10-7.el9_4.1.noarch\n\
                     RHSA-2024:2732 Important/Sec. kernel-5.14.0-427.13.1.el9_4.x86_64\n\
                     RHSA-2024:2999 Important/Sec. kernel-5.14.0-427.13.1.el9_4.x86_64\n";
         assert_eq!(parse_dnf_security(dnf4.as_bytes()), 2);
-        let dnf5 = "Name                  Type     Severity  Package                              Issued\n\
-                    FEDORA-2024-1234abcd  security Important openssl-1:3.2.2-3.fc41.x86_64        2024-10-01 00:00:00\n";
-        assert_eq!(parse_dnf_security(dnf5.as_bytes()), 1);
     }
 
+    /// Made up: two updates, where the captures had at most one, and no
+    /// security patches.
     #[test]
     fn zypper_counts_its_update_elements() {
         let xml = r#"<?xml version='1.0'?>
@@ -969,6 +996,7 @@ grub2-tools.x86_64                     1:2.06-77.el9              baseos
         assert_eq!(parse_zypper(xml.as_bytes()), 2);
     }
 
+    /// Made up for Arch, whose capture had nothing waiting.
     #[test]
     fn checkupdates_and_apk_count_their_lines() {
         let arch = "linux 6.11.5.arch1-1 -> 6.11.6.arch1-1\nopenssl 3.4.0-1 -> 3.4.0-2\n";

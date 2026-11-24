@@ -1,0 +1,14 @@
+Name                   Type     Severity                             Package              Issued
+FEDORA-2026-0866c99872 security Moderate        tpm2-tss-4.2.2-1.fc45.x86_64 2026-11-16 15:55:37
+FEDORA-2026-3dc7e56d1e security Important          pcre2-10.49-1.fc45.x86_64 2026-11-08 17:08:59
+FEDORA-2026-3dc7e56d1e security Important   pcre2-syntax-10.49-1.fc45.noarch 2026-11-08 17:08:59
+FEDORA-2026-4a1f77f0d2 security Important   sqlite-libs-3.54.1-2.fc45.x86_64 2026-11-21 00:58:50
+FEDORA-2026-6c94f2c915 security Moderate        p11-kit-0.26.6-1.fc45.x86_64 2026-11-18 01:04:32
+FEDORA-2026-6c94f2c915 security Moderate  p11-kit-trust-0.26.6-1.fc45.x86_64 2026-11-18 01:04:32
+FEDORA-2026-946f33e2c8 security Moderate    libmodulemd-2.15.4-1.fc45.x86_64 2026-11-10 01:06:09
+FEDORA-2026-b9a53ff63c security Important         dnf5-5.4.8.0-2.fc45.x86_64 2026-11-14 02:35:15
+FEDORA-2026-b9a53ff63c security Important dnf5-plugins-5.4.8.0-2.fc45.x86_64 2026-11-14 02:35:15
+FEDORA-2026-b9a53ff63c security Important      libdnf5-5.4.8.0-2.fc45.x86_64 2026-11-14 02:35:15
+FEDORA-2026-b9a53ff63c security Important  libdnf5-cli-5.4.8.0-2.fc45.x86_64 2026-11-14 02:35:15
+FEDORA-2026-f2ecc7c470 security Important          curl-8.21.0-9.fc45.x86_64 2026-11-05 00:58:42
+FEDORA-2026-f2ecc7c470 security Important       libcurl-8.21.0-9.fc45.x86_64 2026-11-05 00:58:42
