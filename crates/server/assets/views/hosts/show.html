@@ -171,7 +171,7 @@
 {% if drives or drives_problem %}
 <section class="card">
   <h2>Drives</h2>
-  {% if drives_problem %}<p class="notice">{{ drives_problem }}</p>{% endif %}
+  {% if drives_problem %}<p class="notice warn">{{ drives_problem }}</p>{% endif %}
   {% if drives %}
   <div class="table-scroll"><table>
     <thead>
@@ -195,7 +195,7 @@
 {% if updates %}
 <section class="card">
   <h2>Updates</h2>
-  {% if updates.problem %}<p class="notice">{{ updates.problem }}</p>{% endif %}
+  {% if updates.problem %}<p class="notice warn">{{ updates.problem }}</p>{% endif %}
   {% if updates.waiting or updates.reboot or updates.vulnerable or updates.lists_age %}
   <dl class="summary">
     {% if updates.waiting %}<dt>Waiting</dt><dd>{{ updates.waiting }}</dd>{% endif %}

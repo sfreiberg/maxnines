@@ -167,7 +167,7 @@
 <section id="preview" class="preview">
   <h2>Preview</h2>
   <p class="hint">Nothing has been saved. This shows what saving the form above would do, compared with the rules saved now.</p>
-  {% if not preview.enabled %}<p class="notice">This rule isn't enabled, so it won't apply to any host. The table still shows who its condition matches.</p>{% endif %}
+  {% if not preview.enabled %}<p class="notice warn">This rule isn't enabled, so it won't apply to any host. The table still shows who its condition matches.</p>{% endif %}
 
   {% if preview.total == 0 %}
   <p class="empty">There are no approved hosts to try this rule on yet.</p>
