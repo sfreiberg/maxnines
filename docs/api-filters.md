@@ -23,7 +23,7 @@ an agent's own config are under `custom.`, so `role` in its config is `custom.ro
 
 ```sh
 curl -G -H "Authorization: Bearer $MAXNINES_API_KEY" \
-  --data-urlencode 'q=os=linux hostname=web*' \
+  --data-urlencode 'filter=os=linux hostname=web*' \
   "$MAXNINES_URL/api/v1/hosts"
 ```
 
