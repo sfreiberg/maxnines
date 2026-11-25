@@ -1,0 +1,17 @@
+AppleRAID sets (1 found)
+===============================================================================
+Name:                 Capture
+Unique ID:            3CB0E496-927F-49B3-A9FB-948CCBDF0D59
+Type:                 Mirror
+Status:               Offline
+Size:                 268.4 MB (268369920 Bytes)
+Rebuild:              manual
+Device Node:          -
+-------------------------------------------------------------------------------
+#  DevNode   UUID                                  Status     Size
+-------------------------------------------------------------------------------
+0  disk7s1   FBD89E03-6211-4F0A-B0D4-F319796FA81C  Online     268369920
+-  -none-    144296E6-0993-4361-9E05-FE636436C4EE  Missing/Damaged
+-  -none-    E054E8C6-4E87-4E06-9883-DABD21D5F43D  Missing/Damaged
+-  disk10s1  DA0B7BAA-5E39-457C-B539-BEFF8225473E  Spare      268369920
+===============================================================================

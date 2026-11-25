@@ -192,6 +192,33 @@
 </section>
 {% endif %}
 
+{% if arrays or arrays_problems %}
+<section class="card">
+  <h2>RAID and ZFS</h2>
+  {% for problem in arrays_problems %}<p class="notice warn">{{ problem }}</p>{% endfor %}
+  {% if arrays %}
+  <div class="table-scroll"><table>
+    <thead>
+    <tr><th>Array or pool</th><th>Health</th><th>Rebuild or scrub</th><th>Space</th><th>Errors</th><th>Last scrub</th></tr>
+    </thead>
+    <tbody>
+    {% for array in arrays %}
+    <tr>
+      <td><strong>{{ array.name }}</strong>{% if array.what %}<span class="under">{{ array.what }}</span>{% endif %}</td>
+      <td><span class="badge {{ array.badge }}">{{ array.health }}</span>{% if array.state %}<code class="under">{{ array.state }}</code>{% endif %}{% if array.not_working %}<span class="under">{{ array.not_working }}</span>{% endif %}{% if array.note %}<span class="under">{{ array.note }}</span>{% endif %}</td>
+      <td class="nowrap">{% if array.progress %}{{ array.progress }}{% endif %}</td>
+      <td>{% if array.space %}{{ array.space }}{% endif %}</td>
+      <td>{% if array.errors %}{{ array.errors }}{% endif %}</td>
+      <td>{% if array.last_scrub %}{{ array.last_scrub }}{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+  <p class="hint">Linux software RAID, ZFS pools, Storage Spaces and AppleRAID, read every minute, and every 5 minutes on Windows. See <a href="/docs/collectors-raid">RAID and ZFS</a> for what's read and its alerts.</p>
+</section>
+{% endif %}
+
 {% if updates %}
 <section class="card">
   <h2>Updates</h2>

@@ -1,0 +1,12 @@
+
+FriendlyName                  BusType             CanPool CannotPoolReason              Size
+------------                  -------             ------- ----------------              ----
+Msft Virtual Disk             File Backed Virtual    True                         8589934592
+Msft Virtual Disk             File Backed Virtual    True                         8589934592
+Microsoft NVMe Direct Disk v2 NVMe                   True                       236223201280
+Msft Virtual Disk             File Backed Virtual    True                         8589934592
+Msft Virtual Disk             File Backed Virtual    True                         8589934592
+Virtual_Disk NVME Premium     NVMe                  False Insufficient Capacity 274877906944
+
+
+

@@ -25,7 +25,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::models::ConfigStatus;
 use crate::presence::Reach;
-use crate::readings::{Drive, Drives, FailedServices, Updates};
+use crate::readings::{Array, Arrays, Drive, Drives, FailedServices, Updates};
 use crate::registration::{HostRecord, HostState, Upgrade, short_id};
 use crate::rule_engine::Host;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
@@ -586,6 +586,12 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     };
     let drives_problem = drives.problem.clone();
     let drives: Vec<DriveRow> = drives.drives.iter().map(DriveRow::of).collect();
+    let arrays = match Arrays::load(&state.metrics, &id, now).await {
+        Ok(arrays) => arrays,
+        Err(error) => return server_error(&error),
+    };
+    let arrays_problems = arrays.problems.clone();
+    let arrays: Vec<ArrayRow> = arrays.arrays.iter().map(ArrayRow::of).collect();
     let updates = match Updates::load(&state.metrics, &id, now).await {
         Ok(updates) => updates.map(UpdatesCard::of),
         Err(error) => return server_error(&error),
@@ -653,6 +659,8 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("more_runs", &more_runs)
         .with("drives", &drives)
         .with("drives_problem", &drives_problem)
+        .with("arrays", &arrays)
+        .with("arrays_problems", &arrays_problems)
         .with("updates", &updates)
         .with("failed_services", &failed_services)
         .with("decided_by", &host.decided_by)
@@ -721,6 +729,129 @@ impl DriveRow {
                 .temperature_celsius
                 .map(|celsius| format_value(Unit::Celsius, celsius)),
             note,
+        }
+    }
+}
+
+/// One RAID array or ZFS pool on a host's page, from its newest reading.
+#[derive(Debug, PartialEq, Serialize)]
+struct ArrayRow {
+    name: String,
+    /// What it is and how it's laid out, such as `ZFS mirror`.
+    what: String,
+    /// `good`, `warn` or `bad`, for its badge, and the badge's word.
+    badge: &'static str,
+    health: &'static str,
+    /// Its system's own word for how it is, and the devices that aren't working.
+    state: Option<String>,
+    not_working: Option<String>,
+    note: Option<String>,
+    /// A rebuild or scrub running, how far it has got and how fast it goes.
+    progress: Option<String>,
+    /// How full a ZFS pool is.
+    space: Option<String>,
+    /// A ZFS pool's errors, when it has any.
+    errors: Option<String>,
+    /// When a ZFS pool's last scrub finished, and what it repaired.
+    last_scrub: Option<String>,
+}
+
+impl ArrayRow {
+    fn of(array: &Array) -> Self {
+        let any = |count: Option<u64>| count.is_some_and(|count| count > 0);
+        // As the built-in alerts see it.
+        let (badge, health) = if array.failed {
+            ("bad", "Failed")
+        } else if array.degraded {
+            ("bad", "Degraded")
+        } else if any(array.data_errors) {
+            ("bad", "Data errors")
+        } else if array.rebuilding {
+            ("warn", "Rebuilding")
+        } else if any(array.read_errors) || any(array.write_errors) || any(array.checksum_errors) {
+            ("warn", "Errors")
+        } else {
+            ("good", "Healthy")
+        };
+        let kind = match array.kind.as_deref() {
+            Some("md") => "md",
+            Some("zfs") => "ZFS",
+            Some("storage_spaces") => "Storage Spaces",
+            Some("appleraid") => "AppleRAID",
+            _ => "",
+        };
+        let what = [kind, array.level.as_deref().unwrap_or_default()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let speed = array
+            .speed_bytes_per_sec
+            .map(|speed| format!(" at {}", format_value(Unit::BytesPerSecond, speed)))
+            .unwrap_or_default();
+        let done = |percent: Option<f64>| {
+            percent
+                .map(|percent| format!(" {}", format_value(Unit::Percent, percent)))
+                .unwrap_or_default()
+        };
+        let progress = if array.rebuilding {
+            Some(format!("Rebuilding{}{speed}", done(array.rebuild_percent)))
+        } else {
+            array
+                .scrub_percent
+                .map(|_| format!("Scrubbing{}{speed}", done(array.scrub_percent)))
+        };
+        let space = array.used_percent.map(|used| {
+            let mut space = format!("{} used", format_value(Unit::Percent, used));
+            if let Some(size) = array.size_bytes {
+                space = format!("{space} of {}", format_value(Unit::Bytes, size as f64));
+            }
+            if let Some(fragmentation) = array.fragmentation_percent {
+                space = format!(
+                    "{space}, {} fragmented",
+                    format_value(Unit::Percent, fragmentation)
+                );
+            }
+            space
+        });
+        let counted = [
+            (array.read_errors, "read"),
+            (array.write_errors, "write"),
+            (array.checksum_errors, "checksum"),
+            (array.data_errors, "data"),
+        ];
+        let errors: Vec<String> = counted
+            .iter()
+            .filter_map(|(count, kind)| {
+                Some(format!("{} {kind}", count.filter(|count| *count > 0)?))
+            })
+            .collect();
+        let errors = (!errors.is_empty()).then(|| errors.join(", "));
+        let last_scrub = array.scrub_age_secs.map(|age| {
+            let mut said = format!("{} ago", format_value(Unit::Seconds, age as f64));
+            if let Some(repaired) = array.scrub_repaired_bytes.filter(|bytes| *bytes > 0) {
+                said = format!(
+                    "{said}, repaired {}",
+                    format_value(Unit::Bytes, repaired as f64)
+                );
+            }
+            if let Some(left) = array.scrub_errors.filter(|errors| *errors > 0) {
+                said = format!("{said}, {left} errors left");
+            }
+            said
+        });
+        Self {
+            name: array.name.clone(),
+            what,
+            badge,
+            health,
+            state: array.state.clone(),
+            not_working: array.not_working.clone(),
+            note: array.note.clone(),
+            progress,
+            space,
+            errors,
+            last_scrub,
         }
     }
 }

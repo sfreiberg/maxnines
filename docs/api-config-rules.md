@@ -36,8 +36,8 @@ Rules of the same priority apply built-in rules first.
 | `urls` | `apache`, `nginx`, `php_fpm`, `openmetrics` | The status pages to read. Leave it out for the usual page on the host itself. For `openmetrics` they're the [metrics pages](openmetrics.md) to read, which have no usual address |
 
 The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `gpu`, `host`,
-`memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `processes`, `sensors`, `services`,
-`smart`, `system`, `top_processes` and `updates`.
+`memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `processes`, `raid`, `sensors`,
+`services`, `smart`, `system`, `top_processes` and `updates`.
 
 ## List config rules
 

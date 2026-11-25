@@ -28,7 +28,9 @@ brings 7, for each MongoDB server, listed on the
 [MongoDB](collectors-mongodb.md#built-in-alerts) page, and the built-in **Redis**
 template 6, for each Redis, listed on the [Redis](collectors-redis.md#built-in-alerts)
 page. The built-in **Drives** template brings 6, for each drive, listed on the [Drives](collectors-smart.md#built-in-alerts)
-page, and the built-in **Updates** template 4, on updates waiting, reboots and package
+page, the built-in **RAID and ZFS** template 6, for each software RAID array and ZFS
+pool, listed on the [RAID and ZFS](collectors-raid.md#built-in-alerts) page, and the
+built-in **Updates** template 4, on updates waiting, reboots and package
 lists, listed on the [Updates](collectors-updates.md#built-in-alerts) page.
 
 Each disk alerts on its own. Every alert resolves as soon as its problem is gone,

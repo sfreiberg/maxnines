@@ -97,7 +97,7 @@ Every role, from Viewer up:
 | Tool | What it does |
 | --- | --- |
 | `list_hosts` | The hosts, with whether each is online and its health, narrowed with a [filter](api-filters.md) as on the Hosts page |
-| `get_host` | One host, with the facts its agent reports and what its newest readings say: its drives, updates, and watched and failed services |
+| `get_host` | One host, with the facts its agent reports and what its newest readings say: its drives, RAID arrays and ZFS pools, updates, and watched and failed services |
 | `list_alerts` | The alerts open now, then the most recent that have ended, for every host or one |
 | `get_alert` | One alert, with the readings of what it watches around when it fired |
 | `list_metrics` | The metrics MaxNines can read, with their units |

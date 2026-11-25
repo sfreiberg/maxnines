@@ -253,7 +253,8 @@ static TOOLS: [Spec; 14] = [
         title: "Get a host",
         description: "One host: whether it's online, its health, the facts its agent \
             reports, such as its operating system, hardware, addresses and disks, and what \
-            its newest readings say: whether each drive passes its own SMART check, the \
+            its newest readings say: whether each drive passes its own SMART check, \
+            whether each RAID array and ZFS pool is degraded, failed or rebuilding, the \
             updates waiting and whether it needs a reboot, the services it watches and \
             whether they're running, and the services that failed.",
         args: &[HOST_ID],
@@ -786,6 +787,9 @@ impl Call {
                 let mut drives = self
                     .get(&format!("/hosts/{}/drives", host()), NO_HOST)
                     .await?;
+                let mut raid = self
+                    .get(&format!("/hosts/{}/raid", host()), NO_HOST)
+                    .await?;
                 let updates = self
                     .get(&format!("/hosts/{}/updates", host()), NO_HOST)
                     .await?;
@@ -794,12 +798,15 @@ impl Call {
                     .await?;
                 let mut drives_listed = rows("drives", drives["drives"].take(), MAX_ROWS);
                 drives_listed["problem"] = drives["problem"].take();
+                let mut raid_listed = rows("arrays", raid["arrays"].take(), MAX_ROWS);
+                raid_listed["problems"] = raid["problems"].take();
                 let mut watched = rows("watched", services["watched"].take(), MAX_ROWS);
                 watched["failed"] = services["failed"].take();
                 Ok(json!({
                     "host": shown,
                     "facts": facts,
                     "drives": drives_listed,
+                    "raid": raid_listed,
                     "updates": updates,
                     "services": watched,
                 }))

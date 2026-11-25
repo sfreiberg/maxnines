@@ -833,6 +833,207 @@ pub const METRICS: &[StaticMetric] = &[
         },
         chart: ShowChart::Never,
     },
+    // Each md array, ZFS pool, Storage Spaces virtual disk and AppleRAID set,
+    // named by its own name.
+    StaticMetric {
+        name: "raid.degraded",
+        title: "RAID degraded",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.degraded"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "raid.failed",
+        title: "RAID failed",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.failed"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "raid.rebuilding",
+        title: "RAID rebuilding",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.rebuilding"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "raid.rebuild_progress",
+        title: "RAID rebuild progress",
+        unit: Unit::Percent,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.rebuild_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "raid.scrub_progress",
+        title: "RAID scrub progress",
+        unit: Unit::Percent,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.scrub_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "raid.speed",
+        title: "RAID rebuild or scrub speed",
+        unit: Unit::BytesPerSecond,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.speed_bytes_per_sec"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "raid.devices",
+        title: "RAID devices",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.devices"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "raid.working_devices",
+        title: "RAID devices working",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.working_devices"),
+        },
+        chart: ShowChart::WithData,
+    },
+    // What only ZFS says about a pool.
+    StaticMetric {
+        name: "zfs.size",
+        title: "ZFS pool size",
+        unit: Unit::Bytes,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.size_bytes"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "zfs.used",
+        title: "ZFS pool space used",
+        unit: Unit::Percent,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.used_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.fragmentation",
+        title: "ZFS pool fragmentation",
+        unit: Unit::Percent,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.fragmentation_percent"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.read_errors",
+        title: "ZFS read errors",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.read_errors"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.write_errors",
+        title: "ZFS write errors",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.write_errors"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.checksum_errors",
+        title: "ZFS checksum errors",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.checksum_errors"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.data_errors",
+        title: "ZFS data errors",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.data_errors"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.scrub_age",
+        title: "ZFS time since last scrub",
+        unit: Unit::Seconds,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.scrub_age_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "zfs.scrub_repaired",
+        title: "ZFS repaired by last scrub",
+        unit: Unit::Bytes,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.scrub_repaired_bytes"),
+        },
+        chart: ShowChart::Never,
+    },
+    StaticMetric {
+        name: "zfs.scrub_errors",
+        title: "ZFS errors last scrub couldn't repair",
+        unit: Unit::Number,
+        collector: "raid",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.scrub_errors"),
+        },
+        chart: ShowChart::Never,
+    },
     // Whether a host is up to date, from its own package manager.
     StaticMetric {
         name: "updates.pending",

@@ -10,6 +10,7 @@
   - [Containers](collectors-containers.md)
   - [Windows performance counters](collectors-windows-counters.md)
   - [Drives](collectors-smart.md)
+  - [RAID and ZFS](collectors-raid.md)
   - [Updates](collectors-updates.md)
   - [Apache](collectors-apache.md)
   - [nginx](collectors-nginx.md)

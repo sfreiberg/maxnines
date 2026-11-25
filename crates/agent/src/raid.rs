@@ -1,0 +1,1673 @@
+//! Each software RAID array and ZFS pool on a host: whether it's whole, degraded or
+//! failed, whether it's rebuilding or being scrubbed and how far that has got, and
+//! for ZFS how full it is and the errors it has seen.
+//!
+//! Linux's software RAID is read from /proc/mdstat, which anyone may read. ZFS pools,
+//! on Linux and FreeBSD, are read with `zpool list` and `zpool status`, which anyone
+//! may run where /dev/zfs lets them, as OpenZFS sets it up; an agent that can't open
+//! it asks for root through `sudo -n`, as smartctl does. Storage Spaces is read
+//! through PowerShell on Windows, and AppleRAID sets with diskutil on macOS.
+//!
+//! A host with none of these has nothing to report, and isn't told it's missing
+//! anything: most hosts have no arrays.
+
+use std::time::Duration;
+
+use anyhow::Result;
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use crate::background::Background;
+use crate::collector::Collector;
+
+/// An array going wrong is worth knowing about within a minute or two.
+#[cfg(not(windows))]
+const EVERY: Duration = Duration::from_secs(60);
+/// Starting PowerShell takes a second of CPU, too much to do every minute.
+#[cfg(windows)]
+const EVERY: Duration = Duration::from_secs(5 * 60);
+/// The first look comes within this, so a new agent shows its arrays soon.
+const FIRST_WITHIN: Duration = Duration::from_secs(15);
+/// How long one look gets. `zpool status` waits on a pool whose devices have
+/// stopped answering.
+const ROUND_LIMIT: Duration = Duration::from_secs(2 * 60);
+/// How long one program run gets.
+const RUN_LIMIT: Duration = Duration::from_secs(60);
+
+pub struct RaidCollector {
+    background: Background,
+}
+
+impl RaidCollector {
+    pub fn new() -> Result<Self> {
+        let mut background = Background::new();
+        let mut last = Value::Null;
+        background.repeat_from(FIRST_WITHIN, EVERY, Some(ROUND_LIMIT), read, move |found| {
+            // Out of time: what was known still stands.
+            if let Some(found) = found {
+                last = Found::to_value(&found);
+            }
+            last.clone()
+        })?;
+        Ok(Self { background })
+    }
+}
+
+impl Collector for RaidCollector {
+    fn name(&self) -> &'static str {
+        "raid"
+    }
+
+    fn collect(&mut self) -> Result<Value> {
+        Ok(self.background.rows())
+    }
+}
+
+/// What one look found: each array, and what couldn't be read, by what it was
+/// asked with.
+#[derive(Debug, Default, PartialEq)]
+struct Found {
+    arrays: Vec<Array>,
+    problems: Vec<(&'static str, String)>,
+}
+
+impl Found {
+    /// A row for each array, and one for each problem, named by what was asked,
+    /// which is never an array's name: none of them can hold a space.
+    fn to_value(&self) -> Value {
+        let mut rows: Vec<Value> = self.arrays.iter().map(Array::to_value).collect();
+        for (asked, problem) in &self.problems {
+            rows.push(json!({ "name": asked, "problem": problem, "arrays": 0 }));
+        }
+        Value::Array(rows)
+    }
+}
+
+/// One md array, ZFS pool, Storage Spaces virtual disk or AppleRAID set.
+#[derive(Debug, Default, PartialEq)]
+struct Array {
+    name: String,
+    /// `md`, `zfs`, `storage_spaces` or `appleraid`.
+    kind: &'static str,
+    /// How it's laid out, in its system's words: `raid1`, `raidz2`, `Mirror`.
+    level: String,
+    /// Its system's own word for how it is: `clean`, `DEGRADED`, `OK`.
+    state: String,
+    /// The devices it's made of, leaving out spares and caches, and how many of
+    /// them are working.
+    devices: u64,
+    working_devices: u64,
+    /// Those that aren't, with what's wrong with each.
+    not_working: Vec<String>,
+    /// Running without all its redundancy.
+    degraded: bool,
+    /// Unable to serve what's on it.
+    failed: bool,
+    /// Rebuilding its redundancy: md's resync or recovery, a ZFS resilver, a
+    /// Storage Spaces repair, an AppleRAID rebuild.
+    rebuilding: bool,
+    rebuild_percent: Option<f64>,
+    /// How far a scrub, md's check, has got, while one runs.
+    scrub_percent: Option<f64>,
+    /// How fast the rebuild or scrub goes.
+    speed_bytes_per_sec: Option<f64>,
+    /// What its system says is wrong, such as zpool's status.
+    note: String,
+    zfs: Option<Pool>,
+}
+
+/// What only ZFS says about a pool.
+#[derive(Debug, Default, PartialEq)]
+struct Pool {
+    size_bytes: Option<u64>,
+    used_percent: Option<f64>,
+    fragmentation_percent: Option<f64>,
+    read_errors: u64,
+    write_errors: u64,
+    checksum_errors: u64,
+    /// Files or metadata ZFS couldn't repair.
+    data_errors: u64,
+    /// How long since the last scrub finished, if it was the last scan.
+    scrub_age_secs: Option<u64>,
+    scrub_repaired_bytes: Option<u64>,
+    /// What the last scrub found and couldn't repair.
+    scrub_errors: Option<u64>,
+}
+
+impl Array {
+    /// Its row. The texts are always there, even when empty, as the server keeps a
+    /// row's newest text until it's replaced.
+    fn to_value(&self) -> Value {
+        let mut row = Map::new();
+        row.insert("name".into(), json!(self.name));
+        row.insert("kind".into(), json!(self.kind));
+        row.insert("level".into(), json!(self.level));
+        row.insert("state".into(), json!(self.state));
+        row.insert("not_working".into(), json!(self.not_working.join(", ")));
+        row.insert("note".into(), json!(self.note));
+        row.insert("devices".into(), json!(self.devices));
+        row.insert("working_devices".into(), json!(self.working_devices));
+        row.insert("degraded".into(), json!(u8::from(self.degraded)));
+        row.insert("failed".into(), json!(u8::from(self.failed)));
+        row.insert("rebuilding".into(), json!(u8::from(self.rebuilding)));
+        let mut put = |key: &str, value: Option<f64>| {
+            if let Some(value) = value.filter(|value| value.is_finite()) {
+                row.insert(key.into(), json!(value));
+            }
+        };
+        put("rebuild_percent", self.rebuild_percent);
+        put("scrub_percent", self.scrub_percent);
+        put("speed_bytes_per_sec", self.speed_bytes_per_sec);
+        if let Some(pool) = &self.zfs {
+            put("size_bytes", pool.size_bytes.map(|size| size as f64));
+            put("used_percent", pool.used_percent);
+            put("fragmentation_percent", pool.fragmentation_percent);
+            put("read_errors", Some(pool.read_errors as f64));
+            put("write_errors", Some(pool.write_errors as f64));
+            put("checksum_errors", Some(pool.checksum_errors as f64));
+            put("data_errors", Some(pool.data_errors as f64));
+            put("scrub_age_secs", pool.scrub_age_secs.map(|age| age as f64));
+            put(
+                "scrub_repaired_bytes",
+                pool.scrub_repaired_bytes.map(|bytes| bytes as f64),
+            );
+            put(
+                "scrub_errors",
+                pool.scrub_errors.map(|errors| errors as f64),
+            );
+        }
+        Value::Object(row)
+    }
+}
+
+async fn read() -> Found {
+    let mut found = Found::default();
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string("/proc/mdstat") {
+            Ok(mdstat) => found.arrays.extend(parse_mdstat(&mdstat)),
+            // md isn't loaded, so there are no arrays.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => found.problems.push((
+                "/proc/mdstat",
+                format!("/proc/mdstat couldn't be read: {error}"),
+            )),
+        }
+    }
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    zfs::read(&mut found).await;
+    #[cfg(target_os = "macos")]
+    appleraid::read(&mut found).await;
+    #[cfg(windows)]
+    windows::read(&mut found).await;
+    found
+}
+
+/// Runs a program for what it prints, within [`RUN_LIMIT`].
+async fn run(
+    program: &str,
+    arguments: &[&str],
+) -> std::result::Result<crate::programs::Ran, String> {
+    crate::programs::run(program, arguments, RUN_LIMIT).await
+}
+
+/// The first line a program said went wrong, or its exit code.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn failure(program: &str, ran: &crate::programs::Ran) -> String {
+    match ran.stderr.lines().find(|line| !line.trim().is_empty()) {
+        Some(line) => format!("{program}: {}", line.trim()),
+        None => format!("{program} exited with {:?}", ran.code),
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+mod zfs {
+    use super::{Found, failure, parse_zpool, run};
+    use crate::programs::{first_of, refused_by_sudo};
+
+    /// Where each system puts zpool: Linux's packages, and FreeBSD's base system.
+    const PLACES: &[&str] = &["/usr/sbin/zpool", "/sbin/zpool", "/usr/local/sbin/zpool"];
+    /// Where sudo is: the system's own, or the one packages add on FreeBSD.
+    const SUDO: &[&str] = &["/usr/bin/sudo", "/usr/local/bin/sudo"];
+    /// What the agent asks zpool, exactly as a sudoers rule has to allow it.
+    pub const LIST: &[&str] = &[
+        "list",
+        "-Hp",
+        "-o",
+        "name,health,size,allocated,free,fragmentation,capacity",
+    ];
+    pub const STATUS: &[&str] = &["status", "-p"];
+
+    pub async fn read(found: &mut Found) {
+        // ZFS's own device is only there while its module is loaded, which a host
+        // without pools needn't have.
+        if !std::path::Path::new("/dev/zfs").exists() {
+            return;
+        }
+        let Some(zpool) = first_of(PLACES) else {
+            return;
+        };
+        // zpool opens /dev/zfs to read and write, which OpenZFS lets anyone do; on
+        // a host that doesn't, root is asked for.
+        let can_open = nix::unistd::access(
+            "/dev/zfs",
+            nix::unistd::AccessFlags::R_OK | nix::unistd::AccessFlags::W_OK,
+        )
+        .is_ok();
+        let sudo = if can_open { None } else { first_of(SUDO) };
+        if !can_open && sudo.is_none() {
+            found.problems.push((
+                "zpool status",
+                needs_root(zpool, "sudo isn't installed, so"),
+            ));
+            return;
+        }
+        let ask = |arguments: &'static [&'static str]| async move {
+            let mut words: Vec<&str> = Vec::new();
+            let program = match sudo {
+                Some(sudo) => {
+                    words.extend(["-n", zpool]);
+                    sudo
+                }
+                None => zpool,
+            };
+            words.extend(arguments);
+            run(program, &words).await
+        };
+        let list = match ask(LIST).await {
+            Ok(ran) if refused_by_sudo(&ran) => {
+                found.problems.push((
+                    "zpool status",
+                    needs_root(zpool, "sudo didn't allow it, so"),
+                ));
+                return;
+            }
+            Ok(ran) if ran.code == Some(0) => ran.stdout,
+            Ok(ran) => {
+                found
+                    .problems
+                    .push(("zpool status", failure("zpool list", &ran)));
+                return;
+            }
+            Err(error) => {
+                found.problems.push(("zpool status", error));
+                return;
+            }
+        };
+        // Without a pool, status has nothing to add.
+        if list.iter().all(u8::is_ascii_whitespace) {
+            return;
+        }
+        let status = match ask(STATUS).await {
+            Ok(ran) if ran.code == Some(0) => ran.stdout,
+            Ok(ran) => {
+                found
+                    .problems
+                    .push(("zpool status", failure("zpool status", &ran)));
+                return;
+            }
+            Err(error) => {
+                found.problems.push(("zpool status", error));
+                return;
+            }
+        };
+        let now = chrono::Local::now().naive_local();
+        found.arrays.extend(parse_zpool(
+            &String::from_utf8_lossy(&list),
+            &String::from_utf8_lossy(&status),
+            now,
+        ));
+    }
+
+    fn needs_root(zpool: &str, why: &str) -> String {
+        format!(
+            "zpool can't open /dev/zfs as the agent's user, and {why} the agent can't ask for root. \
+             Let anyone open /dev/zfs, as OpenZFS does, or let the agent's user run zpool with a \
+             sudoers rule such as: maxnines ALL=(root) NOPASSWD: {zpool} {}, {zpool} {}",
+            // A comma in a sudoers rule needs a backslash before it.
+            LIST.join(" ").replace(',', "\\,"),
+            STATUS.join(" ")
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+mod appleraid {
+    use super::{Found, failure, parse_appleraid, run};
+
+    pub async fn read(found: &mut Found) {
+        match run("/usr/sbin/diskutil", &["appleRAID", "list"]).await {
+            Ok(ran) if ran.code == Some(0) => {
+                found
+                    .arrays
+                    .extend(parse_appleraid(&String::from_utf8_lossy(&ran.stdout)));
+            }
+            Ok(ran) => found.problems.push((
+                "diskutil appleRAID",
+                failure("diskutil appleRAID list", &ran),
+            )),
+            Err(error) => found.problems.push(("diskutil appleRAID", error)),
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use super::{Found, parse_storage_spaces, run};
+
+    /// Each Storage Spaces virtual disk, as JSON.
+    const SCRIPT: &str = include_str!("raid.ps1");
+
+    pub async fn read(found: &mut Found) {
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let powershell = format!(r"{root}\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let arguments = ["-NoProfile", "-NonInteractive", "-Command", SCRIPT];
+        let problem = match run(&powershell, &arguments).await {
+            Err(error) => error,
+            Ok(ran) if ran.code == Some(0) => match parse_storage_spaces(&ran.stdout) {
+                Ok(arrays) => {
+                    found.arrays.extend(arrays);
+                    return;
+                }
+                Err(error) => error,
+            },
+            Ok(ran) => match ran.stderr.lines().find(|line| !line.trim().is_empty()) {
+                Some(line) => format!("Storage Spaces couldn't be read: {}", line.trim()),
+                None => format!(
+                    "Storage Spaces couldn't be read: PowerShell exited with {:?}",
+                    ran.code
+                ),
+            },
+        };
+        found.problems.push(("Storage Spaces", problem));
+    }
+}
+
+/// Every array in /proc/mdstat.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_mdstat(text: &str) -> Vec<Array> {
+    let mut arrays = Vec::new();
+    let mut lines = text.lines().peekable();
+    while let Some(line) = lines.next() {
+        let Some((name, rest)) = line.split_once(" : ") else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.starts_with("md") || name.contains(char::is_whitespace) {
+            continue;
+        }
+        // Its own lines follow, indented, up to a blank one.
+        let mut detail = Vec::new();
+        while let Some(next) = lines.peek() {
+            if next.trim().is_empty() || !next.starts_with(char::is_whitespace) {
+                break;
+            }
+            detail.push(lines.next().unwrap_or_default().trim());
+        }
+        arrays.push(md_array(name, rest, &detail));
+    }
+    arrays
+}
+
+/// One md array, from its first line, `active raid1 sdb1[1] sda1[0](F)`, and the
+/// lines under it.
+fn md_array(name: &str, first: &str, detail: &[&str]) -> Array {
+    let mut words = first.split_whitespace().peekable();
+    let active = words.next() == Some("active");
+    // `(auto-read-only)` or `(read-only)` can come next.
+    while words.peek().is_some_and(|word| word.starts_with('(')) {
+        words.next();
+    }
+    let mut level = String::new();
+    let mut listed = Vec::new();
+    for word in words {
+        if word.contains('[') {
+            listed.push(word);
+        } else if level.is_empty() {
+            level = word.to_string();
+        }
+    }
+    let spare = |device: &&&str| device.ends_with("(S)");
+    let faulty = |device: &&&str| device.ends_with("(F)");
+    // A device's name is what comes before its number in the array.
+    let device_name = |device: &str| device.split('[').next().unwrap_or(device).to_string();
+
+    let mut array = Array {
+        name: name.to_string(),
+        kind: "md",
+        level: level.clone(),
+        ..Array::default()
+    };
+    let mut not_working: Vec<String> = listed
+        .iter()
+        .filter(faulty)
+        .map(|device| format!("{} failed", device_name(device)))
+        .collect();
+
+    // `[3/2] [UU_]`: how many devices it should have, how many it has working, and
+    // which.
+    let counts = detail.iter().find_map(|line| {
+        let start = line.rfind(" [")?;
+        let (wanted, working) = line[..start]
+            .rsplit_once('[')?
+            .1
+            .strip_suffix(']')?
+            .split_once('/')?;
+        let map = line[start + 2..].strip_suffix(']')?;
+        Some((
+            wanted.parse::<u64>().ok()?,
+            working.parse::<u64>().ok()?,
+            map.to_string(),
+        ))
+    });
+    match &counts {
+        Some((wanted, working, _)) => {
+            array.devices = *wanted;
+            array.working_devices = *working;
+        }
+        // An inactive array lists what it has found as spares, waiting for the rest.
+        None if !active => array.devices = listed.len() as u64,
+        // RAID 0 and linear arrays don't count them, as any device gone takes the
+        // array with it.
+        None => {
+            let members = listed.iter().filter(|device| !spare(device)).count() as u64;
+            array.devices = members;
+            array.working_devices = members - listed.iter().filter(faulty).count() as u64;
+        }
+    }
+    let missing = array
+        .devices
+        .saturating_sub(array.working_devices)
+        .saturating_sub(not_working.len() as u64);
+    if missing > 0 {
+        not_working.push(format!("{missing} missing"));
+    }
+    array.not_working = not_working;
+
+    // What it's doing: `recovery = 12.6% (…) finish=1.8min speed=1000K/sec`, or
+    // `resync=DELAYED` while it waits for another array on the same disks.
+    let mut action = None;
+    for line in detail {
+        for word in ["resync", "recovery", "reshape", "check", "repair"] {
+            let Some(at) = line.find(word) else { continue };
+            let after = line[at + word.len()..].trim_start();
+            if let Some(after) = after.strip_prefix('=') {
+                let after = after.trim_start();
+                let percent = after
+                    .split_once('%')
+                    .and_then(|(percent, _)| percent.trim().parse::<f64>().ok());
+                let speed = line.split_whitespace().find_map(|part| {
+                    let kib = part.strip_prefix("speed=")?.strip_suffix("K/sec")?;
+                    Some(kib.parse::<f64>().ok()? * 1024.0)
+                });
+                action = Some((word, percent, speed));
+                break;
+            }
+        }
+        if action.is_some() {
+            break;
+        }
+    }
+
+    let degraded = array.working_devices < array.devices;
+    array.failed = !active
+        || match &counts {
+            Some((wanted, _, map)) => md_failed(&level, *wanted, map, detail),
+            None => array.working_devices < array.devices,
+        };
+    array.degraded = degraded && !array.failed;
+    match action {
+        Some((word @ ("check" | "repair"), percent, speed)) => {
+            array.scrub_percent = percent;
+            array.speed_bytes_per_sec = speed;
+            array.state = if word == "check" {
+                "checking"
+            } else {
+                "repairing"
+            }
+            .to_string();
+        }
+        Some((word, percent, speed)) => {
+            array.rebuilding = true;
+            array.rebuild_percent = percent;
+            array.speed_bytes_per_sec = speed;
+            array.state = match word {
+                "resync" => "resyncing",
+                "recovery" => "recovering",
+                _ => "reshaping",
+            }
+            .to_string();
+        }
+        None => {}
+    }
+    if !active {
+        array.state = "inactive".to_string();
+    } else if array.failed {
+        array.state = "failed".to_string();
+    } else if array.state.is_empty() {
+        array.state = if degraded { "degraded" } else { "clean" }.to_string();
+    }
+    array
+}
+
+/// Whether an md array with a map of which devices are up, `[UU_]`, has lost more
+/// of them than it can do without: all of them for RAID 1, more than one for RAID 4
+/// and 5, more than two for RAID 6, and for RAID 10 every copy of something, which
+/// is a run of as many devices next to each other as it keeps copies.
+fn md_failed(level: &str, devices: u64, map: &str, detail: &[&str]) -> bool {
+    let up: Vec<bool> = map.chars().map(|c| c == 'U').collect();
+    let down = up.iter().filter(|up| !**up).count() as u64;
+    match level {
+        "raid1" => down >= devices,
+        "raid4" | "raid5" => down > 1,
+        "raid6" => down > 2,
+        "raid10" => {
+            // `2 near-copies`, `2 far-copies` or `2 offset-copies`.
+            let copies = detail
+                .iter()
+                .find_map(|line| {
+                    let words: Vec<&str> = line.split_whitespace().collect();
+                    words.windows(2).find_map(|pair| {
+                        pair[1]
+                            .ends_with("-copies")
+                            .then(|| pair[0].parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(2);
+            let count = up.len();
+            (0..count).any(|start| (0..copies).all(|step| !up[(start + step) % count]))
+        }
+        _ => down > 0,
+    }
+}
+
+/// Every pool `zpool list` and `zpool status` describe. `now` is the local time,
+/// which zpool writes the end of a scrub in.
+#[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+fn parse_zpool(list: &str, status: &str, now: chrono::NaiveDateTime) -> Vec<Array> {
+    let mut described = parse_zpool_status(status, now);
+    let mut pools = Vec::new();
+    for line in list.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        let [
+            name,
+            health,
+            size,
+            _allocated,
+            _free,
+            fragmentation,
+            capacity,
+        ] = fields[..]
+        else {
+            continue;
+        };
+        let mut array = match described.iter().position(|array| array.name == name) {
+            Some(at) => described.swap_remove(at),
+            None => Array {
+                name: name.to_string(),
+                kind: "zfs",
+                ..Array::default()
+            },
+        };
+        array.state = health.to_string();
+        (array.degraded, array.failed) = zfs_health(health);
+        let pool = array.zfs.get_or_insert_with(Pool::default);
+        pool.size_bytes = size.parse().ok();
+        // `-` for a pool too old to say how fragmented it is.
+        pool.used_percent = capacity.parse().ok();
+        pool.fragmentation_percent = fragmentation.parse().ok();
+        pools.push(array);
+    }
+    pools
+}
+
+/// What a pool's health says: whether it's degraded, and whether it has failed.
+fn zfs_health(health: &str) -> (bool, bool) {
+    match health {
+        "ONLINE" => (false, false),
+        "DEGRADED" => (true, false),
+        // FAULTED, UNAVAIL, SUSPENDED and REMOVED can't be used.
+        _ => (false, true),
+    }
+}
+
+/// Each pool `zpool status -p` describes.
+fn parse_zpool_status(text: &str, now: chrono::NaiveDateTime) -> Vec<Array> {
+    let mut pools = Vec::new();
+    // Each pool starts with `  pool: tank`.
+    let mut blocks: Vec<Vec<&str>> = Vec::new();
+    for line in text.lines() {
+        if line.trim_start().starts_with("pool: ") {
+            blocks.push(Vec::new());
+        }
+        if let Some(block) = blocks.last_mut() {
+            block.push(line);
+        }
+    }
+    for block in blocks {
+        pools.push(zfs_pool(&block, now));
+    }
+    pools
+}
+
+/// The fields of one pool's status, each with the lines that carry it on: `scan:
+/// …`, `config:` and the rest.
+fn status_fields<'a>(block: &[&'a str]) -> Vec<(&'a str, Vec<&'a str>)> {
+    let mut fields: Vec<(&str, Vec<&str>)> = Vec::new();
+    for line in block {
+        let trimmed = line.trim_start();
+        let field = trimmed.split_once(':').filter(|(key, _)| {
+            !key.is_empty()
+                && key.chars().all(|c| c.is_ascii_lowercase())
+                && !line.starts_with('\t')
+        });
+        match field {
+            Some((key, value)) => fields.push((key, vec![value.trim()])),
+            None => {
+                if let Some((_, lines)) = fields.last_mut() {
+                    lines.push(line);
+                }
+            }
+        }
+    }
+    fields
+}
+
+fn zfs_pool(block: &[&str], now: chrono::NaiveDateTime) -> Array {
+    let fields = status_fields(block);
+    let field = |key: &str| {
+        fields
+            .iter()
+            .find(|(name, _)| *name == key)
+            .map(|(_, lines)| lines.as_slice())
+            .unwrap_or_default()
+    };
+    let name = field("pool")
+        .first()
+        .copied()
+        .unwrap_or_default()
+        .to_string();
+    let state = field("state")
+        .first()
+        .copied()
+        .unwrap_or_default()
+        .to_string();
+    let joined = |lines: &[&str]| {
+        lines
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let (degraded, failed) = zfs_health(&state);
+    let mut array = Array {
+        name,
+        kind: "zfs",
+        state,
+        degraded,
+        failed,
+        note: joined(field("status")),
+        ..Array::default()
+    };
+    let mut pool = Pool::default();
+    read_config(field("config"), &mut array, &mut pool);
+    read_scan(&joined(field("scan")), now, &mut array, &mut pool);
+    // `No known data errors`, or `2 data errors, use '-v' for a list`.
+    let errors = joined(field("errors"));
+    pool.data_errors = errors
+        .split_whitespace()
+        .next()
+        .and_then(|count| count.parse().ok())
+        .unwrap_or(0);
+    array.zfs = Some(pool);
+    array
+}
+
+/// The device tree under `config:`, a line for each, indented by two spaces a
+/// level under a header: the pool itself, its vdevs, and their devices, then each
+/// of logs, cache, spares, special and dedup with theirs.
+fn read_config(lines: &[&str], array: &mut Array, pool: &mut Pool) {
+    struct Line<'a> {
+        depth: usize,
+        name: &'a str,
+        state: Option<&'a str>,
+        errors: [u64; 3],
+    }
+    let parsed: Vec<Line> = lines
+        .iter()
+        .filter(|line| line.starts_with('\t') && !line.trim().is_empty())
+        .map(|line| {
+            let line = &line[1..];
+            let depth = (line.len() - line.trim_start_matches(' ').len()) / 2;
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let count = |at: usize| {
+                words
+                    .get(at)
+                    .and_then(|word| word.parse().ok())
+                    .unwrap_or(0)
+            };
+            // A device that's gone is named by its number, followed by `was
+            // /dev/sdc1`, where it was.
+            let was = words
+                .iter()
+                .position(|word| *word == "was")
+                .and_then(|at| words.get(at + 1).copied());
+            Line {
+                depth,
+                name: was.unwrap_or(words[0]),
+                state: words.get(1).copied(),
+                errors: [count(2), count(3), count(4)],
+            }
+        })
+        .filter(|line| line.name != "NAME")
+        .collect();
+
+    let mut section = "data";
+    let mut levels = Vec::new();
+    for (at, line) in parsed.iter().enumerate() {
+        if line.depth == 0 {
+            // The pool itself comes first, then the sections, which have no state.
+            if at > 0 {
+                section = line.name;
+            }
+            continue;
+        }
+        if section == "data" && line.depth == 1 {
+            // `mirror-0`, `raidz2-1`, `draid1:2d:4c:0s-0`, or a device on its own.
+            let level = match line.name.rsplit_once('-') {
+                Some((kind, number))
+                    if number.chars().all(|c| c.is_ascii_digit())
+                        && ["mirror", "raidz", "draid"]
+                            .iter()
+                            .any(|kind_of| kind.starts_with(kind_of)) =>
+                {
+                    kind.split(':').next().unwrap_or(kind).to_string()
+                }
+                _ => "stripe".to_string(),
+            };
+            if !levels.contains(&level) {
+                levels.push(level);
+            }
+        }
+        // Spares wait and caches only speed reads up, so neither counts.
+        if section == "spares" || section == "cache" {
+            continue;
+        }
+        let leaf = parsed
+            .get(at + 1)
+            .is_none_or(|next| next.depth <= line.depth);
+        if !leaf {
+            continue;
+        }
+        array.devices += 1;
+        pool.read_errors += line.errors[0];
+        pool.write_errors += line.errors[1];
+        pool.checksum_errors += line.errors[2];
+        match line.state {
+            Some("ONLINE") => array.working_devices += 1,
+            Some(state) => array.not_working.push(format!("{} {state}", line.name)),
+            None => array.not_working.push(line.name.to_string()),
+        }
+    }
+    array.level = levels.join(", ");
+}
+
+/// What `scan:` says: a scrub or resilver running, or how the last one ended.
+fn read_scan(scan: &str, now: chrono::NaiveDateTime, array: &mut Array, pool: &mut Pool) {
+    let percent = scan
+        .split_once("% done")
+        .and_then(|(before, _)| before.rsplit(' ').next()?.parse::<f64>().ok());
+    // `… issued at 50.2M/s`, or in older versions `… scanned at`.
+    let speed = ["issued at ", "scanned at "].iter().find_map(|label| {
+        let after = scan.split_once(label)?.1;
+        let rate = after.split_whitespace().next()?.trim_end_matches(',');
+        bytes(rate.strip_suffix("/s")?)
+    });
+    let running = scan.contains(" in progress since ");
+    if running && (scan.starts_with("resilver") || scan.starts_with("rebuild")) {
+        array.rebuilding = true;
+        array.rebuild_percent = percent;
+        array.speed_bytes_per_sec = speed;
+    } else if running && scan.starts_with("scrub") {
+        array.scrub_percent = percent;
+        array.speed_bytes_per_sec = speed;
+    } else if let Some(rest) = scan.strip_prefix("scrub repaired ") {
+        // `scrub repaired 0B in 00:00:01 with 0 errors on Tue Nov 24 10:00:00 2026`
+        let words: Vec<&str> = rest.split_whitespace().collect();
+        pool.scrub_repaired_bytes = words
+            .first()
+            .and_then(|amount| bytes(amount))
+            .map(|repaired| repaired as u64);
+        pool.scrub_errors = words
+            .iter()
+            .position(|word| *word == "with")
+            .and_then(|at| words.get(at + 1)?.parse().ok());
+        // zpool writes when it ended as ctime does, in the host's time zone.
+        let ended = rest.split_once(" errors on ").and_then(|(_, ended)| {
+            chrono::NaiveDateTime::parse_from_str(ended.trim(), "%a %b %e %H:%M:%S %Y").ok()
+        });
+        if let Some(ended) = ended {
+            pool.scrub_age_secs = Some((now - ended).num_seconds().max(0) as u64);
+        }
+    }
+}
+
+/// An amount as zpool writes it: `1024`, `0B`, `512M`, `1.21G`, in powers of 1024.
+fn bytes(text: &str) -> Option<f64> {
+    let text = text.trim();
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let power = match unit {
+        "" | "B" => 0,
+        "K" => 1,
+        "M" => 2,
+        "G" => 3,
+        "T" => 4,
+        "P" => 5,
+        "E" => 6,
+        _ => return None,
+    };
+    Some(number * 1024f64.powi(power))
+}
+
+/// Every set `diskutil appleRAID list` describes, each between lines of `=`, with
+/// its fields, then a table of its members.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_appleraid(text: &str) -> Vec<Array> {
+    let mut sets = Vec::new();
+    let mut current: Option<Array> = None;
+    let mut in_members = false;
+    for line in text.lines() {
+        if line.starts_with("=====") {
+            if let Some(set) = current.take() {
+                sets.push(finish_appleraid(set));
+            }
+            in_members = false;
+            continue;
+        }
+        if let Some(name) = line.strip_prefix("Name:") {
+            current = Some(Array {
+                name: name.trim().to_string(),
+                kind: "appleraid",
+                ..Array::default()
+            });
+            continue;
+        }
+        let Some(set) = current.as_mut() else {
+            continue;
+        };
+        if let Some(level) = line.strip_prefix("Type:") {
+            set.level = level.trim().to_string();
+        } else if let Some(status) = line.strip_prefix("Status:") {
+            set.state = status.trim().to_string();
+        } else if line.starts_with("#  DevNode") {
+            in_members = true;
+        } else if in_members && !line.starts_with("-----") {
+            // `0  disk7s1   28621718-…  Online     268369920`, or one that's gone,
+            // `-  -none-    DFFF973B-…  Missing/Damaged`.
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let [_, device, uuid, ref status @ ..] = words[..] else {
+                continue;
+            };
+            let device = if device == "-none-" { uuid } else { device };
+            let status = status.join(" ");
+            // A spare waits, and isn't part of the set until it's used.
+            if status.starts_with("Spare") {
+                continue;
+            }
+            set.devices += 1;
+            if status.starts_with("Online") {
+                set.working_devices += 1;
+                continue;
+            }
+            if status.contains("Rebuilding") {
+                set.rebuilding = true;
+                set.rebuild_percent = status.split_whitespace().find_map(|word| {
+                    word.trim_matches(|c| c == '(' || c == ')')
+                        .strip_suffix('%')?
+                        .parse()
+                        .ok()
+                });
+            }
+            // The size that follows a member's status isn't part of it.
+            let status = status
+                .split_whitespace()
+                .filter(|word| !word.chars().all(|c| c.is_ascii_digit()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            set.not_working.push(format!("{device} {status}"));
+        }
+    }
+    if let Some(set) = current {
+        sets.push(finish_appleraid(set));
+    }
+    sets
+}
+
+/// A set's health, from its status: Online, Degraded, or Offline or Failed.
+fn finish_appleraid(mut set: Array) -> Array {
+    match set.state.as_str() {
+        "Online" => {}
+        "Degraded" => set.degraded = true,
+        _ => set.failed = true,
+    }
+    set
+}
+
+/// What the collector's PowerShell script printed: each Storage Spaces virtual disk.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_storage_spaces(json: &[u8]) -> std::result::Result<Vec<Array>, String> {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Disk {
+        name: Option<String>,
+        pool: Option<String>,
+        resiliency: Option<String>,
+        health_status: Option<String>,
+        #[serde(default)]
+        operational_status: Vec<String>,
+        disks: Option<u64>,
+        unhealthy_disks: Option<u64>,
+        #[serde(default)]
+        jobs: Vec<Job>,
+    }
+    /// A repair, or the regeneration Windows runs itself, on the virtual disk.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Job {
+        percent_complete: Option<f64>,
+        bytes_processed: Option<f64>,
+        bytes_total: Option<f64>,
+    }
+    impl Job {
+        /// How far it has got. Its bytes say best: a repair's own percentage can
+        /// read 400 before it knows how much there is to do.
+        fn percent(&self) -> Option<f64> {
+            match (self.bytes_processed, self.bytes_total) {
+                (Some(done), Some(total)) if total > 0.0 => Some(100.0 * done / total),
+                _ => self.percent_complete.filter(|percent| *percent <= 100.0),
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(json);
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let disks: Vec<Disk> = serde_json::from_str(text)
+        .map_err(|_| "Storage Spaces weren't read as JSON".to_string())?;
+    Ok(disks
+        .into_iter()
+        .map(|disk| {
+            let operational = disk.operational_status;
+            let has = |word: &str| operational.iter().any(|status| status == word);
+            let health = disk.health_status.unwrap_or_default();
+            let devices = disk.disks.unwrap_or(0);
+            let unhealthy = disk.unhealthy_disks.unwrap_or(0).min(devices);
+            let failed = health == "Unhealthy" || has("Detached") || has("Lost Communication");
+            let rebuilding = has("InService") || !disk.jobs.is_empty();
+            // With a repair and a regeneration running, the one further behind.
+            let rebuild_percent = disk
+                .jobs
+                .iter()
+                .filter_map(Job::percent)
+                .min_by(f64::total_cmp);
+            let degraded = !failed
+                && (has("Degraded") || has("Incomplete") || (health == "Warning" && !rebuilding));
+            let pool = disk.pool.unwrap_or_default();
+            let mut not_working = Vec::new();
+            if unhealthy > 0 {
+                not_working.push(format!(
+                    "{unhealthy} of {pool}'s {devices} disks not healthy"
+                ));
+            }
+            Array {
+                name: disk.name.unwrap_or_default(),
+                kind: "storage_spaces",
+                level: disk.resiliency.unwrap_or_default(),
+                state: operational.join(", "),
+                devices,
+                working_devices: devices - unhealthy,
+                not_working,
+                degraded,
+                failed,
+                rebuilding,
+                rebuild_percent,
+                ..Array::default()
+            }
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a capture-raid-outputs run kept, under `fixtures/raid/`.
+    fn fixture(path: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/raid")
+            .join(path);
+        std::fs::read_to_string(&path).unwrap_or_else(|error| panic!("{path:?}: {error}"))
+    }
+
+    fn named<'a>(arrays: &'a [Array], name: &str) -> &'a Array {
+        arrays
+            .iter()
+            .find(|array| array.name == name)
+            .unwrap_or_else(|| panic!("no {name} in {arrays:#?}"))
+    }
+
+    /// Ubuntu 22.04's kernel 6.8 and 24.04's 7.0, with mdadm 4.2 and 4.3.
+    const MD_SYSTEMS: [&str; 2] = ["ubuntu-22.04", "ubuntu-24.04"];
+
+    fn md(system: &str, step: &str) -> Vec<Array> {
+        parse_mdstat(&fixture(&format!("{system}/md/{step}.mdstat")))
+    }
+
+    #[test]
+    fn no_md_arrays_is_nothing_to_report() {
+        for system in MD_SYSTEMS {
+            assert_eq!(md(system, "empty"), [], "{system}");
+        }
+    }
+
+    #[test]
+    fn healthy_md_arrays_of_every_level_are_clean() {
+        for system in MD_SYSTEMS {
+            let arrays = md(system, "healthy");
+            assert_eq!(arrays.len(), 4, "{system}: {arrays:#?}");
+            for (name, level, devices) in [
+                ("md0", "raid1", 2),
+                ("md1", "raid5", 3),
+                ("md2", "raid0", 2),
+                ("md3", "raid10", 4),
+            ] {
+                let array = named(&arrays, name);
+                assert_eq!(array.kind, "md");
+                assert_eq!(array.level, level, "{system} {name}");
+                assert_eq!(array.state, "clean", "{system} {name}");
+                assert_eq!(array.devices, devices, "{system} {name}");
+                assert_eq!(array.working_devices, devices, "{system} {name}");
+                assert!(!array.degraded && !array.failed && !array.rebuilding);
+                assert_eq!(array.not_working, Vec::<String>::new());
+                assert_eq!(array.rebuild_percent, None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_md_array_resyncs_and_a_new_raid5_builds_its_parity() {
+        for system in MD_SYSTEMS {
+            let arrays = md(system, "first-sync");
+            let mirror = named(&arrays, "md0");
+            assert_eq!(mirror.state, "resyncing", "{system}");
+            assert!(mirror.rebuilding && !mirror.degraded, "{system}");
+            assert!(
+                mirror
+                    .rebuild_percent
+                    .is_some_and(|percent| percent > 0.0 && percent < 100.0)
+            );
+            assert!(
+                mirror
+                    .speed_bytes_per_sec
+                    .is_some_and(|speed| speed > 100_000.0)
+            );
+            // RAID 5 builds onto its last device, so it has no redundancy until then.
+            let parity = named(&arrays, "md1");
+            assert_eq!(parity.state, "recovering", "{system}");
+            assert!(
+                parity.rebuilding && parity.degraded && !parity.failed,
+                "{system}"
+            );
+            assert_eq!((parity.devices, parity.working_devices), (3, 2));
+            assert_eq!(parity.not_working, ["1 missing"]);
+        }
+    }
+
+    #[test]
+    fn an_md_device_failed_then_removed_leaves_its_array_degraded() {
+        for system in MD_SYSTEMS {
+            let failed = md(system, "raid1-failed");
+            let mirror = named(&failed, "md0");
+            assert!(
+                mirror.degraded && !mirror.failed && !mirror.rebuilding,
+                "{system}"
+            );
+            assert_eq!(mirror.state, "degraded");
+            assert_eq!((mirror.devices, mirror.working_devices), (2, 1));
+            assert_eq!(mirror.not_working.len(), 1, "{system}: {mirror:?}");
+            assert!(mirror.not_working[0].ends_with(" failed"), "{mirror:?}");
+
+            let removed = md(system, "raid1-degraded");
+            let mirror = named(&removed, "md0");
+            assert!(mirror.degraded, "{system}");
+            assert_eq!(mirror.not_working, ["1 missing"]);
+
+            let raid10 = md(system, "raid10-degraded");
+            let raid10 = named(&raid10, "md3");
+            assert!(raid10.degraded && !raid10.failed, "{system}");
+            assert_eq!((raid10.devices, raid10.working_devices), (4, 3));
+        }
+    }
+
+    #[test]
+    fn an_md_device_added_back_is_recovered_onto() {
+        for system in MD_SYSTEMS {
+            let arrays = md(system, "raid1-recovering");
+            let mirror = named(&arrays, "md0");
+            assert_eq!(mirror.state, "recovering", "{system}");
+            assert!(mirror.rebuilding && mirror.degraded, "{system}");
+            assert!(mirror.rebuild_percent.is_some());
+            assert!(mirror.speed_bytes_per_sec.is_some());
+            assert_eq!(mirror.scrub_percent, None);
+        }
+    }
+
+    #[test]
+    fn an_md_check_is_a_scrub_not_a_rebuild() {
+        for system in MD_SYSTEMS {
+            let arrays = md(system, "raid5-check");
+            let parity = named(&arrays, "md1");
+            assert_eq!(parity.state, "checking", "{system}");
+            assert!(!parity.rebuilding && !parity.degraded, "{system}");
+            assert!(parity.scrub_percent.is_some_and(|percent| percent < 100.0));
+            assert!(parity.speed_bytes_per_sec.is_some());
+            assert_eq!(parity.rebuild_percent, None);
+        }
+    }
+
+    #[test]
+    fn an_md_spare_waits_uncounted_and_then_takes_over() {
+        for system in MD_SYSTEMS {
+            let waiting = md(system, "raid5-spare");
+            let parity = named(&waiting, "md1");
+            assert_eq!((parity.devices, parity.working_devices), (3, 3), "{system}");
+            assert_eq!(parity.state, "clean");
+
+            let taking_over = md(system, "raid5-spare-rebuilding");
+            let parity = named(&taking_over, "md1");
+            assert_eq!(parity.state, "recovering", "{system}");
+            assert!(parity.degraded && parity.rebuilding);
+            assert_eq!(parity.not_working.len(), 1, "{parity:?}");
+            assert!(parity.not_working[0].ends_with(" failed"));
+
+            let rebuilt = md(system, "raid5-rebuilt");
+            assert_eq!(named(&rebuilt, "md1").state, "clean", "{system}");
+        }
+    }
+
+    #[test]
+    fn an_md_array_waiting_for_its_devices_has_failed() {
+        for system in MD_SYSTEMS {
+            let arrays = md(system, "inactive");
+            let waiting = named(&arrays, "md2");
+            assert_eq!(waiting.state, "inactive", "{system}");
+            assert!(waiting.failed && !waiting.degraded, "{system}");
+            assert_eq!((waiting.devices, waiting.working_devices), (1, 0));
+        }
+    }
+
+    #[test]
+    fn md_says_an_array_has_failed_once_it_has_lost_more_than_it_can() {
+        // md won't fail the last device a RAID 5 needs, so these are as the kernel
+        // writes such arrays found at boot.
+        let mdstat = "Personalities : [raid1] [raid6] [raid5] [raid4] [raid10]
+md1 : active raid5 sdc1[2] sda1[0]
+      258048 blocks super 1.2 level 5, 512k chunk, algorithm 2 [4/2] [U_U_]
+
+md3 : active raid10 sdd1[3] sda2[0]
+      126976 blocks super 1.2 512K chunks 2 near-copies [4/2] [U__U]
+
+md4 : active raid10 sdd2[3] sdb2[1]
+      126976 blocks super 1.2 512K chunks 2 near-copies [4/2] [_U_U]
+
+md5 : active raid6 sde1[4] sdd3[3] sdc3[2]
+      258048 blocks super 1.2 level 6, 512k chunk, algorithm 2 [5/3] [__UUU]
+
+md6 : active (auto-read-only) raid1 sdb3[1]
+      130048 blocks super 1.2 [2/1] [_U]
+        resync=PENDING
+
+unused devices: <none>
+";
+        let arrays = parse_mdstat(mdstat);
+        assert!(named(&arrays, "md1").failed);
+        assert_eq!(named(&arrays, "md1").state, "failed");
+        // Each pair of a RAID 10's devices holds the same data.
+        assert!(named(&arrays, "md3").failed);
+        assert!(named(&arrays, "md4").degraded && !named(&arrays, "md4").failed);
+        assert!(named(&arrays, "md5").degraded && !named(&arrays, "md5").failed);
+        let pending = named(&arrays, "md6");
+        assert_eq!(pending.level, "raid1");
+        assert!(pending.degraded && pending.rebuilding);
+        assert_eq!(pending.state, "resyncing");
+        assert_eq!(pending.rebuild_percent, None);
+    }
+
+    /// OpenZFS 2.1 on Ubuntu 22.04, 2.2 on Ubuntu 24.04 and FreeBSD 14.3, and 2.4 on
+    /// FreeBSD 15.0.
+    const ZFS_SYSTEMS: [&str; 4] = [
+        "ubuntu-22.04",
+        "ubuntu-24.04",
+        "freebsd-14.3-RELEASE",
+        "freebsd-15.0-RELEASE",
+    ];
+
+    /// A day after the captures, so a scrub's age is under that.
+    fn after_capture() -> chrono::NaiveDateTime {
+        chrono::NaiveDate::from_ymd_opt(2026, 11, 26)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    }
+
+    fn zfs(system: &str, step: &str) -> Vec<Array> {
+        let list = fixture(&format!("{system}/zfs/{step}.list"));
+        let status = fixture(&format!("{system}/zfs/{step}.status"));
+        parse_zpool(&list, &status, after_capture())
+    }
+
+    fn pool(array: &Array) -> &Pool {
+        array.zfs.as_ref().expect("a ZFS pool says more")
+    }
+
+    #[test]
+    fn no_pools_is_nothing_to_report() {
+        for system in ZFS_SYSTEMS {
+            assert_eq!(zfs(system, "empty"), [], "{system}");
+        }
+    }
+
+    #[test]
+    fn healthy_pools_count_their_devices_but_not_spares_or_caches() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "healthy");
+            assert_eq!(pools.len(), 2, "{system}: {pools:#?}");
+            let tank = named(&pools, "tank");
+            assert_eq!(tank.kind, "zfs");
+            assert_eq!(tank.level, "mirror", "{system}");
+            assert_eq!(tank.state, "ONLINE");
+            // Two in the mirror and the log.
+            assert_eq!((tank.devices, tank.working_devices), (3, 3), "{system}");
+            assert!(!tank.degraded && !tank.failed && !tank.rebuilding);
+            assert_eq!(tank.note, "");
+            let tank = pool(tank);
+            assert_eq!(tank.size_bytes, Some(1_006_632_960), "{system}");
+            assert!(
+                tank.used_percent
+                    .is_some_and(|used| used > 50.0 && used < 70.0)
+            );
+            assert!(tank.fragmentation_percent.is_some());
+            assert_eq!(
+                (tank.read_errors, tank.write_errors, tank.checksum_errors),
+                (0, 0, 0)
+            );
+            assert_eq!(tank.data_errors, 0);
+            assert_eq!(tank.scrub_age_secs, None);
+
+            let vault = named(&pools, "vault");
+            assert_eq!(vault.level, "raidz1", "{system}");
+            assert_eq!((vault.devices, vault.working_devices), (3, 3));
+        }
+    }
+
+    #[test]
+    fn zpool_reads_the_same_for_anyone() {
+        for system in ZFS_SYSTEMS {
+            let list = fixture(&format!("{system}/zfs/healthy-user.list"));
+            let status = fixture(&format!("{system}/zfs/healthy-user.status"));
+            assert_eq!(
+                parse_zpool(&list, &status, after_capture()),
+                zfs(system, "healthy"),
+                "{system}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scrub_running_says_how_far_it_has_got_and_a_paused_one_says_nothing() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "scrubbing");
+            let tank = named(&pools, "tank");
+            assert!(!tank.rebuilding, "{system}");
+            assert!(
+                tank.scrub_percent
+                    .is_some_and(|done| done > 0.0 && done < 100.0),
+                "{system}: {tank:?}"
+            );
+            assert!(
+                tank.speed_bytes_per_sec
+                    .is_some_and(|speed| speed > 1_000_000.0)
+            );
+
+            let pools = zfs(system, "scrub-paused");
+            let tank = named(&pools, "tank");
+            assert_eq!(tank.scrub_percent, None, "{system}");
+            assert_eq!(tank.speed_bytes_per_sec, None);
+        }
+    }
+
+    #[test]
+    fn a_finished_scrub_says_when_and_what_it_found() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "scrubbed");
+            let tank = pool(named(&pools, "tank"));
+            assert!(
+                tank.scrub_age_secs.is_some_and(|age| age < 2 * 86_400),
+                "{system}: {tank:?}"
+            );
+            assert_eq!(tank.scrub_repaired_bytes, Some(0));
+            assert_eq!(tank.scrub_errors, Some(0));
+        }
+    }
+
+    #[test]
+    fn a_device_offline_faulted_or_missing_degrades_its_pool() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "offline");
+            let vault = named(&pools, "vault");
+            assert!(vault.degraded && !vault.failed, "{system}");
+            assert_eq!(vault.state, "DEGRADED");
+            assert_eq!(vault.not_working, ["/var/tmp/zfs-capture/r2 OFFLINE"]);
+            assert_eq!(vault.working_devices, 2);
+            assert!(
+                vault
+                    .note
+                    .starts_with("One or more devices has been taken offline")
+            );
+
+            let pools = zfs(system, "faulted");
+            let tank = named(&pools, "tank");
+            assert!(tank.degraded, "{system}");
+            assert_eq!(tank.not_working, ["/var/tmp/zfs-capture/m2 FAULTED"]);
+
+            // Named by where it was, rather than its number.
+            let pools = zfs(system, "missing");
+            let vault = named(&pools, "vault");
+            assert!(vault.degraded, "{system}");
+            assert_eq!(vault.not_working, ["/var/tmp/zfs-capture/r3 UNAVAIL"]);
+        }
+    }
+
+    #[test]
+    fn a_resilver_is_a_rebuild() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "resilvering");
+            let tank = named(&pools, "tank");
+            assert!(tank.rebuilding, "{system}");
+            assert!(
+                tank.rebuild_percent
+                    .is_some_and(|done| done > 0.0 && done < 100.0)
+            );
+            assert!(tank.speed_bytes_per_sec.is_some());
+            assert_eq!(tank.scrub_percent, None);
+
+            // A finished resilver says nothing about the last scrub.
+            let pools = zfs(system, "resilvered");
+            let tank = named(&pools, "tank");
+            assert!(!tank.rebuilding, "{system}");
+            assert_eq!(pool(tank).scrub_age_secs, None);
+        }
+    }
+
+    #[test]
+    fn damage_a_scrub_repaired_and_damage_it_couldnt_are_both_counted() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "scrub-repaired");
+            let tank = pool(named(&pools, "tank"));
+            assert!(tank.checksum_errors > 0, "{system}: {tank:?}");
+            assert!(tank.scrub_repaired_bytes.is_some_and(|bytes| bytes > 0));
+            assert_eq!(tank.scrub_errors, Some(0));
+            assert_eq!(tank.data_errors, 0);
+
+            let pools = zfs(system, "data-errors");
+            let single = named(&pools, "single");
+            assert_eq!(single.level, "stripe", "{system}");
+            assert!(single.note.contains("data corruption"), "{single:?}");
+            let single = pool(single);
+            assert!(single.data_errors > 0, "{system}: {single:?}");
+            assert!(single.checksum_errors > 0);
+            assert!(single.scrub_errors.is_some_and(|errors| errors > 0));
+
+            // Anyone may count them, if not name the files.
+            let list = fixture(&format!("{system}/zfs/data-errors.list"));
+            let status = fixture(&format!("{system}/zfs/data-errors-user.status"));
+            let pools = parse_zpool(&list, &status, after_capture());
+            assert_eq!(
+                pool(named(&pools, "single")).data_errors,
+                single.data_errors
+            );
+        }
+    }
+
+    #[test]
+    fn a_pool_filling_up_says_how_full() {
+        for system in ZFS_SYSTEMS {
+            let pools = zfs(system, "nearly-full");
+            let used = pool(named(&pools, "full")).used_percent.unwrap();
+            assert!((80.0..90.0).contains(&used), "{system}: {used}");
+            // ZFS keeps at least 128 MiB back, so this 1 GiB pool is as full as
+            // it gets well short of 100%.
+            let pools = zfs(system, "full");
+            let used = pool(named(&pools, "full")).used_percent.unwrap();
+            assert!(used >= 85.0, "{system}: {used}");
+        }
+    }
+
+    #[test]
+    fn a_pool_that_cant_be_used_has_failed() {
+        for health in ["FAULTED", "UNAVAIL", "SUSPENDED"] {
+            assert_eq!(zfs_health(health), (false, true));
+        }
+        assert_eq!(zfs_health("DEGRADED"), (true, false));
+        assert_eq!(zfs_health("ONLINE"), (false, false));
+    }
+
+    #[test]
+    fn a_scrubs_age_is_from_its_end_in_local_time() {
+        let mut array = Array::default();
+        let mut pool = Pool::default();
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 11, 24)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let scan = "scrub repaired 1.50M in 00:12:01 with 2 errors on Tue Nov  3 10:00:00 2026";
+        read_scan(scan, now, &mut array, &mut pool);
+        assert_eq!(pool.scrub_age_secs, Some(21 * 86_400 + 2 * 3600));
+        assert_eq!(pool.scrub_repaired_bytes, Some(1_572_864));
+        assert_eq!(pool.scrub_errors, Some(2));
+    }
+
+    #[test]
+    fn amounts_are_in_powers_of_1024() {
+        assert_eq!(bytes("0B"), Some(0.0));
+        assert_eq!(bytes("512"), Some(512.0));
+        assert_eq!(bytes("16.0M"), Some(16.0 * 1024.0 * 1024.0));
+        assert_eq!(bytes("1.5G"), Some(1.5 * 1024f64.powi(3)));
+        assert_eq!(bytes("fast"), None);
+    }
+
+    const MACOS: &str = "macos-26.7.2";
+
+    fn appleraid(step: &str) -> Vec<Array> {
+        parse_appleraid(&fixture(&format!("{MACOS}/appleraid/{step}.txt")))
+    }
+
+    #[test]
+    fn appleraid_sets_say_their_members() {
+        assert_eq!(appleraid("empty"), []);
+        let healthy = appleraid("healthy");
+        let set = named(&healthy, "Capture");
+        assert_eq!(set.kind, "appleraid");
+        assert_eq!(set.level, "Mirror");
+        assert_eq!(set.state, "Online");
+        assert_eq!((set.devices, set.working_devices), (3, 3));
+        assert!(!set.degraded && !set.failed);
+    }
+
+    /// macOS 26 takes a mirror offline when a member goes, rather than running on
+    /// the rest, and adds a member to repair it as a spare that's never used.
+    #[test]
+    fn an_appleraid_set_taken_offline_has_failed() {
+        let degraded = appleraid("degraded");
+        let set = named(&degraded, "Capture");
+        assert_eq!(set.state, "Offline");
+        assert!(set.failed && !set.degraded);
+        assert_eq!((set.devices, set.working_devices), (3, 2));
+        assert_eq!(
+            set.not_working,
+            ["E054E8C6-4E87-4E06-9883-DABD21D5F43D Missing/Damaged"]
+        );
+        let repaired = appleraid("rebuilding");
+        assert_eq!(named(&repaired, "Capture").devices, 3);
+        let none_left = appleraid("none-left");
+        assert_eq!(named(&none_left, "Capture").working_devices, 0);
+    }
+
+    #[test]
+    fn an_appleraid_member_rebuilding_says_how_far() {
+        let text = "AppleRAID sets (1 found)
+===============================================================================
+Name:                 Backup
+Unique ID:            9A19AF87-3E58-4558-9DE6-56C4E52B2575
+Type:                 Mirror
+Status:               Degraded
+Size:                 2.0 TB (2000054796288 Bytes)
+Rebuild:              automatic
+Device Node:          disk4
+-------------------------------------------------------------------------------
+#  DevNode   UUID                                  Status     Size
+-------------------------------------------------------------------------------
+0  disk2s2   98A3A60A-C66B-4657-AF27-FF829DCA0AC6  Online     2000054796288
+1  disk3s2   B1A4FAAE-1636-4509-821F-5341BE14FA34  Rebuilding 2000054796288 (43% complete)
+===============================================================================
+";
+        let sets = parse_appleraid(text);
+        let set = named(&sets, "Backup");
+        assert!(set.degraded && set.rebuilding && !set.failed);
+        assert_eq!(set.rebuild_percent, Some(43.0));
+        assert_eq!(set.not_working, ["disk3s2 Rebuilding (43% complete)"]);
+    }
+
+    /// Windows Server 2022 and 2025, as the collector's own script printed them.
+    const WINDOWS_SYSTEMS: [&str; 2] = ["windows-10.0.20348", "windows-10.0.26100"];
+
+    fn storage_spaces(system: &str, step: &str) -> Vec<Array> {
+        let json = fixture(&format!("{system}/storage-spaces/{step}.json"));
+        parse_storage_spaces(json.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn storage_spaces_virtual_disks_say_their_health() {
+        for system in WINDOWS_SYSTEMS {
+            assert_eq!(storage_spaces(system, "empty"), [], "{system}");
+            let disks = storage_spaces(system, "healthy");
+            assert_eq!(disks.len(), 3, "{system}");
+            for (name, level) in [
+                ("Mirror1", "Mirror"),
+                ("Parity1", "Parity"),
+                ("Simple1", "Simple"),
+            ] {
+                let disk = named(&disks, name);
+                assert_eq!(disk.kind, "storage_spaces");
+                assert_eq!(disk.level, level);
+                assert_eq!(disk.state, "OK");
+                assert_eq!((disk.devices, disk.working_devices), (4, 4), "{system}");
+                assert!(
+                    !disk.degraded && !disk.failed && !disk.rebuilding,
+                    "{system} {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pools_disk_gone_degrades_what_has_redundancy_and_fails_what_hasnt() {
+        for system in WINDOWS_SYSTEMS {
+            let disks = storage_spaces(system, "disk-gone");
+            for name in ["Mirror1", "Parity1"] {
+                let disk = named(&disks, name);
+                assert!(disk.degraded && !disk.failed, "{system} {name}: {disk:?}");
+                assert_eq!(disk.working_devices, 3);
+                assert_eq!(disk.not_working, ["1 of Pool1's 4 disks not healthy"]);
+            }
+            let simple = named(&disks, "Simple1");
+            assert!(simple.failed && !simple.degraded, "{system}");
+            assert_eq!(simple.state, "No Redundancy, Degraded");
+        }
+        // Back, but not yet repaired.
+        let disks = storage_spaces("windows-10.0.26100", "repaired");
+        assert!(named(&disks, "Mirror1").degraded);
+        assert!(!named(&disks, "Simple1").degraded);
+    }
+
+    #[test]
+    fn a_repair_running_is_a_rebuild_as_far_as_its_bytes_say() {
+        let disks = storage_spaces("windows-10.0.26100", "retired-repairing");
+        let mirror = named(&disks, "Mirror1");
+        assert_eq!(mirror.state, "InService");
+        assert!(mirror.rebuilding && !mirror.degraded, "{mirror:?}");
+        // A repair and a regeneration: the one further behind.
+        let percent = mirror.rebuild_percent.unwrap();
+        assert!((percent - 100.0 * 136_839_168.0 / 1_073_741_824.0).abs() < 1e-9);
+        let parity = named(&disks, "Parity1");
+        assert!(parity.rebuilding && !parity.degraded);
+        assert!(
+            parity
+                .rebuild_percent
+                .is_some_and(|percent| (percent - 71.43).abs() < 0.01)
+        );
+        assert!(!named(&disks, "Simple1").rebuilding);
+
+        let starting = storage_spaces("windows-10.0.20348", "retired-repairing");
+        assert_eq!(named(&starting, "Mirror1").rebuild_percent, Some(0.0));
+
+        // Before it knows how much there is, a repair can say it's 400% done.
+        let unsure = br#"[{"Name":"Parity1","Pool":"Pool1","Resiliency":"Parity","HealthStatus":"Healthy","OperationalStatus":["OK"],"Size":2147483648,"Disks":4,"UnhealthyDisks":0,"Jobs":[{"Name":"Parity1-Repair","PercentComplete":400,"BytesProcessed":null,"BytesTotal":null}]}]"#;
+        let disks = parse_storage_spaces(unsure).unwrap();
+        assert!(disks[0].rebuilding);
+        assert_eq!(disks[0].rebuild_percent, None);
+        assert!(parse_storage_spaces(b"Get-StoragePool : Access denied").is_err());
+    }
+
+    #[test]
+    fn rows_have_every_text_and_problems_have_a_name_no_array_can() {
+        let found = Found {
+            arrays: md("ubuntu-24.04", "raid1-recovering"),
+            problems: vec![("zpool status", "zpool couldn't be run".into())],
+        };
+        let rows = found.to_value();
+        let rows = rows.as_array().unwrap();
+        let md0 = rows.iter().find(|row| row["name"] == "md0").unwrap();
+        assert_eq!(md0["kind"], "md");
+        assert_eq!(md0["note"], "");
+        assert_eq!(md0["not_working"], "1 missing");
+        assert_eq!(md0["rebuilding"], 1);
+        assert_eq!(md0["degraded"], 1);
+        assert!(md0.get("size_bytes").is_none());
+        assert_eq!(
+            rows.last().unwrap(),
+            &json!({ "name": "zpool status", "problem": "zpool couldn't be run", "arrays": 0 })
+        );
+        let pools = Found {
+            arrays: zfs("ubuntu-24.04", "data-errors"),
+            problems: Vec::new(),
+        };
+        let rows = pools.to_value();
+        let single = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "single")
+            .unwrap();
+        assert!(single["data_errors"].as_f64().unwrap() > 0.0);
+        assert!(single["size_bytes"].as_f64().is_some());
+        assert_eq!(Found::default().to_value(), json!([]));
+    }
+}

@@ -1642,6 +1642,7 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
         format!("/api/v1/hosts/{id}/facts"),
         format!("/api/v1/hosts/{id}/facts/history"),
         format!("/api/v1/hosts/{id}/drives"),
+        format!("/api/v1/hosts/{id}/raid"),
         format!("/api/v1/hosts/{id}/updates"),
         format!("/api/v1/hosts/{id}/services"),
     ] {
@@ -1652,6 +1653,7 @@ async fn the_facts_api_needs_the_token_and_a_known_agent() {
         "/api/v1/hosts/nope/facts",
         "/api/v1/hosts/nope/facts/history",
         "/api/v1/hosts/nope/drives",
+        "/api/v1/hosts/nope/raid",
         "/api/v1/hosts/nope/updates",
         "/api/v1/hosts/nope/services",
     ] {
@@ -1734,9 +1736,10 @@ async fn an_approved_agent_is_sent_the_default_config() {
 
     assert_eq!(version, config.version().unwrap());
     assert_eq!(config.interval, Duration::from_secs(15));
-    assert_eq!(config.collectors.len(), 8);
+    assert_eq!(config.collectors.len(), 9);
     assert!(config.collectors["system"].enabled);
     assert!(config.collectors["smart"].enabled);
+    assert!(config.collectors["raid"].enabled);
     assert!(config.collectors["updates"].enabled);
 }
 
@@ -4714,6 +4717,173 @@ async fn each_drive_gets_series_by_model_and_serial_and_the_host_page_lists_them
                 "{drives}"
             );
             assert_eq!(drives["drives"], json!([]), "{drives}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{}", page.body);
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    }
+}
+
+#[tokio::test]
+async fn each_array_and_pool_gets_series_by_name_and_the_host_page_lists_them() {
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "nas-1").await;
+    let id = host.id();
+    // As the agent's raid collector sends them, from md and zpool.
+    let rows = json!([
+        {
+            "name": "md0", "kind": "md", "level": "raid1", "state": "recovering",
+            "not_working": "1 missing", "note": "", "devices": 2, "working_devices": 1,
+            "degraded": 1, "failed": 0, "rebuilding": 1, "rebuild_percent": 3.5,
+            "speed_bytes_per_sec": 2_359_296.0
+        },
+        {
+            "name": "tank", "kind": "zfs", "level": "mirror", "state": "ONLINE",
+            "not_working": "", "note": "One or more devices has experienced an unrecoverable error.",
+            "devices": 3, "working_devices": 3, "degraded": 0, "failed": 0, "rebuilding": 0,
+            "size_bytes": 1_006_632_960.0, "used_percent": 86.0, "fragmentation_percent": 22.0,
+            "read_errors": 0.0, "write_errors": 0.0, "checksum_errors": 3209.0,
+            "data_errors": 0.0, "scrub_age_secs": 7200.0, "scrub_repaired_bytes": 407_896_064.0,
+            "scrub_errors": 0.0
+        },
+        {
+            "name": "vault", "kind": "zfs", "level": "raidz1", "state": "DEGRADED",
+            "not_working": "/var/tmp/zfs-capture/r3 UNAVAIL", "note": "", "devices": 3,
+            "working_devices": 2, "degraded": 1, "failed": 0, "rebuilding": 0,
+            "size_bytes": 2_952_790_016.0, "used_percent": 31.0, "read_errors": 0.0,
+            "write_errors": 0.0, "checksum_errors": 0.0, "data_errors": 0.0
+        },
+    ]);
+    let message = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("raid".to_string(), rows)]),
+    });
+    send(&mut client, &message).await;
+
+    let path = format!("/api/v1/hosts/{id}/metrics/raid.degraded?range=1h");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let degraded = loop {
+        let body = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+        if body["series"]
+            .as_array()
+            .is_some_and(|lines| lines.len() == 3)
+        {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the sample never arrived: {body}"
+        );
+        tokio::time::timeout(Duration::from_millis(10), client.next())
+            .await
+            .ok();
+    };
+    let names: BTreeSet<&str> = degraded["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|line| line["name"].as_str())
+        .collect();
+    assert_eq!(names, BTreeSet::from(["md0", "tank", "vault"]));
+    // Only ZFS pools have ZFS's numbers.
+    let path = format!("/api/v1/hosts/{id}/metrics/zfs.checksum_errors?range=1h");
+    let checksums = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(
+        checksums["series"].as_array().unwrap().len(),
+        2,
+        "{checksums}"
+    );
+    let path = format!("/api/v1/hosts/{id}/metrics/raid.rebuild_progress?range=1h");
+    let progress = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(progress["series"][0]["name"], "md0", "{progress}");
+    assert_eq!(progress["series"][0]["points"][0]["avg"], 3.5, "{progress}");
+
+    let mut browser = Browser::default();
+    let page = browser.get(&server, &format!("/hosts/{id}")).await;
+    assert!(page.body.contains("<h2>RAID and ZFS</h2>"), "{}", page.body);
+    assert!(
+        page.body
+            .contains(r#"<span class="badge bad">Degraded</span>"#)
+    );
+    // A pool whose devices have had errors says so, as its alert does.
+    assert!(
+        page.body
+            .contains(r#"<span class="badge warn">Errors</span>"#)
+    );
+    assert!(page.body.contains("md raid1"), "{}", page.body);
+    assert!(
+        page.body.contains("Rebuilding 3.5% at 2.4 MB/s"),
+        "{}",
+        page.body
+    );
+    assert!(
+        page.body.contains("86% used of 960 MiB, 22% fragmented"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("3209 checksum"), "{}", page.body);
+    assert!(
+        page.body.contains("2 h ago, repaired 389 MiB"),
+        "{}",
+        page.body
+    );
+    assert!(page.body.contains("/var/tmp/zfs-capture/r3 UNAVAIL"));
+
+    let path = format!("/api/v1/hosts/{id}/raid");
+    let raid = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+    assert_eq!(raid["problems"], json!([]), "{raid}");
+    let md0 = raid["arrays"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|array| array["name"] == "md0")
+        .unwrap();
+    assert_eq!(
+        md0,
+        &json!({
+            "name": "md0", "kind": "md", "level": "raid1", "state": "recovering",
+            "degraded": true, "failed": false, "rebuilding": true, "rebuild_percent": 3.5,
+            "scrub_percent": null, "speed_bytes_per_sec": 2_359_296.0, "devices": 2,
+            "working_devices": 1, "not_working": "1 missing", "note": null,
+            "size_bytes": null, "used_percent": null, "fragmentation_percent": null,
+            "read_errors": null, "write_errors": null, "checksum_errors": null,
+            "data_errors": null, "scrub_age_secs": null, "scrub_repaired_bytes": null,
+            "scrub_errors": null,
+        }),
+        "{raid}"
+    );
+
+    // zpool refused leaves what to do about it, and md's array as it was.
+    let rows = json!([
+        {
+            "name": "md0", "kind": "md", "level": "raid1", "state": "clean",
+            "not_working": "", "note": "", "devices": 2, "working_devices": 2,
+            "degraded": 0, "failed": 0, "rebuilding": 0
+        },
+        {
+            "name": "zpool status", "arrays": 0,
+            "problem": "zpool can't open /dev/zfs as the agent's user, and sudo didn't allow it"
+        },
+    ]);
+    let message = AgentMessage::Sample(Sample {
+        time: crate::times::now(),
+        metrics: BTreeMap::from([("raid".to_string(), rows)]),
+    });
+    send(&mut client, &message).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let page = browser.get(&server, &format!("/hosts/{id}")).await;
+        if page.body.contains("can&#39;t open /dev/zfs") {
+            assert!(!page.body.contains("UNAVAIL"), "{}", page.body);
+            let path = format!("/api/v1/hosts/{id}/raid");
+            let raid = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
+            assert_eq!(raid["arrays"].as_array().unwrap().len(), 1, "{raid}");
+            assert_eq!(raid["arrays"][0]["state"], "clean", "{raid}");
+            assert_eq!(raid["arrays"][0]["not_working"], Value::Null, "{raid}");
+            assert_eq!(raid["problems"].as_array().unwrap().len(), 1, "{raid}");
             break;
         }
         assert!(Instant::now() < deadline, "{}", page.body);

@@ -12,3 +12,4 @@ unifi
 drives
 updates
 redis
+raid

@@ -1,0 +1,37 @@
+  pool: tank
+ state: ONLINE
+status: One or more devices has experienced an unrecoverable error.  An
+	attempt was made to correct the error.  Applications are unaffected.
+action: Determine if the device needs to be replaced, and clear the errors
+	using 'zpool clear' or replace the device with 'zpool replace'.
+   see: https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-9P
+  scan: scrub repaired 426M in 00:00:00 with 0 errors on Wed Nov 25 01:20:16 2026
+config:
+
+	NAME                          STATE     READ WRITE CKSUM
+	tank                          ONLINE       0     0     0
+	  mirror-0                    ONLINE       0     0     0
+	    /var/tmp/zfs-capture/m1   ONLINE       0     0  3499
+	    /var/tmp/zfs-capture/m2   ONLINE       0     0     0
+	logs	
+	  /var/tmp/zfs-capture/log    ONLINE       0     0     0
+	cache
+	  /var/tmp/zfs-capture/cache  ONLINE       0     0     0
+	spares
+	  /var/tmp/zfs-capture/spare  AVAIL   
+
+errors: No known data errors
+
+  pool: vault
+ state: ONLINE
+  scan: resilvered 12K in 00:00:00 with 0 errors on Wed Nov 25 01:20:05 2026
+config:
+
+	NAME                         STATE     READ WRITE CKSUM
+	vault                        ONLINE       0     0     0
+	  raidz1-0                   ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r1  ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r2  ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r3  ONLINE       0     0     0
+
+errors: No known data errors

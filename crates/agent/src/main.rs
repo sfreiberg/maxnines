@@ -26,6 +26,7 @@ mod openmetrics;
 mod own_usage;
 mod privileges;
 mod programs;
+mod raid;
 mod saved_config;
 mod services;
 mod smart;

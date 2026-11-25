@@ -1345,6 +1345,9 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "PostgreSQL subscription stopped",
             "PostgreSQL too few standbys",
             "PostgreSQL transaction IDs running out",
+            "RAID degraded",
+            "RAID failed",
+            "RAID rebuilding",
             "Reboot required",
             "Redis background save failed",
             "Redis down",
@@ -1356,7 +1359,10 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Service stopped",
             "UniFi device CPU high",
             "UniFi device memory high",
-            "UniFi firmware update available"
+            "UniFi firmware update available",
+            "ZFS pool has errors",
+            "ZFS pool nearly full",
+            "ZFS pool not scrubbed"
         ]
     );
 }
@@ -1476,6 +1482,59 @@ async fn a_drive_failing_its_own_assessment_is_critical_after_a_minute() {
     assert_eq!(open.len(), 1, "{open:?}");
     assert_eq!(open[0].series.as_deref(), Some("WDC WD40EFRX WD-1"));
     assert_eq!(open[0].severity, Severity::Critical);
+}
+
+#[tokio::test]
+async fn a_degraded_array_is_critical_after_a_minute() {
+    let mut test = Harness::start().await;
+    let rule = built_in("RAID degraded").await;
+    assert_eq!(rule.critical.as_deref(), Some("raid.degraded >= 1"));
+    check_rule(&rule).unwrap();
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    for minute in [0, 5] {
+        let offset = MINUTE * minute;
+        let readings = vec![
+            test.reading("md0", test.now + offset, 1.0),
+            test.reading("tank", test.now + offset, 0.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(offset).await;
+    }
+
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0].series.as_deref(), Some("md0"));
+    assert_eq!(open[0].severity, Severity::Critical);
+}
+
+#[tokio::test]
+async fn a_zfs_pool_past_80_percent_warns_and_past_90_is_critical() {
+    let mut test = Harness::start().await;
+    let rule = built_in("ZFS pool nearly full").await;
+    assert_eq!(rule.warning.as_deref(), Some("zfs.used > 80"));
+    assert_eq!(rule.critical.as_deref(), Some("zfs.used > 90"));
+    check_rule(&rule).unwrap();
+    test.database().create_alert_rule(&rule).await.unwrap();
+
+    for minute in [0, 20] {
+        let offset = MINUTE * minute;
+        let readings = vec![
+            test.reading("tank", test.now + offset, 86.0),
+            test.reading("vault", test.now + offset, 93.0),
+            test.reading("backup", test.now + offset, 31.0),
+        ];
+        test.script.set(readings);
+        test.evaluate(offset).await;
+    }
+
+    let mut open = test.open().await;
+    open.sort_by(|a, b| a.series.cmp(&b.series));
+    assert_eq!(open.len(), 2, "{open:?}");
+    assert_eq!(open[0].series.as_deref(), Some("tank"));
+    assert_eq!(open[0].severity, Severity::Warning);
+    assert_eq!(open[1].series.as_deref(), Some("vault"));
+    assert_eq!(open[1].severity, Severity::Critical);
 }
 
 #[tokio::test]

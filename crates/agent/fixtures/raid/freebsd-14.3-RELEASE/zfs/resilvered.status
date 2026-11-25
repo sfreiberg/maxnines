@@ -1,0 +1,32 @@
+  pool: tank
+ state: ONLINE
+  scan: resilvered 233M in 00:00:09 with 0 errors on Wed Nov 25 01:20:34 2026
+config:
+
+	NAME                          STATE     READ WRITE CKSUM
+	tank                          ONLINE       0     0     0
+	  mirror-0                    ONLINE       0     0     0
+	    /var/tmp/zfs-capture/m1   ONLINE       0     0     0
+	    /var/tmp/zfs-capture/m2   ONLINE       0     0     0
+	logs	
+	  /var/tmp/zfs-capture/log    ONLINE       0     0     0
+	cache
+	  /var/tmp/zfs-capture/cache  ONLINE       0     0     0
+	spares
+	  /var/tmp/zfs-capture/spare  AVAIL   
+
+errors: No known data errors
+
+  pool: vault
+ state: ONLINE
+  scan: resilvered 16.5K in 00:00:00 with 0 errors on Wed Nov 25 01:20:20 2026
+config:
+
+	NAME                         STATE     READ WRITE CKSUM
+	vault                        ONLINE       0     0     0
+	  raidz1-0                   ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r1  ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r2  ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r3  ONLINE       0     0     0
+
+errors: No known data errors

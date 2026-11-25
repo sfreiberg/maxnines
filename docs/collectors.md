@@ -12,6 +12,9 @@ each collector reads, how to turn it on, and every metric it reports:
   Windows or the software on it publishes.
 - **[Drives](collectors-smart.md):** each drive's SMART health, with smartctl or
   Windows' own counters.
+- **[RAID and ZFS](collectors-raid.md):** each Linux software RAID array, ZFS pool,
+  Storage Spaces virtual disk and AppleRAID set: degraded, failed, rebuilding, and
+  for ZFS errors, space and scrubs.
 - **[Updates](collectors-updates.md):** updates and security updates waiting, and
   whether a reboot is needed, from each system's own package manager.
 - **Web servers:** [Apache](collectors-apache.md), [nginx](collectors-nginx.md) and
@@ -34,7 +37,7 @@ turns that collector on too, unless the rule sets it to **Off**.
 
 | Collector | On by default | Systems |
 | --- | --- | --- |
-| `cpu`, `memory`, `disk`, `network`, `host`, `system`, `smart`, `updates` | Yes | All |
+| `cpu`, `memory`, `disk`, `network`, `host`, `system`, `smart`, `raid`, `updates` | Yes | All |
 | `gpu` | On Macs | macOS |
 | `processes`, `services`, `files` | Once a rule lists what to watch | All |
 | `top_processes`, `sensors` | No | All |

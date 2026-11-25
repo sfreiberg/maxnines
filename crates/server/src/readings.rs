@@ -1,5 +1,6 @@
 //! What a host's newest readings say about it beyond its numbers: its drives, its
-//! updates and its services, from what its collectors last sent. The host's pages
+//! RAID arrays and ZFS pools, its updates and its services, from what its
+//! collectors last sent. The host's pages
 //! and the API both read them from here, so they can't come to say different things.
 //! Agents send these, so nothing is trusted to be the right shape: anything unusable
 //! is left out or blank.
@@ -60,6 +61,111 @@ impl Drives {
 
     pub async fn load(metrics: &Metrics, host_id: &str, now: Timestamp) -> Result<Self> {
         let output = metrics.latest_output(host_id, "smart", now).await?;
+        Ok(Self::of(output.as_ref()))
+    }
+}
+
+/// One md array, ZFS pool, Storage Spaces virtual disk or AppleRAID set, from the
+/// raid collector's newest reading.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Array {
+    /// Its own name, which its series are called.
+    pub name: String,
+    /// `md`, `zfs`, `storage_spaces` or `appleraid`.
+    pub kind: Option<String>,
+    /// How it's laid out, in its system's words, such as `raid1` or `raidz2`.
+    pub level: Option<String>,
+    /// Its system's own word for how it is, such as `clean` or `DEGRADED`.
+    pub state: Option<String>,
+    /// Running without all its redundancy.
+    pub degraded: bool,
+    /// Unable to serve what's on it.
+    pub failed: bool,
+    /// Rebuilding its redundancy, and how far it has got, if its system says.
+    pub rebuilding: bool,
+    pub rebuild_percent: Option<f64>,
+    /// How far a scrub has got, while one runs.
+    pub scrub_percent: Option<f64>,
+    /// How fast the rebuild or scrub goes.
+    pub speed_bytes_per_sec: Option<f64>,
+    /// The devices it's made of, leaving out spares and caches, and how many of
+    /// them are working.
+    pub devices: Option<u64>,
+    pub working_devices: Option<u64>,
+    /// Those that aren't, with what's wrong with each.
+    pub not_working: Option<String>,
+    /// What its system says is wrong with it.
+    pub note: Option<String>,
+    /// The rest is only for ZFS pools.
+    pub size_bytes: Option<u64>,
+    pub used_percent: Option<f64>,
+    pub fragmentation_percent: Option<f64>,
+    pub read_errors: Option<u64>,
+    pub write_errors: Option<u64>,
+    pub checksum_errors: Option<u64>,
+    /// Files or metadata ZFS couldn't repair.
+    pub data_errors: Option<u64>,
+    /// How long since the last scrub finished, while the last scan was a scrub.
+    pub scrub_age_secs: Option<u64>,
+    pub scrub_repaired_bytes: Option<u64>,
+    /// What the last scrub found and couldn't repair.
+    pub scrub_errors: Option<u64>,
+}
+
+/// Each array and pool the raid collector last read, and what it couldn't read.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Arrays {
+    pub arrays: Vec<Array>,
+    /// Why some couldn't be read, with what to do about it, such as letting the
+    /// agent run zpool.
+    pub problems: Vec<String>,
+}
+
+impl Arrays {
+    pub fn of(output: Option<&Value>) -> Self {
+        let mut arrays = Self::default();
+        for item in output.and_then(Value::as_array).into_iter().flatten() {
+            if let Some(said) = text(item, "problem") {
+                arrays.problems.push(said);
+                continue;
+            }
+            let Some(name) = item["name"].as_str() else {
+                continue;
+            };
+            let flag = |name: &str| item[name].as_f64().is_some_and(|flag| flag >= 1.0);
+            let count = |name: &str| item[name].as_f64().map(|count| count as u64);
+            arrays.arrays.push(Array {
+                name: name.to_string(),
+                kind: text(item, "kind"),
+                level: text(item, "level"),
+                state: text(item, "state"),
+                degraded: flag("degraded"),
+                failed: flag("failed"),
+                rebuilding: flag("rebuilding"),
+                rebuild_percent: item["rebuild_percent"].as_f64(),
+                scrub_percent: item["scrub_percent"].as_f64(),
+                speed_bytes_per_sec: item["speed_bytes_per_sec"].as_f64(),
+                devices: count("devices"),
+                working_devices: count("working_devices"),
+                not_working: text(item, "not_working"),
+                note: text(item, "note"),
+                size_bytes: count("size_bytes"),
+                used_percent: item["used_percent"].as_f64(),
+                fragmentation_percent: item["fragmentation_percent"].as_f64(),
+                read_errors: count("read_errors"),
+                write_errors: count("write_errors"),
+                checksum_errors: count("checksum_errors"),
+                data_errors: count("data_errors"),
+                scrub_age_secs: count("scrub_age_secs"),
+                scrub_repaired_bytes: count("scrub_repaired_bytes"),
+                scrub_errors: count("scrub_errors"),
+            });
+        }
+        arrays
+    }
+
+    pub async fn load(metrics: &Metrics, host_id: &str, now: Timestamp) -> Result<Self> {
+        let output = metrics.latest_output(host_id, "raid", now).await?;
         Ok(Self::of(output.as_ref()))
     }
 }
@@ -251,6 +357,34 @@ mod tests {
         assert_eq!(updates.lists_age_secs, None);
         assert_eq!(updates.manager.as_deref(), Some("pacman"));
         assert_eq!(updates.note, None);
+    }
+
+    #[test]
+    fn arrays_say_what_they_are_and_problems_are_kept_apart() {
+        let output = json!([
+            { "name": "md0", "kind": "md", "level": "raid1", "state": "recovering",
+              "degraded": 1, "failed": 0, "rebuilding": 1, "rebuild_percent": 3.5,
+              "speed_bytes_per_sec": 2359296.0, "devices": 2, "working_devices": 1,
+              "not_working": "1 missing", "note": "" },
+            { "name": "tank", "kind": "zfs", "level": "mirror", "state": "ONLINE",
+              "degraded": 0, "failed": 0, "rebuilding": 0, "devices": 3, "working_devices": 3,
+              "not_working": "", "note": "", "size_bytes": 1006632960, "used_percent": 86.0,
+              "checksum_errors": 3209, "scrub_age_secs": 60 },
+            { "name": "zpool status", "problem": "zpool can't open /dev/zfs", "arrays": 0 },
+        ]);
+        let arrays = Arrays::of(Some(&output));
+        assert_eq!(arrays.problems, ["zpool can't open /dev/zfs"]);
+        assert_eq!(arrays.arrays.len(), 2);
+        let md = &arrays.arrays[0];
+        assert!(md.degraded && md.rebuilding && !md.failed);
+        assert_eq!(md.not_working.as_deref(), Some("1 missing"));
+        assert_eq!(md.note, None);
+        assert_eq!(md.size_bytes, None);
+        let tank = &arrays.arrays[1];
+        assert_eq!(tank.checksum_errors, Some(3209));
+        assert_eq!(tank.used_percent, Some(86.0));
+        assert_eq!(tank.not_working, None);
+        assert_eq!(Arrays::of(None), Arrays::default());
     }
 
     #[test]

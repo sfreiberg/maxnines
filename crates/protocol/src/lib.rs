@@ -93,7 +93,7 @@ impl Protocols {
 
 /// Every collector the project knows about. An agent reports the ones it can
 /// run in its facts, because older agents may not have them all.
-pub const COLLECTORS: [&str; 23] = [
+pub const COLLECTORS: [&str; 24] = [
     "apache",
     "checks",
     "commands",
@@ -111,6 +111,7 @@ pub const COLLECTORS: [&str; 23] = [
     "openmetrics",
     "php_fpm",
     "processes",
+    "raid",
     "sensors",
     "services",
     "smart",
