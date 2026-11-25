@@ -2,3 +2,4 @@
 # its line endings, as Windows ones otherwise do.
 crates/agent/fixtures/** -text
 crates/checks/fixtures/** -text
+crates/collectors/fixtures/** -text
