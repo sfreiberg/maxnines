@@ -733,6 +733,15 @@ impl DriveRow {
     }
 }
 
+/// The thresholds of the built-in RAID and ZFS template's alerts, `templates/raid.hcl`,
+/// which an array's badge goes by too, so the page says what the alerts do. A test
+/// checks the template has the same. `zfs_full` warns past the first and is
+/// critical past the second.
+const ZFS_NEARLY_FULL_PERCENT: f64 = 80.0;
+const ZFS_FULL_PERCENT: f64 = 90.0;
+/// `zfs_scrub_overdue` warns when the last scrub finished longer ago than this.
+const ZFS_SCRUB_OVERDUE_HOURS: u64 = 35 * 24;
+
 /// One RAID array or ZFS pool on a host's page, from its newest reading.
 #[derive(Debug, PartialEq, Serialize)]
 struct ArrayRow {
@@ -759,17 +768,30 @@ struct ArrayRow {
 impl ArrayRow {
     fn of(array: &Array) -> Self {
         let any = |count: Option<u64>| count.is_some_and(|count| count > 0);
-        // As the built-in alerts see it.
+        let used_over = |percent: f64| array.used_percent.is_some_and(|used| used > percent);
+        // As the built-in alerts see it, the worst first, leaving out how long
+        // each has to last: critical `raid_failed`, `raid_degraded`, `zfs_errors`
+        // for data errors and `zfs_full`, then warnings for `raid_rebuilding`,
+        // `zfs_errors` for device errors, `zfs_full` and `zfs_scrub_overdue`.
         let (badge, health) = if array.failed {
             ("bad", "Failed")
         } else if array.degraded {
             ("bad", "Degraded")
         } else if any(array.data_errors) {
             ("bad", "Data errors")
+        } else if used_over(ZFS_FULL_PERCENT) {
+            ("bad", "Nearly full")
         } else if array.rebuilding {
             ("warn", "Rebuilding")
         } else if any(array.read_errors) || any(array.write_errors) || any(array.checksum_errors) {
             ("warn", "Errors")
+        } else if used_over(ZFS_NEARLY_FULL_PERCENT) {
+            ("warn", "Nearly full")
+        } else if array
+            .scrub_age_secs
+            .is_some_and(|age| age > ZFS_SCRUB_OVERDUE_HOURS * 3600)
+        {
+            ("warn", "Not scrubbed")
         } else {
             ("good", "Healthy")
         };
@@ -1124,6 +1146,71 @@ struct OpenAlert<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_arrays_badge_goes_by_the_built_in_alerts_thresholds() {
+        let templates = crate::templates::built_in::all().unwrap();
+        let raid = templates
+            .iter()
+            .find(|built_in| built_in.template.key == "raid")
+            .unwrap();
+        let alert = |key: &str| {
+            raid.template
+                .alerts
+                .iter()
+                .find(|alert| alert.key == key)
+                .unwrap()
+        };
+        let full = alert("zfs_full");
+        assert_eq!(
+            full.warning.as_deref(),
+            Some(format!("zfs.used > {ZFS_NEARLY_FULL_PERCENT}").as_str())
+        );
+        assert_eq!(
+            full.critical.as_deref(),
+            Some(format!("zfs.used > {ZFS_FULL_PERCENT}").as_str())
+        );
+        assert_eq!(
+            alert("zfs_scrub_overdue").warning.as_deref(),
+            Some(format!("zfs.scrub_age > duration('{ZFS_SCRUB_OVERDUE_HOURS}h')").as_str())
+        );
+
+        let pool = |used: f64, scrubbed_days_ago: u64| {
+            let array = Array {
+                name: "tank".into(),
+                kind: Some("zfs".into()),
+                level: Some("mirror".into()),
+                state: Some("ONLINE".into()),
+                degraded: false,
+                failed: false,
+                rebuilding: false,
+                rebuild_percent: None,
+                scrub_percent: None,
+                speed_bytes_per_sec: None,
+                devices: Some(2),
+                working_devices: Some(2),
+                not_working: None,
+                note: None,
+                size_bytes: Some(1 << 30),
+                used_percent: Some(used),
+                fragmentation_percent: None,
+                read_errors: Some(0),
+                write_errors: Some(0),
+                checksum_errors: Some(0),
+                data_errors: Some(0),
+                scrub_age_secs: Some(scrubbed_days_ago * 86_400),
+                scrub_repaired_bytes: None,
+                scrub_errors: None,
+            };
+            let row = ArrayRow::of(&array);
+            (row.badge, row.health)
+        };
+        assert_eq!(pool(50.0, 1), ("good", "Healthy"));
+        assert_eq!(pool(80.0, 35), ("good", "Healthy"));
+        assert_eq!(pool(81.0, 1), ("warn", "Nearly full"));
+        assert_eq!(pool(91.0, 1), ("bad", "Nearly full"));
+        assert_eq!(pool(50.0, 36), ("warn", "Not scrubbed"));
+    }
 
     fn status(version: &str, error: Option<&str>) -> ConfigStatus {
         ConfigStatus {
