@@ -4735,8 +4735,8 @@ async fn each_array_and_pool_gets_series_by_name_and_the_host_page_lists_them() 
     // As the agent's raid collector sends them, from md and zpool.
     let rows = json!([
         {
-            "name": "md0", "kind": "md", "level": "raid1", "state": "recovering",
-            "not_working": "1 missing", "note": "", "devices": 2, "working_devices": 1,
+            "name": "/dev/md0", "kind": "md", "level": "raid1", "state": "recovering",
+            "not_working": "1 rebuilding", "note": "", "devices": 2, "working_devices": 1,
             "degraded": 1, "failed": 0, "rebuilding": 1, "rebuild_percent": 3.5,
             "speed_bytes_per_sec": 2_359_296.0
         },
@@ -4787,7 +4787,7 @@ async fn each_array_and_pool_gets_series_by_name_and_the_host_page_lists_them() 
         .iter()
         .filter_map(|line| line["name"].as_str())
         .collect();
-    assert_eq!(names, BTreeSet::from(["md0", "tank", "vault"]));
+    assert_eq!(names, BTreeSet::from(["/dev/md0", "tank", "vault"]));
     // Only ZFS pools have ZFS's numbers.
     let path = format!("/api/v1/hosts/{id}/metrics/zfs.checksum_errors?range=1h");
     let checksums = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
@@ -4798,7 +4798,7 @@ async fn each_array_and_pool_gets_series_by_name_and_the_host_page_lists_them() 
     );
     let path = format!("/api/v1/hosts/{id}/metrics/raid.rebuild_progress?range=1h");
     let progress = json_body(&server.http("GET", &path, Some(&server.api_key)).await);
-    assert_eq!(progress["series"][0]["name"], "md0", "{progress}");
+    assert_eq!(progress["series"][0]["name"], "/dev/md0", "{progress}");
     assert_eq!(progress["series"][0]["points"][0]["avg"], 3.5, "{progress}");
 
     let mut browser = Browser::default();
@@ -4839,15 +4839,15 @@ async fn each_array_and_pool_gets_series_by_name_and_the_host_page_lists_them() 
         .as_array()
         .unwrap()
         .iter()
-        .find(|array| array["name"] == "md0")
+        .find(|array| array["name"] == "/dev/md0")
         .unwrap();
     assert_eq!(
         md0,
         &json!({
-            "name": "md0", "kind": "md", "level": "raid1", "state": "recovering",
+            "name": "/dev/md0", "kind": "md", "level": "raid1", "state": "recovering",
             "degraded": true, "failed": false, "rebuilding": true, "rebuild_percent": 3.5,
             "scrub_percent": null, "speed_bytes_per_sec": 2_359_296.0, "devices": 2,
-            "working_devices": 1, "not_working": "1 missing", "note": null,
+            "working_devices": 1, "not_working": "1 rebuilding", "note": null,
             "size_bytes": null, "used_percent": null, "fragmentation_percent": null,
             "read_errors": null, "write_errors": null, "checksum_errors": null,
             "data_errors": null, "scrub_age_secs": null, "scrub_repaired_bytes": null,
@@ -4859,12 +4859,12 @@ async fn each_array_and_pool_gets_series_by_name_and_the_host_page_lists_them() 
     // zpool refused leaves what to do about it, and md's array as it was.
     let rows = json!([
         {
-            "name": "md0", "kind": "md", "level": "raid1", "state": "clean",
+            "name": "/dev/md0", "kind": "md", "level": "raid1", "state": "clean",
             "not_working": "", "note": "", "devices": 2, "working_devices": 2,
             "degraded": 0, "failed": 0, "rebuilding": 0
         },
         {
-            "name": "zpool status", "arrays": 0,
+            "name": "/usr/sbin/zpool", "arrays": 0,
             "problem": "zpool can't open /dev/zfs as the agent's user, and sudo didn't allow it"
         },
     ]);

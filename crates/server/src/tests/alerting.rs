@@ -1495,7 +1495,7 @@ async fn a_degraded_array_is_critical_after_a_minute() {
     for minute in [0, 5] {
         let offset = MINUTE * minute;
         let readings = vec![
-            test.reading("md0", test.now + offset, 1.0),
+            test.reading("/dev/md0", test.now + offset, 1.0),
             test.reading("tank", test.now + offset, 0.0),
         ];
         test.script.set(readings);
@@ -1504,7 +1504,7 @@ async fn a_degraded_array_is_critical_after_a_minute() {
 
     let open = test.open().await;
     assert_eq!(open.len(), 1, "{open:?}");
-    assert_eq!(open[0].series.as_deref(), Some("md0"));
+    assert_eq!(open[0].series.as_deref(), Some("/dev/md0"));
     assert_eq!(open[0].severity, Severity::Critical);
 }
 

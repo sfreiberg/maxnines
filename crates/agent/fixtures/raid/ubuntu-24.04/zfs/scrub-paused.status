@@ -1,9 +1,9 @@
   pool: tank
  state: ONLINE
-  scan: scrub paused since Wed Nov 25 01:19:53 2026
-	scrub started on Wed Nov 25 01:19:48 2026
-	601M / 601M scanned, 20.5M / 601M issued
-	0B repaired, 3.42% done
+  scan: scrub paused since Wed Nov 25 02:12:37 2026
+	scrub started on Wed Nov 25 02:12:32 2026
+	601M / 601M scanned, 20.4M / 601M issued
+	0B repaired, 3.39% done
 config:
 
 	NAME                          STATE     READ WRITE CKSUM

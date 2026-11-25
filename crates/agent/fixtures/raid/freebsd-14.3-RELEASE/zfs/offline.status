@@ -1,6 +1,6 @@
   pool: tank
  state: ONLINE
-  scan: scrub repaired 0B in 00:00:12 with 0 errors on Wed Nov 25 01:20:20 2026
+  scan: scrub repaired 0B in 00:00:12 with 0 errors on Wed Nov 25 02:13:03 2026
 config:
 
 	NAME                          STATE     READ WRITE CKSUM

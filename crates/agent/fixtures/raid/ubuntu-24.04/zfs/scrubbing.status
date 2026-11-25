@@ -1,6 +1,6 @@
   pool: tank
  state: ONLINE
-  scan: scrub in progress since Wed Nov 25 01:19:48 2026
+  scan: scrub in progress since Wed Nov 25 02:12:32 2026
 	601M / 601M scanned, 16.0M / 601M issued at 16.0M/s
 	0B repaired, 2.67% done, 00:00:36 to go
 config:

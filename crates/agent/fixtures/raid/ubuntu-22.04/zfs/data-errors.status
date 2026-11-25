@@ -5,12 +5,12 @@ status: One or more devices has experienced an error resulting in data
 action: Restore the file in question if possible.  Otherwise restore the
 	entire pool from backup.
    see: https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-8A
-  scan: scrub repaired 21.5K in 00:00:00 with 192 errors on Wed Nov 25 01:21:44 2026
+  scan: scrub repaired 16.5K in 00:00:00 with 192 errors on Wed Nov 25 02:13:51 2026
 config:
 
 	NAME                       STATE     READ WRITE CKSUM
 	single                     ONLINE       0     0     0
-	  /var/tmp/zfs-capture/s1  ONLINE       0     0   417
+	  /var/tmp/zfs-capture/s1  ONLINE       0     0   413
 
 errors: 192 data errors, use '-v' for a list
 
@@ -21,13 +21,13 @@ status: One or more devices has experienced an unrecoverable error.  An
 action: Determine if the device needs to be replaced, and clear the errors
 	using 'zpool clear' or replace the device with 'zpool replace'.
    see: https://openzfs.github.io/openzfs-docs/msg/ZFS-8000-9P
-  scan: scrub repaired 385M in 00:00:02 with 0 errors on Wed Nov 25 01:21:41 2026
+  scan: scrub repaired 385M in 00:00:03 with 0 errors on Wed Nov 25 02:13:44 2026
 config:
 
 	NAME                          STATE     READ WRITE CKSUM
 	tank                          ONLINE       0     0     0
 	  mirror-0                    ONLINE       0     0     0
-	    /var/tmp/zfs-capture/m1   ONLINE       0     0  3199
+	    /var/tmp/zfs-capture/m1   ONLINE       0     0  3168
 	    /var/tmp/zfs-capture/m2   ONLINE       0     0     0
 	logs	
 	  /var/tmp/zfs-capture/log    ONLINE       0     0     0
@@ -40,7 +40,7 @@ errors: No known data errors
 
   pool: vault
  state: ONLINE
-  scan: resilvered 10K in 00:00:00 with 0 errors on Wed Nov 25 01:21:21 2026
+  scan: resilvered 12K in 00:00:00 with 0 errors on Wed Nov 25 02:13:15 2026
 config:
 
 	NAME                         STATE     READ WRITE CKSUM

@@ -8,6 +8,11 @@ settings, and the built-in **RAID and ZFS** template alerts on what it reads.
 
 Arrays and pools are read every minute, and every 5 minutes on Windows, where starting
 PowerShell costs more. The first look comes within 15 seconds of the agent starting.
+Each program it runs gets a minute, and one that takes longer, as `zpool status` can on
+a pool whose devices have stopped answering, is stopped and said on the host's page,
+while what was read without it is still reported. A look that doesn't finish at all
+within 3 minutes reports only that, rather than how the arrays were before, as an array
+that can't be read may be the one failing.
 The host's page lists each one under **RAID and ZFS**, and the
 [API](api-host-readings.md#get-a-hosts-raid-arrays-and-zfs-pools) gives the same. A host
 with no arrays or pools, which is most of them, reports nothing and has no such section:
@@ -34,23 +39,37 @@ this version.
 
 `/proc/mdstat` is the kernel's own list of md arrays, which anyone may read, so nothing
 needs installing and the agent needs no root. Without the md module loaded there's no
-`/proc/mdstat`, and nothing to report.
+`/proc/mdstat`, and nothing to report. While an array resyncs, the agent also reads its
+`/sys/block/md*/md/sync_action`, which anyone may read too, as only that tells a repair
+from a resync.
+
+The container Intel's RST (IMSM) or DDF metadata keeps, which md always lists as
+inactive with every device a spare, isn't an array: it holds the metadata of the arrays
+in it, and those are read as arrays of their own.
 
 An array is:
 
 - **degraded** when fewer of its devices are working than it should have, which
   `[3/2] [UU_]` says, including while it rebuilds onto a new one;
 - **failed** when it has lost more than it can do without: all of a RAID 1's devices,
-  more than one of a RAID 4 or 5's, more than two of a RAID 6's, both copies of
-  something in a RAID 10, or any device of a RAID 0 or linear array. One that's
-  **inactive**, which is how md leaves an array found at boot without enough of its
-  devices, has failed too;
+  more than one of a RAID 4 or 5's, more than two of a RAID 6's, every copy of
+  something in a RAID 10, or any device of a RAID 0 or linear array. Which devices of
+  a RAID 10 hold the same data is worked out as the kernel does, for near, far and
+  offset layouts: with 4 devices and 2 near copies, 0 and 1 hold the same, and 2 and
+  3, so losing 0 and 3 leaves a copy of everything. One that's **inactive**, which is
+  how md leaves an array found at boot without enough of its devices, or **broken**,
+  as newer kernels say of an array that has lost more than it can do without, has
+  failed too;
 - **rebuilding** while it resyncs, after it's created or shut down uncleanly, recovers
-  onto a device added to it, or is reshaped;
+  onto a device added to it, or is reshaped. An array started read-only, as Debian and
+  Ubuntu start those found at boot until something writes to them, says its resync is
+  `resync pending` until then, which can be days, and isn't rebuilding;
 - **scrubbed** while it's checked or repaired, as the monthly `checkarray` cron job on
   Debian and Ubuntu, or `raid-check` on Red Hat's family, does.
 
-Spares don't count among an array's devices until they're used.
+Spares don't count among an array's devices until they're used. A device being rebuilt
+onto is in the array but not yet working, and the host's page counts it as rebuilding:
+`/proc/mdstat` doesn't say which of an array's devices it is.
 
 ### ZFS
 
@@ -61,7 +80,7 @@ only while `/dev/zfs` is there, which it is while ZFS's module is loaded. It run
 exactly:
 
 ```sh
-zpool list -Hp -o name,health,size,allocated,free,fragmentation,capacity
+zpool list -Hp -o name,health,size,fragmentation,capacity
 zpool status -p
 ```
 
@@ -71,7 +90,7 @@ it does for [smartctl](collectors-smart.md#root), and until sudo allows it the h
 page says so under **RAID and ZFS**, with the rule to add, such as:
 
 ```text
-maxnines ALL=(root) NOPASSWD: /usr/sbin/zpool list -Hp -o name\,health\,size\,allocated\,free\,fragmentation\,capacity, /usr/sbin/zpool status -p
+maxnines ALL=(root) NOPASSWD: /usr/sbin/zpool list -Hp -o name\,health\,size\,fragmentation\,capacity, /usr/sbin/zpool status -p
 ```
 
 The commas in the list of columns need a backslash before them in a sudoers rule.
@@ -81,7 +100,10 @@ its text in each. OpenZFS 2.3 and later can print it as JSON with `zpool status 
 but Ubuntu 24.04 and FreeBSD 14 have 2.2, so the text is what every system has.
 
 A pool is degraded when ZFS says it's `DEGRADED`, and failed when it's `FAULTED`,
-`UNAVAIL` or `SUSPENDED`. A resilver is a rebuild. Its devices are those in its data,
+`UNAVAIL` or `SUSPENDED`. That's from `zpool list`, so when `zpool status` fails or
+runs out of time, as it can on the very pools that have failed, each pool's health,
+size and how full it is are still reported, and its devices, errors and scrubs aren't
+until status can say them. A resilver is a rebuild. Its devices are those in its data,
 log, special and dedup vdevs: spares and caches don't count, as a spare is only waiting
 and a cache only speeds reads up. A device that isn't `ONLINE`, such as one `OFFLINE`,
 `FAULTED`, `UNAVAIL` or `REMOVED`, isn't working, and the host's page lists it by name,
@@ -103,7 +125,11 @@ data and loses its redundancy when one of the pool's disks goes. A virtual disk 
 - **rebuilding** while a repair or regeneration job runs on it, or Windows says it's
   `InService`, with how far the job has got from the bytes it has done and has to do.
   A repair's own percentage can read 400 before it knows how much there is, so it's
-  only used when it has no bytes to go by.
+  only used when it has no bytes to go by. Jobs that only move data about, such as a
+  rebalance or an optimization, aren't rebuilds.
+
+Virtual disks in different pools can have the same name, so each is named by its pool
+and its own name, with a comma between: `Pool1, Mirror1`.
 
 Its devices are the pool's physical disks, and the host's page says how many of them
 aren't healthy.
@@ -120,8 +146,10 @@ others, so on recent macOS a mirror missing a member is failed, not degraded.
 
 ## What's reported
 
-Each metric has a series for each array or pool, named by its own name: `md0`, a ZFS
-pool's name, a virtual disk's friendly name, or an AppleRAID set's. A metric an array
+Each metric has a series for each array or pool: an md array's device, such as
+`/dev/md0`, a ZFS pool's name, a Storage Spaces virtual disk's pool and friendly name,
+such as `Pool1, Mirror1`, or an AppleRAID set's name. md arrays are named by their
+device, under `/dev/`, as a ZFS pool can be called `md0` too. A metric an array
 doesn't report has no series for it, so only ZFS pools have the `zfs.` metrics, and
 the progress and speed are only there while a rebuild or scrub runs.
 

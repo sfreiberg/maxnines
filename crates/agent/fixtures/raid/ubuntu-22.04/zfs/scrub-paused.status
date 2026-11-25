@@ -1,7 +1,7 @@
   pool: tank
  state: ONLINE
-  scan: scrub paused since Wed Nov 25 01:21:15 2026
-	scrub started on Wed Nov 25 01:21:09 2026
+  scan: scrub paused since Wed Nov 25 02:13:08 2026
+	scrub started on Wed Nov 25 02:13:02 2026
 	601M scanned, 21.9M issued, 601M total
 	0B repaired, 3.64% done
 config:

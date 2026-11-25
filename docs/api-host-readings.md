@@ -47,17 +47,20 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 What the [RAID and ZFS](collectors-raid.md) collector last read, as the host's page
 shows it under **RAID and ZFS**: each Linux software RAID array, ZFS pool, Storage
-Spaces virtual disk and AppleRAID set, by its own `name`. `kind` is `md`, `zfs`,
-`storage_spaces` or `appleraid`, `level` how it's laid out in its system's words, such
-as `raid1`, `raidz2` or `Mirror`, and `state` its system's own word for how it is.
-`degraded`, `failed` and `rebuilding` say what the built-in alerts go by, with how far
-a rebuild or scrub has got and how fast it goes while one runs. `devices` leaves out
-spares and caches, and `not_working` names those of them that aren't working, with
-what's wrong with each. `note` is what the system says is wrong, such as zpool's
-status. The fields from `size_bytes` on are only for ZFS pools, and `null` for the
-rest. `problems` says why some arrays couldn't be read, with what to do about it,
-such as letting the agent run zpool. A host with no arrays or pools has both lists
-empty.
+Spaces virtual disk and AppleRAID set, by the `name` its series have: `/dev/md0`, a
+pool's name, `Pool1, Mirror1` for a virtual disk and its pool, or a set's name. `kind`
+is `md`, `zfs`, `storage_spaces` or `appleraid`, `level` how it's laid out in its
+system's words, such as `raid1`, `raidz2` or `Mirror`, and `state` its system's own
+word for how it is. `degraded`, `failed` and `rebuilding` say what the built-in alerts
+go by, with how far a rebuild or scrub has got and how fast it goes while one runs.
+`devices` leaves out spares and caches, and `not_working` names those of them that
+aren't working, with what's wrong with each. `note` is what the system says is wrong,
+such as zpool's status. The fields from `size_bytes` on are only for ZFS pools, and
+`null` for the rest. `problems` says why some arrays couldn't be read, with what to
+do about it, such as letting the agent run zpool. When `zpool status` fails or runs
+out of time, a pool's health, size and space used are still there, from `zpool list`,
+and its devices, errors and scrubs are `null`. A host with no arrays or pools has both
+lists empty.
 
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
@@ -68,7 +71,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 {
   "arrays": [
     {
-      "name": "md0",
+      "name": "/dev/md0",
       "kind": "md",
       "level": "raid1",
       "state": "recovering",
@@ -80,7 +83,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
       "speed_bytes_per_sec": 2359296.0,
       "devices": 2,
       "working_devices": 1,
-      "not_working": "1 missing",
+      "not_working": "1 rebuilding",
       "note": null,
       "size_bytes": null,
       "used_percent": null,

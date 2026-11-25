@@ -3,9 +3,9 @@
 status: One or more devices is currently being resilvered.  The pool will
 	continue to function, possibly in a degraded state.
 action: Wait for the resilver to complete.
-  scan: resilver in progress since Wed Nov 25 01:19:58 2026
-	601M / 601M scanned, 63.0M / 601M issued at 63.0M/s
-	47.2M resilvered, 10.49% done, 00:00:08 to go
+  scan: resilver in progress since Wed Nov 25 02:12:42 2026
+	601M / 601M scanned, 66.6M / 601M issued at 66.6M/s
+	50.6M resilvered, 11.10% done, 00:00:08 to go
 config:
 
 	NAME                              STATE     READ WRITE CKSUM
@@ -26,7 +26,7 @@ errors: No known data errors
 
   pool: vault
  state: ONLINE
-  scan: resilvered 11K in 00:00:00 with 0 errors on Wed Nov 25 01:19:58 2026
+  scan: resilvered 10K in 00:00:00 with 0 errors on Wed Nov 25 02:12:42 2026
 config:
 
 	NAME                         STATE     READ WRITE CKSUM

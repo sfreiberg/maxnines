@@ -362,22 +362,22 @@ mod tests {
     #[test]
     fn arrays_say_what_they_are_and_problems_are_kept_apart() {
         let output = json!([
-            { "name": "md0", "kind": "md", "level": "raid1", "state": "recovering",
+            { "name": "/dev/md0", "kind": "md", "level": "raid1", "state": "recovering",
               "degraded": 1, "failed": 0, "rebuilding": 1, "rebuild_percent": 3.5,
               "speed_bytes_per_sec": 2359296.0, "devices": 2, "working_devices": 1,
-              "not_working": "1 missing", "note": "" },
+              "not_working": "1 rebuilding", "note": "" },
             { "name": "tank", "kind": "zfs", "level": "mirror", "state": "ONLINE",
               "degraded": 0, "failed": 0, "rebuilding": 0, "devices": 3, "working_devices": 3,
               "not_working": "", "note": "", "size_bytes": 1006632960, "used_percent": 86.0,
               "checksum_errors": 3209, "scrub_age_secs": 60 },
-            { "name": "zpool status", "problem": "zpool can't open /dev/zfs", "arrays": 0 },
+            { "name": "/usr/sbin/zpool", "problem": "zpool can't open /dev/zfs", "arrays": 0 },
         ]);
         let arrays = Arrays::of(Some(&output));
         assert_eq!(arrays.problems, ["zpool can't open /dev/zfs"]);
         assert_eq!(arrays.arrays.len(), 2);
         let md = &arrays.arrays[0];
         assert!(md.degraded && md.rebuilding && !md.failed);
-        assert_eq!(md.not_working.as_deref(), Some("1 missing"));
+        assert_eq!(md.not_working.as_deref(), Some("1 rebuilding"));
         assert_eq!(md.note, None);
         assert_eq!(md.size_bytes, None);
         let tank = &arrays.arrays[1];

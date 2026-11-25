@@ -10,6 +10,6 @@ md1 : active raid5 loop7[3] loop6[1] loop5[0]
       
 md0 : active raid1 loop4[2] loop3[0]
       130048 blocks super 1.2 [2/1] [U_]
-      [>....................]  recovery =  3.5% (4608/130048) finish=0.9min speed=2304K/sec
+      [>....................]  recovery =  3.5% (4736/130048) finish=0.8min speed=2368K/sec
       
 unused devices: <none>

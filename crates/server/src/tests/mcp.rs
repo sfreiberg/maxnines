@@ -282,7 +282,7 @@ async fn get_host_says_which_drives_pass_and_which_services_failed() {
         (
             "raid".to_string(),
             json!([
-                { "name": "md0", "kind": "md", "level": "raid1", "state": "degraded",
+                { "name": "/dev/md0", "kind": "md", "level": "raid1", "state": "degraded",
                   "not_working": "1 missing", "note": "", "devices": 2, "working_devices": 1,
                   "degraded": 1, "failed": 0, "rebuilding": 0 },
             ]),
@@ -332,7 +332,7 @@ async fn get_host_says_which_drives_pass_and_which_services_failed() {
     assert_eq!(host["drives"]["drives"][0]["device"], "/dev/sda", "{host}");
     assert_eq!(host["drives"]["problem"], Value::Null, "{host}");
     assert_eq!(host["drives"]["cut_short"], false, "{host}");
-    assert_eq!(host["raid"]["arrays"][0]["name"], "md0", "{host}");
+    assert_eq!(host["raid"]["arrays"][0]["name"], "/dev/md0", "{host}");
     assert_eq!(host["raid"]["arrays"][0]["degraded"], true, "{host}");
     assert_eq!(host["raid"]["problems"], json!([]), "{host}");
     assert_eq!(host["raid"]["cut_short"], false, "{host}");
