@@ -47,7 +47,8 @@ foreach ($vhd in $vhds) {
     Invoke-DiskPart @("create vdisk file=`"$vhd`" maximum=8192 type=expandable", "select vdisk file=`"$vhd`"", 'attach vdisk')
 }
 Start-Sleep -Seconds 5
-$poolable = @(Get-PhysicalDisk -CanPool $true)
+# Only the virtual hard disks: some runners have a spare disk of their own.
+$poolable = @(Get-PhysicalDisk -CanPool $true | Where-Object { [string]$_.BusType -eq 'File Backed Virtual' })
 Get-PhysicalDisk | Select-Object FriendlyName, BusType, CanPool, CannotPoolReason, Size |
     Format-Table -AutoSize | Out-String -Width 200 | Set-Content -Encoding ascii (Join-Path $out 'poolable.txt')
 Get-Content (Join-Path $out 'poolable.txt')
@@ -65,6 +66,7 @@ function Wait-Repair($step) {
     foreach ($try in 1..300) {
         if (@(Get-StorageJob | Where-Object { [string]$_.JobState -eq 'Running' }).Count -gt 0) {
             Snap $step
+            Write-Output (Get-StorageJob | Format-Table Name, JobState, PercentComplete, BytesProcessed, BytesTotal | Out-String)
             break
         }
         Start-Sleep -Milliseconds 200
@@ -75,15 +77,23 @@ function Wait-Repair($step) {
     }
 }
 
+# A volume on the mirror, so a repair has something to copy.
+Get-VirtualDisk -FriendlyName 'Mirror1' | Get-Disk | Initialize-Disk -PartitionStyle GPT -PassThru |
+    New-Partition -UseMaximumSize -DriveLetter M | Format-Volume -FileSystem NTFS -Confirm:$false | Out-Null
+
 # One disk goes away, as if pulled.
 Dismount-DiskImage -ImagePath $vhds[3] | Out-Null
 Start-Sleep -Seconds 15
 Snap 'disk-gone'
 
-# It comes back and the virtual disks are repaired.
+# Written to while it was gone, the mirror has a copy to bring up to date when it
+# comes back.
+$block = New-Object byte[] (64MB)
+(New-Object Random).NextBytes($block)
+$file = [IO.File]::OpenWrite('M:\data.bin')
+foreach ($i in 1..16) { $file.Write($block, 0, $block.Length) }
+$file.Close()
 Mount-DiskImage -ImagePath $vhds[3] -NoDriveLetter | Out-Null
-Start-Sleep -Seconds 10
-Snap 'disk-back'
 Get-VirtualDisk | Where-Object { $_.FriendlyName -ne 'Simple1' } | Repair-VirtualDisk -AsJob | Out-Null
 Wait-Repair 'repairing'
 Start-Sleep -Seconds 5
