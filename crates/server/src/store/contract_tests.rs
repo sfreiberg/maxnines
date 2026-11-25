@@ -589,6 +589,21 @@ fn the_latest_output_of_one_thing_is_an_object() {
 }
 
 #[test]
+fn the_latest_output_has_only_the_numbers_of_the_newest_reading_with_any() {
+    let mut store = in_memory();
+    let synced = json!({ "known": 1, "synced": 1, "max_error_secs": 0.25, "problem": "" });
+    write_metric(&mut store, "a", 1000, "time_sync", synced);
+    let problem = json!({ "known": 0, "problem": "The kernel wouldn't say" });
+    write_metric(&mut store, "a", 2000, "time_sync", problem.clone());
+
+    assert_eq!(latest_output(&store, "a", "time_sync"), Some(problem));
+
+    // Texts alone aren't a reading, which is why every collector's has a number.
+    write_metric(&mut store, "b", 1000, "time_sync", json!({ "problem": "Unread" }));
+    assert_eq!(latest_output(&store, "b", "time_sync"), None);
+}
+
+#[test]
 fn the_latest_output_is_only_ever_this_agents_and_recent() {
     let mut store = in_memory();
     let custom = |name| json!([{ "name": name, "ok": 1, "value": 1.5 }]);

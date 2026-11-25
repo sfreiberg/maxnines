@@ -94,10 +94,12 @@ impl Found {
     }
 
     /// Its row. The texts are always there, even when empty, as the server keeps a
-    /// row's newest text until it's replaced.
+    /// row's newest text until it's replaced. So is a number, `asked`, as the server
+    /// keeps only the numbers of a collector's newest reading that has any.
     fn to_value(&self) -> Value {
         let mut row = Map::new();
         row.insert("manager".into(), json!(self.manager));
+        row.insert("asked".into(), json!(u8::from(self.problem.is_none())));
         let numbers = [
             ("pending", self.pending),
             ("security", self.security),
@@ -1102,13 +1104,11 @@ Software Update found the following new or updated software:
         };
         assert_eq!(
             found.to_value(),
-            json!({ "manager": "apt", "pending": 3, "security": 1, "reboot_required": 0, "problem": "", "note": "" })
+            json!({ "manager": "apt", "asked": 1, "pending": 3, "security": 1, "reboot_required": 0, "problem": "", "note": "" })
         );
-        let problem = Found::problem("pacman", "checkupdates isn't installed");
-        assert_eq!(
-            problem.to_value()["problem"],
-            "checkupdates isn't installed"
-        );
+        let problem = Found::problem("pacman", "checkupdates isn't installed").to_value();
+        assert_eq!(problem["problem"], "checkupdates isn't installed");
+        assert_eq!(problem["asked"], 0);
     }
 
     #[cfg(target_os = "linux")]

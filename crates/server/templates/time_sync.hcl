@@ -26,10 +26,10 @@ template "time_sync" {
   # hours without a correction: the service has stopped or can't reach its time
   # sources. A clock first synced after a long time unsynced can start with an
   # error of a minute or more, which its next corrections bring down, hence the
-  # half hour.
+  # half hour. A clock that's not synced at all is Time not synced's alone.
   alert "time_sync_stopped" {
     name    = "Time sync stopped"
-    warning = "time_sync.max_error > duration('5s')"
+    warning = "time_sync.synced >= 1 && time_sync.max_error > duration('5s')"
     for     = "30m"
     summary = "{{ hostname }}'s time service hasn't corrected its clock for hours, so it could be {{ time_sync.max_error }} out"
   }

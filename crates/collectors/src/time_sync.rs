@@ -10,6 +10,12 @@
 //! it shows as that error growing. Linux marks the clock unsynced once the error
 //! passes 16 seconds.
 //!
+//! On Linux, chrony leaves the clock marked unsynced even while it keeps it in sync,
+//! unless its `rtcsync` setting is on, as Linux then copies the time to the hardware
+//! clock every 11 minutes, which chrony may be set to do itself. It gives the error
+//! as it is either way, and 16 seconds while it isn't in sync, so on Linux a clock
+//! with an error under 16 seconds is synced.
+//!
 //! On Windows it's the Windows Time service's performance counters, which Windows
 //! has published since Windows 10 1607 and Server 2016: how many time sources it's
 //! using, and how far the clock is from them.
@@ -34,8 +40,11 @@ pub struct Reading {
 }
 
 impl Reading {
+    /// Its row, which always has a number, `known`, as the server keeps only the
+    /// numbers of a collector's newest reading that has any, with the texts beside.
     pub fn to_value(&self) -> Value {
         let mut row = Map::new();
+        row.insert("known".into(), json!(u8::from(self.synced.is_some())));
         if let Some(synced) = self.synced {
             row.insert("synced".into(), json!(u8::from(synced)));
         }
@@ -62,14 +71,29 @@ impl Reading {
 #[cfg_attr(not(unix), allow(dead_code))]
 const STA_UNSYNC: i32 = 0x0040;
 
-/// What a kernel's clock status and maximum error, in microseconds as every kernel
-/// keeps it, say.
+/// The largest error Linux keeps, which it gives a clock no time service has synced,
+/// as chrony does one it hasn't.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LINUX_UNSYNCED_MICROS: i64 = 16_000_000;
+
+/// What a FreeBSD or macOS kernel's clock status and maximum error, in microseconds
+/// as every kernel keeps it, say.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn from_kernel(status: i32, max_error_micros: i64) -> Reading {
     Reading {
         synced: Some(status & STA_UNSYNC == 0),
         max_error_secs: Some(max_error_micros as f64 / 1_000_000.0),
         ..Reading::default()
+    }
+}
+
+/// What Linux's say, where chrony leaves the clock marked unsynced unless `rtcsync`
+/// is on, though its error says it's synced.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn from_linux(status: i32, max_error_micros: i64) -> Reading {
+    Reading {
+        synced: Some(status & STA_UNSYNC == 0 || max_error_micros < LINUX_UNSYNCED_MICROS),
+        ..from_kernel(status, max_error_micros)
     }
 }
 
@@ -84,9 +108,16 @@ enum Service {
     /// Stopped, and started only when Windows needs it, as it is on many hosts that
     /// aren't in a domain.
     Idle,
+    /// Stopped, with how it starts unreadable.
+    Stopped,
     /// Not on this host, or not readable.
     Missing,
 }
+
+#[cfg_attr(not(windows), allow(dead_code))]
+const UNREADABLE: &str = "The Windows Time service is running, but its counters couldn't be read";
+#[cfg_attr(not(windows), allow(dead_code))]
+const MISSING: &str = "The Windows Time service couldn't be found";
 
 /// What the Windows Time service's state and counters say: how many time sources
 /// it's using, and how far the clock is from them, which Windows counts in
@@ -108,9 +139,7 @@ fn from_windows(service: Service, sources: Option<f64>, offset_micros: Option<f6
             }
         }
         (Service::Running, None) => Reading {
-            problem: problem(
-                "The Windows Time service is running, but its counters couldn't be read",
-            ),
+            problem: problem(UNREADABLE),
             ..Reading::default()
         },
         (Service::Off, _) => Reading {
@@ -124,9 +153,15 @@ fn from_windows(service: Service, sources: Option<f64>, offset_micros: Option<f6
             ),
             ..Reading::default()
         },
+        (Service::Stopped, _) => Reading {
+            problem: problem(
+                "The Windows Time service isn't running, and how it starts couldn't be read, so whether the clock is synced isn't known",
+            ),
+            ..Reading::default()
+        },
         (Service::Missing, _) => Reading {
             synced: Some(false),
-            problem: problem("The Windows Time service couldn't be found"),
+            problem: problem(MISSING),
             ..Reading::default()
         },
     }
@@ -175,7 +210,7 @@ impl Collector for TimeSyncCollector {
 
 #[cfg(unix)]
 mod kernel {
-    use super::{Reading, from_kernel};
+    use super::Reading;
 
     /// Asks the kernel with nothing set, which any user may do.
     pub fn read() -> Reading {
@@ -196,8 +231,12 @@ mod kernel {
                 ..Reading::default()
             };
         }
+        #[cfg(target_os = "linux")]
+        let read = super::from_linux;
+        #[cfg(not(target_os = "linux"))]
+        let read = super::from_kernel;
         // A c_long, which is 32 bits on some systems.
-        from_kernel(timex.status, timex.maxerror as i64)
+        read(timex.status, timex.maxerror as i64)
     }
 }
 
@@ -227,10 +266,15 @@ mod windows {
         pub fn read(&mut self) -> Reading {
             let service = match crate::failed_services::windows::service("W32Time") {
                 Some((SERVICE_RUNNING, _)) => Service::Running,
-                Some((_, SERVICE_AUTO_START | SERVICE_DISABLED)) => Service::Off,
-                Some(_) => Service::Idle,
+                Some((_, Some(SERVICE_AUTO_START | SERVICE_DISABLED))) => Service::Off,
+                Some((_, Some(_))) => Service::Idle,
+                Some((_, None)) => Service::Stopped,
                 None => Service::Missing,
             };
+            // The counters are only there while it runs.
+            if service != Service::Running {
+                return from_windows(service, None, None);
+            }
             let readings = self.counters.read();
             let value = |path: &str| {
                 readings.iter().find(|(read, _)| read == path).and_then(
@@ -283,7 +327,8 @@ mod tests {
 
     const WINDOWS: [&str; 2] = ["windows-10.0.20348", "windows-10.0.26100"];
 
-    /// What the kernel said in one capture, as read.c prints it.
+    /// What the kernel said in one capture, as read.c prints it, read as the agent
+    /// reads it there.
     fn kernel(system: &str, name: &str) -> Reading {
         let path = fixtures().join(system).join(format!("{name}.txt"));
         let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("{path:?}"));
@@ -293,7 +338,12 @@ mod tests {
                 .unwrap_or_else(|| panic!("{key} in {path:?}"))
         };
         let status = i32::from_str_radix(field("status").trim_start_matches("0x"), 16).unwrap();
-        from_kernel(status, field("maxerror").parse().unwrap())
+        let max_error_micros = field("maxerror").parse().unwrap();
+        if system.starts_with("ubuntu") {
+            from_linux(status, max_error_micros)
+        } else {
+            from_kernel(status, max_error_micros)
+        }
     }
 
     /// The clock's largest possible error, which every capture has.
@@ -310,6 +360,18 @@ mod tests {
                 assert!(error(&reading) < 0.01, "{system} {name}: {reading:?}");
             }
         }
+    }
+
+    #[test]
+    fn linux_is_synced_by_chrony_without_rtcsync_which_leaves_it_marked_unsynced() {
+        // chrony in sync, with its error, and without: Linux's own start, too.
+        assert_eq!(from_linux(0x2041, 2_500).synced, Some(true));
+        assert_eq!(from_linux(0x2041, 16_000_000).synced, Some(false));
+        assert_eq!(from_linux(0x0040, 16_000_000).synced, Some(false));
+        // Past 16 seconds, Linux marks it unsynced itself.
+        assert_eq!(from_linux(0x2041, 16_000_500).synced, Some(false));
+        // Elsewhere, the kernel's word stands.
+        assert_eq!(from_kernel(0x2041, 2_500).synced, Some(false));
     }
 
     #[test]
@@ -397,6 +459,9 @@ mod tests {
             from_windows(Service::Missing, None, None).synced,
             Some(false)
         );
+        let stopped = from_windows(Service::Stopped, None, None);
+        assert_eq!(stopped.synced, None);
+        assert!(stopped.problem.unwrap().contains("isn't known"));
     }
 
     #[test]
@@ -407,14 +472,17 @@ mod tests {
     }
 
     #[test]
-    fn what_is_sent_leaves_out_what_isnt_known() {
+    fn what_is_sent_leaves_out_what_isnt_known_but_always_has_a_number() {
         let kernel = from_kernel(0x2001, 48_677).to_value();
         assert_eq!(
             kernel,
-            json!({ "synced": 1, "max_error_secs": 0.048677, "problem": "" })
+            json!({ "known": 1, "synced": 1, "max_error_secs": 0.048677, "problem": "" })
         );
         let idle = from_windows(Service::Idle, None, None).to_value();
-        assert_eq!(idle.as_object().unwrap().len(), 1, "{idle}");
+        assert_eq!(idle["known"], 0);
+        assert_eq!(idle.as_object().unwrap().len(), 2, "{idle}");
+        let off = from_windows(Service::Off, None, None).to_value();
+        assert_eq!((&off["known"], &off["synced"]), (&json!(1), &json!(0)));
     }
 
     #[test]
@@ -426,7 +494,10 @@ mod tests {
             assert!(reading.synced.is_some());
             assert!(reading.max_error_secs.unwrap() >= 0.0);
         }
+        // Every Windows has the service, and while it runs its counters can be read.
         #[cfg(windows)]
-        assert!(reading.synced.is_some() || reading.problem.is_some());
+        for problem in [MISSING, UNREADABLE] {
+            assert_ne!(reading.problem.as_deref(), Some(problem));
+        }
     }
 }

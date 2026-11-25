@@ -196,16 +196,8 @@ impl Updates {
         if !output.is_object() {
             return None;
         }
-        // The store keeps each number's newest value, so after a problem the
-        // numbers it last read are still there, and aren't what's true now.
-        let problem = text(output, "problem");
-        let fresh = problem.is_none();
-        let count = |name: &str| {
-            output[name]
-                .as_f64()
-                .filter(|_| fresh)
-                .map(|count| count as u64)
-        };
+        // The numbers are all from the newest reading, which always has one.
+        let count = |name: &str| output[name].as_f64().map(|count| count as u64);
         Some(Self {
             manager: text(output, "manager"),
             pending: count("pending"),
@@ -213,10 +205,9 @@ impl Updates {
             vulnerable: count("vulnerable"),
             reboot_required: output["reboot_required"]
                 .as_f64()
-                .filter(|_| fresh)
                 .map(|reboot| reboot >= 1.0),
             lists_age_secs: count("lists_age_secs"),
-            problem,
+            problem: text(output, "problem"),
             note: text(output, "note"),
         })
     }
@@ -249,28 +240,14 @@ impl TimeSync {
         if !output.is_object() {
             return None;
         }
-        // The store keeps each number's newest value, so after a problem the
-        // numbers it last read are still there, and aren't what's true now. A
-        // reading with a problem only ever says the clock isn't synced, never that
-        // it is, so a synced that says so is from before.
-        let problem = text(output, "problem");
-        let fresh = problem.is_none();
-        let synced = output["synced"]
-            .as_f64()
-            .map(|synced| synced >= 1.0)
-            .filter(|synced| fresh || !synced);
-        let number = |name: &str| {
-            output[name]
-                .as_f64()
-                .filter(|value| fresh && value.is_finite())
-        };
+        // The numbers are all from the newest reading, which always has one.
+        let number = |name: &str| output[name].as_f64().filter(|value| value.is_finite());
         Some(Self {
-            synced,
+            synced: number("synced").map(|synced| synced >= 1.0),
             max_error_secs: number("max_error_secs"),
-            // Only said while there's a source to be offset from.
-            offset_secs: number("offset_secs").filter(|_| synced == Some(true)),
+            offset_secs: number("offset_secs"),
             sources: number("sources").map(|sources| sources as u64),
-            problem,
+            problem: text(output, "problem"),
         })
     }
 
@@ -423,38 +400,18 @@ mod tests {
     }
 
     #[test]
-    fn a_problem_reading_time_sync_keeps_only_what_it_said_now() {
-        // The service stopped: the store still holds what was read while it ran.
-        let stopped = TimeSync::of(&json!({
-            "synced": 0, "sources": 1, "offset_secs": 0.000134,
-            "problem": "The Windows Time service isn't running"
-        }))
-        .unwrap();
-        assert_eq!(stopped.synced, Some(false));
-        assert_eq!((stopped.sources, stopped.offset_secs), (None, None));
-        // Idle says nothing of whether it's synced, so a synced from before goes.
+    fn a_problem_reading_says_what_it_knows() {
         let idle = TimeSync::of(&json!({
-            "synced": 1, "sources": 1, "problem": "The Windows Time service isn't running now"
+            "known": 0, "problem": "The Windows Time service isn't running now"
         }))
         .unwrap();
-        assert_eq!(idle.synced, None);
-        // With no source, an offset from before isn't what's true now.
-        let lost =
-            TimeSync::of(&json!({ "synced": 0, "sources": 0, "offset_secs": 0.1, "problem": "" }))
-                .unwrap();
-        assert_eq!((lost.synced, lost.offset_secs), (Some(false), None));
-    }
-
-    #[test]
-    fn a_problem_reading_updates_leaves_none_of_the_numbers_it_last_read() {
-        let output = json!({
-            "manager": "pacman", "pending": 12, "security": 3, "reboot_required": 1,
-            "lists_age_secs": 7200, "problem": "checkupdates isn't installed", "note": "",
-        });
-        let updates = Updates::of(&output).unwrap();
-        assert_eq!(updates.pending, None);
-        assert_eq!(updates.reboot_required, None);
-        assert_eq!(updates.lists_age_secs, None);
+        assert_eq!((idle.synced, idle.sources), (None, None));
+        assert!(idle.problem.is_some());
+        let updates = Updates::of(&json!({
+            "manager": "pacman", "asked": 0, "problem": "checkupdates isn't installed", "note": "",
+        }))
+        .unwrap();
+        assert_eq!((updates.pending, updates.reboot_required), (None, None));
         assert_eq!(updates.manager.as_deref(), Some("pacman"));
         assert_eq!(updates.note, None);
     }

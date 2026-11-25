@@ -35,6 +35,12 @@ sources. A service that stops leaves the clock marked synced, so the growing err
 what shows it. Linux marks the clock unsynced itself once the error passes 16 seconds,
 about 9 hours without a correction.
 
+On Linux, chrony only marks the clock synced when its `rtcsync` setting is on, as it
+is in Ubuntu's `chrony.conf`, among others. Without it, chrony
+still keeps the clock in sync and gives the kernel its error, and gives 16 seconds
+when it isn't in sync, so on Linux a clock with an error under 16 seconds counts as
+synced either way.
+
 A Mac with **Set time and date automatically** turned off in System Settings has its
 clock unsynced. Between corrections, macOS's kernel was seen to stop growing the error
 for minutes at a time, so on a Mac it can be slower to say a time service has stopped.
@@ -57,6 +63,8 @@ how the service starts:
 - **Started only when it's needed:** as on many hosts that aren't in a domain, Windows
   starts it to sync and lets it stop again, so not running isn't a problem. Whether
   the clock is synced isn't known until it runs, and the host's page says so.
+- **How it starts can't be read:** whether the clock is synced isn't known either, and
+  the host's page says so.
 
 ## What's reported
 
@@ -74,15 +82,16 @@ The built-in **Time sync** template brings these, for each host:
 | Alert | When | Severity |
 | --- | --- | --- |
 | **Time not synced** | No time service has had the clock in sync for 30 minutes | Warning |
-| **Time sync stopped** | The clock's largest possible error has been over 5 seconds for 30 minutes | Warning |
+| **Time sync stopped** | A synced clock's largest possible error has been over 5 seconds for 30 minutes | Warning |
 
 A time service syncs within a minute or two of starting, though ntpd can take a quarter
 of an hour before it tells the kernel so, hence the half hour. 5 seconds of error is
 nearly 3 hours without a correction, which no time service leaves a working clock
 for. A clock first synced after a long time without can start with an error of a
 minute or more, which the service's next corrections bring down, so **Time sync
-stopped** waits half an hour too. It never fires on Windows, which doesn't publish the
-error.
+stopped** waits half an hour too. A clock that isn't synced at all is only **Time not
+synced**, as its error says nothing more. **Time sync stopped** never fires on Windows,
+which doesn't publish the error.
 
 Both only warn: a clock without a time service drifts slowly, and **Clock is wrong**
 says when it has actually drifted.

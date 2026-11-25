@@ -289,7 +289,7 @@ async fn get_host_says_which_drives_pass_and_which_services_failed() {
         ),
         (
             "updates".to_string(),
-            json!({ "manager": "apt", "pending": 4, "security": 1, "reboot_required": 0,
+            json!({ "manager": "apt", "asked": 1, "pending": 4, "security": 1, "reboot_required": 0,
                     "lists_age_secs": 600, "problem": "", "note": "" }),
         ),
         (

@@ -815,7 +815,8 @@ fn format_age(value: f64, decimals: usize) -> String {
         age if age >= 86_400.0 => (86_400.0, "d"),
         age if age >= 3600.0 => (3600.0, "h"),
         age if age >= 60.0 => (60.0, "m"),
-        // A clock a few milliseconds out isn't 0 seconds out.
+        // A clock a few milliseconds or microseconds out isn't 0 seconds out.
+        age if age > 0.0 && age < 0.001 => (0.000_001, "µs"),
         age if age > 0.0 && age < 1.0 => (0.001, "ms"),
         _ => (1.0, "s"),
     };
@@ -1489,6 +1490,9 @@ mod tests {
             (Unit::Seconds, 7200.0, "2 h"),
             (Unit::Seconds, 172_800.0, "2 d"),
             (Unit::Seconds, 0.01234, "12.3 ms"),
+            (Unit::Seconds, 0.000_039, "39 µs"),
+            (Unit::Seconds, -0.000_134_8, "-134.8 µs"),
+            (Unit::Seconds, 0.001, "1 ms"),
             (Unit::Celsius, 54.5, "54.5°C"),
         ] {
             assert_eq!(format_value(unit, value), text);

@@ -128,9 +128,10 @@ pub(crate) mod windows {
         start_type(&Handle(service)) == Some(SERVICE_AUTO_START)
     }
 
-    /// A service's state, such as `SERVICE_RUNNING`, and how it starts, or None
-    /// where there's no such service or it can't be read.
-    pub(crate) fn service(name: &str) -> Option<(u32, u32)> {
+    /// A service's state, such as `SERVICE_RUNNING`, and how it starts where that
+    /// could be read, or None where there's no such service or its state can't be
+    /// read.
+    pub(crate) fn service(name: &str) -> Option<(u32, Option<u32>)> {
         // SAFETY: no names means this host's own service database.
         let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
         if manager.is_null() {
@@ -151,7 +152,7 @@ pub(crate) mod windows {
         if unsafe { QueryServiceStatus(service.0, &mut status) } == 0 {
             return None;
         }
-        Some((status.dwCurrentState, start_type(&service)?))
+        Some((status.dwCurrentState, start_type(&service)))
     }
 
     pub fn failed() -> Option<Failed> {

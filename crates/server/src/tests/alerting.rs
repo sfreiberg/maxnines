@@ -1463,6 +1463,55 @@ async fn a_failing_container_alerts_after_a_minute() {
 }
 
 #[tokio::test]
+async fn a_clock_not_synced_is_only_not_synced_and_a_synced_one_left_to_drift_has_stopped() {
+    let mut test = Harness::start().await;
+    for name in ["Time not synced", "Time sync stopped"] {
+        let rule = built_in(name).await;
+        check_rule(&rule).unwrap();
+        test.database().create_alert_rule(&rule).await.unwrap();
+    }
+    let rules = |open: &[crate::alerting::Alert]| {
+        let mut names: Vec<String> = open.iter().map(|alert| alert.rule_name.clone()).collect();
+        names.sort();
+        names
+    };
+    let clock = |synced: f64, max_error: f64| {
+        [
+            ("time_sync.synced", [("Synced", synced)]),
+            ("time_sync.max_error", [("Largest error", max_error)]),
+        ]
+    };
+
+    // Never synced, with Linux's 16 seconds: not synced, and nothing more.
+    for minute in [0, 35] {
+        let [synced, error] = clock(0.0, 16.0);
+        let open = readings_at(
+            &mut test,
+            minute,
+            &[(synced.0, &synced.1), (error.0, &error.1)],
+        )
+        .await;
+        if minute == 35 {
+            assert_eq!(rules(&open), ["Time not synced"]);
+        }
+    }
+
+    // Synced, then left to drift.
+    for minute in [40, 75] {
+        let [synced, error] = clock(1.0, 8.0);
+        let open = readings_at(
+            &mut test,
+            minute,
+            &[(synced.0, &synced.1), (error.0, &error.1)],
+        )
+        .await;
+        if minute == 75 {
+            assert_eq!(rules(&open), ["Time sync stopped"]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn a_drive_failing_its_own_assessment_is_critical_after_a_minute() {
     let mut test = Harness::start().await;
     let rule = built_in("Drive failing").await;

@@ -4901,7 +4901,7 @@ async fn a_hosts_updates_are_metrics_and_its_page_says_what_is_waiting() {
     let mut client = server.connect_approved(&host, "web-1").await;
     let id = host.id();
     let row = json!({
-        "manager": "apt", "pending": 12, "security": 3, "reboot_required": 1,
+        "manager": "apt", "asked": 1, "pending": 12, "security": 3, "reboot_required": 1,
         "lists_age_secs": 7200, "problem": "", "note": ""
     });
     let message = AgentMessage::Sample(Sample {
@@ -4954,6 +4954,7 @@ async fn a_hosts_updates_are_metrics_and_its_page_says_what_is_waiting() {
     // checkupdates missing leaves nothing but what to do about it.
     let row = json!({
         "manager": "pacman",
+        "asked": 0,
         "problem": "checkupdates isn't installed. Install it with: pacman -S pacman-contrib",
         "note": ""
     });

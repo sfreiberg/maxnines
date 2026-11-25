@@ -572,42 +572,31 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
     let flat: FlatFacts = current.into_iter().map(|f| (f.name, f.value)).collect();
     let mut facts = Vec::new();
     fact_rows("", &unflatten(&flat), &mut facts);
-    let own = match state.metrics.latest_output(&id, "agent", now).await {
-        Ok(output) => output,
+    // Each is its own read of the metrics store, so they're asked at once.
+    let readings = tokio::try_join!(
+        state.metrics.latest_output(&id, "agent", now),
+        Drives::load(&state.metrics, &id, now),
+        Arrays::load(&state.metrics, &id, now),
+        Updates::load(&state.metrics, &id, now),
+        TimeSync::load(&state.metrics, &id, now),
+        FailedServices::load(&state.metrics, &id, now),
+        state.metrics.latest_output(&id, "host", now),
+    );
+    let (own, drives, arrays, updates, time_sync, failed_services, host_output) = match readings {
+        Ok(readings) => readings,
         Err(error) => return server_error(&error),
     };
     let own_memory = own
         .as_ref()
         .and_then(|agent| agent["memory_bytes"].as_f64());
     let own_uptime = own.as_ref().and_then(uptime_of);
-    let drives = match Drives::load(&state.metrics, &id, now).await {
-        Ok(drives) => drives,
-        Err(error) => return server_error(&error),
-    };
     let drives_problem = drives.problem.clone();
     let drives: Vec<DriveRow> = drives.drives.iter().map(DriveRow::of).collect();
-    let arrays = match Arrays::load(&state.metrics, &id, now).await {
-        Ok(arrays) => arrays,
-        Err(error) => return server_error(&error),
-    };
     let arrays_problems = arrays.problems.clone();
     let arrays: Vec<ArrayRow> = arrays.arrays.iter().map(ArrayRow::of).collect();
-    let updates = match Updates::load(&state.metrics, &id, now).await {
-        Ok(updates) => updates.map(UpdatesCard::of),
-        Err(error) => return server_error(&error),
-    };
-    let time_sync = match TimeSync::load(&state.metrics, &id, now).await {
-        Ok(time_sync) => time_sync.map(TimeSyncCard::of),
-        Err(error) => return server_error(&error),
-    };
-    let failed_services = match FailedServices::load(&state.metrics, &id, now).await {
-        Ok(failed) => failed,
-        Err(error) => return server_error(&error),
-    };
-    let uptime = match state.metrics.latest_output(&id, "host", now).await {
-        Ok(output) => output.as_ref().and_then(uptime_of),
-        Err(error) => return server_error(&error),
-    };
+    let updates = updates.map(UpdatesCard::of);
+    let time_sync = time_sync.map(TimeSyncCard::of);
+    let uptime = host_output.as_ref().and_then(uptime_of);
     let locator = match Locator::load(&state.database).await {
         Ok(locator) => locator,
         Err(error) => return server_error(&error),
