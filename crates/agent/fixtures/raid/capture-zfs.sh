@@ -2,7 +2,7 @@
 # Builds ZFS pools on files and keeps what `zpool list` and `zpool status`, which
 # the agent's raid collector reads, say at each step: no pools, healthy mirror and
 # raidz pools with a log, cache and spare, a scrub running, paused and finished,
-# a device offline, faulted and gone, a resilver running and finished, a scrub
+# a device offline, faulted and missing, a resilver running and finished, a scrub
 # that repaired damage and one that found damage it couldn't, and a pool nearly
 # full. The capture-raid-outputs workflow runs it as root on Ubuntu and in
 # FreeBSD virtual machines, by hand only. Each step is kept under
@@ -62,6 +62,25 @@ until_seen() {
   done
 }
 
+# slow <pool> <file>...: holds up each read and write of these devices for 20
+# milliseconds, where zinject is installed, so a scan runs long enough to see.
+slow() {
+  pool=$1
+  shift
+  if command -v zinject >/dev/null; then
+    for file in "$@"; do
+      zinject -D 20:1 -d "$work/$file" "$pool" >/dev/null
+    done
+  else
+    echo "zinject isn't installed, so scans run at full speed"
+  fi
+}
+fast() {
+  if command -v zinject >/dev/null; then
+    zinject -c all >/dev/null
+  fi
+}
+
 # fill <file> <MiB>: data that won't compress.
 fill() {
   dd if="$random" of="$1" bs=1048576 count="$2" 2>/dev/null
@@ -85,15 +104,19 @@ snap healthy
 as_user "LC_ALL=C $LIST" >"$out/healthy-user.list" 2>&1
 as_user "LC_ALL=C $STATUS" >"$out/healthy-user.status" 2>&1
 
-# Scrubs: running, paused, and finished with nothing found.
+# Scrubs: running, paused, and finished with nothing found. Pools this small
+# scrub in a second, so each read and write is held up while one is caught.
+slow tank m1 m2
 zpool scrub tank
 until_seen "scrub in progress" tank && snap scrubbing
 zpool scrub -p tank 2>/dev/null && snap scrub-paused
 zpool scrub tank
+until_seen "scrub in progress" tank
+fast
 zpool wait -t scrub tank
 snap scrubbed
 
-# Devices out of service: one taken offline, one faulted, one whose file is gone.
+# Devices out of service: one taken offline, and one faulted.
 zpool offline vault "$work/r2"
 snap offline
 zpool online vault "$work/r2"
@@ -103,9 +126,11 @@ snap faulted
 
 # Written to while one side was out, it has something to resilver when it's back.
 fill /tank/more 300
+slow tank m1 m2
 zpool online tank "$work/m2"
 zpool clear tank
 until_seen "resilver in progress" tank && snap resilvering
+fast
 zpool wait -t resilver tank
 snap resilvered
 
@@ -115,22 +140,21 @@ zpool scrub tank
 zpool wait -t scrub tank
 snap scrub-repaired
 
-# A pool with nowhere else to read from loses what's damaged.
+# A pool with nowhere else to read from loses what's damaged. A scrub reads the
+# disk, not what's cached.
 zpool create -f single "$work/s1"
 fill /single/data 600
-zpool export single
-dd if="$random" of="$work/s1" bs=1048576 seek=64 count=512 conv=notrunc 2>/dev/null
-zpool import -d "$work" single
+dd if="$random" of="$work/s1" bs=1048576 seek=300 count=64 conv=notrunc 2>/dev/null
 zpool scrub single
 zpool wait -t scrub single
 snap data-errors
 as_user "LC_ALL=C $STATUS" >"$out/data-errors-user.status" 2>&1
 zpool destroy -f single
 
+# A device gone while the pool was exported, as a disk missing at boot.
+zpool export vault
 rm -f "$work/r3"
-zpool reopen vault 2>/dev/null
-zpool scrub vault 2>/dev/null
-zpool wait -t scrub vault 2>/dev/null
+zpool import -d "$work" vault
 snap missing
 
 # Nearly full, then as full as it gets.

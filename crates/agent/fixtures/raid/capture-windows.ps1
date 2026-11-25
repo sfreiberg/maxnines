@@ -1,7 +1,8 @@
 # Builds a Storage Spaces pool on virtual hard disks and keeps what the agent's
-# raid collector reads at each step, by running its own script, crates/agent/src/raid.ps1:
-# no pools, healthy mirror, parity and simple virtual disks, one disk gone, and a
-# repair once it's back. What Windows' own commands say in full is kept beside it.
+# raid collector reads at each step, by running its own script,
+# crates/agent/src/raid.ps1: no pools, healthy mirror, parity and simple virtual
+# disks, one disk gone, a repair once it's back, and a disk retired and repaired
+# away from. What Windows' own commands say in full is kept beside it.
 # The capture-raid-outputs workflow runs it as an administrator on a Windows
 # runner, in Windows PowerShell as the agent does, by hand only. Each step is kept
 # under out/<system>/storage-spaces/.
@@ -41,7 +42,7 @@ function Invoke-DiskPart($lines) {
 
 Snap 'empty'
 
-$vhds = 1..3 | ForEach-Object { Join-Path $work "disk$_.vhdx" }
+$vhds = 1..4 | ForEach-Object { Join-Path $work "disk$_.vhdx" }
 foreach ($vhd in $vhds) {
     Invoke-DiskPart @("create vdisk file=`"$vhd`" maximum=8192 type=expandable", "select vdisk file=`"$vhd`"", 'attach vdisk')
 }
@@ -54,36 +55,47 @@ Get-Content (Join-Path $out 'poolable.txt')
 $subsystem = Get-StorageSubSystem | Where-Object { $_.FriendlyName -like 'Windows Storage*' } | Select-Object -First 1
 New-StoragePool -FriendlyName 'Pool1' -StorageSubSystemUniqueId $subsystem.UniqueId -PhysicalDisks $poolable | Out-Null
 New-VirtualDisk -StoragePoolFriendlyName 'Pool1' -FriendlyName 'Mirror1' -ResiliencySettingName Mirror -NumberOfDataCopies 2 -Size 2GB -ProvisioningType Fixed | Out-Null
-New-VirtualDisk -StoragePoolFriendlyName 'Pool1' -FriendlyName 'Parity1' -ResiliencySettingName Parity -Size 2GB -ProvisioningType Fixed | Out-Null
-New-VirtualDisk -StoragePoolFriendlyName 'Pool1' -FriendlyName 'Simple1' -ResiliencySettingName Simple -Size 1GB -ProvisioningType Fixed | Out-Null
+New-VirtualDisk -StoragePoolFriendlyName 'Pool1' -FriendlyName 'Parity1' -ResiliencySettingName Parity -NumberOfColumns 3 -Size 2GB -ProvisioningType Fixed | Out-Null
+New-VirtualDisk -StoragePoolFriendlyName 'Pool1' -FriendlyName 'Simple1' -ResiliencySettingName Simple -NumberOfColumns 4 -Size 1GB -ProvisioningType Fixed | Out-Null
 Start-Sleep -Seconds 5
 Snap 'healthy'
 
-# One disk goes away.
-Invoke-DiskPart @("select vdisk file=`"$($vhds[2])`"", 'detach vdisk')
+# Wait-Repair: catches a repair running, if one does, then waits for them all.
+function Wait-Repair($step) {
+    foreach ($try in 1..300) {
+        if (@(Get-StorageJob | Where-Object { [string]$_.JobState -eq 'Running' }).Count -gt 0) {
+            Snap $step
+            break
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    foreach ($try in 1..300) {
+        if (@(Get-StorageJob | Where-Object { [string]$_.JobState -eq 'Running' }).Count -eq 0) { break }
+        Start-Sleep -Seconds 1
+    }
+}
+
+# One disk goes away, as if pulled.
+Dismount-DiskImage -ImagePath $vhds[3] | Out-Null
 Start-Sleep -Seconds 15
 Snap 'disk-gone'
 
 # It comes back and the virtual disks are repaired.
-Invoke-DiskPart @("select vdisk file=`"$($vhds[2])`"", 'attach vdisk')
+Mount-DiskImage -ImagePath $vhds[3] -NoDriveLetter | Out-Null
 Start-Sleep -Seconds 10
 Snap 'disk-back'
 Get-VirtualDisk | Where-Object { $_.FriendlyName -ne 'Simple1' } | Repair-VirtualDisk -AsJob | Out-Null
-$seen = $false
-foreach ($try in 1..300) {
-    $running = @(Get-StorageJob | Where-Object { [string]$_.JobState -eq 'Running' })
-    if ($running.Count -gt 0) {
-        Snap 'repairing'
-        $seen = $true
-        break
-    }
-    Start-Sleep -Milliseconds 200
-}
-if (-not $seen) { Write-Output 'never saw a repair running' }
-foreach ($try in 1..300) {
-    if (@(Get-StorageJob | Where-Object { [string]$_.JobState -eq 'Running' }).Count -eq 0) { break }
-    Start-Sleep -Seconds 1
-}
+Wait-Repair 'repairing'
 Start-Sleep -Seconds 5
 Snap 'repaired'
+
+# A disk retired, as before replacing it, which the mirror is repaired away from.
+$retired = Get-PhysicalDisk | Where-Object { [string]$_.BusType -eq 'File Backed Virtual' } | Select-Object -First 1
+$retired | Set-PhysicalDisk -Usage Retired
+Start-Sleep -Seconds 5
+Snap 'retired'
+Get-VirtualDisk -FriendlyName 'Mirror1' | Repair-VirtualDisk -AsJob | Out-Null
+Wait-Repair 'retired-repairing'
+Start-Sleep -Seconds 5
+Snap 'retired-repaired'
 exit 0

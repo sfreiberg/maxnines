@@ -30,6 +30,8 @@ jobs:
       - run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mdadm zfsutils-linux >/dev/null
+          # zinject, which slows a scan down enough to be seen, where it's packaged.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zfs-test >/dev/null || true
       - run: sudo sh crates/agent/fixtures/raid/capture-md.sh
       - run: sudo sh crates/agent/fixtures/raid/capture-zfs.sh
       - uses: actions/upload-artifact@v7
