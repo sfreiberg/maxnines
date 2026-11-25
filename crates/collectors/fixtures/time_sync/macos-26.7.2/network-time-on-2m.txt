@@ -1,0 +1,5 @@
+state=0
+status=0x2081
+maxerror=82503471
+esterror=500000
+offset=1

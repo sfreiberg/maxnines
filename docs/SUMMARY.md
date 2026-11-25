@@ -11,6 +11,7 @@
   - [Windows performance counters](collectors-windows-counters.md)
   - [Drives](collectors-smart.md)
   - [RAID and ZFS](collectors-raid.md)
+  - [Time sync](collectors-time-sync.md)
   - [Updates](collectors-updates.md)
   - [Apache](collectors-apache.md)
   - [nginx](collectors-nginx.md)

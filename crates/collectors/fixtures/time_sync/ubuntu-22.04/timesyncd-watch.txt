@@ -1,0 +1,10 @@
+05:11:45 state=0 status=0x2001 maxerror=1000 esterror=0 offset=-3445381 
+05:12:15 state=0 status=0x2001 maxerror=15000 esterror=0 offset=-160549 
+05:12:45 state=0 status=0x2001 maxerror=30000 esterror=0 offset=-23160 
+05:13:15 state=0 status=0x2001 maxerror=13000 esterror=0 offset=82712 
+05:13:45 state=0 status=0x2001 maxerror=28000 esterror=0 offset=31909 
+05:14:15 state=0 status=0x2001 maxerror=43000 esterror=0 offset=12310 
+05:14:45 state=0 status=0x2001 maxerror=58000 esterror=0 offset=4749 
+05:15:15 state=0 status=0x2001 maxerror=9000 esterror=0 offset=-118874 
+05:15:45 state=0 status=0x2001 maxerror=24000 esterror=0 offset=-74114 
+05:16:15 state=0 status=0x2001 maxerror=39000 esterror=0 offset=-46208 

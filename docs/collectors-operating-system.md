@@ -350,6 +350,10 @@ has to be right.
 | --- | --- |
 | **Clock is wrong** | Over 5 seconds out for a minute, then critical over 30 |
 
+Whether a time service is keeping each clock in sync, as the host itself says, is read
+by the [Time sync](collectors-time-sync.md) collector, which warns of one that has
+stopped before its clock drifts this far.
+
 ## Uptime and the agent
 
 The `host` collector, on by default, reports how long the host has been up. Every

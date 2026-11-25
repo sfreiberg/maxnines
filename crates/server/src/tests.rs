@@ -1736,11 +1736,12 @@ async fn an_approved_agent_is_sent_the_default_config() {
 
     assert_eq!(version, config.version().unwrap());
     assert_eq!(config.interval, Duration::from_secs(15));
-    assert_eq!(config.collectors.len(), 9);
+    assert_eq!(config.collectors.len(), 10);
     assert!(config.collectors["system"].enabled);
     assert!(config.collectors["smart"].enabled);
     assert!(config.collectors["raid"].enabled);
     assert!(config.collectors["updates"].enabled);
+    assert!(config.collectors["time_sync"].enabled);
 }
 
 #[tokio::test]

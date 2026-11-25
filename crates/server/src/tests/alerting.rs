@@ -1357,6 +1357,8 @@ async fn every_server_starts_with_rules_for_agents_going_offline_and_disks_filli
             "Redis replica not receiving",
             "Security updates waiting",
             "Service stopped",
+            "Time not synced",
+            "Time sync stopped",
             "UniFi device CPU high",
             "UniFi device memory high",
             "UniFi firmware update available",

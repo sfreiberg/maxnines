@@ -1,6 +1,6 @@
 //! What a host's newest readings say about it beyond its numbers: its drives, its
-//! RAID arrays and ZFS pools, its updates and its services, from what its
-//! collectors last sent. The host's pages
+//! RAID arrays and ZFS pools, its updates, its clock's sync and its services, from
+//! what its collectors last sent. The host's pages
 //! and the API both read them from here, so they can't come to say different things.
 //! Agents send these, so nothing is trusted to be the right shape: anything unusable
 //! is left out or blank.
@@ -227,6 +227,59 @@ impl Updates {
     }
 }
 
+/// Whether a host's time service keeps its clock in sync, from the time_sync
+/// collector's newest reading.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TimeSync {
+    /// Whether a time service has the clock in sync, if it could be told.
+    pub synced: Option<bool>,
+    /// The most the clock could be out, by the kernel's reckoning, on Linux, FreeBSD
+    /// and macOS.
+    pub max_error_secs: Option<f64>,
+    /// How far the clock is from its time source, on Windows, while it has one.
+    pub offset_secs: Option<f64>,
+    /// How many time sources the Windows Time service is using.
+    pub sources: Option<u64>,
+    /// Why it couldn't be read, or why whether it's synced isn't known.
+    pub problem: Option<String>,
+}
+
+impl TimeSync {
+    pub fn of(output: &Value) -> Option<Self> {
+        if !output.is_object() {
+            return None;
+        }
+        // The store keeps each number's newest value, so after a problem the
+        // numbers it last read are still there, and aren't what's true now. A
+        // reading with a problem only ever says the clock isn't synced, never that
+        // it is, so a synced that says so is from before.
+        let problem = text(output, "problem");
+        let fresh = problem.is_none();
+        let synced = output["synced"]
+            .as_f64()
+            .map(|synced| synced >= 1.0)
+            .filter(|synced| fresh || !synced);
+        let number = |name: &str| {
+            output[name]
+                .as_f64()
+                .filter(|value| fresh && value.is_finite())
+        };
+        Some(Self {
+            synced,
+            max_error_secs: number("max_error_secs"),
+            // Only said while there's a source to be offset from.
+            offset_secs: number("offset_secs").filter(|_| synced == Some(true)),
+            sources: number("sources").map(|sources| sources as u64),
+            problem,
+        })
+    }
+
+    pub async fn load(metrics: &Metrics, host_id: &str, now: Timestamp) -> Result<Option<Self>> {
+        let output = metrics.latest_output(host_id, "time_sync", now).await?;
+        Ok(output.as_ref().and_then(Self::of))
+    }
+}
+
 /// A watched service as its host's service manager last described it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WatchedService {
@@ -343,6 +396,53 @@ mod tests {
 
         // Systems with no such state don't count them.
         assert_eq!(FailedServices::of(&json!({ "processes": 3 })), None);
+    }
+
+    #[test]
+    fn time_sync_says_what_the_kernel_or_windows_said() {
+        let kernel = TimeSync::of(&json!({ "synced": 1, "max_error_secs": 0.25, "problem": "" }));
+        assert_eq!(
+            kernel,
+            Some(TimeSync {
+                synced: Some(true),
+                max_error_secs: Some(0.25),
+                offset_secs: None,
+                sources: None,
+                problem: None,
+            })
+        );
+        let windows = TimeSync::of(&json!({
+            "synced": 1, "sources": 1, "offset_secs": 0.000134, "problem": ""
+        }))
+        .unwrap();
+        assert_eq!(
+            (windows.synced, windows.sources, windows.offset_secs),
+            (Some(true), Some(1), Some(0.000134))
+        );
+        assert_eq!(TimeSync::of(&Value::Null), None);
+    }
+
+    #[test]
+    fn a_problem_reading_time_sync_keeps_only_what_it_said_now() {
+        // The service stopped: the store still holds what was read while it ran.
+        let stopped = TimeSync::of(&json!({
+            "synced": 0, "sources": 1, "offset_secs": 0.000134,
+            "problem": "The Windows Time service isn't running"
+        }))
+        .unwrap();
+        assert_eq!(stopped.synced, Some(false));
+        assert_eq!((stopped.sources, stopped.offset_secs), (None, None));
+        // Idle says nothing of whether it's synced, so a synced from before goes.
+        let idle = TimeSync::of(&json!({
+            "synced": 1, "sources": 1, "problem": "The Windows Time service isn't running now"
+        }))
+        .unwrap();
+        assert_eq!(idle.synced, None);
+        // With no source, an offset from before isn't what's true now.
+        let lost =
+            TimeSync::of(&json!({ "synced": 0, "sources": 0, "offset_secs": 0.1, "problem": "" }))
+                .unwrap();
+        assert_eq!((lost.synced, lost.offset_secs), (Some(false), None));
     }
 
     #[test]

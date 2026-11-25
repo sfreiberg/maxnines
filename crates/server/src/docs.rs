@@ -889,6 +889,7 @@ mod tests {
         ("collectors-windows-counters", &["counters"]),
         ("collectors-smart", &["smart"]),
         ("collectors-raid", &["raid"]),
+        ("collectors-time-sync", &["time_sync"]),
         ("collectors-updates", &["updates"]),
         ("collectors-apache", &["apache"]),
         ("collectors-nginx", &["nginx"]),

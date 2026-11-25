@@ -80,14 +80,15 @@ pub async fn failed_services() -> Option<Failed> {
 }
 
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, ENUM_SERVICE_STATUS_PROCESSW, EnumServicesStatusExW, OpenSCManagerW,
-        OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, SC_ENUM_PROCESS_INFO, SC_HANDLE,
-        SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE, SERVICE_AUTO_START, SERVICE_QUERY_CONFIG,
-        SERVICE_STATE_ALL, SERVICE_STOPPED, SERVICE_WIN32,
+        OpenServiceW, QUERY_SERVICE_CONFIGW, QueryServiceConfigW, QueryServiceStatus,
+        SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE,
+        SERVICE_AUTO_START, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_STATE_ALL,
+        SERVICE_STATUS, SERVICE_STOPPED, SERVICE_WIN32,
     };
 
     use super::Failed;
@@ -103,13 +104,9 @@ mod windows {
         }
     }
 
-    fn starts_automatically(manager: &Handle, name: *const u16) -> bool {
-        // SAFETY: the manager is open and the name ends with a zero.
-        let service = unsafe { OpenServiceW(manager.0, name, SERVICE_QUERY_CONFIG) };
-        if service.is_null() {
-            return false;
-        }
-        let service = Handle(service);
+    /// How a service starts, such as `SERVICE_AUTO_START`, or None where it can't
+    /// be read.
+    fn start_type(service: &Handle) -> Option<u32> {
         let mut needed = 0u32;
         // SAFETY: asking how much room the config needs, with nowhere to put it.
         unsafe { QueryServiceConfigW(service.0, null_mut(), 0, &mut needed) };
@@ -119,7 +116,42 @@ mod windows {
         // SAFETY: the buffer is as big as Windows asked for, and aligned.
         let read = unsafe { QueryServiceConfigW(service.0, config, needed, &mut needed) };
         // SAFETY: Windows filled the config in.
-        read != 0 && unsafe { (*config).dwStartType } == SERVICE_AUTO_START
+        (read != 0).then(|| unsafe { (*config).dwStartType })
+    }
+
+    fn starts_automatically(manager: &Handle, name: *const u16) -> bool {
+        // SAFETY: the manager is open and the name ends with a zero.
+        let service = unsafe { OpenServiceW(manager.0, name, SERVICE_QUERY_CONFIG) };
+        if service.is_null() {
+            return false;
+        }
+        start_type(&Handle(service)) == Some(SERVICE_AUTO_START)
+    }
+
+    /// A service's state, such as `SERVICE_RUNNING`, and how it starts, or None
+    /// where there's no such service or it can't be read.
+    pub(crate) fn service(name: &str) -> Option<(u32, u32)> {
+        // SAFETY: no names means this host's own service database.
+        let manager = unsafe { OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT) };
+        if manager.is_null() {
+            return None;
+        }
+        let manager = Handle(manager);
+        let name = crate::windows_text::wide(name);
+        let access = SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS;
+        // SAFETY: the manager is open and the name ends with a zero.
+        let service = unsafe { OpenServiceW(manager.0, name.as_ptr(), access) };
+        if service.is_null() {
+            return None;
+        }
+        let service = Handle(service);
+        // SAFETY: an all-zero status is a valid one for Windows to fill in.
+        let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+        // SAFETY: the service is open, with its status somewhere to go.
+        if unsafe { QueryServiceStatus(service.0, &mut status) } == 0 {
+            return None;
+        }
+        Some((status.dwCurrentState, start_type(&service)?))
     }
 
     pub fn failed() -> Option<Failed> {

@@ -1,0 +1,5 @@
+state=5
+status=0x40
+maxerror=897792339000
+esterror=500000
+offset=0

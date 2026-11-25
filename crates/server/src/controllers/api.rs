@@ -38,7 +38,7 @@ use crate::models::User;
 use crate::models::{ConfigStatus, MAX_TIMELINE, RuleInput, UserChange, check_new_user, is_theme};
 use crate::notifier::{self, Notice};
 use crate::presence::{HostPresence, Reach};
-use crate::readings::{Arrays, Drives, FailedServices, Updates, WatchedService};
+use crate::readings::{Arrays, Drives, FailedServices, TimeSync, Updates, WatchedService};
 use crate::registration::{HostRecord, HostState, Upgrade};
 use crate::remote_checks::{LatestResults, RemoteCheck, RemoteCheckInput, SignInWith};
 use crate::roles::Role;
@@ -109,6 +109,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
         .route("/hosts/{id}/drives", get(host_drives))
         .route("/hosts/{id}/raid", get(host_raid))
         .route("/hosts/{id}/updates", get(host_updates))
+        .route("/hosts/{id}/time-sync", get(host_time_sync))
         .route("/hosts/{id}/services", get(host_services))
         .route("/hosts/{id}/metrics/{metric}", get(host_metric))
         .route("/metrics", get(metric_catalog))
@@ -940,6 +941,18 @@ async fn host_updates(State(state): State<AppState>, UrlPath(id): UrlPath<String
     }
     match Updates::load(&state.metrics, &id, times::now()).await {
         Ok(updates) => Json(updates).into_response(),
+        Err(error) => server_error(&error),
+    }
+}
+
+/// Whether a host's clock is kept in sync, as its page shows it, or null if it
+/// hasn't said.
+async fn host_time_sync(State(state): State<AppState>, UrlPath(id): UrlPath<String>) -> Response {
+    if state.registry.get(&id).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match TimeSync::load(&state.metrics, &id, times::now()).await {
+        Ok(time_sync) => Json(time_sync).into_response(),
         Err(error) => server_error(&error),
     }
 }

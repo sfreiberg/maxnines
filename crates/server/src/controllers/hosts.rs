@@ -25,7 +25,7 @@ use crate::metric_charts::format_value;
 use crate::metrics::Unit;
 use crate::models::ConfigStatus;
 use crate::presence::Reach;
-use crate::readings::{Array, Arrays, Drive, Drives, FailedServices, Updates};
+use crate::readings::{Array, Arrays, Drive, Drives, FailedServices, TimeSync, Updates};
 use crate::registration::{HostRecord, HostState, Upgrade, short_id};
 use crate::rule_engine::Host;
 use crate::silences::{ActiveSilences, Cover, Silence, SilenceInput};
@@ -596,6 +596,10 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         Ok(updates) => updates.map(UpdatesCard::of),
         Err(error) => return server_error(&error),
     };
+    let time_sync = match TimeSync::load(&state.metrics, &id, now).await {
+        Ok(time_sync) => time_sync.map(TimeSyncCard::of),
+        Err(error) => return server_error(&error),
+    };
     let failed_services = match FailedServices::load(&state.metrics, &id, now).await {
         Ok(failed) => failed,
         Err(error) => return server_error(&error),
@@ -662,6 +666,7 @@ async fn show(State(state): State<AppState>, Path(id): Path<String>, token: Csrf
         .with("arrays", &arrays)
         .with("arrays_problems", &arrays_problems)
         .with("updates", &updates)
+        .with("time_sync", &time_sync)
         .with("failed_services", &failed_services)
         .with("decided_by", &host.decided_by)
         .with("has_facts", &!flat.is_empty())
@@ -913,6 +918,35 @@ impl UpdatesCard {
                 .map(|secs| format_value(Unit::Seconds, secs as f64)),
             problem: updates.problem,
             note: updates.note,
+        }
+    }
+}
+
+/// Whether a host's clock is kept in sync, in words for its page.
+#[derive(Debug, PartialEq, Serialize)]
+struct TimeSyncCard {
+    synced: Option<&'static str>,
+    max_error: Option<String>,
+    offset: Option<String>,
+    sources: Option<String>,
+    /// Why it couldn't be read, or why whether it's synced isn't known.
+    problem: Option<String>,
+}
+
+impl TimeSyncCard {
+    fn of(time_sync: TimeSync) -> Self {
+        Self {
+            synced: time_sync
+                .synced
+                .map(|synced| if synced { "Yes" } else { "No" }),
+            max_error: time_sync
+                .max_error_secs
+                .map(|secs| format_value(Unit::Seconds, secs)),
+            offset: time_sync
+                .offset_secs
+                .map(|secs| format_value(Unit::Seconds, secs)),
+            sources: time_sync.sources.map(|sources| sources.to_string()),
+            problem: time_sync.problem,
         }
     }
 }

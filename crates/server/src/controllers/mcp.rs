@@ -255,8 +255,9 @@ static TOOLS: [Spec; 14] = [
             reports, such as its operating system, hardware, addresses and disks, and what \
             its newest readings say: whether each drive passes its own SMART check, \
             whether each RAID array and ZFS pool is degraded, failed or rebuilding, the \
-            updates waiting and whether it needs a reboot, the services it watches and \
-            whether they're running, and the services that failed.",
+            updates waiting and whether it needs a reboot, whether a time service keeps \
+            its clock in sync, the services it watches and whether they're running, and \
+            the services that failed.",
         args: &[HOST_ID],
         method: Method::GET,
         route: "/hosts/{id}",
@@ -793,6 +794,9 @@ impl Call {
                 let updates = self
                     .get(&format!("/hosts/{}/updates", host()), NO_HOST)
                     .await?;
+                let time_sync = self
+                    .get(&format!("/hosts/{}/time-sync", host()), NO_HOST)
+                    .await?;
                 let mut services = self
                     .get(&format!("/hosts/{}/services", host()), NO_HOST)
                     .await?;
@@ -808,6 +812,7 @@ impl Call {
                     "drives": drives_listed,
                     "raid": raid_listed,
                     "updates": updates,
+                    "time_sync": time_sync,
                     "services": watched,
                 }))
             }

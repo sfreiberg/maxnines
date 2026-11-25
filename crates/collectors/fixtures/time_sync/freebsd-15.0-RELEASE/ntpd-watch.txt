@@ -1,0 +1,10 @@
+05:17:12 state=0 status=0x2001 maxerror=31018 esterror=5237 offset=549601 
+05:17:42 state=0 status=0x2001 maxerror=46018 esterror=5237 offset=533726 
+05:18:12 state=0 status=0x2001 maxerror=61018 esterror=5237 offset=518309 
+05:18:42 state=0 status=0x2001 maxerror=76018 esterror=5237 offset=503337 
+05:19:12 state=0 status=0x2001 maxerror=91018 esterror=5237 offset=488798 
+05:19:42 state=0 status=0x2001 maxerror=106018 esterror=5237 offset=474678 
+05:20:12 state=0 status=0x2001 maxerror=121018 esterror=5237 offset=460967 
+05:20:42 state=0 status=0x2001 maxerror=136018 esterror=5237 offset=447651 
+05:21:12 state=0 status=0x2001 maxerror=151018 esterror=5237 offset=434721 
+05:21:42 state=0 status=0x2001 maxerror=166018 esterror=5237 offset=422163 

@@ -236,6 +236,22 @@
 </section>
 {% endif %}
 
+{% if time_sync %}
+<section class="card">
+  <h2>Time sync</h2>
+  {% if time_sync.problem %}<p class="notice warn">{{ time_sync.problem }}</p>{% endif %}
+  {% if time_sync.synced or time_sync.max_error or time_sync.offset or time_sync.sources %}
+  <dl class="summary">
+    {% if time_sync.synced %}<dt>Synced</dt><dd>{{ time_sync.synced }}</dd>{% endif %}
+    {% if time_sync.max_error %}<dt>Largest possible error</dt><dd>{{ time_sync.max_error }}</dd>{% endif %}
+    {% if time_sync.sources %}<dt>Time sources</dt><dd>{{ time_sync.sources }}</dd>{% endif %}
+    {% if time_sync.offset %}<dt>Offset from its source</dt><dd>{{ time_sync.offset }}</dd>{% endif %}
+  </dl>
+  {% endif %}
+  <p class="hint">{% if os_family == "windows" %}As the Windows Time service says.{% else %}As the kernel says, whichever time service runs.{% endif %} How far the clock really is from the server's is charted as Clock difference from the server. See <a href="/docs/collectors-time-sync">Time sync</a> for what's read and its alerts.</p>
+</section>
+{% endif %}
+
 {% if failed_services %}
 <section class="card">
   <h2>Failed services</h2>

@@ -1,7 +1,8 @@
 # Host readings API
 
 What a host's newest readings say beyond its numbers, as its pages show them: its
-drives, its RAID arrays and ZFS pools, its updates, and its services. Each is what the
+drives, its RAID arrays and ZFS pools, its updates, its clock's time sync, and its
+services. Each is what the
 host's collectors last sent in the last 5 minutes, so a host with a collector off, or
 that hasn't been heard from, has nothing to say about it. The numbers themselves, such as each drive's temperature
 over time, are [metrics](api-hosts.md#get-a-hosts-metric) too. Each returns `404` if
@@ -154,6 +155,35 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "lists_age_secs": 7200,
   "problem": null,
   "note": null
+}
+```
+
+## Get a host's time sync
+
+`GET /api/v1/hosts/{id}/time-sync`
+
+What the [Time sync](collectors-time-sync.md) collector last read, as the host's page
+shows it under **Time sync**: whether a time service has the clock `synced`, and on
+Linux, FreeBSD and macOS the most the kernel reckons the clock could be out,
+`max_error_secs`. On Windows, `sources` is how many time sources the Windows Time
+service is using, and `offset_secs` how far the clock is from them, while it has one.
+`problem` says why it couldn't be read, or why whether it's synced isn't known, as on a
+Windows host whose time service only starts when it's needed. The other numbers are
+`null` then, and `synced` is only ever `false`. The answer is `null` for a host that
+hasn't read its time sync.
+
+```sh
+curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
+  "$MAXNINES_URL/api/v1/hosts/$HOST_ID/time-sync"
+```
+
+```json
+{
+  "synced": true,
+  "max_error_secs": 0.048677,
+  "offset_secs": null,
+  "sources": null,
+  "problem": null
 }
 ```
 

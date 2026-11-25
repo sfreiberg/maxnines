@@ -12,15 +12,16 @@ template "host" {
     interval_secs       = 15
     facts_interval_secs = 3600
     collectors = {
-      host    = { enabled = true }
-      cpu     = { enabled = true }
-      memory  = { enabled = true }
-      disk    = { enabled = true }
-      network = { enabled = true }
-      system  = { enabled = true }
-      smart   = { enabled = true }
-      raid    = { enabled = true }
-      updates = { enabled = true }
+      host      = { enabled = true }
+      cpu       = { enabled = true }
+      memory    = { enabled = true }
+      disk      = { enabled = true }
+      network   = { enabled = true }
+      system    = { enabled = true }
+      smart     = { enabled = true }
+      raid      = { enabled = true }
+      updates   = { enabled = true }
+      time_sync = { enabled = true }
     }
   }
 

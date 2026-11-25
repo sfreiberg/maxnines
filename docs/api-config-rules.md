@@ -37,7 +37,7 @@ Rules of the same priority apply built-in rules first.
 
 The collectors are `apache`, `checks`, `containers`, `counters`, `cpu`, `custom`, `disk`, `files`, `gpu`, `host`,
 `memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `processes`, `raid`, `sensors`,
-`services`, `smart`, `system`, `top_processes` and `updates`.
+`services`, `smart`, `system`, `time_sync`, `top_processes` and `updates`.
 
 ## List config rules
 
