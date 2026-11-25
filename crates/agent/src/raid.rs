@@ -479,7 +479,8 @@ fn md_array(name: &str, first: &str, detail: &[&str]) -> Array {
         .devices
         .saturating_sub(array.working_devices)
         .saturating_sub(not_working.len() as u64);
-    if missing > 0 {
+    // An inactive array doesn't say how many it's waiting for.
+    if missing > 0 && active {
         not_working.push(format!("{missing} missing"));
     }
     array.not_working = not_working;
@@ -1210,6 +1211,7 @@ mod tests {
             assert_eq!(waiting.state, "inactive", "{system}");
             assert!(waiting.failed && !waiting.degraded, "{system}");
             assert_eq!((waiting.devices, waiting.working_devices), (1, 0));
+            assert_eq!(waiting.not_working, Vec::<String>::new());
         }
     }
 
