@@ -76,43 +76,43 @@ snap empty
 for file in m1 m2 r1 r2 r3 log cache spare s1 f1; do
   truncate -s 1G "$work/$file"
 done
-zpool create -f -o failmode=continue mirror0 mirror "$work/m1" "$work/m2"
-zpool create -f raidz0 raidz "$work/r1" "$work/r2" "$work/r3"
-zpool add -f mirror0 log "$work/log" cache "$work/cache" spare "$work/spare"
-fill /mirror0/data 600
-fill /raidz0/data 600
+zpool create -f -o failmode=continue tank mirror "$work/m1" "$work/m2"
+zpool create -f vault raidz "$work/r1" "$work/r2" "$work/r3"
+zpool add -f tank log "$work/log" cache "$work/cache" spare "$work/spare"
+fill /tank/data 600
+fill /vault/data 600
 snap healthy
 as_user "LC_ALL=C $LIST" >"$out/healthy-user.list" 2>&1
 as_user "LC_ALL=C $STATUS" >"$out/healthy-user.status" 2>&1
 
 # Scrubs: running, paused, and finished with nothing found.
-zpool scrub mirror0
-until_seen "scrub in progress" mirror0 && snap scrubbing
-zpool scrub -p mirror0 2>/dev/null && snap scrub-paused
-zpool scrub mirror0
-zpool wait -t scrub mirror0
+zpool scrub tank
+until_seen "scrub in progress" tank && snap scrubbing
+zpool scrub -p tank 2>/dev/null && snap scrub-paused
+zpool scrub tank
+zpool wait -t scrub tank
 snap scrubbed
 
 # Devices out of service: one taken offline, one faulted, one whose file is gone.
-zpool offline raidz0 "$work/r2"
+zpool offline vault "$work/r2"
 snap offline
-zpool online raidz0 "$work/r2"
-zpool wait -t resilver raidz0 2>/dev/null
-zpool offline -f mirror0 "$work/m2"
+zpool online vault "$work/r2"
+zpool wait -t resilver vault 2>/dev/null
+zpool offline -f tank "$work/m2"
 snap faulted
 
 # Written to while one side was out, it has something to resilver when it's back.
-fill /mirror0/more 300
-zpool online mirror0 "$work/m2"
-zpool clear mirror0
-until_seen "resilver in progress" mirror0 && snap resilvering
-zpool wait -t resilver mirror0
+fill /tank/more 300
+zpool online tank "$work/m2"
+zpool clear tank
+until_seen "resilver in progress" tank && snap resilvering
+zpool wait -t resilver tank
 snap resilvered
 
 # Damage one side of the mirror, which a scrub repairs from the other.
 dd if="$random" of="$work/m1" bs=1048576 seek=64 count=512 conv=notrunc 2>/dev/null
-zpool scrub mirror0
-zpool wait -t scrub mirror0
+zpool scrub tank
+zpool wait -t scrub tank
 snap scrub-repaired
 
 # A pool with nowhere else to read from loses what's damaged.
@@ -128,9 +128,9 @@ as_user "LC_ALL=C $STATUS" >"$out/data-errors-user.status" 2>&1
 zpool destroy -f single
 
 rm -f "$work/r3"
-zpool reopen raidz0 2>/dev/null
-zpool scrub raidz0 2>/dev/null
-zpool wait -t scrub raidz0 2>/dev/null
+zpool reopen vault 2>/dev/null
+zpool scrub vault 2>/dev/null
+zpool wait -t scrub vault 2>/dev/null
 snap missing
 
 # Nearly full, then as full as it gets.
@@ -142,7 +142,7 @@ dd if="$random" of=/full/rest bs=1048576 2>/dev/null
 sync
 snap full
 
-for pool in full raidz0 mirror0; do
+for pool in full vault tank; do
   zpool destroy -f "$pool"
 done
 rm -rf "$work"

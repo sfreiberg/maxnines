@@ -17,7 +17,7 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 
 function Snap($step) {
     # As the agent runs it.
-    $agent = & powershell.exe -NoProfile -NonInteractive -File $script 2>&1
+    $agent = & powershell.exe -NoProfile -NonInteractive -Command (Get-Content -Raw $script) 2>&1
     $code = $LASTEXITCODE
     [IO.File]::WriteAllText((Join-Path $out "$step.json"), (($agent | Out-String).TrimEnd() + "`n"))
     "$code" | Set-Content -Encoding ascii (Join-Path $out "$step.code")
@@ -33,17 +33,17 @@ function Snap($step) {
     $agent
 }
 
-function DiskPart($lines) {
+function Invoke-DiskPart($lines) {
     $file = Join-Path $work 'diskpart.txt'
     [IO.File]::WriteAllLines($file, $lines)
-    diskpart /s $file | Out-Null
+    diskpart.exe /s $file | Out-Null
 }
 
 Snap 'empty'
 
 $vhds = 1..3 | ForEach-Object { Join-Path $work "disk$_.vhdx" }
 foreach ($vhd in $vhds) {
-    DiskPart @("create vdisk file=`"$vhd`" maximum=8192 type=expandable", "select vdisk file=`"$vhd`"", 'attach vdisk')
+    Invoke-DiskPart @("create vdisk file=`"$vhd`" maximum=8192 type=expandable", "select vdisk file=`"$vhd`"", 'attach vdisk')
 }
 Start-Sleep -Seconds 5
 $poolable = @(Get-PhysicalDisk -CanPool $true)
@@ -60,12 +60,12 @@ Start-Sleep -Seconds 5
 Snap 'healthy'
 
 # One disk goes away.
-DiskPart @("select vdisk file=`"$($vhds[2])`"", 'detach vdisk')
+Invoke-DiskPart @("select vdisk file=`"$($vhds[2])`"", 'detach vdisk')
 Start-Sleep -Seconds 15
 Snap 'disk-gone'
 
 # It comes back and the virtual disks are repaired.
-DiskPart @("select vdisk file=`"$($vhds[2])`"", 'attach vdisk')
+Invoke-DiskPart @("select vdisk file=`"$($vhds[2])`"", 'attach vdisk')
 Start-Sleep -Seconds 10
 Snap 'disk-back'
 Get-VirtualDisk | Where-Object { $_.FriendlyName -ne 'Simple1' } | Repair-VirtualDisk -AsJob | Out-Null

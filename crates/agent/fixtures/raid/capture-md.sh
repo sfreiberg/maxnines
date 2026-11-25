@@ -3,8 +3,9 @@
 # /proc/mdstat, which the agent's raid collector reads, says at each step: no
 # arrays, healthy RAID 0, 1, 5 and 10, a first resync, a device failed and then
 # removed, recovery after it's added back, a check, a spare taking over and an
-# array that can't start. The capture-raid-outputs workflow runs it as root on an
-# Ubuntu runner, by hand only. Each step is kept as out/<system>/md/<step>.mdstat.
+# array waiting for its devices. The capture-raid-outputs workflow runs it as
+# root on an Ubuntu runner, by hand only. Each step is kept as
+# out/<system>/md/<step>.mdstat.
 set -u
 
 # shellcheck disable=SC1091
@@ -117,19 +118,19 @@ mdadm --wait /dev/md1 >/dev/null 2>&1
 mdadm /dev/md1 --remove "$b2" >/dev/null 2>&1
 snap raid5-rebuilt
 
-# An array with too few of its devices doesn't start.
+# An array found with too few of its devices waits for the rest, inactive, as
+# it does when a disk is missing at boot.
 mdadm --stop /dev/md2 >/dev/null 2>&1
-mdadm --assemble /dev/md2 "$c1" >/dev/null 2>&1
+mdadm --incremental "$c1" >/dev/null 2>&1
 snap inactive
 
-# A RAID 5 with two devices gone has failed.
+# md won't fail the device a RAID 5 can't do without, so this is as far as
+# failing devices goes.
 mdadm /dev/md1 --fail "$b3" >/dev/null 2>&1
 mdadm /dev/md1 --fail "$b4" >/dev/null 2>&1
 snap raid5-failed
 
 uname -r >"$out/kernel"
 mdadm --version >"$out/mdadm-version" 2>&1
-for md in /dev/md0 /dev/md1 /dev/md2 /dev/md3; do
-  mdadm --stop "$md" >/dev/null 2>&1
-done
+mdadm --stop --scan >/dev/null 2>&1
 exit 0

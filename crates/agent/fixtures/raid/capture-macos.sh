@@ -1,8 +1,9 @@
 #!/bin/sh
 # Builds an AppleRAID mirror on disk images and keeps what `diskutil appleRAID
-# list` says at each step: no sets, a healthy mirror, one member gone, and a
-# rebuild onto a new member. The capture-raid-outputs workflow runs it with sudo
-# on a macOS runner, by hand only. Each step is kept under out/<system>/appleraid/.
+# list` says at each step: no sets, a healthy mirror, one member gone, a
+# rebuild onto a new member, and members gone until none is left. The
+# capture-raid-outputs workflow runs it with sudo on a macOS runner, by hand
+# only. Each step is kept under out/<system>/appleraid/.
 set -u
 
 out="${OUT:-out}/macos-$(sw_vers -productVersion)/appleraid"
@@ -27,18 +28,23 @@ snap empty
 one=$(image one)
 two=$(image two)
 three=$(image three)
-diskutil appleRAID create mirror Capture JHFS+ "$one" "$two"
+four=$(image four)
+diskutil appleRAID create mirror Capture JHFS+ "$one" "$two" "$three"
 set_id=$(diskutil appleRAID list | awk '/^Unique ID:/ { print $3; exit }')
 snap healthy
 
-# One member goes away.
-hdiutil detach -force "$two"
-sleep 5
+# One member goes away, which leaves two.
+hdiutil detach -force "$three"
+sleep 10
 snap degraded
 
-# A new member is added and the mirror rebuilds onto it.
-diskutil appleRAID add member "$three" "$set_id"
-sleep 2
+# A new member repairs the mirror, which rebuilds onto it.
+diskutil appleRAID repairMirror "$set_id" "$four"
+tries=0
+until diskutil appleRAID list | grep -q Rebuilding || [ "$tries" -ge 100 ]; do
+  tries=$((tries + 1))
+  sleep 0.1
+done
 snap rebuilding
 tries=0
 while diskutil appleRAID list | grep -q Rebuilding && [ "$tries" -lt 300 ]; do
@@ -46,4 +52,12 @@ while diskutil appleRAID list | grep -q Rebuilding && [ "$tries" -lt 300 ]; do
   sleep 1
 done
 snap rebuilt
+
+# Both other members go away, which leaves one.
+hdiutil detach -force "$two"
+sleep 10
+snap one-left
+hdiutil detach -force "$one"
+sleep 10
+snap none-left
 exit 0
