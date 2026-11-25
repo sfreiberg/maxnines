@@ -9,6 +9,7 @@ with how to turn it on, the account to sign in as, and every metric it reports:
 - **[MySQL and MariaDB](collectors-mysql.md)**
 - **[MongoDB](collectors-mongodb.md)**
 - **[ClickHouse](collectors-clickhouse.md)**
+- **[Redis](collectors-redis.md)**, which reads Valkey too
 
 Each is read by its built-in [template](templates.md), which reads every database of its
 kind with no config rule needed.
@@ -30,12 +31,12 @@ database "orders" {
 
 | Setting | Description |
 |---|---|
-| `kind` | `postgres`, `mysql` for MySQL and MariaDB, `mongodb`, or `clickhouse` |
+| `kind` | `postgres`, `mysql` for MySQL and MariaDB, `mongodb`, `clickhouse`, or `redis` |
 | `target` | `host:port`. For ClickHouse, the HTTP port, usually 8123, or 8443 for HTTPS |
 | `database` | PostgreSQL: the database to sign in to, by default `postgres`. MongoDB: the database the account was made in, by default `admin` |
 | `tls` | `true` to only connect over TLS, which for ClickHouse is HTTPS. PostgreSQL uses TLS whenever the server offers it anyway |
 | `insecure` | `true` to accept a certificate that can't be verified |
-| `username`, `password` | Who to sign in as. `env()` reads the password from the agent's environment. MongoDB can be read without them where it allows that |
+| `username`, `password` | Who to sign in as. `env()` reads the password from the agent's environment. MongoDB and Redis can be read without them where they allow that, and Redis with a password alone. ClickHouse and Redis only send a password without TLS to the host itself |
 
 The name is what the database's series are called, so it can't have spaces. Restart
 the agent after changing these. The agent tells the server the names and kinds of the
@@ -45,12 +46,12 @@ The agent keeps one connection to each database open between samples, and opens 
 one if that stops working. Each of its reads has a 5 second limit, so a busy server is
 never held up by it, and its session is read only. A database that doesn't answer is
 tried again after 5 seconds, then waits doubling to a minute. MongoDB has no read-only
-sessions, so there what's read is up to its account.
+sessions, and nor has Redis, so there what's read is up to the account.
 
 ## Hosts without an agent
 
 For a database on a [host without an agent](agentless-hosts.md), such as a managed one,
-the server reads it instead. Add a PostgreSQL, MySQL, MongoDB or ClickHouse check about
+the server reads it instead. Add a PostgreSQL, MySQL, MongoDB, ClickHouse or Redis check about
 the host on the **Checks** page, with how it signs in, and tick **Read its health and
 replication**. Its stats are charted on the host's metrics page, as an agent's are,
 named after the check. The server keeps one connection open between runs, as an agent
@@ -68,10 +69,10 @@ database, and is 1 if it may and 0 if not:
 | Metric | Unit | Series | What it is |
 | --- | --- | --- | --- |
 | `database_account.overprivileged` | 1 or 0 | Each database | Whether it may do any of the below |
-| `database_account.superuser` | 1 or 0 | Each database | Whether it may do anything: a PostgreSQL superuser, MySQL's `SUPER` or every privilege on `*.*`, ClickHouse's `ALL` on everything, or MongoDB's `root` or `anyAction` |
-| `database_account.writes` | 1 or 0 | Each database | Whether it may change data or tables anywhere: insert, update, delete, truncate, create, alter, drop, or add triggers, routines or events, including through a role or only some columns. On MongoDB, an action such as `insert`, `update`, `remove`, `createCollection` or `dropDatabase` anywhere |
-| `database_account.manages` | 1 or 0 | Each database | Whether it may manage accounts or the server: create accounts, roles or databases, pass its privileges on (`WITH GRANT OPTION`, `WITH ADMIN OPTION`), replicate, or, on MySQL and MariaDB, `RELOAD`, `SHUTDOWN` or any admin privilege. On MongoDB, the actions that manage users, roles, the replica set, shards or the server, such as `createUser`, `grantRole`, `replSetConfigure`, `setParameter`, `shutdown` or `killop` |
-| `database_account.server_files` | 1 or 0 | Each database | Whether it may read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE`. On ClickHouse, `FILE`, `URL`, `REMOTE`, `S3` and the other table functions that reach outside it, and `BACKUP`. MongoDB has no way to reach them but being a superuser |
+| `database_account.superuser` | 1 or 0 | Each database | Whether it may do anything: a PostgreSQL superuser, MySQL's `SUPER` or every privilege on `*.*`, ClickHouse's `ALL` on everything, MongoDB's `root` or `anyAction`, or on Redis `+@all`, or a password alone before Redis 6 |
+| `database_account.writes` | 1 or 0 | Each database | Whether it may change data or tables anywhere: insert, update, delete, truncate, create, alter, drop, or add triggers, routines or events, including through a role or only some columns. On MongoDB, an action such as `insert`, `update`, `remove`, `createCollection` or `dropDatabase` anywhere. On Redis, `+@write` |
+| `database_account.manages` | 1 or 0 | Each database | Whether it may manage accounts or the server: create accounts, roles or databases, pass its privileges on (`WITH GRANT OPTION`, `WITH ADMIN OPTION`), replicate, or, on MySQL and MariaDB, `RELOAD`, `SHUTDOWN` or any admin privilege. On MongoDB, the actions that manage users, roles, the replica set, shards or the server, such as `createUser`, `grantRole`, `replSetConfigure`, `setParameter`, `shutdown` or `killop`. On Redis, being able to read accounts with `ACL GETUSER`, which shows every account's password hashes; an account that can't is one Redis limits, and [counts as only reading](collectors-redis.md#the-account-to-sign-in-as) |
+| `database_account.server_files` | 1 or 0 | Each database | Whether it may read or write the database server's own files, or run programs there: `pg_read_server_files`, `pg_write_server_files` or `pg_execute_server_program`, or `FILE`. On ClickHouse, `FILE`, `URL`, `REMOTE`, `S3` and the other table functions that reach outside it, and `BACKUP`. MongoDB has no way to reach them but being a superuser. On Redis, `CONFIG SET`, through `+config`, `+@admin` or `+@dangerous`, which can point its saves anywhere it can write |
 
 MaxNines only ever reads, in sessions that can't write, but an account that can do more
 is one a template's SQL, or anyone who learns its password, could misuse, so the

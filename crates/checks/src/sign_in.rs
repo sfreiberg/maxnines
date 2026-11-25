@@ -269,13 +269,41 @@ pub(crate) async fn mysql_connection(
     mysql_async::Conn::new(options).await.map_err(short)
 }
 
-pub(crate) async fn check_redis(
+/// Whether a host is this machine itself, which a password can be sent to without
+/// TLS, as it never crosses a network.
+pub(crate) fn is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+/// A Redis client that signs in with `credentials`, if they have anything: a
+/// password, for Redis before 6 or its default user, or an ACL user and its
+/// password. TLS is only used when the check says so. Redis takes a password as
+/// it is, so one is only sent without TLS to the host itself.
+pub(crate) fn redis_client(
     check: &Check,
     credentials: Option<&Credentials>,
-    findings: &mut Findings,
-) -> Result<()> {
+) -> Result<redis::Client> {
     let (host, port) = host_and_port(&check.target)?;
-    let address = if check.tls == Some(true) {
+    let tls = check.tls == Some(true);
+    let mut settings = redis::RedisConnectionInfo::default().set_skip_set_lib_name();
+    if let Some(credentials) = credentials.filter(|given| !given.is_empty()) {
+        let password = credentials
+            .password
+            .as_deref()
+            .context("signing in needs a password")?;
+        ensure!(
+            tls || is_loopback(&host),
+            "a password is only sent without TLS to the host itself, so set tls for one elsewhere"
+        );
+        settings = settings.set_password(password);
+        if let Some(username) = &credentials.username {
+            settings = settings.set_username(username);
+        }
+    }
+    let address = if tls {
         redis::ConnectionAddr::TcpTls {
             host,
             port,
@@ -285,22 +313,19 @@ pub(crate) async fn check_redis(
     } else {
         redis::ConnectionAddr::Tcp(host, port)
     };
-    let mut settings = redis::RedisConnectionInfo::default().set_skip_set_lib_name();
-    let signing_in = credentials.filter(|given| !given.is_empty());
-    if let Some(credentials) = signing_in {
-        let password = credentials
-            .password
-            .as_deref()
-            .context("signing in needs a password")?;
-        settings = settings.set_password(password);
-        if let Some(username) = &credentials.username {
-            settings = settings.set_username(username);
-        }
-    }
     let info = redis::IntoConnectionInfo::into_connection_info(address)
         .map_err(short)?
         .set_redis_settings(settings);
-    let client = redis::Client::open(info).map_err(short)?;
+    redis::Client::open(info).map_err(short)
+}
+
+pub(crate) async fn check_redis(
+    check: &Check,
+    credentials: Option<&Credentials>,
+    findings: &mut Findings,
+) -> Result<()> {
+    let signing_in = credentials.filter(|given| !given.is_empty());
+    let client = redis_client(check, signing_in)?;
     drop(open(check, findings).await?);
     let mut connection = client
         .get_multiplexed_async_connection()

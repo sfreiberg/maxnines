@@ -9,8 +9,8 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use super::{
-    Alert, Counters, Discover, Fill, Join, Metric, Notice, Query, RegistryRead, Target, Template,
-    yes,
+    Alert, Asked, Counters, Discover, Fill, Join, Metric, Notice, Query, RegistryRead, Target,
+    Template, yes,
 };
 
 /// Reads a template file, which holds one `template "<key>" { … }` block. Only the
@@ -140,7 +140,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
         counters: Vec::new(),
         alerts: Vec::new(),
     };
-    let mongodb = template.is_mongodb();
+    let asked = template.asked();
     for block in blocks {
         match block.identifier.as_str() {
             "config" => {
@@ -157,7 +157,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
                 let key = label_of(&block, "discover")?;
                 let (discover, _) = read_discover(key.clone(), block.body)
                     .and_then(|read| match read.0.sql {
-                        Some(_) => asked_as(read, mongodb),
+                        Some(_) => asked_as(read, asked),
                         None => Ok(read),
                     })
                     .with_context(|| format!("discover {key:?}"))?;
@@ -172,7 +172,7 @@ fn read_template(key: String, body: Body) -> Result<Template> {
             "query" => {
                 let key = label_of(&block, "query")?;
                 let (query, _) = read_query(key.clone(), block.body)
-                    .and_then(|read| asked_as(read, mongodb))
+                    .and_then(|read| asked_as(read, asked))
                     .with_context(|| format!("query {key:?}"))?;
                 template.queries.push(query);
             }
@@ -208,8 +208,8 @@ struct DiscoverFields {
     counter_sets: IndexMap<String, String>,
 }
 
-/// A block's SQL, or its MongoDB command, which it has one of, and whether it's a
-/// command.
+/// A block's SQL, or its MongoDB or Redis command, which it has one of, and
+/// whether it's a command.
 fn statement(sql: Option<String>, command: Option<String>) -> Result<(Option<String>, bool)> {
     match (sql, command) {
         (Some(_), Some(_)) => bail!("has sql or a command, not both"),
@@ -219,11 +219,14 @@ fn statement(sql: Option<String>, command: Option<String>) -> Result<(Option<Str
 }
 
 /// A block read, if it's written as its template's kind of database is asked:
-/// with a command for MongoDB, and SQL for the rest.
-fn asked_as<T>(read: (T, bool), mongodb: bool) -> Result<(T, bool)> {
-    match (read.1, mongodb) {
-        (true, false) => bail!("a command is only for MongoDB: give SQL as sql"),
-        (false, true) => bail!("MongoDB isn't asked with SQL: give its command as command"),
+/// with a command for MongoDB and Redis, and SQL for the rest.
+fn asked_as<T>(read: (T, bool), asked: Asked) -> Result<(T, bool)> {
+    match (read.1, asked) {
+        (true, Asked::Sql) => bail!("a command is only for MongoDB and Redis: give SQL as sql"),
+        (false, Asked::Mongodb) => {
+            bail!("MongoDB isn't asked with SQL: give its command as command")
+        }
+        (false, Asked::Redis) => bail!("Redis isn't asked with SQL: give its command as command"),
         _ => Ok(read),
     }
 }
@@ -357,7 +360,7 @@ fn read_query(key: String, body: Body) -> Result<(Query, bool)> {
     let (attributes, blocks) = split(body);
     let fields: QueryFields = read_fields(attributes)?;
     let (Some(sql), command) = statement(fields.sql, fields.command)? else {
-        bail!("needs its sql, or for MongoDB its command");
+        bail!("needs its sql, or for MongoDB and Redis its command");
     };
     let mut fills = Vec::new();
     for block in blocks {

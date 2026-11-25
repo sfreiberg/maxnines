@@ -21,7 +21,11 @@ pub const TIMEOUT: Duration = Duration::from_secs(10);
 pub fn is_database(kind: CheckKind) -> bool {
     matches!(
         kind,
-        CheckKind::Postgres | CheckKind::Mysql | CheckKind::Mongodb | CheckKind::Clickhouse
+        CheckKind::Postgres
+            | CheckKind::Mysql
+            | CheckKind::Mongodb
+            | CheckKind::Clickhouse
+            | CheckKind::Redis
     )
 }
 

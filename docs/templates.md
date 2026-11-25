@@ -44,16 +44,18 @@ shown afterwards is written out from the parts.
 | **MongoDB** | Each MongoDB database: its connections, operations and how long they take, work waiting, WiredTiger's cache, and its replica set as each member sees it, read with MongoDB's own commands, with 7 alerts, one of them off until its oplog has filled. Its database sizes ship turned off. What it reads is listed on the [MongoDB](collectors-mongodb.md) page |
 | **MySQL** | Each MySQL or MariaDB database: its load, InnoDB, transactions and queries, replication into it, read through `SHOW`, semi-synchronous replication, Group Replication and Galera, with 7 alerts. MySQL's and MariaDB's differences are queries of their own, picked by what discovery finds. Its database and binary log sizes ship turned off. What it reads is listed on the [MySQL and MariaDB](collectors-mysql.md) page |
 | **PostgreSQL** | Each PostgreSQL database: its health, load, replication from both ends, replication slots, archiving and subscriptions, with 14 alerts, one of them off until you say how many standbys a primary should have. Its sizes ship turned off, as they're slow on big servers. What it reads is listed on the [PostgreSQL](collectors-postgresql.md) page |
+| **Redis** | Each Redis or Valkey: its clients, memory against its limit, keys evicted and expired, its cache hit rate, each database's keys, its saves, and replication from both ends, read with `INFO`, with 6 alerts. What it reads is listed on the [Redis](collectors-redis.md) page |
 
 ## What templates can read so far
 
 - **Databases:** PostgreSQL, MySQL and MariaDB, and ClickHouse, with SQL, and MongoDB
-  with [commands](#mongodb-commands). ClickHouse is read over its HTTP interface, where
+  and Redis with their own commands, [MongoDB's](#mongodb-commands) and
+  [Redis'](#redis-commands). ClickHouse is read over its HTTP interface, where
   every statement is a GET, which it only lets read, and its account's own profile
   sets its time limit.
 - **Windows:** performance counters and registry values, on hosts with an agent.
-- **Every database** MaxNines reads, PostgreSQL, MySQL and MariaDB, MongoDB and
-  ClickHouse, is read by its built-in template.
+- **Every database** MaxNines reads, PostgreSQL, MySQL and MariaDB, MongoDB,
+  ClickHouse and Redis, is read by its built-in template.
 
 Where a template is read, and how, is the same on an agent and on the server for a
 [host without an agent](#hosts-without-an-agent-and-maxnines-own-database).
@@ -114,8 +116,8 @@ One field says what a template is for, and it runs once for each match on a host
 | none | Once on every host, agentless ones too |
 
 Only a template for a database has SQL, its `query` blocks and the `sql` of its
-discover blocks, as there's nothing else to run SQL on. A template for MongoDB has
-a `command` in their place. The others read Windows
+discover blocks, as there's nothing else to run SQL on. A template for MongoDB or
+Redis has a `command` in their place. The others read Windows
 performance counters and the registry, so they run only on Windows hosts with an
 agent, and a template for `os` has to list `windows` to read them. A database's
 template can't read them, as they're the host's: read them in a template for the
@@ -149,8 +151,9 @@ changes quickly can be looked at often and what hardly changes rarely:
 
 - `sql`: each column of the first row, by its name. A column called `version` is
   read as a version, from the first number in it, so `16.4 (Debian 16.4-1)` is 16.4;
-- `command` and `columns`, for MongoDB: each field `columns` names in the reply, by
-  its name, as a [query's](#mongodb-commands) are read;
+- `command` and `columns`, for MongoDB and Redis: each field `columns` names in the
+  reply, by its name, as a [MongoDB](#mongodb-commands) or [Redis](#redis-commands)
+  query's are read;
 - `registry "<key>" { name = "Value" }`: Windows registry values, each by its name.
   Only keys under `HKLM` (`HKEY_LOCAL_MACHINE`) are read, as the agent runs as a
   service with no user's settings. Text is read as text and numbers as numbers, and
@@ -194,8 +197,8 @@ alerts with `when` or `since` are checked on the hosts where what was found fits
   No label can be called `instance`, in any template, as that's the database a series
   is from;
 - a NULL gives no sample, rather than zero;
-- a column whose name starts with `_`, which only a SHOW statement's or MongoDB's
-  `columns` can name, is only there to work other metrics out with `value`, and isn't
+- a column whose name starts with `_`, which only a SHOW statement's, MongoDB's or
+  Redis' `columns` can name, is only there to work other metrics out with `value`, and isn't
   kept. `metrics` can say one is a running total, `_reads = { total = true }`, so
   `rate(_reads)` works.
 
@@ -312,8 +315,9 @@ In a path:
 
 - a list is read as how many it holds, so `members` is how many members there are;
 - `[field=value]` after a list's name keeps only the documents in it whose `field` is
-  `value`, so `members[health=1]` is how many are healthy;
-- going on past a list reads the first document it kept, so
+  `value`, so `members[health=1]` is how many are healthy. After a document's name it
+  keeps those of its fields that are documents whose `field` is `value`;
+- going on past what's kept reads the first document it kept, so
   `members[state=1].optimeDate` is the primary's;
 - dates and MongoDB's timestamps are read as seconds since 1970, to work lengths of time
   out from with `value`.
@@ -321,7 +325,8 @@ In a path:
 A reply is one row, or with a cursor, as `aggregate` and `find` give, a row for each
 document of its first batch. `rows` says where else its rows are: a list, each of whose
 items is a row, or a document, each of whose fields is a row of its name, `k`, and its
-value, `v`, as MongoDB's `$objectToArray` has them. In a query with rows, a path is in
+value, `v`, as MongoDB's `$objectToArray` has them, as are the fields of a document
+that `[field=value]` keeps. In a query with rows, a path is in
 each row, and one starting `$.` is in the whole reply:
 
 ```hcl
@@ -347,6 +352,49 @@ query "members" {
 
 A field that isn't there gives no sample. A `value` that comes to `null` gives none
 either.
+
+#### Redis commands
+
+Redis isn't SQL either, so a template for it, `database = "redis"`, asks it with one
+[Redis command](https://redis.io/docs/latest/commands/) for each discover block and
+query, in `command` rather than `sql`: its name and arguments, separated by spaces, as
+`INFO memory` or `CONFIG GET maxclients`. It's sent as those words, so it's only ever
+one command, whatever they say, and Redis has 5 seconds to answer. Redis has no
+read-only sessions, so what a command may do is up to the account it signs in as:
+give MaxNines a [user that can only run INFO and
+PING](collectors-redis.md#the-account-to-sign-in-as), and more only for what your own
+template asks. Valkey is asked the same way.
+
+The reply is made a document, read with `columns`, `rows` and paths as a
+[MongoDB](#mongodb-commands) reply is:
+
+- `INFO`'s is a document for each `# Section`, by its name in lower case, of its
+  `name:value` lines, so `clients.connected_clients` is how many clients there are. A
+  value of `name=value` pairs, as a database's `db0:keys=12,expires=3,avg_ttl=0` and a
+  replica's `slave0:ip=10.0.0.12,port=6379,state=online,offset=8812,lag=0` are, is a
+  document of its own, so `keyspace.db0.keys` is db0's keys;
+- `CONFIG GET`'s is a field for each setting it names, such as `maxclients`;
+- any other's is one field, `value`, such as `DBSIZE`'s.
+
+Numbers are read as numbers, and the words Redis says how things went in, `ok` and
+`up`, as true, as `err` and `down` are false, and `yes` and `no` too, so
+`persistence.rdb_last_bgsave_status` is true or false. Anything else is text, which
+discovery can find and `when` look at, such as `replication.role`, which is `master` or
+`slave`. `rows = "keyspace"` gives a row for each database, its name in `k`, and
+`rows = "replication[state=online]"` a row for each replica that's streaming:
+
+```hcl
+query "keyspace" {
+  command = "INFO keyspace"
+  rows    = "keyspace"
+  labels  = ["db"]
+  columns = {
+    db      = "k"
+    keys    = "v.keys"
+    expires = "v.expires"
+  }
+}
+```
 
 ### Performance counters
 
@@ -524,7 +572,8 @@ the database check signs in as, so what that account may do is what a template c
 do. Give it an account of its own that can read what monitoring needs and change
 nothing: each database's page gives one, for [PostgreSQL](collectors-postgresql.md#the-account-to-sign-in-as),
 [MySQL and MariaDB](collectors-mysql.md#the-account-to-sign-in-as),
-[MongoDB](collectors-mongodb.md#the-account-to-sign-in-as) and
+[MongoDB](collectors-mongodb.md#the-account-to-sign-in-as),
+[Redis](collectors-redis.md#the-account-to-sign-in-as) and
 [ClickHouse](collectors-clickhouse.md#the-account-to-sign-in-as). Whenever it connects,
 and every 5 minutes, MaxNines reads [what the account may
 do](database-stats.md#what-the-account-may-do) beyond reading, and the built-in

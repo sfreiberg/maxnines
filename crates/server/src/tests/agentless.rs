@@ -1327,6 +1327,11 @@ async fn only_a_database_check_reads_stats() {
     )
     .await;
     assert_eq!(status, 422, "{body}");
+    // Redis is read by its template, as every kind of database is.
+    let mut redis = request("redis", "db:6379");
+    redis["check"]["name"] = json!("sessions");
+    let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &redis).await;
+    assert_eq!(status, 201, "{body}");
     // MongoDB is read by its template, as every kind of database is.
     let (status, added) = api(
         &server,
@@ -1466,6 +1471,77 @@ async fn a_mysql_check_reads_its_stats_with_the_built_in_template() {
         }
     }
     // Nothing went wrong reading it.
+    let errors = server
+        .state
+        .database
+        .template_errors(Some(&id), None)
+        .await
+        .unwrap();
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+/// Reads a throwaway Redis, named as `host:port [username] password`, as a host with
+/// no agent: by the built-in template, with an ACL user that can only run INFO and
+/// PING, as the docs suggest, signed in to on the host itself without TLS.
+#[tokio::test]
+async fn a_redis_check_reads_its_stats_with_the_built_in_template() {
+    let Ok(real) = std::env::var("MAXNINES_TEST_CHECK_REDIS") else {
+        return;
+    };
+    let words: Vec<&str> = real.split_whitespace().collect();
+    let (target, username, password) = match words.as_slice() {
+        [target, password] => (*target, None, *password),
+        [target, username, password] => (*target, Some(*username), *password),
+        _ => panic!("MAXNINES_TEST_CHECK_REDIS is host:port [username] password"),
+    };
+    let server = start_with_metrics().await;
+    server
+        .state
+        .database
+        .sync_templates(
+            &crate::templates::built_in::all().unwrap(),
+            crate::times::now(),
+        )
+        .await
+        .unwrap();
+    let id = add_host(&server, "cache").await;
+    let check = json!({
+        "host_id": id,
+        "check": { "name": "sessions", "kind": "redis", "target": target },
+        "interval_secs": 10,
+        "username": username,
+        "password": password,
+        "read_stats": true,
+    });
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &check).await;
+    assert_eq!(status, 201, "{added}");
+    let mut scheduler = check_scheduler(&server);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut now = crate::times::now();
+    // A primary's, once discovery has said it's one.
+    for metric in [
+        "redis.connections",
+        "redis.uptime",
+        "redis.up",
+        "redis.memory",
+        "redis.replica",
+        "redis.replicas",
+    ] {
+        loop {
+            let body = host_metric(&server, &id, metric).await;
+            if body["series"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty())
+            {
+                assert!(body.to_string().contains("sessions"), "{body}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no {metric}: {body}");
+            run_due(&mut scheduler, now).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            now += TimeDelta::seconds(11);
+        }
+    }
     let errors = server
         .state
         .database

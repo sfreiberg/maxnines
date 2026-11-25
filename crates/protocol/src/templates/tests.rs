@@ -528,7 +528,7 @@ template "docs" {
 fn mongodb_is_asked_with_commands_whose_replies_columns_name() {
     let template = parse(MONGO).unwrap();
     assert!(template.check().is_empty(), "{:?}", template.check());
-    assert!(template.is_mongodb());
+    assert_eq!(template.asked(), Asked::Mongodb);
     assert_eq!(
         template.discover[0].sql.as_deref(),
         Some("{ \"buildInfo\": 1 }\n")
@@ -683,4 +683,78 @@ fn a_column_only_for_working_others_out_starts_with_an_underscore() {
         "{:?}",
         problems(&bad_path)
     );
+}
+
+const REDIS_TEMPLATE: &str = r#"
+template "cache" {
+  name     = "Cache"
+  database = "redis"
+
+  discover "server" {
+    command = "INFO server"
+    columns = { version = "server.redis_version" }
+  }
+
+  query "keyspace" {
+    command = "INFO keyspace"
+    rows    = "keyspace"
+    labels  = ["db"]
+    columns = {
+      db   = "k"
+      keys = "v.keys"
+    }
+  }
+}
+"#;
+
+#[test]
+fn redis_is_asked_with_its_commands_written_as_words() {
+    let template = parse(REDIS_TEMPLATE).unwrap();
+    assert!(template.check().is_empty(), "{:?}", template.check());
+    assert_eq!(template.asked(), Asked::Redis);
+    assert!(template.asked().with_commands());
+    assert_eq!(template.queries[0].sql, "INFO keyspace");
+    // Written out as it was read, with command in place of sql.
+    let written = to_hcl(&template);
+    assert!(written.contains("command = \"INFO keyspace\""), "{written}");
+    assert_eq!(parse(&written).unwrap(), template);
+    let sql_for_redis = REDIS_TEMPLATE.replace("command = \"INFO keyspace\"", "sql = \"SELECT 1\"");
+    let error = format!("{:#}", parse(&sql_for_redis).unwrap_err());
+    assert!(error.contains("Redis isn't asked with SQL"), "{error}");
+}
+
+#[test]
+fn a_redis_command_is_its_words_sent_as_a_list() {
+    assert_eq!(
+        redis_command("  CONFIG GET  maxmemory\n"),
+        Ok(vec![
+            "CONFIG".to_string(),
+            "GET".to_string(),
+            "maxmemory".to_string()
+        ])
+    );
+    for (command, why) in [
+        ("", "needs a command"),
+        ("{ \"ping\": 1 }", "isn't a command's name"),
+    ] {
+        let error = redis_command(command).unwrap_err();
+        assert!(error.contains(why), "{command}: {error}");
+    }
+    let sent = redis_command_sent(&redis_command("INFO server").unwrap());
+    assert_eq!(sent, r#"["INFO","server"]"#);
+    assert!(is_command(&sent));
+    assert_eq!(
+        read_redis_command(&sent),
+        Ok(vec!["INFO".to_string(), "server".to_string()])
+    );
+    // Where it runs takes it as one, and nothing else as one.
+    assert!(work::check_statement("q", &sent).is_ok());
+    for refused in [
+        r#"[]"#,
+        r#"["INFO server"]"#,
+        r#"["INFO", 1]"#,
+        "INFO server",
+    ] {
+        assert!(work::check_statement("q", refused).is_err(), "{refused}");
+    }
 }

@@ -130,8 +130,8 @@ fn template_block(template: &Template) -> Block {
         }
         block = block.add_block(settings.block("config", None).build());
     }
-    // MongoDB is asked with commands rather than SQL, which HCL says.
-    let statement = match template.is_mongodb() {
+    // MongoDB and Redis are asked with commands rather than SQL, which HCL says.
+    let statement = match template.asked().with_commands() {
         true => "command",
         false => "sql",
     };

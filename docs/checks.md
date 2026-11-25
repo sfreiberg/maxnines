@@ -261,16 +261,9 @@ check "mail" {
   username = "monitor@example.com"
   password = env("MAIL_PASSWORD")
 }
-
-# Redis before version 6 has a password and no usernames.
-check "cache" {
-  kind     = "redis"
-  target   = "127.0.0.1:6379"
-  password = env("REDIS_PASSWORD")
-}
 ```
 
-Each can also have `insecure = true`. A database is a [`database` block](database-stats.md#the-database-block)
+Each can also have `insecure = true`. A database, Redis included, is a [`database` block](database-stats.md#the-database-block)
 instead, which reads its stats as well as whether it answers. The agent tells the server the names of the
 checks its config allows, never more, and a [config rule](api-config-rules.md) picks
 which of them to run and how often, under **Checks from the agent's config**. A name
@@ -286,7 +279,9 @@ agent runs as. Restart the agent after changing any of these.
 A PostgreSQL check uses TLS whenever the server offers it, and with **Use TLS**
 ticked, only over TLS, so one that stops offering it, or someone in the middle
 answering for it, is never sent the password. MySQL, MariaDB, Redis and MongoDB
-checks use TLS when **Use TLS** is ticked. The certificate is checked as a website's
+checks use TLS when **Use TLS** is ticked. Redis takes a password as it is, with
+nothing to hide it, so a Redis check only sends one without TLS to the host itself,
+and one elsewhere needs **Use TLS**. The certificate is checked as a website's
 is, during the handshake, so a password is never sent to a server whose certificate
 can't be trusted. For a server with a certificate from a private authority, tick
 **Don't count a bad certificate as down**.
@@ -362,7 +357,8 @@ ACL SETUSER maxnines on >a-long-random-password -@all +ping +info
 ACL SAVE
 ```
 
-`+info` lets the check report the server's version. `ACL SAVE` keeps the user over a
+`+info` lets the check report the server's version, and is all reading its
+[stats](collectors-redis.md) needs too. `ACL SAVE` keeps the user over a
 restart when users are kept in an ACL file; with users in `redis.conf`, use
 `CONFIG REWRITE` instead. Before Redis 6 there's one password for everything, given
 without a username, and the check can then do anything a client can.

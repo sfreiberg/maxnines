@@ -99,10 +99,12 @@ pub struct DiscoverWork {
     pub key: String,
     #[serde(rename = "interval_secs", with = "time::seconds")]
     pub interval: Duration,
-    /// The SQL, or for MongoDB its command, as JSON.
+    /// The SQL, or for MongoDB its command, as JSON, and for Redis its command's
+    /// words, as a JSON list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
-    /// For MongoDB, where in the reply each thing it finds is, by its name.
+    /// For MongoDB and Redis, where in the reply each thing it finds is, by its
+    /// name.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub columns: IndexMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -191,9 +193,10 @@ pub struct CounterWork {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryWork {
     pub key: String,
-    /// The SQL, or for MongoDB its command, as JSON.
+    /// The SQL, or for MongoDB its command, as JSON, and for Redis its command's
+    /// words, as a JSON list.
     pub sql: String,
-    /// For MongoDB, where in the reply its rows are.
+    /// For MongoDB and Redis, where in the reply its rows are.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<String>,
     /// How often it runs, if less often than every sample.
@@ -208,8 +211,8 @@ pub struct QueryWork {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
     /// For a SHOW statement, the only columns read, each by the name it's given
-    /// and the column it's from, and rows with the same labels add up. For MongoDB,
-    /// each by where in a row it is.
+    /// and the column it's from, and rows with the same labels add up. For MongoDB
+    /// and Redis, each by where in a row it is.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub columns: IndexMap<String, String>,
     /// The columns that are running totals, sent as the change since the last read.
@@ -309,7 +312,7 @@ pub fn check_work(work: &[TemplateWork]) -> Result<()> {
                 (Some(sql), true) => {
                     check_sql(&discover.key, sql)?;
                     if super::is_command(sql) {
-                        super::check_command(sql)
+                        super::check_sent_command(sql)
                             .map_err(|error| anyhow!("discover {:?} {error}", discover.key))?;
                     }
                 }
@@ -408,12 +411,12 @@ fn check_sql(key: &str, sql: &str) -> Result<()> {
     Ok(())
 }
 
-/// A statement is one SELECT or one SHOW, or for MongoDB one command, which saving
-/// checks and is checked again here, as where it runs is the last place it can be.
-/// What it may read is up to the account it runs as.
+/// A statement is one SELECT or one SHOW, or for MongoDB or Redis one command,
+/// which saving checks and is checked again here, as where it runs is the last
+/// place it can be. What it may read is up to the account it runs as.
 pub fn check_statement(key: &str, sql: &str) -> Result<()> {
     if super::is_command(sql) {
-        super::check_command(sql).map_err(|error| anyhow!("query {key:?} {error}"))?;
+        super::check_sent_command(sql).map_err(|error| anyhow!("query {key:?} {error}"))?;
         return Ok(());
     }
     ensure!(

@@ -757,3 +757,171 @@ fn mongodb_is_asked_with_commands_whose_fields_become_metrics() {
         "{found:?}"
     );
 }
+
+/// What real Redis 8.12 said to INFO, captured by the checks' `fixtures/redis/capture.sh`.
+macro_rules! redis_info {
+    ($name:literal) => {
+        include_str!(concat!("../../../checks/fixtures/redis/", $name, ".info"))
+    };
+}
+
+/// Each row the built-in Redis template's work gives for INFO saying each of
+/// `infos` in turn, a minute apart, where discovery found `found`, with what the
+/// server works out from them: the last round's rows.
+fn redis_rows(found: Value, infos: &[&str]) -> Vec<Value> {
+    use maxnines_checks::templates::{Cell, Totals, metric_rows, picked, redis::info};
+    use maxnines_protocol::Sample;
+    use maxnines_protocol::templates::work::collector_of;
+    use std::collections::{BTreeMap, HashMap};
+
+    let template = built_in::all()
+        .unwrap()
+        .into_iter()
+        .find(|built_in| built_in.template.key == "redis")
+        .unwrap()
+        .template;
+    let found = found.as_object().unwrap().clone();
+    let work = work::database_work(&template, "cache", Some(&found));
+    let values = values::worked_out(&template);
+    let mut totals: HashMap<String, Totals> = HashMap::new();
+    let mut last_sent = values::LastSent::default();
+    let start = crate::times::now();
+    let mut rows = Vec::new();
+    for (round, text) in infos.iter().enumerate() {
+        let mut read = Vec::new();
+        for query in &work.queries {
+            // What the agent's Redis session gives: the reply, as a document.
+            let reply = vec![vec![(
+                "reply".to_string(),
+                Cell::Reply(Box::new(info(text))),
+            )]];
+            let totals = totals.entry(query.key.clone()).or_default();
+            read.extend(metric_rows(&picked(reply, query), query, "cache", totals));
+        }
+        let mut sample = Sample {
+            time: start + chrono::TimeDelta::minutes(round as i64),
+            metrics: BTreeMap::from([(collector_of("redis"), Value::Array(read))]),
+        };
+        values::work_out(
+            &mut sample,
+            &values,
+            std::slice::from_ref(&work),
+            &Value::Null,
+            &mut last_sent,
+        );
+        rows = sample.metrics[&collector_of("redis")]
+            .as_array()
+            .unwrap()
+            .clone();
+    }
+    rows
+}
+
+/// The one row of a query's whose labels hold these, besides the database's.
+fn redis_row<'a>(rows: &'a [Value], query: &str, labels: Value) -> &'a Value {
+    let matching: Vec<&Value> = rows
+        .iter()
+        .filter(|row| row["_query"] == query)
+        .filter(|row| {
+            labels
+                .as_object()
+                .unwrap()
+                .iter()
+                .all(|(name, value)| &row["labels"][name] == value)
+        })
+        .collect();
+    assert_eq!(matching.len(), 1, "{query} {labels}: {rows:#?}");
+    matching[0]
+}
+
+#[test]
+fn the_built_in_redis_template_reads_what_real_redis_says() {
+    let template = built_in::all()
+        .unwrap()
+        .into_iter()
+        .find(|built_in| built_in.template.key == "redis")
+        .unwrap()
+        .template;
+    // Commands go to where they run as their words, so they can't be taken for SQL.
+    let found = json!({ "version": "8.12.0", "role": "master", "policy": "noeviction" });
+    let work = work::database_work(&template, "cache", found.as_object());
+    assert_eq!(
+        work.discover[0].sql.as_deref(),
+        Some(r#"["INFO","server"]"#)
+    );
+    assert_eq!(work.queries[0].sql, r#"["INFO"]"#);
+    maxnines_protocol::templates::work::check_work(&[work]).unwrap();
+
+    // A primary with no limit and one replica, then the same with a limit it's
+    // evicting keys to stay under.
+    let rows = redis_rows(
+        found.clone(),
+        &[redis_info!("primary"), redis_info!("maxmemory")],
+    );
+    let server = redis_row(&rows, "server", json!({ "instance": "cache" }));
+    assert_eq!(server["memory_limit"], 4_194_304.0);
+    let used = server["memory_used"].as_f64().unwrap();
+    assert!((100.0..101.0).contains(&used), "{server}");
+    // Running totals are what changed in the minute between.
+    assert_eq!(server["evicted"], 832.0);
+    assert_eq!(server["last_save_ok"], 1.0);
+    assert_eq!(server["refused"], 0.0);
+    assert!(
+        server["connections_used"].as_f64().unwrap() > 0.0,
+        "{server}"
+    );
+    let primary = redis_row(&rows, "primary", json!({}));
+    assert_eq!(
+        (&primary["replica"], &primary["replicas"]),
+        (&json!(0.0), &json!(1.0))
+    );
+    assert_eq!(primary["replicas_online"], 1.0);
+    let replica = redis_row(
+        &rows,
+        "replicas",
+        json!({ "replica": "127.0.0.1", "port": "56380" }),
+    );
+    assert_eq!(replica["lag_bytes"], 10_057_467.0 - 60.0);
+    assert_eq!(replica["last_acknowledged"], 0.0);
+
+    // No limit gives nothing used of it, rather than dividing by 0. Keys in two
+    // databases.
+    let rows = redis_rows(found.clone(), &[redis_info!("standalone")]);
+    let server = redis_row(&rows, "server", json!({}));
+    assert_eq!(server["memory_limit"], 0.0);
+    assert!(server.get("memory_used").is_none(), "{server}");
+    let db0 = redis_row(&rows, "keyspace", json!({ "db": "db0" }));
+    assert_eq!((&db0["keys"], &db0["expires"]), (&json!(12.0), &json!(2.0)));
+    let db3 = redis_row(&rows, "keyspace", json!({ "db": "db3" }));
+    assert_eq!((&db3["keys"], &db3["expires"]), (&json!(2.0), &json!(1.0)));
+    assert!(
+        !rows.iter().any(|row| row["_query"] == "replicas"),
+        "{rows:#?}"
+    );
+
+    // A background save that failed.
+    let rows = redis_rows(found, &[redis_info!("bgsave-failed")]);
+    assert_eq!(redis_row(&rows, "server", json!({}))["last_save_ok"], 0.0);
+
+    // A replica, its link up, then down once its primary had gone.
+    let replica = json!({ "version": "8.12.0", "role": "slave", "policy": "noeviction" });
+    let rows = redis_rows(replica.clone(), &[redis_info!("replica")]);
+    let up = redis_row(&rows, "replica", json!({}));
+    assert_eq!(
+        (&up["replica"], &up["receiving"]),
+        (&json!(1.0), &json!(1.0))
+    );
+    assert_eq!(
+        (&up["last_received"], &up["syncing"]),
+        (&json!(0.0), &json!(0.0))
+    );
+    assert!(
+        !rows.iter().any(|row| row["_query"] == "primary"),
+        "{rows:#?}"
+    );
+    let rows = redis_rows(replica, &[redis_info!("replica-link-down")]);
+    let down = redis_row(&rows, "replica", json!({}));
+    assert_eq!(down["receiving"], 0.0);
+    // Redis says -1 when it hasn't heard at all, which is nothing to chart.
+    assert!(down.get("last_received").is_none(), "{down}");
+}

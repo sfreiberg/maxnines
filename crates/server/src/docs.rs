@@ -903,6 +903,7 @@ mod tests {
         ("collectors-mysql", "mysql"),
         ("collectors-clickhouse", "clickhouse"),
         ("collectors-mongodb", "mongodb"),
+        ("collectors-redis", "redis"),
     ];
 
     /// Collectors whose metrics are described elsewhere, without a table of every

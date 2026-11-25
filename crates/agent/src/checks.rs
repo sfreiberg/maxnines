@@ -475,14 +475,6 @@ mod tests {
                     ..defined("ssh", "bastion.example.com:22")
                 },
             ),
-            // Redis before version 6 has only a password.
-            (
-                "cache".to_string(),
-                CheckDefinition {
-                    username: None,
-                    ..defined("redis", "127.0.0.1:6379")
-                },
-            ),
         ]);
         load_check_definitions(&mut definitions, Path::new("")).unwrap();
         let read = definitions["bastion"].private_key.as_deref().unwrap();
@@ -492,6 +484,11 @@ mod tests {
         for (bad, why) in [
             (defined("tcp", "a:1"), "never signs in"),
             (defined("gopher", "a:1"), "isn't a kind of check"),
+            // Its database block reads whether it answers along with its stats.
+            (
+                defined("redis", "127.0.0.1:6379"),
+                "give it as a database block",
+            ),
             (defined("imap", "noport"), "host:port"),
             (
                 CheckDefinition {
@@ -573,13 +570,7 @@ mod tests {
     #[test]
     fn a_rule_runs_the_checks_the_config_defines_and_only_those() {
         let (target, reached) = counted();
-        let definitions = CheckDefinitions::from([(
-            "cache".to_string(),
-            CheckDefinition {
-                username: None,
-                ..defined("redis", &target)
-            },
-        )]);
+        let definitions = CheckDefinitions::from([("cache".to_string(), defined("smtp", &target))]);
         let local = [
             LocalCheck {
                 timeout: Some(Duration::from_secs(1)),
@@ -603,8 +594,8 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        // It went where the config says, as a Redis check.
-        assert_eq!(row("cache")["kind"], "redis", "{output}");
+        // It went where the config says, as a mail check.
+        assert_eq!(row("cache")["kind"], "smtp", "{output}");
         assert!(reached.load(std::sync::atomic::Ordering::Relaxed) > 0);
         assert_eq!(
             row("nowhere"),

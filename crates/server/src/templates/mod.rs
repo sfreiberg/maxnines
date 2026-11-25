@@ -26,8 +26,8 @@ use sqlparser::dialect::{
 use sqlparser::parser::Parser;
 
 use maxnines_protocol::templates::{
-    Alert, Place, Problem, Problems, Target, Template, check_command, filled_sql, is_key, is_show,
-    parse_duration,
+    Alert, Asked, Place, Problem, Problems, Target, Template, check_command, filled_sql, is_key,
+    is_show, parse_duration, redis_command,
 };
 
 use crate::alert_conditions::{Names, Variable};
@@ -323,16 +323,26 @@ fn dialect_for(target: Option<&Target>) -> Box<dyn Dialect> {
 }
 
 /// What the field holding a template's statements is called: `command` for
-/// MongoDB's, and `sql` for the rest.
+/// MongoDB's and Redis', and `sql` for the rest.
 pub fn statement_field(template: &Template) -> &'static str {
-    match template.is_mongodb() {
+    match template.asked().with_commands() {
         true => "command",
         false => "sql",
     }
 }
 
+/// A command as its kind of database writes one, MongoDB's or Redis', checked.
+fn check_asked_command(asked: Asked, text: &str) -> Result<(), (&'static str, String)> {
+    let checked = match asked {
+        Asked::Redis => redis_command(text).map(drop),
+        _ => check_command(text).map(drop),
+    };
+    checked.map_err(|message| ("command", message))
+}
+
 /// What a discover block's statement finds, by name: its SQL's columns, or the
-/// fields its MongoDB command's `columns` name. What's wrong says which field.
+/// fields its MongoDB or Redis command's `columns` name. What's wrong says which
+/// field.
 fn discover_columns(
     template: &Template,
     discover: &maxnines_protocol::templates::Discover,
@@ -340,8 +350,9 @@ fn discover_columns(
     let Some(sql) = discover.sql.as_deref() else {
         return Ok(Vec::new());
     };
-    if template.is_mongodb() {
-        check_command(sql).map_err(|message| ("command", message))?;
+    let asked = template.asked();
+    if asked.with_commands() {
+        check_asked_command(asked, sql)?;
         if discover.columns.is_empty() {
             return Err((
                 "columns",
@@ -380,14 +391,16 @@ pub fn query_columns_of(
 
 /// The columns of a query, with each version's fills filled in, each once. A SHOW
 /// statement's are the names its `columns` gives them, as what it gives isn't known
-/// until it runs, as are a MongoDB command's. What's wrong says which field.
+/// until it runs, as are a MongoDB or Redis command's. What's wrong says which
+/// field.
 fn query_columns(
     template: &Template,
     query: &maxnines_protocol::templates::Query,
 ) -> Result<Vec<String>, (&'static str, String)> {
-    if template.is_mongodb() {
+    let asked = template.asked();
+    if asked.with_commands() {
         for command in filled_sql(query) {
-            check_command(&command).map_err(|message| ("command", message))?;
+            check_asked_command(asked, &command)?;
         }
         if query.columns.is_empty() {
             return Err((

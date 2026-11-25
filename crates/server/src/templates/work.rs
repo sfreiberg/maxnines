@@ -22,8 +22,8 @@ use maxnines_protocol::templates::work::{
     RegistryWork, TemplateErrors, TemplateWork,
 };
 use maxnines_protocol::templates::{
-    Counters, DEFAULT_DISCOVERY_INTERVAL, Metric, Query, Target, Template, Version, fill,
-    parse_duration,
+    Asked, Counters, DEFAULT_DISCOVERY_INTERVAL, Metric, Query, Target, Template, Version, fill,
+    parse_duration, redis_command, redis_command_sent,
 };
 use tracing::warn;
 
@@ -299,6 +299,19 @@ pub fn host_work(template: &Template, found: Option<&Map<String, Value>>) -> Tem
     }
 }
 
+/// A statement as it's sent to where it runs: a Redis command as a list of its
+/// words, so nothing could take it for SQL, and anything else as it's written.
+/// Saving checked it, so a Redis command that isn't one is sent as written, which
+/// where it runs refuses.
+fn sent(template: &Template, statement: String) -> String {
+    match template.asked() {
+        Asked::Redis => redis_command(&statement)
+            .map(|words| redis_command_sent(&words))
+            .unwrap_or(statement),
+        Asked::Sql | Asked::Mongodb => statement,
+    }
+}
+
 fn discover_interval(interval: Option<&String>) -> Duration {
     seconds(interval).unwrap_or(DEFAULT_DISCOVERY_INTERVAL)
 }
@@ -311,7 +324,7 @@ fn discover_work(template: &Template) -> Vec<DiscoverWork> {
             Some(DiscoverWork {
                 key: discover.key.clone(),
                 interval: discover_interval(discover.interval.as_ref()),
-                sql: Some(discover.sql.clone()?),
+                sql: Some(sent(template, discover.sql.clone()?)),
                 columns: discover.columns.clone(),
                 registry: Vec::new(),
                 counter_sets: BTreeMap::new(),
@@ -387,7 +400,7 @@ fn query_work(template: &Template, found: Option<&Map<String, Value>>) -> Vec<Qu
         .filter(|query| picked(query.when.as_deref(), query.since.as_deref(), found))
         .map(|query| QueryWork {
             key: query.key.clone(),
-            sql: fill(query, version.as_ref()),
+            sql: sent(template, fill(query, version.as_ref())),
             rows: query.rows.clone(),
             interval: seconds(query.interval.as_ref()),
             labels: query.labels.clone(),

@@ -4,14 +4,14 @@
     <input type="text" name="{{ p }}key" value="{{ query.key }}"{% if part_only %} readonly{% endif %} spellcheck="false">
     {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
-  {% if mongodb %}
+  {% if asked != "sql" %}
   <label>Command
-    <textarea name="{{ p }}sql" rows="5" spellcheck="false" placeholder='{ "serverStatus": 1 }'>{{ query.sql }}</textarea>
-    <small>One MongoDB command, as JSON, run on <code>admin</code> unless its <code>$db</code> says.</small>
+    <textarea name="{{ p }}sql" rows="5" spellcheck="false" placeholder='{% if asked == "redis" %}INFO{% else %}{ "serverStatus": 1 }{% endif %}'>{{ query.sql }}</textarea>
+    <small>{% if asked == "redis" %}One Redis command and its arguments, separated by spaces, such as <code>INFO</code> or <code>INFO memory</code>. INFO's reply is a document for each section, by its name in lower case.{% else %}One MongoDB command, as JSON, run on <code>admin</code> unless its <code>$db</code> says.{% endif %}</small>
     {% set e = errors | get(key=p ~ "command", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
   <label>Rows
-    <input type="text" name="{{ p }}rows" value="{{ query.rows }}" spellcheck="false" placeholder="members">
+    <input type="text" name="{{ p }}rows" value="{{ query.rows }}" spellcheck="false" placeholder="{% if asked == "redis" %}keyspace{% else %}members{% endif %}">
     <small>Where in the reply its rows are: a list, each of whose items is a row, or a document, each of whose fields is a row of <code>k</code> and <code>v</code>. Without it, a cursor's documents are the rows, or the reply is one row.</small>
     {% set e = errors | get(key=p ~ "rows", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
@@ -29,7 +29,7 @@
   </label>
   <label>Columns
     <textarea name="{{ p }}columns" rows="2" spellcheck="false" placeholder="lag = Seconds_Behind_Source">{{ query.columns }}</textarea>
-    <small>{% if mongodb %}A name for each field read, and where in a row it is, one to a line, such as <code>connections = connections.current</code>. A name starting <code>_</code> is only for working out others.{% else %}Only for a SHOW statement, whose columns aren't known until it runs: a name for each column read, one to a line.{% endif %}</small>
+    <small>{% if asked != "sql" %}A name for each field read, and where in a row it is, one to a line, such as <code>{% if asked == "redis" %}clients = clients.connected_clients{% else %}connections = connections.current{% endif %}</code>. A name starting <code>_</code> is only for working out others.{% else %}Only for a SHOW statement, whose columns aren't known until it runs: a name for each column read, one to a line.{% endif %}</small>
     {% set e = errors | get(key=p ~ "columns", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
   <div class="field-row">

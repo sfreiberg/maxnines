@@ -17,9 +17,9 @@ each collector reads, how to turn it on, and every metric it reports:
 - **Web servers:** [Apache](collectors-apache.md), [nginx](collectors-nginx.md) and
   [PHP-FPM](collectors-php-fpm.md).
 - **Databases:** [PostgreSQL](collectors-postgresql.md), [MySQL and
-  MariaDB](collectors-mysql.md), [MongoDB](collectors-mongodb.md) and
-  [ClickHouse](collectors-clickhouse.md), with what they share under [database
-  stats](database-stats.md).
+  MariaDB](collectors-mysql.md), [MongoDB](collectors-mongodb.md),
+  [ClickHouse](collectors-clickhouse.md) and [Redis](collectors-redis.md), with what
+  they share under [database stats](database-stats.md).
 
 [Checks](checks.md), [check commands](check-commands.md), custom metrics and
 [OpenMetrics pages](openmetrics.md) are collectors too, with pages of their own, and

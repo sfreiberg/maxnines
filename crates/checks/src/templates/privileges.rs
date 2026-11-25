@@ -13,7 +13,9 @@
 //! one query over `system.grants`, for the account and the roles it's been given
 //! and those roles' own, which an account that can read `system.*` can see. On
 //! MongoDB it's `connectionStatus`, which lists every action the account's roles
-//! allow, its roles' own roles' too.
+//! allow, its roles' own roles' too. On Redis it's the account's ACL rules, as
+//! `ACL GETUSER` gives them, which only an account that may read every account's can
+//! read: see [`super::redis::privileges`].
 
 use anyhow::{Result, bail};
 use maxnines_protocol::CheckKind;
@@ -291,6 +293,22 @@ impl Session {
                 match rows.first().and_then(|row| row.first()) {
                     Some((_, Cell::Reply(reply))) => Ok(mongodb_privileges(reply)),
                     _ => bail!("MongoDB didn't say what the account may do"),
+                }
+            }
+            CheckKind::Redis => {
+                if self.open.is_none() {
+                    self.open(STATEMENT_LIMIT).await?;
+                }
+                let username = self.database.credentials.username.clone();
+                match &mut self.open {
+                    Some(Open::Redis {
+                        connection,
+                        account_hidden,
+                    }) => {
+                        super::redis::privileges(connection, username.as_deref(), account_hidden)
+                            .await
+                    }
+                    _ => bail!("not connected"),
                 }
             }
             other => bail!("templates can't read {} yet", other.as_str()),

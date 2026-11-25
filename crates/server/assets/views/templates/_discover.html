@@ -8,14 +8,14 @@
     <input type="text" name="{{ d }}interval" value="{{ discover.interval }}" spellcheck="false" placeholder="1h">
     {% set e = errors | get(key=d ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
-  {% if mongodb %}
+  {% if asked != "sql" %}
   <label>Command
-    <textarea name="{{ d }}sql" rows="4" spellcheck="false" placeholder='{ "buildInfo": 1 }'>{{ discover.sql }}</textarea>
-    <small>One MongoDB command, as JSON, run on <code>admin</code> unless its <code>$db</code> says.</small>
+    <textarea name="{{ d }}sql" rows="4" spellcheck="false" placeholder='{% if asked == "redis" %}INFO server{% else %}{ "buildInfo": 1 }{% endif %}'>{{ discover.sql }}</textarea>
+    <small>{% if asked == "redis" %}One Redis command and its arguments, separated by spaces, such as <code>INFO server</code>.{% else %}One MongoDB command, as JSON, run on <code>admin</code> unless its <code>$db</code> says.{% endif %}</small>
     {% set e = errors | get(key=d ~ "command", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>
   <label>Columns
-    <textarea name="{{ d }}columns" rows="2" spellcheck="false" placeholder="version = version">{{ discover.columns }}</textarea>
+    <textarea name="{{ d }}columns" rows="2" spellcheck="false" placeholder="{% if asked == "redis" %}version = server.redis_version{% else %}version = version{% endif %}">{{ discover.columns }}</textarea>
     <small>One <code>name = field</code> to a line, each something <code>when</code> can look at by its name, read from where the field is in the reply. A <code>version</code> is read as a version.</small>
     {% set e = errors | get(key=d ~ "columns", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
   </label>

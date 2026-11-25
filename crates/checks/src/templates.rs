@@ -17,7 +17,10 @@
 //! run on the database its `$db` says, or `admin`, with the same time limit, and a
 //! cursor it leaves open closed. Its reply is read by [`from_reply`]: the fields
 //! each column names, from each of the rows the query says it has. MongoDB has no
-//! read-only sessions, so what a command may do is the account's to say.
+//! read-only sessions, so what a command may do is the account's to say. Nor is
+//! Redis, which a template asks with one of its commands, sent as its words, whose
+//! reply is made a document for [`from_reply`] to read as MongoDB's is: see
+//! [`redis`]. Again, what a command may do is the account's to say.
 //!
 //! What the account it signs in as may do is read as [`Privileges`], so an account
 //! that can change things can be reported, though it's still used.
@@ -48,6 +51,7 @@ use crate::sign_in::{
 
 mod privileges;
 pub mod reader;
+pub mod redis;
 pub use privileges::Privileges;
 
 /// How long one statement gets before the database stops it.
@@ -88,6 +92,12 @@ enum Open {
     /// only lets read.
     Clickhouse(Box<crate::databases::clickhouse::Clickhouse>),
     Mongodb(mongodb::Client),
+    Redis {
+        connection: ::redis::aio::MultiplexedConnection,
+        /// Whether the account was found unable to read what it may do on this
+        /// connection, so it isn't asked again.
+        account_hidden: bool,
+    },
 }
 
 impl Drop for Open {
@@ -174,15 +184,19 @@ impl Session {
             }
             Some(Open::Clickhouse(clickhouse)) => clickhouse.ping().await.is_ok(),
             Some(Open::Mongodb(client)) => mongodb_ping(client).await.is_ok(),
+            Some(Open::Redis { connection, .. }) => redis::run(connection, &redis::sent(&["PING"]))
+                .await
+                .is_ok(),
             None => false,
         }
     }
 
     /// Sees that it still answers, in `limit` at most, as a statement that reads
-    /// nothing would: `SELECT 1`, or MongoDB's `ping`.
+    /// nothing would: `SELECT 1`, or MongoDB's `ping`, or Redis' `PING`.
     pub async fn ping(&mut self, limit: Duration) -> Result<()> {
         match self.database.check.kind {
             CheckKind::Mongodb => self.run(r#"{ "ping": 1 }"#, limit).await.map(drop),
+            CheckKind::Redis => self.run(&redis::sent(&["PING"]), limit).await.map(drop),
             _ => self.run("SELECT 1", limit).await.map(drop),
         }
     }
@@ -235,6 +249,10 @@ impl Session {
                 mongodb_ping(&client).await?;
                 Ok(Open::Mongodb(client))
             }
+            CheckKind::Redis => Ok(Open::Redis {
+                connection: redis::connect(&self.database).await?,
+                account_hidden: false,
+            }),
             other => bail!("templates can't read {} yet", other.as_str()),
         }
     }
@@ -249,6 +267,7 @@ impl Session {
             Some(Open::Mysql { connection, .. }) => run_mysql(connection, sql).await,
             Some(Open::Clickhouse(clickhouse)) => clickhouse.typed_rows(sql).await,
             Some(Open::Mongodb(client)) => run_mongodb(client, sql).await,
+            Some(Open::Redis { connection, .. }) => redis::run(connection, sql).await,
             None => bail!("not connected"),
         }
     }
@@ -304,15 +323,15 @@ async fn run_mongodb(client: &mongodb::Client, text: &str) -> Result<Vec<Row>> {
     )]])
 }
 
-/// What the one cell of a MongoDB command's rows is called.
+/// What the one cell of a MongoDB or Redis command's rows is called.
 const REPLY: &str = "reply";
 
-/// A MongoDB command's rows as a template reads them: the fields each column
-/// names, by its [`Path`], in each row the query has, which `rows` says, or each
-/// document of a cursor's first batch, or the whole reply. A list's items are
+/// A MongoDB or Redis command's rows as a template reads them: the fields each
+/// column names, by its [`Path`], in each row the query has, which `rows` says, or
+/// each document of a cursor's first batch, or the whole reply. A list's items are
 /// rows, and a document's fields each a row of its name, `k`, and its value, `v`,
-/// as MongoDB's own `$objectToArray` has them. Rows that aren't a reply's are as
-/// they are.
+/// as MongoDB's own `$objectToArray` has them, as are the fields of a document
+/// that `[field=value]` keeps. Rows that aren't a reply's are as they are.
 pub fn from_reply(
     rows: Vec<Row>,
     columns: &IndexMap<String, String>,
@@ -347,6 +366,13 @@ pub fn from_reply(
                 owned.iter().collect()
             }
             Some(At::Kept(kept)) => kept,
+            Some(At::Fields(kept)) => {
+                owned = kept
+                    .into_iter()
+                    .map(|(name, value)| doc! { "k": name, "v": value.clone() })
+                    .collect();
+                owned.iter().collect()
+            }
             _ => Vec::new(),
         },
         Some(Err(_)) => Vec::new(),
@@ -386,6 +412,8 @@ enum At<'a> {
     Value(&'a mongodb::bson::Bson),
     /// The documents of a list that `[field=value]` kept.
     Kept(Vec<&'a mongodb::bson::Document>),
+    /// The fields of a document that `[field=value]` kept, by name.
+    Fields(Vec<(&'a str, &'a mongodb::bson::Document)>),
 }
 
 impl At<'_> {
@@ -395,6 +423,7 @@ impl At<'_> {
         use mongodb::bson::Bson;
         let value = match self {
             Self::Kept(kept) => return Cell::Number(kept.len() as f64),
+            Self::Fields(kept) => return Cell::Number(kept.len() as f64),
             Self::Document(_) => return Cell::Other,
             Self::Value(value) => value,
         };
@@ -428,22 +457,33 @@ fn at<'a>(
         let document = match here {
             At::Document(document) | At::Value(Bson::Document(document)) => document,
             At::Kept(kept) => *kept.first()?,
+            At::Fields(kept) => kept.first()?.1,
             At::Value(_) => return None,
         };
         let value = document.get(&step.field)?;
         here = match &step.only {
             None => At::Value(value),
             Some((field, wanted)) => {
-                let Bson::Array(items) = value else {
-                    return None;
+                let keeps = |item: &&mongodb::bson::Document| {
+                    item.get(field).is_some_and(|value| is(value, wanted))
                 };
-                At::Kept(
-                    items
-                        .iter()
-                        .filter_map(Bson::as_document)
-                        .filter(|item| item.get(field).is_some_and(|value| is(value, wanted)))
-                        .collect(),
-                )
+                match value {
+                    Bson::Array(items) => At::Kept(
+                        items
+                            .iter()
+                            .filter_map(Bson::as_document)
+                            .filter(keeps)
+                            .collect(),
+                    ),
+                    Bson::Document(document) => At::Fields(
+                        document
+                            .iter()
+                            .filter_map(|(name, value)| Some((name.as_str(), value.as_document()?)))
+                            .filter(|(_, item)| keeps(item))
+                            .collect(),
+                    ),
+                    _ => return None,
+                }
             }
         };
     }

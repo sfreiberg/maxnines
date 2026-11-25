@@ -9,13 +9,13 @@
 //! Statements share one connection while it's open, and a new one is opened when
 //! ClickHouse has closed it, as it does with one left idle.
 
-use std::net::IpAddr;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use maxnines_protocol::{Check, CheckKind};
 use serde_json::{Map, Value};
 
+use crate::sign_in::is_loopback;
 use crate::templates::{Cell, Row};
 use crate::{Credentials, Findings, Login, WebConnection, decompress, host_and_port, open_web};
 
@@ -53,13 +53,6 @@ fn encoded(text: &str) -> String {
             other => format!("%{other:02X}"),
         })
         .collect()
-}
-
-fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 /// A value as a template's cell, by its column's type, which may be wrapped as

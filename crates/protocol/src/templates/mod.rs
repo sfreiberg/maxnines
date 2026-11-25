@@ -143,9 +143,9 @@ pub struct Discover {
     /// How often it runs, or [`DEFAULT_DISCOVERY_INTERVAL`].
     pub interval: Option<String>,
     /// Its columns each become something to look at, by their names. For MongoDB
-    /// it's a command, as JSON, written `command` in HCL.
+    /// and Redis it's a command, written `command` in HCL.
     pub sql: Option<String>,
-    /// For MongoDB, whose replies aren't columns: what each field it reads is
+    /// For MongoDB and Redis, whose replies aren't columns: what each field it reads is
     /// found as, and where in the reply it is, such as `version = "version"`.
     #[serde(default)]
     pub columns: IndexMap<String, String>,
@@ -172,14 +172,15 @@ pub struct Notice {
     pub text: String,
 }
 
-/// SQL whose columns become metrics, or for MongoDB, a command whose reply's
-/// fields do.
+/// SQL whose columns become metrics, or for MongoDB and Redis, a command whose
+/// reply's fields do.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Query {
     pub key: String,
-    /// The SQL, or for MongoDB its command, as JSON, written `command` in HCL.
+    /// The SQL, or for MongoDB and Redis its command, written `command` in HCL:
+    /// MongoDB's as JSON, and Redis' as its words, like `INFO server`.
     pub sql: String,
-    /// For MongoDB: where in the reply its rows are, a list each of whose items is
+    /// For MongoDB and Redis: where in the reply its rows are, a list each of whose items is
     /// a row, or a document each of whose fields is, as `k` and `v`. Without it, a
     /// reply with a cursor has a row for each document of its first batch, and any
     /// other is one row.
@@ -195,8 +196,8 @@ pub struct Query {
     pub labels: Vec<String>,
     /// For a SHOW statement, whose columns aren't known until it runs: the name
     /// each column it reads is given, as a metric or a label, and the column, such
-    /// as `lag = "Seconds_Behind_Source"`. For MongoDB, the field each is read
-    /// from, as a [`Path`]. No other column is read. One whose name starts with `_`
+    /// as `lag = "Seconds_Behind_Source"`. For MongoDB and Redis, the field each
+    /// is read from, as a [`Path`]. No other column is read. One whose name starts with `_`
     /// is only for working other metrics out, and isn't kept.
     #[serde(default)]
     pub columns: IndexMap<String, String>,
@@ -238,15 +239,94 @@ pub fn is_show(sql: &str) -> bool {
     first_keyword(sql) == "SHOW"
 }
 
-/// The kind of database whose queries are commands rather than SQL.
+/// The kind of database whose queries are commands written as JSON.
 pub const MONGODB: &str = "mongodb";
+
+/// The kind of database whose queries are commands written as Redis' own are.
+pub const REDIS: &str = "redis";
+
+/// How a kind of database is asked: with SQL, or with MongoDB's or Redis' own
+/// commands, whose replies aren't columns, so `columns` says where in each what's
+/// read is, as a [`Path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    Sql,
+    Mongodb,
+    Redis,
+}
+
+impl Asked {
+    /// How a kind of database, such as `postgres`, is asked.
+    pub fn of(database: &str) -> Self {
+        match database {
+            MONGODB => Self::Mongodb,
+            REDIS => Self::Redis,
+            _ => Self::Sql,
+        }
+    }
+
+    /// Whether it's asked with commands, written `command` in HCL, rather than SQL.
+    pub fn with_commands(self) -> bool {
+        self != Self::Sql
+    }
+}
 
 /// The database a MongoDB command runs on, unless it says otherwise with `$db`.
 pub const COMMAND_DATABASE: &str = "admin";
 
-/// Whether a query's text is a MongoDB command, written as JSON, rather than SQL.
+/// Whether a statement as it's sent to where it runs is a command rather than SQL:
+/// MongoDB's, written as JSON, or Redis', as [`redis_command_sent`] writes one.
 pub fn is_command(text: &str) -> bool {
-    text.trim_start().starts_with('{')
+    text.trim_start().starts_with(['{', '['])
+}
+
+/// A command as it's sent to where it runs, MongoDB's or Redis', checked as
+/// [`check_command`] or [`read_redis_command`] does.
+pub fn check_sent_command(text: &str) -> Result<(), String> {
+    match text.trim_start().starts_with('[') {
+        true => read_redis_command(text).map(drop),
+        false => check_command(text).map(drop),
+    }
+}
+
+/// A Redis command as a template writes one: its name and then its arguments,
+/// separated by spaces, as `INFO server` or `CONFIG GET maxmemory`. It gives each
+/// word. What a command may do is up to the account it runs as.
+pub fn redis_command(text: &str) -> Result<Vec<String>, String> {
+    let words: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    match words.first() {
+        None => Err("needs a command, like INFO server".to_string()),
+        Some(name)
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-|".contains(c)) =>
+        {
+            Err(format!(
+                "starts with {name:?}, which isn't a command's name: give a command and its arguments, like INFO server"
+            ))
+        }
+        Some(_) => Ok(words),
+    }
+}
+
+/// A Redis command as it's sent to where it runs: a JSON list of its words, which
+/// can't be taken for SQL or for a MongoDB command.
+pub fn redis_command_sent(words: &[String]) -> String {
+    serde_json::to_string(words).unwrap_or_default()
+}
+
+/// The words of a Redis command as [`redis_command_sent`] writes it.
+pub fn read_redis_command(text: &str) -> Result<Vec<String>, String> {
+    let words: Vec<String> = serde_json::from_str(text)
+        .map_err(|error| format!("isn't a Redis command's words as a JSON list: {error}"))?;
+    redis_command(&words.join(" "))?;
+    match words
+        .iter()
+        .any(|word| word.chars().any(char::is_whitespace))
+    {
+        true => Err("is a Redis command's words, none of which have spaces".to_string()),
+        false => Ok(words),
+    }
 }
 
 /// A MongoDB command, written as JSON, as MongoDB's own documents write one: one
@@ -279,14 +359,16 @@ pub fn check_command(text: &str) -> Result<(String, String), String> {
     Ok((name, database))
 }
 
-/// Where a field is in a MongoDB reply, as a MongoDB query column says: a field's
-/// name, or names down through documents, as `connections.current`. A list is
-/// read as how many it holds, and `[field=value]` after a list's name keeps only
+/// Where a field is in a MongoDB or Redis reply, as such a query's column says: a
+/// field's name, or names down through documents, as `connections.current`. A list
+/// is read as how many it holds, and `[field=value]` after a list's name keeps only
 /// the documents in it whose `field` is `value`, so `members[health=1]` is how
-/// many members are healthy. Going on past a list reads the first document it
-/// keeps: `members[state=1].optimeDate` is the primary's. In a query whose rows
-/// are a list's items, a path is in each row, and one starting `$.` is in the
-/// whole reply.
+/// many members are healthy. After a document's name it keeps those of its fields
+/// that are documents whose `field` is `value`, as `replication[state=online]`.
+/// Going on past what's kept reads the first document it keeps:
+/// `members[state=1].optimeDate` is the primary's. In a query whose rows are a
+/// list's items, a path is in each row, and one starting `$.` is in the whole
+/// reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Path {
     /// Whether it's in the whole reply rather than the row.
@@ -847,7 +929,7 @@ impl Template {
             Place::Discover,
             &mut say,
         );
-        let mongodb = self.is_mongodb();
+        let commands = self.asked().with_commands();
         // What every discover block finds is looked at together, by name.
         let mut found = BTreeSet::new();
         for (index, discover) in self.discover.iter().enumerate() {
@@ -928,11 +1010,11 @@ impl Template {
                     say(place, "counter_sets", format!("{name:?} is found twice"));
                 }
             }
-            if !discover.columns.is_empty() && !mongodb {
+            if !discover.columns.is_empty() && !commands {
                 say(
                     place,
                     "columns",
-                    "are only for MongoDB: name SQL's columns with AS".to_string(),
+                    "are only for MongoDB and Redis: name SQL's columns with AS".to_string(),
                 );
             }
             if discover.columns.len() > work::MAX_COLUMNS {
@@ -1008,7 +1090,7 @@ impl Template {
         }
         check_keys(self.queries.iter().map(|q| &q.key), Place::Query, &mut say);
         for (index, query) in self.queries.iter().enumerate() {
-            check_query(index, query, mongodb, &mut say);
+            check_query(index, query, commands, &mut say);
         }
 
         check_keys(
@@ -1046,9 +1128,14 @@ impl Template {
         problems
     }
 
-    /// Whether it's for MongoDB, whose queries are commands rather than SQL.
-    pub fn is_mongodb(&self) -> bool {
-        matches!(&self.target, Some(Target::Database(kind)) if kind == MONGODB)
+    /// How the kind of database it's for is asked: with SQL, or with MongoDB's or
+    /// Redis' commands. A template that isn't for a database has SQL, which it's
+    /// told it can't run.
+    pub fn asked(&self) -> Asked {
+        match &self.target {
+            Some(Target::Database(kind)) => Asked::of(kind),
+            _ => Asked::Sql,
+        }
     }
 
     /// Its metrics' keys, each once, in the order they're written.
@@ -1183,17 +1270,17 @@ fn check_metric(
 fn check_query(
     index: usize,
     query: &Query,
-    mongodb: bool,
+    commands: bool,
     say: &mut dyn FnMut(Place, &str, String),
 ) {
     let place = Place::Query(index);
-    match (&query.rows, mongodb) {
+    match (&query.rows, commands) {
         (Some(rows), true) => {
             if let Err(message) = parse_path(rows) {
                 say(place, "rows", message);
             }
         }
-        (Some(_), false) => say(place, "rows", "are only for MongoDB".to_string()),
+        (Some(_), false) => say(place, "rows", "are only for MongoDB and Redis".to_string()),
         (None, _) => {}
     }
     if query.sql.trim().is_empty() {
@@ -1245,7 +1332,7 @@ fn check_query(
                 "columns",
                 format!("{name:?} needs the column it's read from"),
             );
-        } else if mongodb && let Err(message) = parse_path(column) {
+        } else if commands && let Err(message) = parse_path(column) {
             say(place, "columns", message);
         }
         if is_helper(name) && query.labels.contains(name) {

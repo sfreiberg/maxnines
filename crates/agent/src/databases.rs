@@ -68,7 +68,7 @@ impl DatabaseDefinition {
             .filter(|kind| is_database(*kind))
             .with_context(|| {
                 format!(
-                    "{:?} isn't a kind of database, which are postgres, mysql, mongodb and clickhouse",
+                    "{:?} isn't a kind of database, which are postgres, mysql, mongodb, clickhouse and redis",
                     self.kind
                 )
             })?;
@@ -102,7 +102,9 @@ pub fn check_database_definitions(definitions: &DatabaseDefinitions) -> Result<(
         let database = definition
             .database(name)
             .map_err(|error| problem(&format!("has a problem: {error:#}")))?;
-        if database.check.kind != CheckKind::Mongodb {
+        // MongoDB and Redis can be read without signing in, where they allow it,
+        // and Redis before 6 has a password and no usernames.
+        if !matches!(database.check.kind, CheckKind::Mongodb | CheckKind::Redis) {
             ensure!(
                 definition
                     .username
@@ -144,13 +146,27 @@ mod tests {
             password: None,
             ..defined("mongodb", "db:27017")
         };
-        one("documents", open).unwrap();
+        one("documents", open.clone()).unwrap();
+        one(
+            "cache",
+            DatabaseDefinition {
+                kind: "redis".to_string(),
+                ..open
+            },
+        )
+        .unwrap();
+        // Redis before 6, or its default user, with a password alone.
+        let password_only = DatabaseDefinition {
+            username: None,
+            ..defined("redis", "127.0.0.1:6379")
+        };
+        one("sessions", password_only).unwrap();
 
         for (name, definition, why) in [
             ("two words", defined("postgres", "a:1"), "without spaces"),
             (
                 "orders",
-                defined("redis", "a:1"),
+                defined("memcached", "a:1"),
                 "isn't a kind of database",
             ),
             ("orders", defined("postgres", "nowhere"), "host:port"),

@@ -17,7 +17,7 @@ use serde_json::json;
 use maxnines_protocol::templates::{Counters, Discover, Place, Problem, Query, Template};
 
 use super::template_form::{TemplateForm, field_errors};
-use super::templates::local_suggestions;
+use super::templates::{asked_name, local_suggestions};
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::NameTaken;
 use crate::app_state::AppState;
@@ -220,7 +220,7 @@ fn form_page(
             &format!("/templates/{}/{segment}/{key}", stored.id),
         )
         .with("form", form)
-        .with("mongodb", &as_run.is_mongodb())
+        .with("asked", asked_name(as_run.asked()))
         .with("part_only", &true)
         .with("errors", &field_errors(problems))
         .with("problem_count", &problems.len())

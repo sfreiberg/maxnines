@@ -11,3 +11,4 @@ mongodb
 unifi
 drives
 updates
+redis

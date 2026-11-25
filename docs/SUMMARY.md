@@ -19,6 +19,7 @@
   - [MySQL and MariaDB](collectors-mysql.md)
   - [MongoDB](collectors-mongodb.md)
   - [ClickHouse](collectors-clickhouse.md)
+  - [Redis](collectors-redis.md)
 - [HTTPS](https.md)
 - [Proxies](proxies.md)
 - [Databases](databases.md)

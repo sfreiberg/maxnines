@@ -13,7 +13,7 @@ use axum_csrf::CsrfToken;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use maxnines_protocol::templates::{Problem, Problems, Template, parse, to_hcl};
+use maxnines_protocol::templates::{Asked, Problem, Problems, Template, parse, to_hcl};
 
 use super::template_form::{TemplateForm, field_errors};
 use super::{CsrfForm, Page, local_date, local_time, server_error};
@@ -90,6 +90,16 @@ fn target_words(template: &Template) -> String {
                 .collect();
             names.join(", ")
         }
+    }
+}
+
+/// How a template's form shows its statements: `sql`, or `mongodb` and `redis` for
+/// those kinds' commands.
+pub(super) fn asked_name(asked: Asked) -> &'static str {
+    match asked {
+        Asked::Sql => "sql",
+        Asked::Mongodb => "mongodb",
+        Asked::Redis => "redis",
     }
 }
 
@@ -811,11 +821,9 @@ async fn form_page(
     let page = Page::new(state, token, "templates/form.html")
         .with("id", &id)
         .with("form", form)
-        // MongoDB is asked with commands, which the form says rather than SQL.
-        .with(
-            "mongodb",
-            &(form.database.trim() == maxnines_protocol::templates::MONGODB),
-        )
+        // MongoDB and Redis are asked with commands, which the form says rather
+        // than SQL.
+        .with("asked", asked_name(Asked::of(form.database.trim())))
         .with("errors", &errors)
         .with("problem_count", &problems.len())
         .with("operating_systems", &crate::rule_engine::OPERATING_SYSTEMS)

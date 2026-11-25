@@ -12,7 +12,7 @@ that host. A check added without a host gets a new host of its own.
 | `interval_secs` | Required. How often it runs, from 10 seconds to a day. For a heartbeat, how often it should be pinged, from a minute to 31 days |
 | `grace_secs` | For a heartbeat: how much later than `interval_secs` a ping can come before it's down, up to 7 days. Left out, none |
 | `enabled` | Defaults to `true` |
-| `read_stats` | For a PostgreSQL, MySQL, MongoDB or ClickHouse check: `true` also reads the database's health and replication with its kind's built-in template, saved under the check's host, as described in [database stats](database-stats.md#hosts-without-an-agent) |
+| `read_stats` | For a PostgreSQL, MySQL, MongoDB, ClickHouse or Redis check: `true` also reads the database's health and replication with its kind's built-in template, saved under the check's host, as described in [database stats](database-stats.md#hosts-without-an-agent) |
 | `username` | For a check that [signs in](checks.md#signing-in): who as |
 | `password` | Its password, which can be set but is never given back |
 | `password_env` | Or the server's environment variable that holds it. Its name has to start with `MAXNINES_SECRET_` |
