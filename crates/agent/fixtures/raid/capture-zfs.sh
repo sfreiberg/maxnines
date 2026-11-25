@@ -30,7 +30,7 @@ rm -rf "$work"
 mkdir -p "$work"
 
 # The very commands the agent runs.
-LIST="zpool list -Hp -o name,health,size,allocated,free,fragmentation,capacity"
+LIST="zpool list -Hp -o name,health,size,fragmentation,capacity"
 STATUS="zpool status -p"
 if zpool status -j >/dev/null 2>&1; then
   json=yes

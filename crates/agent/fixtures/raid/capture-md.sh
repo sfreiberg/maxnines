@@ -2,10 +2,12 @@
 # Builds Linux software RAID arrays with mdadm on loop devices and keeps what
 # /proc/mdstat, which the agent's raid collector reads, says at each step: no
 # arrays, healthy RAID 0, 1, 5 and 10, a first resync, a device failed and then
-# removed, recovery after it's added back, a check, a spare taking over and an
-# array waiting for its devices. The capture-raid-outputs workflow runs it as
-# root on an Ubuntu runner, by hand only. Each step is kept as
-# out/<system>/md/<step>.mdstat.
+# removed, recovery after it's added back, a check and a repair, a spare taking
+# over, an array waiting for its devices, a resync left pending by an array
+# started read-only, and an Intel RST container with an array in it. The
+# capture-raid-outputs workflow runs it as root on an Ubuntu runner. Each step is
+# kept as out/<system>/md/<step>.mdstat, and what sysfs says an array is doing,
+# where the agent reads that too, as <step>.<array>.sync_action.
 set -u
 
 # shellcheck disable=SC1091
@@ -24,6 +26,12 @@ snap() {
   cp /proc/mdstat "$out/$1.mdstat"
   echo "== $1"
   cat /proc/mdstat
+}
+
+# action <step> <array>: keeps what sysfs says the array is doing now.
+action() {
+  cp "/sys/block/$2/md/sync_action" "$out/$1.$2.sync_action"
+  echo "== $1 $2: $(cat "/sys/block/$2/md/sync_action")"
 }
 
 # disk <name> <size>: a loop device backed by a file, printed as its path.
@@ -69,6 +77,7 @@ sleep 3
 # RAID 1 resyncs its first time, and RAID 5 builds its parity by recovering
 # onto its last device.
 snap first-sync
+action first-sync md0
 
 fast
 create /dev/md2 --level=0 --raid-devices=2 "$c1" "$c2"
@@ -106,6 +115,17 @@ echo idle >/sys/block/md1/md/sync_action
 fast
 mdadm --wait /dev/md1 >/dev/null 2>&1
 
+# A repair rewrites what a check only counts. /proc/mdstat calls it a resync, and
+# only sysfs says it's a repair.
+slow
+echo repair >/sys/block/md1/md/sync_action
+sleep 3
+snap raid5-repair
+action raid5-repair md1
+echo idle >/sys/block/md1/md/sync_action
+fast
+mdadm --wait /dev/md1 >/dev/null 2>&1
+
 # A spare waits, then takes a failed device's place.
 mdadm /dev/md1 --add "$b4" >/dev/null 2>&1
 snap raid5-spare
@@ -129,6 +149,32 @@ snap inactive
 mdadm /dev/md1 --fail "$b3" >/dev/null 2>&1
 mdadm /dev/md1 --fail "$b4" >/dev/null 2>&1
 snap raid5-failed
+
+# An array started read-only, as Debian and Ubuntu start those found at boot until
+# something writes to them, leaves a resync it was in the middle of pending.
+e1=$(disk e1 128M)
+e2=$(disk e2 128M)
+slow
+create /dev/md4 --level=1 --raid-devices=2 "$e1" "$e2"
+sleep 3
+mdadm --stop /dev/md4 >/dev/null 2>&1
+echo 1 >/sys/module/md_mod/parameters/start_ro
+mdadm --assemble /dev/md4 "$e1" "$e2" >/dev/null 2>&1
+snap resync-pending
+mdadm --stop /dev/md4 >/dev/null 2>&1
+echo 0 >/sys/module/md_mod/parameters/start_ro
+fast
+
+# Intel's RST keeps its metadata in a container, an md array that's always
+# inactive and holds nothing itself, with the arrays it holds next to it. mdadm's
+# own tests make one on loop devices with these.
+export IMSM_NO_PLATFORM=1 IMSM_DEVNAME_AS_SERIAL=1
+f1=$(disk f1 256M)
+f2=$(disk f2 256M)
+mdadm --create /dev/md/imsm0 --run --metadata=imsm --raid-devices=2 "$f1" "$f2"
+mdadm --create /dev/md/vol0 --run --level=1 --raid-devices=2 --size=65536 /dev/md/imsm0
+sleep 3
+snap container
 
 uname -r >"$out/kernel"
 mdadm --version >"$out/mdadm-version" 2>&1

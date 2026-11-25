@@ -20,7 +20,6 @@ $found = foreach ($pool in @(Get-StoragePool | Where-Object { -not $_.IsPrimordi
             Resiliency = $disk.ResiliencySettingName
             HealthStatus = [string]$disk.HealthStatus
             OperationalStatus = @($disk.OperationalStatus | ForEach-Object { [string]$_ })
-            Size = $disk.Size
             Disks = $disks.Count
             UnhealthyDisks = $unhealthy
             Jobs = $jobs
