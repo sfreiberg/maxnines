@@ -23,9 +23,11 @@ listed on the [PostgreSQL](collectors-postgresql.md#built-in-alerts) page. The b
 **ClickHouse** template brings 7, for each ClickHouse database it reads, listed on the
 [ClickHouse](collectors-clickhouse.md#built-in-alerts) page, and the built-in **MySQL**
 template 7 more, for each MySQL or MariaDB database, listed on the [MySQL and
-MariaDB](collectors-mysql.md#built-in-alerts) page, and the built-in **Redis** template
-6, for each Redis, listed on the [Redis](collectors-redis.md#built-in-alerts) page. The built-in **Drives** template
-brings 6, for each drive, listed on the [Drives](collectors-smart.md#built-in-alerts)
+MariaDB](collectors-mysql.md#built-in-alerts) page. The built-in **MongoDB** template
+brings 7, for each MongoDB server, listed on the
+[MongoDB](collectors-mongodb.md#built-in-alerts) page, and the built-in **Redis**
+template 6, for each Redis, listed on the [Redis](collectors-redis.md#built-in-alerts)
+page. The built-in **Drives** template brings 6, for each drive, listed on the [Drives](collectors-smart.md#built-in-alerts)
 page, and the built-in **Updates** template 4, on updates waiting, reboots and package
 lists, listed on the [Updates](collectors-updates.md#built-in-alerts) page.
 
