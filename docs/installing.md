@@ -57,6 +57,9 @@ docker exec maxnines maxnines-server --config /etc/maxnines/server.hcl \
 
 ## Windows
 
+They run on Windows 10 and 11, and Windows Server 2016 and later. Older versions
+can't run them.
+
 The server and the agent each have an installer for x64 and Arm, such as
 `maxnines-server-<version>-x86_64-pc-windows-msvc.msi` or
 `maxnines-agent-<version>-aarch64-pc-windows-msvc.msi`. Each installs a service that
