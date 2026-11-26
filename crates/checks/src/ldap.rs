@@ -27,8 +27,6 @@ use crate::{Findings, certificate_verdict, connect, elapsed_secs, host_and_port,
 
 const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
 const BUSY: &str = "it's too busy, or unavailable";
-const CLOSED: &str = "it closed the connection";
-const ENDED: &str = "it ended the session";
 
 /// StartTLS's extended operation.
 const START_TLS: &str = "1.3.6.1.4.1.1466.20037";
@@ -209,10 +207,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         match self.answer(id, EXTENDED_RESPONSE).await {
             Ok((SUCCESS, _)) => Ok(StartTls::Offered),
             Ok(_) => Ok(StartTls::Refused),
-            Err(error)
-                if error.downcast_ref::<std::io::Error>().is_some()
-                    || [CLOSED, ENDED].contains(&error.to_string().as_str()) =>
-            {
+            Err(error) if error.is::<std::io::Error>() || error.is::<Disconnected>() => {
                 Ok(StartTls::HungUp)
             }
             Err(error) => Err(error),
@@ -397,7 +392,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             bail!(NOT_LDAP);
         };
         let answers = universal_integer(answers).context(NOT_LDAP)?;
-        ensure!(answers != 0, ENDED);
+        if answers == 0 {
+            return Err(Disconnected::Ended.into());
+        }
         ensure!(answers == id, NOT_LDAP);
         Ok(op)
     }
@@ -418,10 +415,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
                 return Ok(message);
             }
             let read = self.stream.read_buf(&mut self.buffer).await?;
-            ensure!(read > 0, CLOSED);
+            if read == 0 {
+                return Err(Disconnected::Closed.into());
+            }
         }
     }
 }
+
+/// How a server hung up.
+#[derive(Debug)]
+enum Disconnected {
+    /// It closed the connection.
+    Closed,
+    /// It sent a notice of disconnection, as it does before closing.
+    Ended,
+}
+
+impl std::fmt::Display for Disconnected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Closed => "it closed the connection",
+            Self::Ended => "it ended the session",
+        })
+    }
+}
+
+impl std::error::Error for Disconnected {}
 
 /// A BER header at the start of `bytes`: its tag byte, how long the header is, and
 /// how long what follows it is. None until enough has come to say, and an error
@@ -652,8 +671,16 @@ mod tests {
     struct Fake {
         tls: Tls,
         anonymous: Anonymous,
+        seen: Arc<Seen>,
+    }
+
+    /// What a fake saw, for a test to look at.
+    #[derive(Default)]
+    struct Seen {
         /// Whether a password ever came over a plain connection.
-        leaked: Arc<AtomicBool>,
+        leaked: AtomicBool,
+        /// When it last finished refusing a read of its log, just before saying so.
+        refused: std::sync::Mutex<Option<std::time::Instant>>,
     }
 
     /// Where a fake's connection is, which lasts through an upgrade to TLS.
@@ -663,24 +690,24 @@ mod tests {
         signed_in: bool,
     }
 
-    async fn fake(tls: Tls, anonymous: Anonymous) -> (SocketAddr, Arc<AtomicBool>) {
+    async fn fake(tls: Tls, anonymous: Anonymous) -> (SocketAddr, Arc<Seen>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let leaked = Arc::new(AtomicBool::new(false));
-        let noted = leaked.clone();
+        let seen = Arc::new(Seen::default());
+        let noted = seen.clone();
         let acceptor = acceptor();
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
                 let fake = Arc::new(Fake {
                     tls,
                     anonymous,
-                    leaked: noted.clone(),
+                    seen: noted.clone(),
                 });
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move { fake.serve(socket, &acceptor).await });
             }
         });
-        (address, leaked)
+        (address, seen)
     }
 
     fn reply(id: i64, op: StructureTag) -> BytesMut {
@@ -759,7 +786,9 @@ mod tests {
                         let _version = parts.next();
                         let name = text(parts.next().unwrap()).unwrap();
                         let password = parts.next().unwrap().expect_primitive().unwrap();
-                        self.leaked.fetch_or(!session.secure, Ordering::Relaxed);
+                        self.seen
+                            .leaked
+                            .fetch_or(!session.secure, Ordering::Relaxed);
                         session.signed_in = name == ACCOUNT && password == b"s3cret";
                         let code = if session.signed_in {
                             SUCCESS
@@ -813,6 +842,7 @@ mod tests {
                         } else if base == "cn=accesslog" {
                             // Slow, so timing it with the data's own read shows.
                             tokio::time::sleep(SLOW_REFUSAL).await;
+                            *self.seen.refused.lock().unwrap() = Some(std::time::Instant::now());
                             INSUFFICIENT_ACCESS
                         } else {
                             NO_SUCH_OBJECT
@@ -847,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn it_signs_in_and_searches_after_upgrading_to_tls_and_from_the_start() {
         for tls in [Tls::Upgrade, Tls::Implicit] {
-            let (address, leaked) = fake(tls, Anonymous::Allowed).await;
+            let (address, seen) = fake(tls, Anonymous::Allowed).await;
             let ldap = check(address, tls);
             let result = run_signed_in(&ldap, None).await;
             assert_eq!(result["up"], 1, "{tls:?} without signing in: {result}");
@@ -865,16 +895,22 @@ mod tests {
             let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
             assert_eq!(result["up"], 1, "{tls:?}: {result}");
             assert_eq!(result["signed_in"], true, "{tls:?}: {result}");
-            // Only the read that worked is timed, not the refused one before it.
+            // Only the read that worked is timed, not the refused one before it,
+            // so its time fits in what's passed since the refusal was sent. The
+            // refusal was slow, so a time that started before it wouldn't.
+            let since_refused = seen.refused.lock().unwrap().unwrap().elapsed();
             let searched = result["search_secs"].as_f64().unwrap();
-            assert!(searched < SLOW_REFUSAL.as_secs_f64(), "{tls:?}: {result}");
+            assert!(
+                searched <= since_refused.as_secs_f64(),
+                "{tls:?}: {result}, {since_refused:?} since the refusal"
+            );
 
             let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "guess"))).await;
             assert_eq!(result["up"], 0, "{tls:?} with a wrong password: {result}");
             assert_eq!(result["signed_in"], false, "{tls:?}: {result}");
             assert!(!result.to_string().contains("guess"), "{result}");
             assert!(
-                !leaked.load(Ordering::Relaxed),
+                !seen.leaked.load(Ordering::Relaxed),
                 "{tls:?} sent a password in the clear"
             );
         }
@@ -882,7 +918,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_password_is_never_sent_to_a_server_without_tls() {
-        let (address, leaked) = fake(Tls::Never, Anonymous::Allowed).await;
+        let (address, seen) = fake(Tls::Never, Anonymous::Allowed).await;
         let ldap = check(address, Tls::Never);
         let result = run_signed_in(&ldap, None).await;
         assert_eq!(result["up"], 1, "{result}");
@@ -893,14 +929,14 @@ mod tests {
         assert_eq!(result["up"], 0, "{result}");
         assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
         assert!(
-            !leaked.load(Ordering::Relaxed),
+            !seen.leaked.load(Ordering::Relaxed),
             "sent a password in the clear"
         );
     }
 
     #[tokio::test]
     async fn a_server_that_hangs_up_on_starttls_is_looked_at_again_without_it() {
-        let (address, leaked) = fake(Tls::HangsUp, Anonymous::Allowed).await;
+        let (address, seen) = fake(Tls::HangsUp, Anonymous::Allowed).await;
         let ldap = check(address, Tls::HangsUp);
         let result = run_signed_in(&ldap, None).await;
         assert_eq!(result["up"], 1, "{result}");
@@ -910,7 +946,7 @@ mod tests {
         let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
         assert_eq!(result["up"], 0, "{result}");
         assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
-        assert!(!leaked.load(Ordering::Relaxed));
+        assert!(!seen.leaked.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

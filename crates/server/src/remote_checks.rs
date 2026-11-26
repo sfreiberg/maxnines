@@ -271,7 +271,10 @@ impl SignIn {
         variable(&self.private_key_env)?;
         match self.with() {
             SignInWith::Key => {
-                ensure!(kind == CheckKind::Ssh, "only SSH checks sign in with a key");
+                ensure!(
+                    kind.sign_in().is_some_and(|needs| needs.key),
+                    "only SSH checks sign in with a key"
+                );
                 ensure!(
                     self.password.is_none() && self.password_env.is_none(),
                     "sign in with a password or a key, not both"

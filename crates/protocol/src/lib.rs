@@ -741,18 +741,19 @@ impl CheckKind {
         self.options().contains(&option)
     }
 
-    /// What it needs to sign in with a username and password, or a key for ssh,
-    /// for a kind that can.
+    /// What it needs to sign in with a username and password, or a key where it
+    /// takes one, for a kind that can.
     pub fn sign_in(self) -> Option<SignInNeeds> {
         let both = SignInNeeds {
             username: true,
             password: true,
+            key: false,
             password_in_clear: false,
         };
         match self {
+            Self::Ssh => Some(SignInNeeds { key: true, ..both }),
             Self::Mongodb
             | Self::Clickhouse
-            | Self::Ssh
             | Self::Smtp
             | Self::Imap
             | Self::Pop3
@@ -795,21 +796,18 @@ impl CheckKind {
     /// What only this kind reports, of what a check reports, by field name. The
     /// rest, such as `up` and the time each stage took, any kind can report.
     pub fn reports(self) -> &'static [&'static str] {
-        const WEB: &[&str] = &[
+        const WEBSITE: &[&str] = &[
+            "domain_days_left",
             "first_byte_secs",
             "download_secs",
             "content_length",
             "status",
         ];
         match self {
-            Self::Http => &[
-                "first_byte_secs",
-                "download_secs",
-                "content_length",
-                "status",
-                "domain_days_left",
-            ],
-            Self::Unifi => WEB,
+            Self::Http => WEBSITE,
+            // What a website reports but its domain's, as a console's address is
+            // only ever looked at for what it answers.
+            Self::Unifi => &WEBSITE[1..],
             Self::Dns => &["records"],
             Self::Ping => &[
                 "packet_loss_percent",
@@ -925,8 +923,10 @@ impl CheckOption {
 pub struct SignInNeeds {
     /// Whether it needs a username.
     pub username: bool,
-    /// Whether it needs a password, or for ssh a password or a key.
+    /// Whether it needs a password, or a key where it takes one.
     pub password: bool,
+    /// Whether it can sign in with a private key in place of a password.
+    pub key: bool,
     /// Whether it takes a password as it is, with nothing to hide it, and can't
     /// upgrade to TLS, so a password is only sent without TLS to its own host.
     pub password_in_clear: bool,
@@ -1963,6 +1963,49 @@ mod tests {
         every.host_key = Some("SHA256:x".to_string());
         every.site = Some("default".to_string());
         every.topic = Some("t".to_string());
+        // Without `..`, a field added to a check doesn't compile until it's said
+        // here whether it's an option, and one that is has to be counted, or it's
+        // an unused binding, so a new option can't be left out of `ALL`.
+        let Check {
+            name: _,
+            kind: _,
+            target: _,
+            timeout: _,
+            interval: _,
+            method,
+            body,
+            regex,
+            insecure,
+            server,
+            record,
+            count,
+            database,
+            tls,
+            host_key,
+            domain_expiry,
+            site,
+            topic,
+        } = every.clone();
+        let options = [
+            method.is_some(),
+            body.is_some(),
+            regex.is_some(),
+            insecure.is_some(),
+            server.is_some(),
+            record.is_some(),
+            count.is_some(),
+            database.is_some(),
+            tls.is_some(),
+            host_key.is_some(),
+            domain_expiry.is_some(),
+            site.is_some(),
+            topic.is_some(),
+        ];
+        assert!(options.into_iter().all(|set| set));
+        assert_eq!(options.len(), CheckOption::ALL.len(), "missing from ALL");
+        let names: std::collections::BTreeSet<&str> =
+            CheckOption::ALL.map(CheckOption::as_str).into();
+        assert_eq!(names.len(), CheckOption::ALL.len(), "listed twice");
         let written = serde_json::to_value(&every).unwrap();
         for option in CheckOption::ALL {
             assert!(every.has(option), "{option:?}");

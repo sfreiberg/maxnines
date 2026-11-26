@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -11,7 +11,7 @@ use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
 use chrono::TimeDelta;
 use maxnines_checks::databases::is_database;
-use maxnines_protocol::{Check, CheckKind};
+use maxnines_protocol::{Check, CheckKind, CheckOption};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -239,29 +239,34 @@ impl CheckForm {
         }
         let mut check = Check::new(self.name.trim(), kind, self.target.trim());
         check.timeout = number(&self.timeout_secs, "the timeout")?.map(Duration::from_secs);
-        check.method = optional(&self.method);
-        check.body = optional(&self.body);
-        check.regex = optional(&self.regex);
-        check.insecure = self.insecure.then_some(true);
-        check.server = optional(&self.server);
-        check.record = optional(&self.record);
-        check.count = number(&self.count, "the count")?;
-        check.database = optional(&self.database);
-        check.tls = self.tls.then_some(true);
-        check.host_key = optional(&self.host_key);
-        // Only a website check has a domain to look up, and on is how it starts.
-        check.domain_expiry = (kind == CheckKind::Http && !self.domain_expiry).then_some(false);
-        // Only a UniFi check has a site, and it signs in with its API key alone.
-        if kind == CheckKind::Unifi {
-            check.site = optional(&self.site);
-        }
-        if kind == CheckKind::Mqtt {
-            check.topic = optional(&self.topic);
-        }
+        // The boxes for options this kind doesn't take are hidden, and whatever's
+        // left in them from another kind doesn't count.
+        let text =
+            |option: CheckOption, value: &str| optional(value).filter(|_| kind.takes(option));
+        let ticked =
+            |option: CheckOption, value: bool| (value && kind.takes(option)).then_some(true);
+        check.method = text(CheckOption::Method, &self.method);
+        check.body = text(CheckOption::Body, &self.body);
+        check.regex = text(CheckOption::Regex, &self.regex);
+        check.insecure = ticked(CheckOption::Insecure, self.insecure);
+        check.server = text(CheckOption::Server, &self.server);
+        check.record = text(CheckOption::Record, &self.record);
+        check.count = match kind.takes(CheckOption::Count) {
+            true => number(&self.count, "the count")?,
+            false => None,
+        };
+        check.database = text(CheckOption::Database, &self.database);
+        check.tls = ticked(CheckOption::Tls, self.tls);
+        check.host_key = text(CheckOption::HostKey, &self.host_key);
+        // On is how a domain lookup starts, so only off is written.
+        check.domain_expiry =
+            (kind.takes(CheckOption::DomainExpiry) && !self.domain_expiry).then_some(false);
+        check.site = text(CheckOption::Site, &self.site);
+        check.topic = text(CheckOption::Topic, &self.topic);
         let with = match self.sign_in.as_str() {
             _ if kind == CheckKind::Unifi => SignInWith::ApiKey,
             "password" if kind.signs_in() => SignInWith::Password,
-            "key" if kind == CheckKind::Ssh => SignInWith::Key,
+            "key" if kind.sign_in().is_some_and(|needs| needs.key) => SignInWith::Key,
             _ => SignInWith::None,
         };
         // A password or key is whatever was typed, spaces and all.
@@ -583,12 +588,16 @@ fn can_report(metric: &Metric, kind: CheckKind) -> bool {
             .collect(),
         Source::Labelled(_) => Vec::new(),
     };
+    // What only some kinds report, worked out once.
+    static SOME_KINDS_OWN: LazyLock<BTreeSet<&str>> = LazyLock::new(|| {
+        CheckKind::KNOWN
+            .iter()
+            .flat_map(|kind| kind.reports().iter().copied())
+            .collect()
+    });
     fields.iter().all(|field| {
         let field = field.trim_start_matches("$.");
-        let some_kinds_own = CheckKind::KNOWN
-            .iter()
-            .any(|other| other.reports().contains(&field));
-        !some_kinds_own || kind.reports().contains(&field)
+        !SOME_KINDS_OWN.contains(field) || kind.reports().contains(&field)
     })
 }
 
@@ -1431,6 +1440,43 @@ mod tests {
         form.kind = "tcp".to_string();
         form.target = "example.com:443".to_string();
         assert_eq!(form.to_input().unwrap().0.check.domain_expiry, None);
+    }
+
+    /// Switching kinds hides the boxes for options the new kind doesn't take, and
+    /// what's still typed in them is left out, so it can't stop the check saving.
+    #[test]
+    fn boxes_hidden_for_the_kind_are_left_out() {
+        let mut form = CheckForm::blank();
+        form.name = "every box".to_string();
+        form.method = "POST".to_string();
+        form.body = "hello".to_string();
+        form.regex = "Welcome".to_string();
+        form.domain_expiry = false;
+        form.insecure = true;
+        form.server = "8.8.8.8".to_string();
+        form.record = "MX".to_string();
+        form.count = "3".to_string();
+        form.database = "postgres".to_string();
+        form.tls = true;
+        form.host_key = "SHA256:abc".to_string();
+        form.site = "default".to_string();
+        form.topic = "monitoring".to_string();
+        for kind in CheckKind::KNOWN {
+            form.kind = kind.as_str().to_string();
+            let check = form.to_input().unwrap().0.check;
+            let written = serde_json::to_value(&check).unwrap();
+            for option in CheckOption::ALL {
+                assert_eq!(
+                    written.get(option.as_str()).is_some(),
+                    kind.takes(option),
+                    "{kind:?} {option:?}"
+                );
+            }
+        }
+        // Not even a count that isn't a number.
+        form.kind = "tcp".to_string();
+        form.count = "lots".to_string();
+        form.to_input().unwrap();
     }
 
     #[test]

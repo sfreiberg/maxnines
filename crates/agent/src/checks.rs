@@ -144,18 +144,7 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path)
             problem("is a database, so give it as a database block, which reads its stats too")
         );
         check.validate()?;
-        ensure!(
-            definition
-                .username
-                .as_deref()
-                .is_some_and(|username| !username.is_empty())
-                || definition.password.is_some(),
-            problem("needs a username or a password")
-        );
-        ensure!(
-            definition.password.is_none() || definition.private_key_file.is_none(),
-            problem("has a password or a private key, not both")
-        );
+        // An empty one, as from an environment variable that isn't set, is none.
         let username = definition
             .username
             .as_deref()
@@ -165,13 +154,22 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path)
             .as_deref()
             .is_some_and(|password| !password.is_empty())
             || definition.private_key_file.is_some();
+        ensure!(
+            username || secret,
+            problem("needs a username or a password")
+        );
+        ensure!(
+            definition.password.is_none() || definition.private_key_file.is_none(),
+            problem("has a password or a private key, not both")
+        );
+        ensure!(
+            definition.private_key_file.is_none()
+                || check.kind.sign_in().is_some_and(|needs| needs.key),
+            problem("can only sign in with a private key if it's an SSH check")
+        );
         if let Some(why) = maxnines_checks::sign_in_problem(&check, username, secret) {
             return Err(problem(&format!("can never sign in: {why}")));
         }
-        ensure!(
-            definition.private_key_file.is_none() || check.kind == CheckKind::Ssh,
-            problem("can only sign in with a private key if it's an SSH check")
-        );
         if let Some(path) = &mut definition.private_key_file {
             *path = folder.join(&*path);
             let key = std::fs::read_to_string(&*path).with_context(|| {
@@ -527,6 +525,22 @@ mod tests {
                 },
                 "needs a username or a password",
             ),
+            // As from an environment variable that isn't set.
+            (
+                CheckDefinition {
+                    username: None,
+                    password: Some(String::new()),
+                    ..defined("imap", "a:1")
+                },
+                "needs a username or a password",
+            ),
+            (
+                CheckDefinition {
+                    password: None,
+                    ..defined("ssh", "a:22")
+                },
+                "can never sign in: signing in needs a password or a private key",
+            ),
             (
                 CheckDefinition {
                     private_key_file: Some(key.clone()),
@@ -539,6 +553,16 @@ mod tests {
                     password: None,
                     private_key_file: Some(folder.path().join("key")),
                     ..defined("imap", "a:993")
+                },
+                "only sign in with a private key if it's an SSH check",
+            ),
+            // A broker elsewhere without TLS would be refused for a password, but
+            // what's wrong is the key.
+            (
+                CheckDefinition {
+                    password: None,
+                    private_key_file: Some(folder.path().join("key")),
+                    ..defined("mqtt", "mqtt.example.com:1883")
                 },
                 "only sign in with a private key if it's an SSH check",
             ),

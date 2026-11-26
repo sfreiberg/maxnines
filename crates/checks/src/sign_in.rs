@@ -52,8 +52,8 @@ pub(crate) const TLS_NEEDED_ELSEWHERE: &str =
     "a password is only sent without TLS to the host itself, so set tls for one elsewhere";
 
 /// The username and password a check of `kind` signs in with, if it was given any,
-/// with what its kind needs. An empty one is none, and a password left out where
-/// the kind can do without is empty.
+/// with what its kind needs. An empty one is none, and a username or password left
+/// out where the kind can do without is empty.
 pub(crate) fn username_and_password(
     credentials: Option<&Credentials>,
     kind: CheckKind,
@@ -64,11 +64,15 @@ pub(crate) fn username_and_password(
     let needs = kind
         .sign_in()
         .context("this kind of check never signs in")?;
-    let username = credentials
+    let username = match credentials
         .username
         .as_deref()
         .filter(|username| !username.is_empty())
-        .context("signing in needs a username")?;
+    {
+        Some(given) => given,
+        None if !needs.username => "",
+        None => bail!("signing in needs a username"),
+    };
     let password = match credentials
         .password
         .as_deref()
@@ -84,7 +88,8 @@ pub(crate) fn username_and_password(
 /// Why a check can never sign in with what it's given, as its kind needs, if it
 /// can't, so the mistake is turned down when it's saved or read from the agent's
 /// config, rather than failing every time the check runs. `username` and `secret`
-/// say whether each is given, the secret being a password, or for ssh a key.
+/// say whether each is given, the secret being a password, or a key where the kind
+/// takes one.
 pub fn sign_in_problem(check: &Check, username: bool, secret: bool) -> Option<&'static str> {
     let needs = check.kind.sign_in()?;
     if !username && !secret {
@@ -94,7 +99,10 @@ pub fn sign_in_problem(check: &Check, username: bool, secret: bool) -> Option<&'
     if needs.username && !username {
         Some("signing in needs a username")
     } else if needs.password && !secret {
-        Some("signing in needs a password")
+        Some(match needs.key {
+            true => "signing in needs a password or a private key",
+            false => "signing in needs a password",
+        })
     } else if needs.password_in_clear && secret && check.tls != Some(true) && !on_its_own_host() {
         Some(TLS_NEEDED_ELSEWHERE)
     } else {
@@ -646,6 +654,36 @@ mod tests {
 
     use super::*;
     use crate::run_signed_in;
+
+    /// A login is taken as the kind's description says it needs one.
+    #[test]
+    fn a_login_needs_what_its_kind_says() {
+        let given = |username: Option<&str>, password: Option<&str>| Credentials {
+            username: username.map(str::to_string),
+            password: password.map(str::to_string),
+            private_key: None,
+        };
+        fn login(
+            kind: CheckKind,
+            credentials: &Credentials,
+        ) -> Result<Option<(&str, &str)>, String> {
+            username_and_password(Some(credentials), kind).map_err(|error| error.to_string())
+        }
+        // Redis before version 6 has no usernames.
+        let redis = given(None, Some("s3cret"));
+        assert_eq!(login(CheckKind::Redis, &redis), Ok(Some(("", "s3cret"))));
+        assert_eq!(
+            login(CheckKind::Ldap, &redis),
+            Err("signing in needs a username".to_string())
+        );
+        // A broker can let a username in alone.
+        let alone = given(Some("monitor"), None);
+        assert_eq!(login(CheckKind::Mqtt, &alone), Ok(Some(("monitor", ""))));
+        assert_eq!(
+            login(CheckKind::Ldap, &alone),
+            Err("signing in needs a password".to_string())
+        );
+    }
 
     /// Made for these tests with ssh-keygen, and used for nothing else.
     const HOST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACAB99nrYQk+/nYtnTbIiPL9foeIin2Zuz6/JzHdMY6x6QAAAJjXJLHv1ySx\n7wAAAAtzc2gtZWQyNTUxOQAAACAB99nrYQk+/nYtnTbIiPL9foeIin2Zuz6/JzHdMY6x6Q\nAAAEAIbYu2uOxRiqZJta5kjeML6CJE0GVnmCr3Threer9h3gH32ethCT7+di2dNsiI8v1+\nh4iKfZm7Pr8nMd0xjrHpAAAAEm1heG5pbmVzIHRlc3QgaG9zdAECAw==\n-----END OPENSSH PRIVATE KEY-----";
