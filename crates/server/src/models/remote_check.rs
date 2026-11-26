@@ -26,6 +26,8 @@ pub struct Model {
     pub database: Option<String>,
     pub tls: Option<bool>,
     pub host_key: Option<String>,
+    /// For MQTT: the topic to send a test message to.
+    pub topic: Option<String>,
     pub username: Option<String>,
     /// As it was typed in, when it was.
     pub password: Option<String>,

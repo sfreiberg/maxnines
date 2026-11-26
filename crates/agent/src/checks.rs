@@ -69,6 +69,9 @@ pub struct CheckDefinition {
     insecure: Option<bool>,
     #[serde(default)]
     host_key: Option<String>,
+    /// For MQTT: where to send a test message.
+    #[serde(default)]
+    topic: Option<String>,
 }
 
 impl fmt::Debug for CheckDefinition {
@@ -91,6 +94,7 @@ impl CheckDefinition {
         check.tls = self.tls;
         check.insecure = self.insecure;
         check.host_key = self.host_key.clone();
+        check.topic = self.topic.clone();
         check.timeout = timing.timeout;
         check.interval = timing.interval;
         Ok(check)
@@ -306,7 +310,7 @@ mod tests {
         let target = listener.local_addr().unwrap().to_string();
         let config: maxnines_protocol::AgentConfig = serde_json::from_value(json!({
             "collectors": { "checks": { "checks": [
-                { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+                { "name": "burrow", "kind": "gopher", "target": "gopher.example.com:70" },
                 { "name": "port", "kind": "tcp", "target": target },
             ] } },
         }))
@@ -336,9 +340,9 @@ mod tests {
                 .clone()
         };
         assert_eq!(row("port")["up"], 1, "{output}");
-        assert_eq!(row("directory")["up"], 0, "{output}");
+        assert_eq!(row("burrow")["up"], 0, "{output}");
         assert_eq!(
-            row("directory")["error"],
+            row("burrow")["error"],
             CheckKind::UNKNOWN_MESSAGE,
             "{output}"
         );
@@ -457,6 +461,7 @@ mod tests {
             tls: None,
             insecure: None,
             host_key: None,
+            topic: None,
         }
     }
 

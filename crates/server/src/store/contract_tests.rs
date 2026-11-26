@@ -936,6 +936,8 @@ fn new_metrics_read_what_the_agent_sends() {
             "name": "cache", "up": 1, "hit_rate_percent": 75.0, "evictions": 3,
             "memory_used_bytes": 16, "memory_limit_bytes": 64, "connections": 7,
         },
+        { "name": "directory", "up": 1, "search_secs": 0.25 },
+        { "name": "broker", "up": 1, "round_trip_secs": 0.5 },
     ]);
     write_metric(&mut store, "a", 20_000, "checks", checks);
     let unifi = json!({
@@ -990,6 +992,8 @@ fn new_metrics_read_what_the_agent_sends() {
     assert_eq!(value("check.memory_used", "cache"), Some(16.0));
     assert_eq!(value("check.memory_usage", "cache"), Some(25.0));
     assert_eq!(value("check.connections", "cache"), Some(7.0));
+    assert_eq!(value("check.search", "directory"), Some(0.25));
+    assert_eq!(value("check.round_trip", "broker"), Some(0.5));
     assert_eq!(value("unifi.up", "Up"), Some(1.0));
     assert_eq!(value("unifi.cpu", "CPU"), Some(12.5));
     assert_eq!(value("unifi.memory", "Memory"), Some(61.0));

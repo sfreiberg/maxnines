@@ -86,6 +86,8 @@ struct CheckForm {
     password_env: String,
     private_key: String,
     private_key_env: String,
+    /// MQTT: the topic to send a test message to.
+    topic: String,
     /// UniFi: the one site to read, and the API key made on the console.
     site: String,
     api_key: String,
@@ -162,6 +164,7 @@ impl CheckForm {
             password_env: text(&input.sign_in.password_env),
             private_key: String::new(),
             private_key_env: text(&input.sign_in.private_key_env),
+            topic: text(&check.topic),
             site: text(&check.site),
             api_key: String::new(),
             api_key_env: text(&input.sign_in.api_key_env),
@@ -201,6 +204,7 @@ impl CheckForm {
             password_env: text("password_env"),
             private_key: text("private_key"),
             private_key_env: text("private_key_env"),
+            topic: text("topic"),
             site: text("site"),
             api_key: text("api_key"),
             api_key_env: text("api_key_env"),
@@ -250,6 +254,9 @@ impl CheckForm {
         // Only a UniFi check has a site, and it signs in with its API key alone.
         if kind == CheckKind::Unifi {
             check.site = optional(&self.site);
+        }
+        if kind == CheckKind::Mqtt {
+            check.topic = optional(&self.topic);
         }
         let with = match self.sign_in.as_str() {
             _ if kind == CheckKind::Unifi => SignInWith::ApiKey,
@@ -516,13 +523,15 @@ async fn edit(State(state): State<AppState>, Path(id): Path<i64>, token: CsrfTok
 
 /// What a check's response time is made of, as the lines of one chart, in the
 /// order they happen after the total.
-const PHASES: [(&str, &str); 6] = [
+const PHASES: [(&str, &str); 8] = [
     ("check.response", "Total"),
     ("check.dns", "DNS lookup"),
     ("check.connect", "Connecting"),
     ("check.tls", "TLS handshake"),
     ("check.first_byte", "First byte"),
     ("check.download", "Download"),
+    ("check.search", "Directory search"),
+    ("check.round_trip", "Test message"),
 ];
 
 /// A chart on a check's page.

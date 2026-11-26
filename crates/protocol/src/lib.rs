@@ -557,6 +557,10 @@ pub struct Check {
     /// `default`. Every site the console has without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site: Option<String>,
+    /// mqtt: a topic to send a test message to and receive it back from, timing
+    /// how long that takes. Without one, the check only connects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,6 +582,10 @@ pub enum CheckKind {
     Imap,
     Pop3,
     Ftp,
+    /// A directory, such as OpenLDAP or Active Directory.
+    Ldap,
+    /// An MQTT broker, such as Mosquitto.
+    Mqtt,
     /// Scheduled work pings the server when it finishes, and it's down when it
     /// hasn't in time. Only the server watches these: an agent never runs one.
     Heartbeat,
@@ -599,7 +607,7 @@ impl CheckKind {
     /// Every kind this build can run.
     /// In the order people are offered them. `Unknown` stays the last variant, which
     /// a test relies on to check that nothing's missing here.
-    pub const KNOWN: [Self; 18] = [
+    pub const KNOWN: [Self; 20] = [
         Self::Http,
         Self::Tcp,
         Self::Tls,
@@ -616,6 +624,8 @@ impl CheckKind {
         Self::Imap,
         Self::Pop3,
         Self::Ftp,
+        Self::Ldap,
+        Self::Mqtt,
         Self::Unifi,
         Self::Heartbeat,
     ];
@@ -638,6 +648,8 @@ impl CheckKind {
             Self::Imap => "imap",
             Self::Pop3 => "pop3",
             Self::Ftp => "ftp",
+            Self::Ldap => "ldap",
+            Self::Mqtt => "mqtt",
             Self::Heartbeat => "heartbeat",
             Self::Unifi => "unifi",
             Self::Unknown => "unknown",
@@ -658,6 +670,8 @@ impl CheckKind {
                 | Self::Imap
                 | Self::Pop3
                 | Self::Ftp
+                | Self::Ldap
+                | Self::Mqtt
         )
     }
 
@@ -726,6 +740,7 @@ impl Check {
             host_key: None,
             domain_expiry: None,
             site: None,
+            topic: None,
         }
     }
 
@@ -771,7 +786,9 @@ impl Check {
             | CheckKind::Smtp
             | CheckKind::Imap
             | CheckKind::Pop3
-            | CheckKind::Ftp => ensure!(
+            | CheckKind::Ftp
+            | CheckKind::Ldap
+            | CheckKind::Mqtt => ensure!(
                 has_port(target),
                 "check {name:?} needs a target like host:port"
             ),
@@ -825,6 +842,8 @@ impl Check {
                 CheckKind::Imap,
                 CheckKind::Pop3,
                 CheckKind::Ftp,
+                CheckKind::Ldap,
+                CheckKind::Mqtt,
             ],
         )?;
         only_for(
@@ -846,6 +865,8 @@ impl Check {
                 CheckKind::Imap,
                 CheckKind::Pop3,
                 CheckKind::Ftp,
+                CheckKind::Ldap,
+                CheckKind::Mqtt,
             ],
         )?;
         only_for(self.host_key.is_some(), "host_key", &[CheckKind::Ssh])?;
@@ -855,6 +876,21 @@ impl Check {
             &[CheckKind::Http],
         )?;
         only_for(self.site.is_some(), "site", &[CheckKind::Unifi])?;
+        only_for(self.topic.is_some(), "topic", &[CheckKind::Mqtt])?;
+        if let Some(topic) = &self.topic {
+            // A wildcard would subscribe to more than the test message, and a topic
+            // starting with $ is the broker's own.
+            ensure!(
+                !topic.is_empty()
+                    && topic.len() <= MAX_SETTING_LEN
+                    && !topic.starts_with('$')
+                    && !topic
+                        .chars()
+                        .any(|c| c.is_control() || c == '+' || c == '#'),
+                "check {name:?} needs a topic of at most {MAX_SETTING_LEN} characters, \
+                 without + or # wildcards or control characters, that doesn't start with $"
+            );
+        }
         if let Some(site) = &self.site {
             ensure!(
                 !site.trim().is_empty() && site.len() <= 64 && !site.chars().any(char::is_control),
@@ -1713,6 +1749,32 @@ mod tests {
     }
 
     #[test]
+    fn only_an_mqtt_check_has_a_topic_and_never_a_wildcard() {
+        let mut mqtt = Check::new("broker", CheckKind::Mqtt, "mqtt.example.com:1883");
+        mqtt.topic = Some("monitoring/maxnines".to_string());
+        mqtt.validate().unwrap();
+        for bad in [
+            "",
+            "sensors/+/temp",
+            "sensors/#",
+            "$SYS/broker/version",
+            "a\nb",
+        ] {
+            mqtt.topic = Some(bad.to_string());
+            assert!(mqtt.validate().is_err(), "{bad:?}");
+        }
+        mqtt.topic = Some("x".repeat(MAX_SETTING_LEN + 1));
+        assert!(mqtt.validate().is_err());
+
+        let mut ldap = Check::new("directory", CheckKind::Ldap, "ldap.example.com:389");
+        ldap.validate().unwrap();
+        ldap.topic = Some("monitoring".to_string());
+        assert!(ldap.validate().is_err());
+        let bare = Check::new("directory", CheckKind::Ldap, "ldap.example.com");
+        assert!(bare.validate().is_err());
+    }
+
+    #[test]
     fn check_kinds_read_back_as_written() {
         for kind in CheckKind::KNOWN {
             assert_eq!(CheckKind::parse(kind.as_str()), Some(kind));
@@ -1745,6 +1807,8 @@ mod tests {
             | CheckKind::Imap
             | CheckKind::Pop3
             | CheckKind::Ftp
+            | CheckKind::Ldap
+            | CheckKind::Mqtt
             | CheckKind::Unifi
             | CheckKind::Heartbeat => true,
             CheckKind::Unknown => false,
@@ -1763,7 +1827,7 @@ mod tests {
             "collectors": {
                 "checks": {
                     "checks": [
-                        { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+                        { "name": "burrow", "kind": "gopher", "target": "gopher.example.com:70" },
                         { "name": "site", "kind": "http", "target": "https://example.com/" },
                     ],
                 },
@@ -1786,17 +1850,17 @@ mod tests {
     #[test]
     fn a_server_never_saves_a_check_of_a_kind_it_does_not_know() {
         let error = with_unknown_kind().validate().unwrap_err().to_string();
-        assert!(error.contains("\"directory\" needs a kind"), "{error}");
+        assert!(error.contains("\"burrow\" needs a kind"), "{error}");
         assert!(error.contains("http, tcp"), "{error}");
     }
 
     #[test]
     fn a_check_of_an_unknown_kind_still_needs_a_name_that_can_be_a_series() {
-        let config = check("ldap", "x");
+        let config = check("gopher", "x");
         config.validate_sent().unwrap();
         let bad = serde_json::from_value::<AgentConfig>(json!({
             "collectors": { "checks": { "checks": [
-                { "name": "a\nb", "kind": "ldap", "target": "x" },
+                { "name": "a\nb", "kind": "gopher", "target": "x" },
             ] } },
         }))
         .unwrap();

@@ -1197,6 +1197,28 @@ pub const METRICS: &[StaticMetric] = &[
         chart: ShowChart::WithData,
     },
     StaticMetric {
+        name: "check.search",
+        title: "Directory search time",
+        unit: Unit::Seconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.search_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
+        name: "check.round_trip",
+        title: "Test message round trip",
+        unit: Unit::Seconds,
+        collector: "checks",
+        source: Source::Items {
+            name: "$.name",
+            reading: Reading::Field("$.round_trip_secs"),
+        },
+        chart: ShowChart::WithData,
+    },
+    StaticMetric {
         name: "check.size",
         title: "Page size",
         unit: Unit::Bytes,

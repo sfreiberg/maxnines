@@ -32,7 +32,7 @@
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
-      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% elif kind == "ftp" %}FTP or FTPS{% elif kind == "unifi" %}UniFi console{% else %}Heartbeat (pinged by scheduled work){% endif %}</option>
+      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% elif kind == "ftp" %}FTP or FTPS{% elif kind == "ldap" %}Directory (LDAP){% elif kind == "mqtt" %}MQTT broker{% elif kind == "unifi" %}UniFi console{% else %}Heartbeat (pinged by scheduled work){% endif %}</option>
       {% endfor %}
     </select>
   </label>
@@ -90,7 +90,7 @@
 
   <label class="checkbox for-tls-option">
     <input type="checkbox" name="tls"{% if check.tls %} checked{% endif %}> Use TLS from the start
-    <small>For mail, as on ports 465, 993 and 995, and FTPS on port 990. Otherwise a mail check upgrades with STARTTLS, and an FTP check with AUTH TLS, and neither ever sends a password without TLS. PostgreSQL uses TLS whenever it's offered, and with this ticked, only over TLS.</small>
+    <small>For mail, as on ports 465, 993 and 995, FTPS on port 990, LDAPS on port 636 and MQTT on port 8883. Otherwise a mail check upgrades with STARTTLS, an FTP check with AUTH TLS and an LDAP check with StartTLS, and none of them ever sends a password without TLS. An MQTT broker can't upgrade, so it's only sent a password without this when it's on the server's own host. PostgreSQL uses TLS whenever it's offered, and with this ticked, only over TLS.</small>
   </label>
 
   <fieldset class="for-unifi">
@@ -130,7 +130,7 @@
     </label>
     <label class="username-field">Username
       <input type="text" name="username" value="{{ check.username }}" maxlength="255" autocomplete="off" spellcheck="false">
-      <small>Redis before version 6 has no usernames, so leave it empty there.</small>
+      <small>For LDAP, the account's DN, such as <code>cn=monitor,dc=example,dc=com</code>, or <code>monitor@example.com</code> for Active Directory. Redis before version 6 has no usernames, so leave it empty there.</small>
     </label>
     <div class="password-fields">
       <label>Password
@@ -163,6 +163,11 @@
       <input type="text" name="record" value="{{ check.record }}" spellcheck="false" placeholder="A">
     </label>
   </fieldset>
+
+  <label class="for-mqtt">Test message topic
+    <input type="text" name="topic" value="{{ check.topic }}" maxlength="255" spellcheck="false" placeholder="monitoring/maxnines">
+    <small>Optional. The check subscribes to it, sends a message there and times how long it takes to come back. Leave empty to only connect. No <code>+</code> or <code>#</code> wildcards.</small>
+  </label>
 
   <label class="for-ping">Packets to send
     <input type="number" name="count" value="{{ check.count }}" min="1" max="20">

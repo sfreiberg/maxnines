@@ -7,8 +7,10 @@
 
 pub mod databases;
 mod ftp;
+mod ldap;
 mod mail;
 mod memcached;
+mod mqtt;
 pub mod openmetrics;
 #[cfg(windows)]
 mod ping;
@@ -105,7 +107,9 @@ pub fn host_reached(check: &Check) -> String {
         | CheckKind::Smtp
         | CheckKind::Imap
         | CheckKind::Pop3
-        | CheckKind::Ftp => target
+        | CheckKind::Ftp
+        | CheckKind::Ldap
+        | CheckKind::Mqtt => target
             .rsplit_once(':')
             .map_or(target, |(host, _port)| host)
             .to_string(),
@@ -155,7 +159,7 @@ struct Findings {
     cert_valid_until: Option<DateTime<Utc>>,
     cert_days_left: Option<i64>,
     records: Option<usize>,
-    /// postgres, mail and ftp: whether it offers TLS, asked without signing in.
+    /// postgres, mail, ftp and ldap: whether it offers TLS, asked without signing in.
     tls_offered: Option<bool>,
     /// What the server says it is, such as 16.4 or 8.4.3.
     server_version: Option<String>,
@@ -181,6 +185,10 @@ struct Findings {
     memory_limit_bytes: Option<u64>,
     /// memcached: how many connections it has open, this one included.
     connections: Option<u64>,
+    /// ldap: reading the entry the directory's data starts at, once signed in.
+    search_secs: Option<f64>,
+    /// mqtt: a test message going to the broker and coming back.
+    round_trip_secs: Option<f64>,
     packet_loss_percent: Option<f64>,
     rtt_min_secs: Option<f64>,
     rtt_max_secs: Option<f64>,
@@ -246,6 +254,8 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
             CheckKind::Imap => mail::check_imap(check, credentials, &mut findings).await,
             CheckKind::Pop3 => mail::check_pop3(check, credentials, &mut findings).await,
             CheckKind::Ftp => ftp::check_ftp(check, credentials, &mut findings).await,
+            CheckKind::Ldap => ldap::check_ldap(check, credentials, &mut findings).await,
+            CheckKind::Mqtt => mqtt::check_mqtt(check, credentials, &mut findings).await,
             CheckKind::Heartbeat => Err(anyhow!(
                 "a heartbeat is pinged at the server rather than run"
             )),

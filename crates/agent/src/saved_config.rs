@@ -82,7 +82,7 @@ mod tests {
         let path = folder.path().join("config.json");
         let sent = json!({
             "collectors": { "checks": { "checks": [
-                { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+                { "name": "burrow", "kind": "gopher", "target": "gopher.example.com:70" },
             ] } },
             "from_a_newer_server": { "x": 1 },
         });

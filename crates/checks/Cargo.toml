@@ -50,6 +50,12 @@ mongodb = { version = "3.10.1", default-features = false, features = ["compat-3-
 # TLS, so it can't time them or read the certificate, and POP3's only library can't
 # upgrade to TLS with STLS, so both are spoken here instead.
 async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+# The packets of LDAP (BER, from the ldap3 client's own library) and MQTT 3.1.1 (from
+# the rumqttc client, without its TLS), spoken over the check's own connection, as
+# the clients make their own, which couldn't be timed or have their certificate read.
+bytes = "1"
+lber = "0.5.1"
+rumqttc = { version = "0.25.1", default-features = false }
 
 # Pinging with Windows' own ICMP functions, which any account may use.
 [target.'cfg(windows)'.dependencies]

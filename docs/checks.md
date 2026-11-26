@@ -24,6 +24,8 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **Mail sending** (`smtp`) | `host:port` | That it greets as a mail server, or that an account can sign in to send |
 | **Mailbox** (`imap`, `pop3`) | `host:port` | That it greets as one, or that an account can sign in |
 | **FTP or FTPS** (`ftp`) | `host:port` | That it greets as FTP, and its certificate where it offers TLS, or that an account can sign in |
+| **Directory** (`ldap`) | `host:port` | That it answers as LDAP, and what it says it is, or that an account can sign in and read the directory |
+| **MQTT broker** (`mqtt`) | `host:port` | That it takes a connection, or that an account can, and optionally that a test message comes back |
 | **UniFi console** (`unifi`) | The console's address | Every device the console has adopted, each a host of its own, with its CPU, memory, uplink and clients, as [UniFi](unifi.md) describes. Only the server runs these |
 | **Heartbeat** (`heartbeat`) | None | That scheduled work, such as a cron job or a backup, pinged its address in time, or [said it failed](#heartbeats) |
 
@@ -41,7 +43,7 @@ named after what the check reaches, in lower case:
 | Kind | Named after | Example target | Host's name |
 |---|---|---|---|
 | `http`, `unifi` | The host in the address, without the scheme, port, path or any username | `https://www.example.com/health` | `www.example.com` |
-| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp` | What's before the port | `db1.internal:5432` | `db1.internal` |
+| `tcp`, `tls`, `postgres`, `mysql`, `redis`, `memcached`, `mongodb`, `clickhouse`, `ssh`, `smtp`, `imap`, `pop3`, `ftp`, `ldap`, `mqtt` | What's before the port | `db1.internal:5432` | `db1.internal` |
 | `dns` | The name it looks up | `example.com` | `example.com` |
 | `heartbeat` | The check's own name | | `nightly backup` |
 | `ping` | The host it pings | `192.0.2.7` | `192.0.2.7` |
@@ -66,9 +68,11 @@ check doesn't go through is left out.
 |---|---|---|
 | `dns_secs` | **DNS lookup time** | Looking up the target's name, or asking the DNS server, for a DNS check |
 | `connect_secs` | **Connection time** | Opening the TCP connection, once the address is known, and nothing after it: no TLS, greeting or signing in |
-| `tls_secs` | **TLS handshake time** | The TLS handshake, for a website, a certificate, and mail, FTP and the rest over TLS |
+| `tls_secs` | **TLS handshake time** | The TLS handshake, for a website, a certificate, and mail, FTP, LDAP and the rest over TLS |
 | `first_byte_secs` | **Time to first byte** | A website: from sending the request to the answer starting |
 | `download_secs` | **Download time** | A website: reading the rest of the page |
+| `search_secs` | **Directory search time** | LDAP, signed in: reading the entry the directory's data starts at |
+| `round_trip_secs` | **Test message round trip** | MQTT: a test message going to the broker and coming back |
 | `response_secs` | **Check response time** | The whole check, when it worked, signing in included |
 | `rtt_min_secs`, `rtt_max_secs`, `rtt_stddev_secs` | | A ping's fastest and slowest replies, and how much they varied |
 
@@ -119,6 +123,50 @@ mail check, it never sends a password without TLS, so signing in to a server tha
 doesn't offer it counts as down without the password being sent. To check a plain
 FTP server, don't sign in. No data connection is ever opened, so nothing is listed,
 fetched or sent.
+
+## LDAP and Active Directory
+
+An LDAP check, for OpenLDAP, 389 Directory Server, Active Directory and other
+directories, asks to upgrade to TLS with StartTLS. Where the server agrees, the
+check upgrades and reads its certificate as a website check does, and a certificate
+that fails counts as down unless **Don't count a bad certificate as down** is ticked.
+`tls_offered` says whether it agreed. For LDAPS, usually on port 636, tick **Use
+TLS from the start**.
+
+It then reads the directory's root entry, which says where its data starts and,
+for some servers such as 389 Directory Server, what it is, in `server_version`.
+OpenLDAP and Active Directory don't say. A server that won't let anyone read its
+root entry without signing in still counts as up, as it answered as LDAP.
+
+Given a username and password, it signs in with a simple bind and reads the entry
+the directory's data starts at, such as `dc=example,dc=com`, asking for none of its
+attributes, which shows the directory's database is working. How long that takes is
+`search_secs`, on **Directory search time**. The username is the account's DN, such
+as `cn=monitor,ou=services,dc=example,dc=com`, or for Active Directory
+`monitor@example.com`. Like a mail check, it never sends a password without TLS, so
+signing in to a server that doesn't offer it counts as down without the password
+being sent. It never writes anything.
+
+## MQTT
+
+An MQTT check connects to the broker in MQTT 3.1.1, which every broker speaks, with
+a clean session, so the broker keeps nothing for it after it leaves. Given a username
+and password, it signs in, and counts as down if they aren't accepted. Without them,
+a broker that needs signing in still counts as up, as it answered as a broker.
+
+MQTT has no way to upgrade to TLS, so for a broker using TLS, usually on port 8883,
+tick **Use TLS from the start**, and its certificate is read as a website's is. A
+broker takes a password as it is, so as for Redis, a check only sends one without
+TLS to a broker on its own host.
+
+Given a **Test message topic**, such as `monitoring/maxnines`, the check subscribes
+to it, sends a message there that no other would, and waits for it to come back.
+How long that takes is `round_trip_secs`, on **Test message round trip**, which is
+how long a message takes to pass through the broker. Both go at most once and the
+message isn't retained, so nothing is left on the topic. A broker whose rules don't
+let the account send to the topic, or read it, usually drops the message without
+saying so, which counts as down, saying the message didn't come back in time. Use a
+topic set aside for the check, as other messages sent there are passed over.
 
 ## Heartbeats
 
@@ -224,11 +272,12 @@ To be warned in good time, add an alert rule on **Domain days left** below 30.
 
 ## Signing in
 
-A database, Redis, SSH, mail or FTP check that isn't given a way to sign in checks only
+A database, Redis, SSH, mail, FTP, LDAP or MQTT check that isn't given a way to sign in checks only
 what it can without one: that the server answers, and as what. Given a username and
 password, or for SSH a private key, it signs in, and counts as down if it can't.
 Nothing else is done once it has: no queries are run, no commands, and no mail is
-sent or read.
+sent or read. An LDAP check reads one entry, and an MQTT check sends its test
+message, where it's given a topic.
 
 ### On the server
 
@@ -260,6 +309,15 @@ check "mail" {
   tls      = true
   username = "monitor@example.com"
   password = env("MAIL_PASSWORD")
+}
+
+check "broker" {
+  kind     = "mqtt"
+  target   = "mqtt.example.com:8883"
+  tls      = true
+  username = "maxnines"
+  password = env("MQTT_PASSWORD")
+  topic    = "monitoring/maxnines"
 }
 ```
 
@@ -381,6 +439,42 @@ A MongoDB check talks to the one server it's given, never the rest of its replic
 set or cluster, so give each member its own check. It takes `host:port`, not a
 `mongodb+srv://` address; on Atlas, use a member's host name, shown under the
 cluster's connection details, and tick **Use TLS**, which Atlas needs.
+
+### LDAP
+
+On OpenLDAP or 389 Directory Server, make an entry for the check with a password,
+which can do no more than sign in and read what anyone may:
+
+```text
+dn: cn=maxnines,ou=services,dc=example,dc=com
+objectClass: organizationalRole
+objectClass: simpleSecurityObject
+cn: maxnines
+userPassword: {SSHA}...
+```
+
+Make the hash with `slappasswd`. Whether it can read the entry the data starts at
+depends on the server's access rules; most let any account that's signed in read
+it, and a check that's refused counts as down, saying the account isn't allowed to
+read the directory.
+
+On Active Directory, any domain user can sign in and read the domain's own entry, so
+make an ordinary user, outside any admin groups, with a password that doesn't
+expire, and sign in with `maxnines@example.com`. Give each domain controller its own
+check, by its own name, as the domain's name answers with any of them.
+
+### MQTT
+
+On Mosquitto, add a user with `mosquitto_passwd`, and where an ACL file limits what
+each can do, let it use only the check's topic:
+
+```text
+user maxnines
+topic readwrite monitoring/maxnines
+```
+
+Other brokers, such as EMQX and HiveMQ, have the same in their own access rules. A
+check that only connects needs nothing but signing in.
 
 ### What other tools ask for
 

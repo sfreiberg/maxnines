@@ -1,0 +1,940 @@
+//! The LDAP check, for directories such as OpenLDAP, 389 Directory Server and Active
+//! Directory. Without a username and password, it upgrades to TLS with StartTLS where
+//! it's offered, reading the certificate as a website's is, and reads the directory's
+//! root entry, which says what the server is and where its data starts. With them, it
+//! signs in with a simple bind, then reads the entry its data starts at, timing that
+//! search. Nothing is ever written.
+//!
+//! A password is only ever sent over TLS: from the start where the check says so, as
+//! on port 636, or after StartTLS. A server that offers neither isn't sent it.
+//!
+//! LDAP's messages are BER, which `lber`, the BER library of the `ldap3` client,
+//! reads and writes. The client itself makes its own connections and TLS, so it
+//! couldn't time them or read the certificate.
+
+use std::time::Instant;
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use bytes::BytesMut;
+use lber::common::TagClass;
+use lber::structure::{PL, StructureTag};
+use lber::structures::{ASNTag, Boolean, Enumerated, Integer, OctetString};
+use maxnines_protocol::Check;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use crate::sign_in::Credentials;
+use crate::{Findings, certificate_verdict, connect, elapsed_secs, host_and_port, resolve, secure};
+
+const NO_TLS: &str = "it doesn't offer TLS, so the password wasn't sent";
+const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
+const BUSY: &str = "it's too busy, or unavailable";
+
+/// StartTLS's extended operation.
+const START_TLS: &str = "1.3.6.1.4.1.1466.20037";
+
+/// Bigger than any answer the check asks for, and nothing a server needs to send.
+const MAX_MESSAGE: usize = 64 * 1024;
+/// How deep an answer's structures can go. The check's own go 5 deep, and a deeper
+/// one could only be meant to use up the stack that reads it.
+const MAX_NESTING: usize = 16;
+/// A search of one entry finds one, so more is a server not being reasonable.
+const MAX_ENTRIES: usize = 16;
+
+/// What each message does, by its application tag.
+const BIND_REQUEST: u64 = 0;
+const BIND_RESPONSE: u64 = 1;
+const UNBIND_REQUEST: u64 = 2;
+const SEARCH_REQUEST: u64 = 3;
+const SEARCH_ENTRY: u64 = 4;
+const SEARCH_DONE: u64 = 5;
+const SEARCH_REFERENCE: u64 = 19;
+const EXTENDED_REQUEST: u64 = 23;
+const EXTENDED_RESPONSE: u64 = 24;
+
+/// The result codes the check tells apart.
+const SUCCESS: i64 = 0;
+const NO_SUCH_OBJECT: i64 = 32;
+const INVALID_CREDENTIALS: i64 = 49;
+const INSUFFICIENT_ACCESS: i64 = 50;
+const BUSY_CODE: i64 = 51;
+const UNAVAILABLE: i64 = 52;
+
+/// BER's own tags for the universal types the check uses.
+const INTEGER: u64 = 2;
+const OCTET_STRING: u64 = 4;
+const ENUMERATED: u64 = 10;
+const SEQUENCE: u64 = 16;
+
+/// The username and password the check signs in with, if it was given them. A
+/// simple bind with an empty password signs in as nobody, which most servers
+/// accept, so it isn't one.
+fn login(credentials: Option<&Credentials>) -> Result<Option<(&str, &str)>> {
+    let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
+        return Ok(None);
+    };
+    let username = credentials
+        .username
+        .as_deref()
+        .filter(|username| !username.is_empty())
+        .context("signing in needs a username")?;
+    let password = credentials
+        .password
+        .as_deref()
+        .filter(|password| !password.is_empty())
+        .context("signing in needs a password")?;
+    Ok(Some((username, password)))
+}
+
+pub(crate) async fn check_ldap(
+    check: &Check,
+    credentials: Option<&Credentials>,
+    findings: &mut Findings,
+) -> Result<()> {
+    let login = login(credentials)?;
+    let (host, port) = host_and_port(&check.target)?;
+    let addresses = resolve(&host, port, findings).await?;
+    let socket = connect(&addresses, findings).await?;
+    if check.tls == Some(true) {
+        let secured = secure(&host, socket, &[], findings).await?;
+        certificate_verdict(check, secured.problem)?;
+        return Ldap::new(secured.stream, 1).look(login, findings).await;
+    }
+    let mut ldap = Ldap::new(socket, 1);
+    let offered = ldap.start_tls().await?;
+    findings.tls_offered = Some(offered);
+    if !offered {
+        if login.is_some() {
+            ldap.unbind().await;
+            bail!(NO_TLS);
+        }
+        return ldap.look(None, findings).await;
+    }
+    // Nothing more comes before the TLS handshake, so nothing is left unread.
+    ensure!(ldap.buffer.is_empty(), NOT_LDAP);
+    let next_id = ldap.next_id;
+    let secured = secure(&host, ldap.stream, &[], findings).await?;
+    certificate_verdict(check, secured.problem)?;
+    Ldap::new(secured.stream, next_id)
+        .look(login, findings)
+        .await
+}
+
+/// Just enough LDAP for a check: StartTLS, a simple bind, reading one entry and
+/// leaving.
+struct Ldap<S> {
+    stream: S,
+    buffer: BytesMut,
+    /// Each request on a connection has an ID of its own, which its answers carry.
+    next_id: i64,
+}
+
+/// What a directory's root entry says about it.
+#[derive(Debug, Default)]
+struct RootEntry {
+    /// Where its data starts, such as `dc=example,dc=com`: Active Directory's own
+    /// domain, or the first of the server's naming contexts.
+    base: Option<String>,
+    /// What it says it is, which OpenLDAP and Active Directory don't.
+    version: Option<String>,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
+    fn new(stream: S, next_id: i64) -> Self {
+        Self {
+            stream,
+            buffer: BytesMut::new(),
+            next_id,
+        }
+    }
+
+    /// Signs in where given a login, and reads the root entry and, signed in, the
+    /// entry the data starts at. Always leaves, whatever happened.
+    async fn look(mut self, login: Option<(&str, &str)>, findings: &mut Findings) -> Result<()> {
+        let looked = self.look_around(login, findings).await;
+        self.unbind().await;
+        looked
+    }
+
+    async fn look_around(
+        &mut self,
+        login: Option<(&str, &str)>,
+        findings: &mut Findings,
+    ) -> Result<()> {
+        if let Some((username, password)) = login {
+            let code = self.bind(username, password).await?;
+            findings.signed_in = Some(code == SUCCESS);
+            match code {
+                SUCCESS => {}
+                INVALID_CREDENTIALS => bail!("it didn't accept the username and password"),
+                BUSY_CODE | UNAVAILABLE => bail!(BUSY),
+                code => bail!("it didn't let the account sign in, with result code {code}"),
+            }
+        }
+        let root = self.root_entry().await?;
+        findings.server_version = root.version;
+        // Reading the data is what shows its database works, and only an account
+        // can be expected to be let in to it.
+        if login.is_some()
+            && let Some(base) = root.base
+        {
+            let started = Instant::now();
+            self.read_entry(&base).await?;
+            findings.search_secs = Some(elapsed_secs(started));
+        }
+        Ok(())
+    }
+
+    /// Asks to upgrade to TLS, saying whether the server agreed.
+    async fn start_tls(&mut self) -> Result<bool> {
+        let name = context_primitive(0, START_TLS.as_bytes());
+        let id = self
+            .send(constructed(
+                TagClass::Application,
+                EXTENDED_REQUEST,
+                vec![name],
+            ))
+            .await?;
+        let (code, _) = self.answer(id, EXTENDED_RESPONSE).await?;
+        Ok(code == SUCCESS)
+    }
+
+    async fn bind(&mut self, username: &str, password: &str) -> Result<i64> {
+        let request = constructed(
+            TagClass::Application,
+            BIND_REQUEST,
+            vec![
+                integer(3),
+                octets(username.as_bytes()),
+                context_primitive(0, password.as_bytes()),
+            ],
+        );
+        let id = self.send(request).await?;
+        Ok(self.answer(id, BIND_RESPONSE).await?.0)
+    }
+
+    /// Reads the root entry, which anyone may, though some servers won't let in
+    /// someone who hasn't signed in. That still answers as LDAP, and says nothing
+    /// about the server.
+    async fn root_entry(&mut self) -> Result<RootEntry> {
+        let attributes = [
+            "namingContexts",
+            "defaultNamingContext",
+            "vendorName",
+            "vendorVersion",
+        ];
+        let (code, entries) = self.search("", &attributes).await?;
+        match code {
+            SUCCESS => {}
+            BUSY_CODE | UNAVAILABLE => bail!(BUSY),
+            _ => return Ok(RootEntry::default()),
+        }
+        let Some(entry) = entries.into_iter().next() else {
+            return Ok(RootEntry::default());
+        };
+        let first = |name: &str| {
+            entry
+                .iter()
+                .find(|(attribute, _)| attribute.eq_ignore_ascii_case(name))
+                .and_then(|(_, values)| values.first().cloned())
+                .filter(|value| !value.is_empty())
+        };
+        let version = match (first("vendorName"), first("vendorVersion")) {
+            (_, Some(version)) => Some(version),
+            (name, None) => name,
+        };
+        Ok(RootEntry {
+            base: first("defaultNamingContext").or_else(|| first("namingContexts")),
+            version,
+        })
+    }
+
+    /// Reads one entry, asking for none of its attributes, which is enough for the
+    /// server to have found it in its database.
+    async fn read_entry(&mut self, base: &str) -> Result<()> {
+        let (code, _) = self.search(base, &["1.1"]).await?;
+        match code {
+            SUCCESS => Ok(()),
+            NO_SUCH_OBJECT => bail!("the entry its data starts at wasn't found"),
+            INSUFFICIENT_ACCESS => bail!("the account isn't allowed to read the directory"),
+            BUSY_CODE | UNAVAILABLE => bail!(BUSY),
+            code => bail!("searching it failed, with result code {code}"),
+        }
+    }
+
+    /// A search of the one entry at `base`, giving the result code and each entry
+    /// found, as its attributes and their values.
+    async fn search(
+        &mut self,
+        base: &str,
+        attributes: &[&str],
+    ) -> Result<(i64, Vec<Vec<(String, Vec<String>)>>)> {
+        let request = constructed(
+            TagClass::Application,
+            SEARCH_REQUEST,
+            vec![
+                octets(base.as_bytes()),
+                // Only the entry itself, never following aliases.
+                enumerated(0),
+                enumerated(0),
+                // One entry, in at most 10 seconds.
+                integer(1),
+                integer(10),
+                Boolean::default().into_structure(),
+                // Every entry has an objectClass, so this matches whatever's there.
+                context_primitive(7, b"objectClass"),
+                universal_sequence(
+                    attributes
+                        .iter()
+                        .map(|attribute| octets(attribute.as_bytes()))
+                        .collect(),
+                ),
+            ],
+        );
+        let id = self.send(request).await?;
+        let mut entries = Vec::new();
+        loop {
+            let op = self.message(id).await?;
+            ensure!(op.class == TagClass::Application, NOT_LDAP);
+            match op.id {
+                SEARCH_ENTRY => {
+                    ensure!(entries.len() < MAX_ENTRIES, NOT_LDAP);
+                    entries.push(read_attributes(op).context(NOT_LDAP)?);
+                }
+                SEARCH_REFERENCE => {}
+                SEARCH_DONE => return Ok((result_code(&op).context(NOT_LDAP)?, entries)),
+                _ => bail!(NOT_LDAP),
+            }
+        }
+    }
+
+    async fn unbind(&mut self) {
+        let unbind = StructureTag {
+            class: TagClass::Application,
+            id: UNBIND_REQUEST,
+            payload: PL::P(Vec::new()),
+        };
+        let _ = self.send(unbind).await;
+        let _ = self.stream.shutdown().await;
+    }
+
+    /// Sends a request, giving its ID.
+    async fn send(&mut self, op: StructureTag) -> Result<i64> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = universal_sequence(vec![integer(id), op]);
+        let mut bytes = BytesMut::new();
+        lber::write::encode_into(&mut bytes, message)?;
+        self.stream.write_all(&bytes).await?;
+        Ok(id)
+    }
+
+    /// The result code of the answer to request `id`, which has to be an `op`, and
+    /// the answer itself.
+    async fn answer(&mut self, id: i64, op: u64) -> Result<(i64, StructureTag)> {
+        let answer = self.message(id).await?;
+        ensure!(
+            answer.class == TagClass::Application && answer.id == op,
+            NOT_LDAP
+        );
+        Ok((result_code(&answer).context(NOT_LDAP)?, answer))
+    }
+
+    /// The next message's operation, which has to answer request `id`. A server
+    /// ending the session says so with an unasked-for message of ID 0.
+    async fn message(&mut self, id: i64) -> Result<StructureTag> {
+        let message = self.read_message().await?;
+        let mut parts = message
+            .expect_constructed()
+            .filter(|parts| parts.len() >= 2)
+            .context(NOT_LDAP)?
+            .into_iter();
+        let (Some(answers), Some(op)) = (parts.next(), parts.next()) else {
+            bail!(NOT_LDAP);
+        };
+        let answers = universal_integer(answers).context(NOT_LDAP)?;
+        if answers == 0 {
+            bail!("it ended the session");
+        }
+        ensure!(answers == id, NOT_LDAP);
+        Ok(op)
+    }
+
+    /// Reads one whole message, which is one BER sequence.
+    async fn read_message(&mut self) -> Result<StructureTag> {
+        loop {
+            if let Some(length) = message_length(&self.buffer)? {
+                let bytes = self.buffer.split_to(length);
+                ensure!(nesting_within(&bytes, MAX_NESTING), NOT_LDAP);
+                let (rest, message) =
+                    lber::parse::parse_tag(&bytes).map_err(|_| anyhow!(NOT_LDAP))?;
+                ensure!(rest.is_empty(), NOT_LDAP);
+                ensure!(
+                    message.class == TagClass::Universal && message.id == SEQUENCE,
+                    NOT_LDAP
+                );
+                return Ok(message);
+            }
+            let read = self.stream.read_buf(&mut self.buffer).await?;
+            ensure!(read > 0, "it closed the connection");
+        }
+    }
+}
+
+/// How long the message at the start of `buffer` is in all, once enough of it has
+/// come to say. Only an LDAP message's outer sequence is read here, so anything
+/// else, or one too long, isn't LDAP.
+fn message_length(buffer: &[u8]) -> Result<Option<usize>> {
+    let Some(&first) = buffer.first() else {
+        return Ok(None);
+    };
+    // A universal, constructed sequence.
+    ensure!(first == 0x30, NOT_LDAP);
+    let Some(&length) = buffer.get(1) else {
+        return Ok(None);
+    };
+    let (header, content) = if length < 0x80 {
+        (2, usize::from(length))
+    } else {
+        let count = usize::from(length & 0x7f);
+        // 0x80 alone is BER's length to be found later, which LDAP doesn't allow.
+        ensure!((1..=4).contains(&count), NOT_LDAP);
+        let Some(bytes) = buffer.get(2..2 + count) else {
+            return Ok(None);
+        };
+        let content = bytes
+            .iter()
+            .fold(0usize, |total, &byte| total << 8 | usize::from(byte));
+        (2 + count, content)
+    };
+    ensure!(content <= MAX_MESSAGE, NOT_LDAP);
+    let total = header + content;
+    Ok((buffer.len() >= total).then_some(total))
+}
+
+/// Whether BER no deeper than `limit` is all `bytes` holds, checked without
+/// recursing, as `lber` reads structures by recursing once for each level.
+fn nesting_within(mut bytes: &[u8], limit: usize) -> bool {
+    // Where each structure being read ends, as how much is left after it.
+    let mut ends: Vec<usize> = Vec::new();
+    while !bytes.is_empty() {
+        while ends.last() == Some(&bytes.len()) {
+            ends.pop();
+        }
+        let Some((&tag, rest)) = bytes.split_first() else {
+            return false;
+        };
+        let mut rest = rest;
+        // A tag number above 30 takes more bytes, each with its top bit set but
+        // the last.
+        if tag & 0x1f == 0x1f {
+            loop {
+                let Some((&byte, after)) = rest.split_first() else {
+                    return false;
+                };
+                rest = after;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+            }
+        }
+        let Some((&length, after)) = rest.split_first() else {
+            return false;
+        };
+        rest = after;
+        let length = if length < 0x80 {
+            usize::from(length)
+        } else {
+            let count = usize::from(length & 0x7f);
+            if !(1..=4).contains(&count) || rest.len() < count {
+                return false;
+            }
+            let (digits, after) = rest.split_at(count);
+            rest = after;
+            digits
+                .iter()
+                .fold(0usize, |total, &byte| total << 8 | usize::from(byte))
+        };
+        if length > rest.len() || ends.last().is_some_and(|&end| rest.len() - length < end) {
+            return false;
+        }
+        if tag & 0x20 != 0 {
+            ends.push(rest.len() - length);
+            if ends.len() > limit {
+                return false;
+            }
+            bytes = rest;
+        } else {
+            bytes = &rest[length..];
+        }
+    }
+    true
+}
+
+fn constructed(class: TagClass, id: u64, parts: Vec<StructureTag>) -> StructureTag {
+    StructureTag {
+        class,
+        id,
+        payload: PL::C(parts),
+    }
+}
+
+fn universal_sequence(parts: Vec<StructureTag>) -> StructureTag {
+    constructed(TagClass::Universal, SEQUENCE, parts)
+}
+
+fn context_primitive(id: u64, bytes: &[u8]) -> StructureTag {
+    StructureTag {
+        class: TagClass::Context,
+        id,
+        payload: PL::P(bytes.to_vec()),
+    }
+}
+
+fn integer(value: i64) -> StructureTag {
+    Integer {
+        inner: value,
+        ..Integer::default()
+    }
+    .into_structure()
+}
+
+fn enumerated(value: i64) -> StructureTag {
+    Enumerated {
+        inner: value,
+        ..Enumerated::default()
+    }
+    .into_structure()
+}
+
+fn octets(bytes: &[u8]) -> StructureTag {
+    OctetString {
+        inner: bytes.to_vec(),
+        ..OctetString::default()
+    }
+    .into_structure()
+}
+
+/// A whole number of up to 8 bytes, as BER writes them, most significant first and
+/// signed.
+fn number(bytes: &[u8]) -> Option<i64> {
+    let (&first, _) = bytes.split_first()?;
+    if bytes.len() > 8 {
+        return None;
+    }
+    let start = if first & 0x80 != 0 { -1i64 } else { 0 };
+    Some(
+        bytes
+            .iter()
+            .fold(start, |total, &byte| total << 8 | i64::from(byte)),
+    )
+}
+
+fn universal_integer(tag: StructureTag) -> Option<i64> {
+    let tag = tag.match_class(TagClass::Universal)?.match_id(INTEGER)?;
+    number(&tag.expect_primitive()?)
+}
+
+/// An answer's result code, the first part of every LDAP result.
+fn result_code(op: &StructureTag) -> Option<i64> {
+    let PL::C(parts) = &op.payload else {
+        return None;
+    };
+    let code = parts.first()?;
+    match (&code.class, code.id, &code.payload) {
+        (TagClass::Universal, ENUMERATED, PL::P(bytes)) => number(bytes),
+        _ => None,
+    }
+}
+
+fn text(tag: StructureTag) -> Option<String> {
+    let tag = tag
+        .match_class(TagClass::Universal)?
+        .match_id(OCTET_STRING)?;
+    String::from_utf8(tag.expect_primitive()?).ok()
+}
+
+/// A search entry's attributes, each with its values.
+fn read_attributes(entry: StructureTag) -> Option<Vec<(String, Vec<String>)>> {
+    let mut parts = entry.expect_constructed()?.into_iter();
+    let _name = parts.next()?;
+    let attributes = parts.next()?.expect_constructed()?;
+    attributes
+        .into_iter()
+        .map(|attribute| {
+            let mut parts = attribute.expect_constructed()?.into_iter();
+            let name = text(parts.next()?)?;
+            let values = parts
+                .next()?
+                .expect_constructed()?
+                .into_iter()
+                .filter_map(text)
+                .collect();
+            Some((name, values))
+        })
+        .collect()
+}
+
+/// Reads whole messages from the start of `buffer`, for the fake server in tests.
+#[cfg(test)]
+fn take_message(buffer: &mut BytesMut) -> Option<StructureTag> {
+    let length = message_length(buffer).ok()??;
+    let bytes = buffer.split_to(length);
+    let (_, message) = lber::parse::parse_tag(&bytes).ok()?;
+    Some(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use maxnines_protocol::CheckKind;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
+
+    use super::*;
+    use crate::run_signed_in;
+    use crate::test_tls::acceptor;
+
+    const ACCOUNT: &str = "cn=monitor,dc=example,dc=com";
+    const BASE: &str = "dc=example,dc=com";
+
+    /// How a fake server offers TLS.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Tls {
+        Never,
+        /// After StartTLS.
+        Upgrade,
+        /// From the start, as on port 636.
+        Implicit,
+    }
+
+    /// How a fake server treats someone who hasn't signed in.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Anonymous {
+        /// Lets them read the root entry, as most servers do.
+        Allowed,
+        /// Turns down every search, as a server set to need signing in does.
+        Refused,
+    }
+
+    struct Fake {
+        tls: Tls,
+        anonymous: Anonymous,
+        /// Whether a password ever came over a plain connection.
+        leaked: Arc<AtomicBool>,
+    }
+
+    /// Where a fake's connection is, which lasts through an upgrade to TLS.
+    #[derive(Default)]
+    struct Session {
+        secure: bool,
+        signed_in: bool,
+    }
+
+    async fn fake(tls: Tls, anonymous: Anonymous) -> (SocketAddr, Arc<AtomicBool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let leaked = Arc::new(AtomicBool::new(false));
+        let noted = leaked.clone();
+        let acceptor = acceptor();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let fake = Arc::new(Fake {
+                    tls,
+                    anonymous,
+                    leaked: noted.clone(),
+                });
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move { fake.serve(socket, &acceptor).await });
+            }
+        });
+        (address, leaked)
+    }
+
+    fn reply(id: i64, op: StructureTag) -> BytesMut {
+        let mut bytes = BytesMut::new();
+        lber::write::encode_into(&mut bytes, universal_sequence(vec![integer(id), op])).unwrap();
+        bytes
+    }
+
+    fn result(op: u64, code: i64) -> StructureTag {
+        constructed(
+            TagClass::Application,
+            op,
+            vec![enumerated(code), octets(b""), octets(b"")],
+        )
+    }
+
+    fn entry(name: &str, attributes: &[(&str, &str)]) -> StructureTag {
+        let attributes = attributes
+            .iter()
+            .map(|(attribute, value)| {
+                universal_sequence(vec![
+                    octets(attribute.as_bytes()),
+                    constructed(TagClass::Universal, 17, vec![octets(value.as_bytes())]),
+                ])
+            })
+            .collect();
+        constructed(
+            TagClass::Application,
+            SEARCH_ENTRY,
+            vec![octets(name.as_bytes()), universal_sequence(attributes)],
+        )
+    }
+
+    impl Fake {
+        async fn serve(&self, mut socket: TcpStream, acceptor: &TlsAcceptor) {
+            let mut session = Session::default();
+            if self.tls != Tls::Implicit && !self.answer(&mut socket, &mut session).await {
+                return;
+            }
+            let Ok(mut stream) = acceptor.accept(socket).await else {
+                return;
+            };
+            session.secure = true;
+            self.answer(&mut stream, &mut session).await;
+        }
+
+        /// Answers requests until the connection ends, or the client asks to
+        /// upgrade to TLS and is told yes, which gives true.
+        async fn answer<S: AsyncRead + AsyncWrite + Unpin>(
+            &self,
+            stream: &mut S,
+            session: &mut Session,
+        ) -> bool {
+            let mut buffer = BytesMut::new();
+            loop {
+                let Some(message) = take_message(&mut buffer) else {
+                    match stream.read_buf(&mut buffer).await {
+                        Ok(n) if n > 0 => continue,
+                        _ => return false,
+                    }
+                };
+                let mut parts = message.expect_constructed().unwrap().into_iter();
+                let id = universal_integer(parts.next().unwrap()).unwrap();
+                let op = parts.next().unwrap();
+                let answer = match op.id {
+                    EXTENDED_REQUEST if self.tls == Tls::Upgrade && !session.secure => {
+                        let answer = reply(id, result(EXTENDED_RESPONSE, SUCCESS));
+                        stream.write_all(&answer).await.unwrap();
+                        return true;
+                    }
+                    // Unavailable, as Active Directory says without a certificate.
+                    EXTENDED_REQUEST => reply(id, result(EXTENDED_RESPONSE, UNAVAILABLE)),
+                    BIND_REQUEST => {
+                        let mut parts = op.expect_constructed().unwrap().into_iter();
+                        let _version = parts.next();
+                        let name = text(parts.next().unwrap()).unwrap();
+                        let password = parts.next().unwrap().expect_primitive().unwrap();
+                        self.leaked.fetch_or(!session.secure, Ordering::Relaxed);
+                        session.signed_in = name == ACCOUNT && password == b"s3cret";
+                        let code = if session.signed_in {
+                            SUCCESS
+                        } else {
+                            INVALID_CREDENTIALS
+                        };
+                        reply(id, result(BIND_RESPONSE, code))
+                    }
+                    SEARCH_REQUEST => {
+                        let base = text(op.expect_constructed().unwrap().remove(0)).unwrap();
+                        let mut answer = BytesMut::new();
+                        let code = if self.anonymous == Anonymous::Refused && !session.signed_in {
+                            INSUFFICIENT_ACCESS
+                        } else if base.is_empty() {
+                            answer.extend(reply(
+                                id,
+                                entry(
+                                    "",
+                                    &[
+                                        ("namingContexts", BASE),
+                                        ("vendorName", "Fake Directory"),
+                                        ("vendorVersion", "Fake Directory 2.1"),
+                                    ],
+                                ),
+                            ));
+                            SUCCESS
+                        } else if base == BASE {
+                            answer.extend(reply(id, entry(BASE, &[])));
+                            SUCCESS
+                        } else {
+                            NO_SUCH_OBJECT
+                        };
+                        answer.extend(reply(id, result(SEARCH_DONE, code)));
+                        answer
+                    }
+                    _ => return false,
+                };
+                stream.write_all(&answer).await.unwrap();
+            }
+        }
+    }
+
+    fn check(address: SocketAddr, tls: Tls) -> Check {
+        let mut check = Check::new("directory", CheckKind::Ldap, &address.to_string());
+        check.insecure = Some(true);
+        if tls == Tls::Implicit {
+            check.tls = Some(true);
+        }
+        check
+    }
+
+    fn login(username: &str, password: &str) -> Credentials {
+        Credentials {
+            username: Some(username.to_string()),
+            password: Some(password.to_string()),
+            private_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn it_signs_in_and_searches_after_upgrading_to_tls_and_from_the_start() {
+        for tls in [Tls::Upgrade, Tls::Implicit] {
+            let (address, leaked) = fake(tls, Anonymous::Allowed).await;
+            let ldap = check(address, tls);
+            let result = run_signed_in(&ldap, None).await;
+            assert_eq!(result["up"], 1, "{tls:?} without signing in: {result}");
+            for stage in ["dns_secs", "connect_secs", "tls_secs", "response_secs"] {
+                assert!(result[stage].is_f64(), "{tls:?} {stage}: {result}");
+            }
+            assert_eq!(result["server_version"], "Fake Directory 2.1", "{result}");
+            assert!(result["cert_days_left"].is_i64(), "{tls:?}: {result}");
+            // Only an account is expected to read the data.
+            assert!(result.get("search_secs").is_none(), "{tls:?}: {result}");
+            if tls == Tls::Upgrade {
+                assert_eq!(result["tls_offered"], true, "{result}");
+            }
+
+            let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
+            assert_eq!(result["up"], 1, "{tls:?}: {result}");
+            assert_eq!(result["signed_in"], true, "{tls:?}: {result}");
+            assert!(result["search_secs"].is_f64(), "{tls:?}: {result}");
+
+            let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "guess"))).await;
+            assert_eq!(result["up"], 0, "{tls:?} with a wrong password: {result}");
+            assert_eq!(result["signed_in"], false, "{tls:?}: {result}");
+            assert!(!result.to_string().contains("guess"), "{result}");
+            assert!(
+                !leaked.load(Ordering::Relaxed),
+                "{tls:?} sent a password in the clear"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_password_is_never_sent_to_a_server_without_tls() {
+        let (address, leaked) = fake(Tls::Never, Anonymous::Allowed).await;
+        let ldap = check(address, Tls::Never);
+        let result = run_signed_in(&ldap, None).await;
+        assert_eq!(result["up"], 1, "{result}");
+        assert_eq!(result["tls_offered"], false, "{result}");
+        assert!(result.get("tls_secs").is_none(), "{result}");
+
+        let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], NO_TLS, "{result}");
+        assert!(
+            !leaked.load(Ordering::Relaxed),
+            "sent a password in the clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_password_is_not_a_login() {
+        let (address, _) = fake(Tls::Upgrade, Anonymous::Allowed).await;
+        let result = run_signed_in(&check(address, Tls::Upgrade), Some(&login(ACCOUNT, ""))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], "signing in needs a password", "{result}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_needs_signing_in_to_search_is_still_up() {
+        let (address, _) = fake(Tls::Upgrade, Anonymous::Refused).await;
+        let ldap = check(address, Tls::Upgrade);
+        let result = run_signed_in(&ldap, None).await;
+        assert_eq!(result["up"], 1, "{result}");
+        assert!(result.get("server_version").is_none(), "{result}");
+
+        let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
+        assert_eq!(result["up"], 1, "{result}");
+        assert!(result["search_secs"].is_f64(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_certificate_is_down_unless_it_is_not_minded() {
+        for tls in [Tls::Upgrade, Tls::Implicit] {
+            let (address, _) = fake(tls, Anonymous::Allowed).await;
+            let mut strict = check(address, tls);
+            strict.insecure = None;
+            let result = run_signed_in(&strict, None).await;
+            assert_eq!(result["up"], 0, "{tls:?}: {result}");
+            assert!(result["cert_days_left"].is_i64(), "{tls:?}: {result}");
+        }
+    }
+
+    #[tokio::test]
+    async fn something_else_is_not_taken_for_ldap() {
+        // A deeply nested answer is turned down before it's read.
+        let mut nested = vec![0x04, 0x00];
+        for _ in 0..40 {
+            let mut outer = vec![0x30, u8::try_from(nested.len()).unwrap()];
+            outer.extend(&nested);
+            nested = outer;
+        }
+        for answer in [
+            b"SSH-2.0-OpenSSH_9.6\r\n".to_vec(),
+            b"220 mail.example.com ESMTP\r\n".to_vec(),
+            nested,
+            // Far longer than anything it asks for.
+            vec![0x30, 0x84, 0x7f, 0xff, 0xff, 0xff],
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    let answer = answer.clone();
+                    tokio::spawn(async move {
+                        let mut request = [0u8; 256];
+                        let _ = socket.read(&mut request).await;
+                        let _ = socket.write_all(&answer).await;
+                        let mut rest = Vec::new();
+                        let _ = socket.read_to_end(&mut rest).await;
+                    });
+                }
+            });
+            let result = run_signed_in(&check(address, Tls::Never), None).await;
+            assert_eq!(result["up"], 0, "{result}");
+            assert_eq!(result["error"], NOT_LDAP, "{result}");
+        }
+    }
+
+    #[test]
+    fn nesting_is_measured_without_recursing() {
+        let mut nested = vec![0x04, 0x01, b'x'];
+        for depth in 1..=20 {
+            let mut outer = vec![0x30, u8::try_from(nested.len()).unwrap()];
+            outer.extend(&nested);
+            nested = outer;
+            assert_eq!(nesting_within(&nested, 16), depth <= 16, "{depth}");
+        }
+        // A part claiming more than its structure holds.
+        assert!(!nesting_within(&[0x30, 0x03, 0x04, 0x05, 0x00], 16));
+        assert!(!nesting_within(&[0x30, 0x80, 0x00, 0x00], 16));
+        assert!(nesting_within(&[0x30, 0x00, 0x04, 0x00], 16));
+    }
+
+    #[test]
+    fn numbers_read_as_ber_writes_them() {
+        for value in [0i64, 1, 3, 127, 128, 255, 256, 65_535, i64::from(i32::MAX)] {
+            let StructureTag { payload, .. } = integer(value);
+            let PL::P(bytes) = payload else { panic!() };
+            assert_eq!(number(&bytes), Some(value), "{value}");
+        }
+        assert_eq!(number(&[0xff]), Some(-1));
+        assert_eq!(number(&[0x80]), Some(-128));
+        assert_eq!(number(&[0xff, 0x7f]), Some(-129));
+        assert_eq!(number(&[]), None);
+        assert_eq!(number(&[1; 9]), None);
+    }
+}

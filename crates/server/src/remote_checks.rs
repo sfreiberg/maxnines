@@ -246,7 +246,7 @@ impl SignIn {
         );
         ensure!(
             kind.signs_in(),
-            "only database, Redis, SSH, mail and FTP checks sign in"
+            "only database, Redis, SSH, mail, FTP, LDAP and MQTT checks sign in"
         );
         if let Some(username) = &self.username {
             ensure!(

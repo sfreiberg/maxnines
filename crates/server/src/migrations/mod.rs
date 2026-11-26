@@ -1945,6 +1945,7 @@ impl MigrationTrait for CreateTables {
                     .col(ColumnDef::new(RemoteChecks::Database).string_len(63))
                     .col(ColumnDef::new(RemoteChecks::Tls).boolean())
                     .col(ColumnDef::new(RemoteChecks::HostKey).string_len(100))
+                    .col(ColumnDef::new(RemoteChecks::Topic).string_len(255))
                     .col(ColumnDef::new(RemoteChecks::Username).string_len(255))
                     .col(ColumnDef::new(RemoteChecks::Password).text())
                     .col(ColumnDef::new(RemoteChecks::PasswordEnv).string_len(255))
@@ -2671,6 +2672,7 @@ enum RemoteChecks {
     Database,
     Tls,
     HostKey,
+    Topic,
     Username,
     Password,
     PasswordEnv,

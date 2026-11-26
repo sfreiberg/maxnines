@@ -930,7 +930,7 @@ mod tests {
         let config = json!({
             "interval_secs": 9,
             "collectors": { "checks": { "checks": [
-                { "name": "directory", "kind": "ldap", "target": "ldap.example.com:389" },
+                { "name": "burrow", "kind": "gopher", "target": "gopher.example.com:70" },
             ] } },
             "from_a_newer_server": true,
         });
