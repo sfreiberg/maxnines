@@ -37,6 +37,17 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Every dependency's license has to be one deny.toml allows. Advisories
+      # aren't checked here, as a new one would fail a change that didn't cause it.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
   test:
     name: Clippy and tests on ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
