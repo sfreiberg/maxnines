@@ -37,7 +37,16 @@ Nothing moves between databases, so changing later starts this data afresh.
 either.
 
 - **DuckDB** is the default. It's built into the server, so there's nothing else to run.
-  Use it for smaller installations.
+  Use it for smaller installations. By default it's limited to 128 MiB of memory,
+  and spills work that needs more to a temp folder beside the database. Raise the
+  limit with `memory_limit` for a big fleet:
+
+  ```hcl
+  metrics "duckdb" {
+    path         = "/var/lib/maxnines-server/metrics.duckdb"
+    memory_limit = "512MiB"
+  }
+  ```
 - **ClickHouse** runs as a server of its own. Use it for bigger fleets. Point the
   `metrics "clickhouse"` block at it, and the database and tables are created for you.
 

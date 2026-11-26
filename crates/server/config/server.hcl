@@ -57,8 +57,10 @@ metrics "duckdb" {
   # database and its write-ahead log out of iCloud Drive.
   path = "data.nosync/maxnines.duckdb"
 
-  # How much memory DuckDB may use, such as "1GiB" or "512MiB". Defaults to 1GiB.
-  memory_limit = "1GiB"
+  # How much memory DuckDB may use, such as "128MiB" or "1GiB". Defaults to
+  # 128MiB, plenty for a small fleet; what doesn't fit spills to a temp folder
+  # beside the database. Raise it for a big fleet.
+  memory_limit = "128MiB"
 }
 
 # For bigger fleets, use ClickHouse instead. It runs as a server of its own, and the

@@ -42,7 +42,7 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "size": "417.5 MiB",
     "write_ahead_log": "9.9 KiB",
     "memory_used": "718.0 KiB",
-    "memory_limit": "953.6 MiB",
+    "memory_limit": "128.0 MiB",
     "collectors": [
       {
         "name": "cpu",

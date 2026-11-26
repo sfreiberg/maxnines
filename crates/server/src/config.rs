@@ -105,7 +105,8 @@ impl TlsConfig {
 pub enum MetricsConfig {
     Duckdb {
         path: PathBuf,
-        /// How much memory DuckDB may use, such as "1GiB" or "512MB".
+        /// How much memory DuckDB may use, such as "128MiB" or "1GiB". What it
+        /// can't keep within this it spills to a temp folder beside the database.
         #[serde(default = "default_duckdb_memory_limit")]
         memory_limit: String,
     },
@@ -289,7 +290,7 @@ fn default_heartbeat_timeout() -> Duration {
 }
 
 fn default_duckdb_memory_limit() -> String {
-    "1GiB".to_string()
+    "128MiB".to_string()
 }
 
 fn default_max_pending() -> usize {
@@ -646,7 +647,7 @@ mod tests {
             config.metrics,
             MetricsConfig::Duckdb {
                 path: "data.nosync/maxnines.duckdb".into(),
-                memory_limit: "1GiB".to_string(),
+                memory_limit: "128MiB".to_string(),
             }
         );
         assert_eq!(config.audience(), "ws://127.0.0.1:9000/ws");
@@ -663,7 +664,7 @@ mod tests {
             config.metrics,
             MetricsConfig::Duckdb {
                 path: "/var/lib/maxnines-server/metrics.duckdb".into(),
-                memory_limit: "1GiB".to_string(),
+                memory_limit: "128MiB".to_string(),
             }
         );
         assert_eq!(
@@ -684,7 +685,7 @@ mod tests {
             config.metrics,
             MetricsConfig::Duckdb {
                 path: "/var/lib/maxnines-server/metrics.duckdb".into(),
-                memory_limit: "1GiB".to_string(),
+                memory_limit: "128MiB".to_string(),
             }
         );
     }
@@ -735,12 +736,12 @@ mod tests {
     }
 
     #[test]
-    fn memory_limit_defaults_to_1gib() {
+    fn memory_limit_defaults_to_128mib() {
         assert_eq!(
             parse(STORAGE).unwrap().metrics,
             MetricsConfig::Duckdb {
                 path: "x".into(),
-                memory_limit: "1GiB".to_string(),
+                memory_limit: "128MiB".to_string(),
             }
         );
     }
