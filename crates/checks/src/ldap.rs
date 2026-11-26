@@ -27,6 +27,8 @@ use crate::{Findings, certificate_verdict, connect, elapsed_secs, host_and_port,
 
 const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
 const BUSY: &str = "it's too busy, or unavailable";
+const CLOSED: &str = "it closed the connection";
+const ENDED: &str = "it ended the session";
 
 /// StartTLS's extended operation.
 const START_TLS: &str = "1.3.6.1.4.1.1466.20037";
@@ -85,13 +87,20 @@ pub(crate) async fn check_ldap(
     }
     let mut ldap = Ldap::new(socket, 1);
     let offered = ldap.start_tls().await?;
-    findings.tls_offered = Some(offered);
-    if !offered {
-        if login.is_some() {
+    findings.tls_offered = Some(offered == StartTls::Offered);
+    match offered {
+        StartTls::Offered => {}
+        _ if login.is_some() => {
             ldap.unbind().await;
             bail!(TLS_NOT_OFFERED);
         }
-        return ldap.look(None, findings).await;
+        StartTls::Refused => return ldap.look(None, findings).await,
+        // Some servers and proxies hang up on an operation they don't know, which
+        // says nothing about the rest, so it's looked at again without asking.
+        StartTls::HungUp => {
+            let socket = connect(&addresses, findings).await?;
+            return Ldap::new(socket, 1).look(None, findings).await;
+        }
     }
     // Nothing more comes before the TLS handshake, so nothing is left unread.
     ensure!(ldap.buffer.is_empty(), NOT_LDAP);
@@ -110,6 +119,16 @@ struct Ldap<S> {
     buffer: BytesMut,
     /// Each request on a connection has an ID of its own, which its answers carry.
     next_id: i64,
+}
+
+/// How a server answered being asked to upgrade to TLS.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StartTls {
+    Offered,
+    Refused,
+    /// It closed the connection, or said it was ending the session, rather than
+    /// answer.
+    HungUp,
 }
 
 /// What a directory's root entry says about it.
@@ -147,7 +166,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
     ) -> Result<()> {
         if let Some((username, password)) = login {
             let code = self.bind(username, password).await?;
-            findings.signed_in = Some(code == SUCCESS);
+            // A server too busy to look at the login hasn't said anything about it.
+            if !matches!(code, BUSY_CODE | UNAVAILABLE) {
+                findings.signed_in = Some(code == SUCCESS);
+            }
             match code {
                 SUCCESS => {}
                 INVALID_CREDENTIALS => bail!("it didn't accept the username and password"),
@@ -159,23 +181,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         // Reading the data is what shows its database works, and only an account
         // can be expected to be let in to it.
         if login.is_none() {
-            findings.server_version = root.and_then(|root| root.version);
+            findings.server_version = root.ok().and_then(|root| root.version);
             return Ok(());
         }
-        let root = root.context("the account isn't allowed to read the directory's root entry")?;
+        let root = match root {
+            Ok(root) => root,
+            Err(INSUFFICIENT_ACCESS) => {
+                bail!("the account isn't allowed to read the directory's root entry")
+            }
+            Err(code) => bail!("reading its root entry failed, with result code {code}"),
+        };
         findings.server_version = root.version;
-        ensure!(
-            !root.bases.is_empty(),
-            "its root entry doesn't say where its data is, so it couldn't be read"
-        );
-        let started = Instant::now();
-        self.read_data(&root.bases).await?;
-        findings.search_secs = Some(elapsed_secs(started));
+        findings.search_secs = Some(self.read_data(&root.bases).await?);
         Ok(())
     }
 
-    /// Asks to upgrade to TLS, saying whether the server agreed.
-    async fn start_tls(&mut self) -> Result<bool> {
+    /// Asks to upgrade to TLS, saying how the server answered.
+    async fn start_tls(&mut self) -> Result<StartTls> {
         let name = context_primitive(0, START_TLS.as_bytes());
         let id = self
             .send(constructed(
@@ -184,8 +206,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
                 vec![name],
             ))
             .await?;
-        let (code, _) = self.answer(id, EXTENDED_RESPONSE).await?;
-        Ok(code == SUCCESS)
+        match self.answer(id, EXTENDED_RESPONSE).await {
+            Ok((SUCCESS, _)) => Ok(StartTls::Offered),
+            Ok(_) => Ok(StartTls::Refused),
+            Err(error)
+                if error.downcast_ref::<std::io::Error>().is_some()
+                    || [CLOSED, ENDED].contains(&error.to_string().as_str()) =>
+            {
+                Ok(StartTls::HungUp)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     async fn bind(&mut self, username: &str, password: &str) -> Result<i64> {
@@ -203,8 +234,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
     }
 
     /// Reads the root entry, which anyone may, though some servers won't let in
-    /// someone who hasn't signed in, which gives none. That still answers as LDAP.
-    async fn root_entry(&mut self) -> Result<Option<RootEntry>> {
+    /// someone who hasn't signed in. That still answers as LDAP, and gives the
+    /// result code it was turned down with.
+    async fn root_entry(&mut self) -> Result<std::result::Result<RootEntry, i64>> {
         let attributes = [
             "namingContexts",
             "defaultNamingContext",
@@ -215,10 +247,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         match code {
             SUCCESS => {}
             BUSY_CODE | UNAVAILABLE => bail!(BUSY),
-            _ => return Ok(None),
+            code => return Ok(Err(code)),
         }
         let Some(entry) = entries.into_iter().next() else {
-            return Ok(Some(RootEntry::default()));
+            return Ok(Ok(RootEntry::default()));
         };
         let values = |name: &str| -> Vec<String> {
             entry
@@ -240,19 +272,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             }
         }
         bases.truncate(MAX_BASES);
-        Ok(Some(RootEntry { bases, version }))
+        Ok(Ok(RootEntry { bases, version }))
     }
 
     /// Reads the entry the directory's data starts at, asking for none of its
-    /// attributes, which is enough for the server to have found it in its database.
-    /// Each of `bases` is tried in turn until one can be read, and when none can,
-    /// it's the first that says why.
-    async fn read_data(&mut self, bases: &[String]) -> Result<()> {
+    /// attributes, which is enough for the server to have found it in its database,
+    /// and gives how long that took in seconds. Each of `bases` is tried in turn
+    /// until one can be read, which is the one timed, and when none can, it's the
+    /// first that says why.
+    async fn read_data(&mut self, bases: &[String]) -> Result<f64> {
         let mut first_failure = None;
         for base in bases {
+            let started = Instant::now();
             let (code, _) = self.search(base, &["1.1"]).await?;
             match code {
-                SUCCESS => return Ok(()),
+                SUCCESS => return Ok(elapsed_secs(started)),
                 BUSY_CODE | UNAVAILABLE => bail!(BUSY),
                 code => {
                     first_failure.get_or_insert(code);
@@ -363,9 +397,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             bail!(NOT_LDAP);
         };
         let answers = universal_integer(answers).context(NOT_LDAP)?;
-        if answers == 0 {
-            bail!("it ended the session");
-        }
+        ensure!(answers != 0, ENDED);
         ensure!(answers == id, NOT_LDAP);
         Ok(op)
     }
@@ -386,44 +418,51 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
                 return Ok(message);
             }
             let read = self.stream.read_buf(&mut self.buffer).await?;
-            ensure!(read > 0, "it closed the connection");
+            ensure!(read > 0, CLOSED);
         }
     }
+}
+
+/// A BER header at the start of `bytes`: its tag byte, how long the header is, and
+/// how long what follows it is. None until enough has come to say, and an error
+/// for what LDAP never sends: a tag number that takes more bytes, which `lber`
+/// would read differently, or a length that's to be found later or takes more than
+/// 4 bytes.
+fn ber_header(bytes: &[u8]) -> Result<Option<(u8, usize, usize)>> {
+    let (Some(&tag), Some(&length)) = (bytes.first(), bytes.get(1)) else {
+        return Ok(None);
+    };
+    ensure!(tag & 0x1f != 0x1f, NOT_LDAP);
+    if length < 0x80 {
+        return Ok(Some((tag, 2, usize::from(length))));
+    }
+    let count = usize::from(length & 0x7f);
+    ensure!((1..=4).contains(&count), NOT_LDAP);
+    let Some(digits) = bytes.get(2..2 + count) else {
+        return Ok(None);
+    };
+    let length = digits
+        .iter()
+        .fold(0usize, |total, &byte| total << 8 | usize::from(byte));
+    Ok(Some((tag, 2 + count, length)))
 }
 
 /// How long the message at the start of `buffer` is in all, once enough of it has
 /// come to say. Only an LDAP message's outer sequence is read here, so anything
 /// else, or one too long, isn't LDAP.
 fn message_length(buffer: &[u8]) -> Result<Option<usize>> {
-    let Some(&first) = buffer.first() else {
-        return Ok(None);
-    };
     // A universal, constructed sequence.
-    ensure!(first == 0x30, NOT_LDAP);
-    let Some(&length) = buffer.get(1) else {
+    ensure!(buffer.first().is_none_or(|&tag| tag == 0x30), NOT_LDAP);
+    let Some((_, header, content)) = ber_header(buffer)? else {
         return Ok(None);
-    };
-    let (header, content) = if length < 0x80 {
-        (2, usize::from(length))
-    } else {
-        let count = usize::from(length & 0x7f);
-        // 0x80 alone is BER's length to be found later, which LDAP doesn't allow.
-        ensure!((1..=4).contains(&count), NOT_LDAP);
-        let Some(bytes) = buffer.get(2..2 + count) else {
-            return Ok(None);
-        };
-        let content = bytes
-            .iter()
-            .fold(0usize, |total, &byte| total << 8 | usize::from(byte));
-        (2 + count, content)
     };
     ensure!(content <= MAX_MESSAGE, NOT_LDAP);
     let total = header + content;
     Ok((buffer.len() >= total).then_some(total))
 }
 
-/// Whether BER no deeper than `limit` is all `bytes` holds, checked without
-/// recursing, as `lber` reads structures by recursing once for each level.
+/// Whether BER no deeper than `limit`, read as `lber` reads it, is all `bytes`
+/// holds, checked without recursing, as `lber` recurses once for each level.
 fn nesting_within(mut bytes: &[u8], limit: usize) -> bool {
     // Where each structure being read ends, as how much is left after it.
     let mut ends: Vec<usize> = Vec::new();
@@ -431,40 +470,10 @@ fn nesting_within(mut bytes: &[u8], limit: usize) -> bool {
         while ends.last() == Some(&bytes.len()) {
             ends.pop();
         }
-        let Some((&tag, rest)) = bytes.split_first() else {
+        let Ok(Some((tag, header, length))) = ber_header(bytes) else {
             return false;
         };
-        let mut rest = rest;
-        // A tag number above 30 takes more bytes, each with its top bit set but
-        // the last.
-        if tag & 0x1f == 0x1f {
-            loop {
-                let Some((&byte, after)) = rest.split_first() else {
-                    return false;
-                };
-                rest = after;
-                if byte & 0x80 == 0 {
-                    break;
-                }
-            }
-        }
-        let Some((&length, after)) = rest.split_first() else {
-            return false;
-        };
-        rest = after;
-        let length = if length < 0x80 {
-            usize::from(length)
-        } else {
-            let count = usize::from(length & 0x7f);
-            if !(1..=4).contains(&count) || rest.len() < count {
-                return false;
-            }
-            let (digits, after) = rest.split_at(count);
-            rest = after;
-            digits
-                .iter()
-                .fold(0usize, |total, &byte| total << 8 | usize::from(byte))
-        };
+        let rest = &bytes[header..];
         if length > rest.len() || ends.last().is_some_and(|&end| rest.len() - length < end) {
             return false;
         }
@@ -610,6 +619,8 @@ mod tests {
 
     const ACCOUNT: &str = "cn=monitor,dc=example,dc=com";
     const BASE: &str = "dc=example,dc=com";
+    /// How long the fake takes to refuse a read of its log.
+    const SLOW_REFUSAL: std::time::Duration = std::time::Duration::from_millis(300);
 
     /// How a fake server offers TLS.
     #[derive(Clone, Copy, PartialEq, Debug)]
@@ -619,6 +630,9 @@ mod tests {
         Upgrade,
         /// From the start, as on port 636.
         Implicit,
+        /// Hangs up on being asked to upgrade, as some proxies do with an
+        /// operation they don't know.
+        HangsUp,
     }
 
     /// Who a fake server lets search.
@@ -737,6 +751,7 @@ mod tests {
                         stream.write_all(&answer).await.unwrap();
                         return true;
                     }
+                    EXTENDED_REQUEST if self.tls == Tls::HangsUp => return false,
                     // Unavailable, as Active Directory says without a certificate.
                     EXTENDED_REQUEST => reply(id, result(EXTENDED_RESPONSE, UNAVAILABLE)),
                     BIND_REQUEST => {
@@ -748,6 +763,8 @@ mod tests {
                         session.signed_in = name == ACCOUNT && password == b"s3cret";
                         let code = if session.signed_in {
                             SUCCESS
+                        } else if password == b"busy" {
+                            BUSY_CODE
                         } else {
                             INVALID_CREDENTIALS
                         };
@@ -794,6 +811,8 @@ mod tests {
                             answer.extend(reply(id, entry(BASE, &[])));
                             SUCCESS
                         } else if base == "cn=accesslog" {
+                            // Slow, so timing it with the data's own read shows.
+                            tokio::time::sleep(SLOW_REFUSAL).await;
                             INSUFFICIENT_ACCESS
                         } else {
                             NO_SUCH_OBJECT
@@ -846,7 +865,9 @@ mod tests {
             let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
             assert_eq!(result["up"], 1, "{tls:?}: {result}");
             assert_eq!(result["signed_in"], true, "{tls:?}: {result}");
-            assert!(result["search_secs"].is_f64(), "{tls:?}: {result}");
+            // Only the read that worked is timed, not the refused one before it.
+            let searched = result["search_secs"].as_f64().unwrap();
+            assert!(searched < SLOW_REFUSAL.as_secs_f64(), "{tls:?}: {result}");
 
             let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "guess"))).await;
             assert_eq!(result["up"], 0, "{tls:?} with a wrong password: {result}");
@@ -875,6 +896,31 @@ mod tests {
             !leaked.load(Ordering::Relaxed),
             "sent a password in the clear"
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_hangs_up_on_starttls_is_looked_at_again_without_it() {
+        let (address, leaked) = fake(Tls::HangsUp, Anonymous::Allowed).await;
+        let ldap = check(address, Tls::HangsUp);
+        let result = run_signed_in(&ldap, None).await;
+        assert_eq!(result["up"], 1, "{result}");
+        assert_eq!(result["tls_offered"], false, "{result}");
+        assert_eq!(result["server_version"], "Fake Directory 2.1", "{result}");
+
+        let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
+        assert!(!leaked.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_busy_server_says_nothing_about_the_login() {
+        let (address, _) = fake(Tls::Upgrade, Anonymous::Allowed).await;
+        let result =
+            run_signed_in(&check(address, Tls::Upgrade), Some(&login(ACCOUNT, "busy"))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], BUSY, "{result}");
+        assert!(result.get("signed_in").is_none(), "{result}");
     }
 
     #[tokio::test]
@@ -949,6 +995,8 @@ mod tests {
             nested,
             // Far longer than anything it asks for.
             vec![0x30, 0x84, 0x7f, 0xff, 0xff, 0xff],
+            // A tag number that takes more bytes, which lber reads differently.
+            vec![0x30, 0x02, 0x1f, 0x00],
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
@@ -979,6 +1027,13 @@ mod tests {
             nested = outer;
             assert_eq!(nesting_within(&nested, 16), depth <= 16, "{depth}");
         }
+        // A tag number that takes more bytes, which lber reads as a length.
+        // Read as a tag number of more bytes, this was one empty part and then
+        // another, but lber reads it as a part of tag 31, then three more.
+        assert!(!nesting_within(
+            &[0x30, 0x05, 0x1f, 0x00, 0x00, 0x00, 0x00],
+            16
+        ));
         // A part claiming more than its structure holds.
         assert!(!nesting_within(&[0x30, 0x03, 0x04, 0x05, 0x00], 16));
         assert!(!nesting_within(&[0x30, 0x80, 0x00, 0x00], 16));

@@ -121,11 +121,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
             answer.code,
             ConnectReturnCode::BadUserNamePassword | ConnectReturnCode::NotAuthorized
         );
-        if login.is_some() {
+        // A broker that turns the check down for something else hasn't said
+        // anything about the login.
+        if login.is_some() && (needs_login || answer.code == ConnectReturnCode::Success) {
             findings.signed_in = Some(answer.code == ConnectReturnCode::Success);
         }
         match answer.code {
             ConnectReturnCode::Success => {}
+            _ if needs_login && login.is_some_and(|(_, password)| password.is_empty()) => {
+                bail!(
+                    "it didn't let the account in with its username alone, so it needs a password"
+                )
+            }
             _ if needs_login && login.is_some() => {
                 bail!("it didn't accept the username and password")
             }
@@ -141,12 +148,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
             _ => bail!(NOT_MQTT),
         }
         if let Some(topic) = &check.topic {
+            // Whatever connecting took comes out of the time the message gets, so
+            // how long that was is said, as well as the likeliest reason.
+            let left = deadline.saturating_duration_since(Instant::now());
             let round_trip = timeout_at(deadline.into(), self.round_trip(topic))
                 .await
                 .map_err(|_| {
                     anyhow!(
-                        "the test message didn't come back in time, as it doesn't when the \
-                         account isn't allowed to send to the topic or read it"
+                        "the test message didn't come back in the {:.1} seconds left of the \
+                         check's time, as it doesn't when the account isn't allowed to send \
+                         to the topic or read it",
+                        left.as_secs_f64()
                     )
                 })??;
             findings.round_trip_secs = Some(round_trip);
@@ -287,12 +299,15 @@ mod tests {
         /// Lets the check subscribe and send, but never passes messages on, as a
         /// broker whose rules don't let an account send to a topic does.
         drops_messages: bool,
+        /// Turns everyone away as unavailable.
+        unavailable: bool,
     }
 
     const OPEN: Broker = Broker {
         tls: false,
         needs_login: false,
         drops_messages: false,
+        unavailable: false,
     };
 
     /// A broker that passes each message back to whoever sent it, after a
@@ -335,6 +350,7 @@ mod tests {
                     }
                     let accepted = given.is_some_and(|login| login.validate("monitor", "s3cret"));
                     let code = match given {
+                        _ if broker.unavailable => ConnectReturnCode::ServiceUnavailable,
                         _ if accepted || !broker.needs_login => ConnectReturnCode::Success,
                         Some(_) => ConnectReturnCode::BadUserNamePassword,
                         None => ConnectReturnCode::NotAuthorized,
@@ -427,6 +443,12 @@ mod tests {
         assert_eq!(result["signed_in"], false, "{result}");
         assert!(!result.to_string().contains("guess"), "{result}");
 
+        // No password was sent, so it isn't blamed.
+        let result = run_signed_in(&mqtt, Some(&login(""))).await;
+        assert_eq!(result["signed_in"], false, "{result}");
+        let error = result["error"].as_str().unwrap();
+        assert!(error.contains("username alone"), "{error}");
+
         // Without a login, a broker that needs one is up, unless there's a message
         // to send.
         let result = run_signed_in(&mqtt, None).await;
@@ -458,9 +480,25 @@ mod tests {
         assert_eq!(result["up"], 0, "{result}");
         let error = result["error"].as_str().unwrap();
         assert!(
-            error.starts_with("the test message didn't come back"),
+            error.starts_with("the test message didn't come back in the 0."),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_broker_says_nothing_about_the_login() {
+        let broker = Broker {
+            unavailable: true,
+            ..OPEN
+        };
+        let (address, _) = fake(broker).await;
+        let result = run_signed_in(&check(address, broker), Some(&login("s3cret"))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(
+            result["error"], "it isn't taking connections now",
+            "{result}"
+        );
+        assert!(result.get("signed_in").is_none(), "{result}");
     }
 
     #[tokio::test]

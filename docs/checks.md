@@ -62,7 +62,9 @@ deletes its checks.
 
 Each check says how long each stage took, in seconds, so a slow answer can be told
 apart from slow DNS. Each stage is timed the same way whatever the kind, and one a
-check doesn't go through is left out.
+check doesn't go through is left out. On a check's page, the stages are lines on
+its **Response time** chart. On its host's metrics page, and in alert rules, each
+is a metric of its own, by the name in the Chart column.
 
 | Field | Chart | What it is |
 |---|---|---|
@@ -130,8 +132,10 @@ An LDAP check, for OpenLDAP, 389 Directory Server, Active Directory and other
 directories, asks to upgrade to TLS with StartTLS. Where the server agrees, the
 check upgrades and reads its certificate as a website check does, and a certificate
 that fails counts as down unless **Don't count a bad certificate as down** is ticked.
-`tls_offered` says whether it agreed. For LDAPS, usually on port 636, tick **Use
-TLS from the start**.
+`tls_offered` says whether it agreed. A server that hangs up rather than answer, as
+some proxies do with a request they don't know, is checked again without asking,
+and doesn't offer TLS. For LDAPS, usually on port 636, tick **Use TLS from the
+start**.
 
 It then reads the directory's root entry, which says where its data starts and,
 for some servers such as 389 Directory Server, what it is, in `server_version`.
@@ -143,7 +147,8 @@ the directory's data starts at, such as `dc=example,dc=com`, asking for none of 
 attributes, which shows the directory's database is working. That's Active
 Directory's own domain, or the first of the server's naming contexts the account can
 read, as a server can list one of its own first, such as OpenLDAP's `cn=accesslog`.
-How long that takes is `search_secs`, on **Directory search time**. Signed in, a
+How long the read that worked takes is `search_secs`, the **Directory search
+time**. Signed in, a
 check that can't read the root entry, or finds no naming contexts in it, counts as
 down, saying why. The username is the account's DN, such
 as `cn=monitor,ou=services,dc=example,dc=com`, or for Active Directory
@@ -156,8 +161,8 @@ being sent. It never writes anything.
 An MQTT check connects to the broker in MQTT 3.1.1, which every broker speaks, with
 a clean session, so the broker keeps nothing for it after it leaves. Given a username
 and password, or a username alone for a broker that takes that, it signs in, and
-counts as down if it isn't let in. Without them,
-a broker that needs signing in still counts as up, as it answered as a broker.
+counts as down if it isn't let in. Without them, a broker that needs signing in
+still counts as up, as it answered as a broker.
 
 MQTT has no way to upgrade to TLS, so for a broker using TLS, usually on port 8883,
 tick **Use TLS from the start**, and its certificate is read as a website's is. A
@@ -167,8 +172,8 @@ down when it's saved.
 
 Given a **Test message topic**, such as `monitoring/maxnines`, the check subscribes
 to it, sends a message there that no other would, and waits for it to come back.
-How long that takes is `round_trip_secs`, on **Test message round trip**, which is
-how long a message takes to pass through the broker. Both go at most once and the
+How long that takes from sending it is `round_trip_secs`, the **Test message round
+trip**, which is how long a message takes to pass through the broker. Both go at most once and the
 message isn't retained, so nothing is left on the topic. A broker whose rules don't
 let the account send to the topic, or read it, usually drops the message without
 saying so, which counts as down, saying the message didn't come back in time. Use a
