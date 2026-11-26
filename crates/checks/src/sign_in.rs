@@ -51,57 +51,54 @@ pub(crate) const TLS_NOT_OFFERED: &str = "it doesn't offer TLS, so the password 
 pub(crate) const TLS_NEEDED_ELSEWHERE: &str =
     "a password is only sent without TLS to the host itself, so set tls for one elsewhere";
 
-/// Whether a check needs a password with its username, or can sign in with a
-/// username alone, as an MQTT broker can let it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Password {
-    Needed,
-    Optional,
-}
-
-/// The username and password a check signs in with, if it was given any. An empty
-/// one is none, and a password left out where it's optional is empty.
+/// The username and password a check of `kind` signs in with, if it was given any,
+/// with what its kind needs. An empty one is none, and a password left out where
+/// the kind can do without is empty.
 pub(crate) fn username_and_password(
     credentials: Option<&Credentials>,
-    password: Password,
+    kind: CheckKind,
 ) -> Result<Option<(&str, &str)>> {
     let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
         return Ok(None);
     };
+    let needs = kind
+        .sign_in()
+        .context("this kind of check never signs in")?;
     let username = credentials
         .username
         .as_deref()
         .filter(|username| !username.is_empty())
         .context("signing in needs a username")?;
-    let given = credentials
+    let password = match credentials
         .password
         .as_deref()
-        .filter(|password| !password.is_empty());
-    let password = match (given, password) {
-        (Some(given), _) => given,
-        (None, Password::Optional) => "",
-        (None, Password::Needed) => bail!("signing in needs a password"),
+        .filter(|password| !password.is_empty())
+    {
+        Some(given) => given,
+        None if !needs.password => "",
+        None => bail!("signing in needs a password"),
     };
     Ok(Some((username, password)))
 }
 
-/// Why a check can never sign in with what it's given, if it can't, so the mistake
-/// is turned down when it's saved, rather than failing every time the check runs.
-/// `username` and `password` say whether each is given.
-pub fn sign_in_problem(check: &Check, username: bool, password: bool) -> Option<&'static str> {
+/// Why a check can never sign in with what it's given, as its kind needs, if it
+/// can't, so the mistake is turned down when it's saved or read from the agent's
+/// config, rather than failing every time the check runs. `username` and `secret`
+/// say whether each is given, the secret being a password, or for ssh a key.
+pub fn sign_in_problem(check: &Check, username: bool, secret: bool) -> Option<&'static str> {
+    let needs = check.kind.sign_in()?;
+    if !username && !secret {
+        return None;
+    }
     let on_its_own_host = || host_and_port(&check.target).is_ok_and(|(host, _)| is_loopback(&host));
-    match check.kind {
-        // A simple bind with no password signs in as nobody.
-        CheckKind::Ldap if username && !password => Some("signing in needs a password"),
-        CheckKind::Ldap | CheckKind::Mqtt if password && !username => {
-            Some("signing in needs a username")
-        }
-        CheckKind::Mqtt | CheckKind::Redis
-            if password && check.tls != Some(true) && !on_its_own_host() =>
-        {
-            Some(TLS_NEEDED_ELSEWHERE)
-        }
-        _ => None,
+    if needs.username && !username {
+        Some("signing in needs a username")
+    } else if needs.password && !secret {
+        Some("signing in needs a password")
+    } else if needs.password_in_clear && secret && check.tls != Some(true) && !on_its_own_host() {
+        Some(TLS_NEEDED_ELSEWHERE)
+    } else {
+        None
     }
 }
 

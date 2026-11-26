@@ -21,9 +21,7 @@ use rumqttc::{Connect, Publish, Subscribe};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout_at;
 
-use crate::sign_in::{
-    Credentials, Password, TLS_NEEDED_ELSEWHERE, is_loopback, username_and_password,
-};
+use crate::sign_in::{Credentials, TLS_NEEDED_ELSEWHERE, is_loopback, username_and_password};
 use crate::{
     Findings, certificate_verdict, connect, elapsed_secs, host_and_port, limit, resolve, secure,
 };
@@ -51,7 +49,7 @@ pub(crate) async fn check_mqtt(
 ) -> Result<()> {
     let deadline = Instant::now() + limit(check).saturating_sub(MESSAGE_MARGIN);
     // MQTT lets a client give a username alone, but never a password alone.
-    let login = username_and_password(credentials, Password::Optional)?;
+    let login = username_and_password(credentials, check.kind)?;
     let (host, port) = host_and_port(&check.target)?;
     let tls = check.tls == Some(true);
     if login.is_some_and(|(_, password)| !password.is_empty()) {

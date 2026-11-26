@@ -273,10 +273,6 @@ impl SignIn {
             SignInWith::Key => {
                 ensure!(kind == CheckKind::Ssh, "only SSH checks sign in with a key");
                 ensure!(
-                    self.username.is_some(),
-                    "signing in with a key needs a username"
-                );
-                ensure!(
                     self.password.is_none() && self.password_env.is_none(),
                     "sign in with a password or a key, not both"
                 );
@@ -301,21 +297,6 @@ impl SignIn {
                     ensure!(
                         !password.is_empty() && password.len() <= MAX_PASSWORD_LEN,
                         "the password can't be empty or over {MAX_PASSWORD_LEN} characters"
-                    );
-                }
-                // Redis before version 6 has a password and no usernames. The rest
-                // need someone to sign in as.
-                if kind != CheckKind::Redis {
-                    ensure!(self.username.is_some(), "signing in needs a username");
-                }
-                // An MQTT broker can let a client sign in with its username alone.
-                if !matches!(
-                    kind,
-                    CheckKind::Postgres | CheckKind::Mysql | CheckKind::Mqtt
-                ) {
-                    ensure!(
-                        self.password.is_some() || self.password_env.is_some(),
-                        "signing in needs a password"
                     );
                 }
             }
@@ -372,10 +353,14 @@ fn default_enabled() -> bool {
 pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     input.check.validate()?;
     input.sign_in.validate(input.check.kind)?;
+    // What each kind needs to sign in is said once, where the checks are.
     let sign_in = &input.sign_in;
-    let password = sign_in.password.is_some() || sign_in.password_env.is_some();
+    let secret = sign_in.password.is_some()
+        || sign_in.password_env.is_some()
+        || sign_in.private_key.is_some()
+        || sign_in.private_key_env.is_some();
     if let Some(why) =
-        maxnines_checks::sign_in_problem(&input.check, sign_in.username.is_some(), password)
+        maxnines_checks::sign_in_problem(&input.check, sign_in.username.is_some(), secret)
     {
         bail!("{why}");
     }

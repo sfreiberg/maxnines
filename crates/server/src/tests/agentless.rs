@@ -1178,7 +1178,7 @@ async fn a_checks_password_is_kept_but_never_given_back() {
     let form = browser.get(&server, "/checks/new").await;
     assert!(
         form.body
-            .contains(r#"<option value="mongodb">MongoDB</option>"#),
+            .contains(r#"<option value="mongodb" data-takes="database tls insecure sign_in stats">MongoDB</option>"#),
         "{}",
         form.body
     );

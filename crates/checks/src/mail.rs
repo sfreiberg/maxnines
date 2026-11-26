@@ -15,7 +15,7 @@ use maxnines_protocol::Check;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::sign_in::{Credentials, Password, TLS_NOT_OFFERED, short, username_and_password};
+use crate::sign_in::{Credentials, TLS_NOT_OFFERED, short, username_and_password};
 use crate::{Findings, certificate_verdict, connect, host_and_port, resolve, secure};
 
 pub(crate) async fn check_smtp(
@@ -23,7 +23,7 @@ pub(crate) async fn check_smtp(
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = username_and_password(credentials, Password::Needed)?;
+    let login = username_and_password(credentials, check.kind)?;
     let (host, socket) = open(check, findings).await?;
     let local = socket.local_addr().ok();
     if check.tls == Some(true) {
@@ -174,7 +174,7 @@ pub(crate) async fn check_imap(
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = username_and_password(credentials, Password::Needed)?;
+    let login = username_and_password(credentials, check.kind)?;
     let (host, socket) = open(check, findings).await?;
     if check.tls == Some(true) {
         let secured = secure(&host, socket, &[], findings).await?;
@@ -290,7 +290,7 @@ pub(crate) async fn check_pop3(
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = username_and_password(credentials, Password::Needed)?;
+    let login = username_and_password(credentials, check.kind)?;
     let (host, socket) = open(check, findings).await?;
     if check.tls == Some(true) {
         let secured = secure(&host, socket, &[], findings).await?;

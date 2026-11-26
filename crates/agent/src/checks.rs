@@ -160,11 +160,12 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path)
             .username
             .as_deref()
             .is_some_and(|username| !username.is_empty());
-        let password = definition
+        let secret = definition
             .password
             .as_deref()
-            .is_some_and(|password| !password.is_empty());
-        if let Some(why) = maxnines_checks::sign_in_problem(&check, username, password) {
+            .is_some_and(|password| !password.is_empty())
+            || definition.private_key_file.is_some();
+        if let Some(why) = maxnines_checks::sign_in_problem(&check, username, secret) {
             return Err(problem(&format!("can never sign in: {why}")));
         }
         ensure!(

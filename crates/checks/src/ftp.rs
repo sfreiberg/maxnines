@@ -11,7 +11,7 @@ use maxnines_protocol::Check;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::sign_in::{Credentials, Password, TLS_NOT_OFFERED, username_and_password};
+use crate::sign_in::{Credentials, TLS_NOT_OFFERED, username_and_password};
 use crate::{Findings, certificate_verdict, connect, host_and_port, resolve, secure};
 
 const NOT_FTP: &str = "it didn't answer as an FTP server does";
@@ -26,7 +26,7 @@ pub(crate) async fn check_ftp(
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = username_and_password(credentials, Password::Needed)?;
+    let login = username_and_password(credentials, check.kind)?;
     let (host, port) = host_and_port(&check.target)?;
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;

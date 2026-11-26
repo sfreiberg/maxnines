@@ -27,7 +27,7 @@ use crate::check_history;
 use crate::heartbeats;
 use crate::host_filter;
 use crate::metric_charts::{self, Chart, Frame};
-use crate::metrics::{self, Metric, Series, SeriesResult, TimeRange, Unit};
+use crate::metrics::{self, Metric, Reading, Series, SeriesResult, Source, TimeRange, Unit};
 use crate::registration::HostState;
 use crate::remote_checks::{RemoteCheck, RemoteCheckInput, SignIn, SignInWith};
 use crate::roles::Role;
@@ -415,7 +415,7 @@ async fn form_page(
     form: &CheckForm,
     error: Option<&str>,
 ) -> Response {
-    let kinds: Vec<&str> = CheckKind::KNOWN.map(CheckKind::as_str).to_vec();
+    let kinds = kind_choices();
     // A check that exists goes back to its own page, and a new one to its host's.
     let back = match id {
         Some(id) => format!("/checks/{id}"),
@@ -435,6 +435,40 @@ async fn form_page(
         Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
         None => page.render(),
     }
+}
+
+/// A kind of check as the form offers it, with what it takes, as words the page's
+/// styles show and hide the form's boxes by: its options, by their names, and
+/// `sign_in` and `stats` for a kind that signs in or has its stats read.
+#[derive(Serialize)]
+struct KindChoice {
+    value: &'static str,
+    label: &'static str,
+    takes: String,
+}
+
+fn kind_choices() -> Vec<KindChoice> {
+    CheckKind::KNOWN
+        .iter()
+        .map(|&kind| {
+            let mut takes: Vec<&str> = kind
+                .options()
+                .iter()
+                .map(|option| option.as_str())
+                .collect();
+            if kind.signs_in() {
+                takes.push("sign_in");
+            }
+            if is_database(kind) {
+                takes.push("stats");
+            }
+            KindChoice {
+                value: kind.as_str(),
+                label: kind.label(),
+                takes: takes.join(" "),
+            }
+        })
+        .collect()
 }
 
 /// What a new host for the check on the form would be called if its name were left
@@ -534,23 +568,28 @@ const PHASES: [(&str, &str); 8] = [
     ("check.round_trip", "Test message"),
 ];
 
-/// Whether a check of `kind` can report `metric`. Most of what checks report
-/// comes from any kind that gets that far, and these are a kind's own.
-fn can_report(metric: &str, kind: CheckKind) -> bool {
-    match metric {
-        "check.first_byte" | "check.download" | "check.size" | "check.status" => {
-            matches!(kind, CheckKind::Http | CheckKind::Unifi)
-        }
-        "check.domain_days" => kind == CheckKind::Http,
-        "check.records" => kind == CheckKind::Dns,
-        "check.packet_loss" => kind == CheckKind::Ping,
-        "check.password_sign_in" => kind == CheckKind::Ssh,
-        "check.hit_rate" | "check.memory_used" | "check.memory_usage" | "check.evictions"
-        | "check.connections" => kind == CheckKind::Memcached,
-        "check.search" => kind == CheckKind::Ldap,
-        "check.round_trip" => kind == CheckKind::Mqtt,
-        _ => true,
-    }
+/// Whether a check of `kind` can report `metric`: whether it reads only what any
+/// kind reports, or what this kind reports of its own.
+fn can_report(metric: &Metric, kind: CheckKind) -> bool {
+    let read = |reading: &Reading| match *reading {
+        Reading::Field(field) | Reading::Rate(field) => vec![field],
+        Reading::Percent { part, whole } => vec![part, whole],
+    };
+    let fields = match &metric.source {
+        Source::Items { reading, .. } | Source::Entries(reading) => read(reading),
+        Source::Fields(fields) => fields
+            .iter()
+            .flat_map(|(_, reading)| read(reading))
+            .collect(),
+        Source::Labelled(_) => Vec::new(),
+    };
+    fields.iter().all(|field| {
+        let field = field.trim_start_matches("$.");
+        let some_kinds_own = CheckKind::KNOWN
+            .iter()
+            .any(|other| other.reports().contains(&field));
+        !some_kinds_own || kind.reports().contains(&field)
+    })
 }
 
 /// A chart on a check's page.
@@ -576,7 +615,7 @@ async fn charts(
     // what this kind of check can report is asked for.
     let about_checks: Vec<Arc<Metric>> = metrics::built_in()
         .iter()
-        .filter(|metric| metric.collector == "checks" && can_report(&metric.name, kind))
+        .filter(|metric| metric.collector == "checks" && can_report(metric, kind))
         .cloned()
         .collect();
     let mut queries = tokio::task::JoinSet::new();
@@ -1287,40 +1326,50 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 mod tests {
     use super::*;
 
-    /// Each metric only some kinds report is one the server has, so a misspelt
-    /// name can't leave a kind's chart out, and a website reports its own.
+    /// Each field only some kinds report is read by a metric of the server's, so a
+    /// misspelt one can't leave a kind's chart out, and each kind is only asked for
+    /// the metrics it can report.
     #[test]
     fn only_a_kind_s_own_metrics_are_asked_for() {
-        let own = [
-            "check.first_byte",
-            "check.download",
-            "check.size",
-            "check.status",
-            "check.domain_days",
-            "check.records",
-            "check.packet_loss",
-            "check.password_sign_in",
-            "check.hit_rate",
-            "check.memory_used",
-            "check.memory_usage",
-            "check.evictions",
-            "check.connections",
-            "check.search",
-            "check.round_trip",
-        ];
-        for name in own {
-            assert!(metrics::find(name).is_some(), "{name}");
-            assert!(
-                CheckKind::KNOWN.iter().any(|&kind| can_report(name, kind))
-                    && !CheckKind::KNOWN.iter().all(|&kind| can_report(name, kind)),
-                "{name}"
-            );
+        let checks: Vec<_> = metrics::built_in()
+            .iter()
+            .filter(|metric| metric.collector == "checks")
+            .cloned()
+            .collect();
+        for kind in CheckKind::KNOWN {
+            for field in kind.reports() {
+                let read = |metric: &&Arc<Metric>| {
+                    let Source::Items { reading, .. } = &metric.source else {
+                        return false;
+                    };
+                    match *reading {
+                        Reading::Field(read) | Reading::Rate(read) => read == format!("$.{field}"),
+                        Reading::Percent { part, whole } => {
+                            [part, whole].contains(&format!("$.{field}").as_str())
+                        }
+                    }
+                };
+                // The ping's spread is only shown on its page, not charted.
+                if !field.starts_with("rtt_") {
+                    assert!(
+                        checks.iter().any(|metric| read(&metric)),
+                        "{kind:?} {field}"
+                    );
+                }
+            }
         }
-        assert!(can_report("check.search", CheckKind::Ldap));
-        assert!(!can_report("check.search", CheckKind::Http));
-        assert!(can_report("check.round_trip", CheckKind::Mqtt));
-        assert!(can_report("check.response", CheckKind::Mqtt));
-        assert!(can_report("check.first_byte", CheckKind::Http));
+        let metric = |name: &str| metrics::find(name).unwrap();
+        assert!(can_report(&metric("check.search"), CheckKind::Ldap));
+        assert!(!can_report(&metric("check.search"), CheckKind::Http));
+        assert!(can_report(&metric("check.round_trip"), CheckKind::Mqtt));
+        assert!(can_report(&metric("check.response"), CheckKind::Mqtt));
+        assert!(can_report(&metric("check.first_byte"), CheckKind::Http));
+        assert!(!can_report(&metric("check.first_byte"), CheckKind::Tcp));
+        assert!(can_report(
+            &metric("check.memory_usage"),
+            CheckKind::Memcached
+        ));
+        assert!(!can_report(&metric("check.memory_usage"), CheckKind::Redis));
     }
 
     fn input() -> RemoteCheckInput {

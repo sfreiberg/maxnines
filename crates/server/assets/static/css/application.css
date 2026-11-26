@@ -612,21 +612,22 @@ svg.chart { display: block; width: 100%; height: auto; margin-top: 0.25rem; font
 .sign-in .password-fields, .sign-in .token-fields { display: contents; }
 .sign-in:not(:has(option[value="password"]:checked)) .password-fields,
 .sign-in:not(:has(option[value="token"]:checked)) .token-fields { display: none; }
-/* Only the options a kind of check uses. Without :has() they all stay. */
-.remote-check:not(:has(option[value="http"]:checked)) .for-http { display: none; }
-.remote-check:not(:has(option[value="dns"]:checked)) .for-dns { display: none; }
-.remote-check:not(:has(option[value="ping"]:checked)) .for-ping { display: none; }
-.remote-check:not(:has(option[value="mqtt"]:checked)) .for-mqtt { display: none; }
-.remote-check:not(:has(option[value="http"]:checked)):not(:has(option[value="unifi"]:checked)):not(:has(option[value="tls"]:checked)):not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="redis"]:checked)):not(:has(option[value="memcached"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)):not(:has(option[value="smtp"]:checked)):not(:has(option[value="imap"]:checked)):not(:has(option[value="pop3"]:checked)):not(:has(option[value="ftp"]:checked)):not(:has(option[value="ldap"]:checked)):not(:has(option[value="mqtt"]:checked)) .for-certificate { display: none; }
-.remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mongodb"]:checked)) .for-database { display: none; }
-.remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="redis"]:checked)):not(:has(option[value="memcached"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)):not(:has(option[value="smtp"]:checked)):not(:has(option[value="imap"]:checked)):not(:has(option[value="pop3"]:checked)):not(:has(option[value="ftp"]:checked)):not(:has(option[value="ldap"]:checked)):not(:has(option[value="mqtt"]:checked)) .for-tls-option { display: none; }
-.remote-check:not(:has(option[value="ssh"]:checked)) .for-ssh { display: none; }
-.remote-check:not(:has(option[value="unifi"]:checked)) .for-unifi { display: none; }
+/* Only the options a kind of check takes, which each kind's option lists in
+   data-takes. Without :has() they all stay. */
+.remote-check:not(:has(option:checked[data-takes~="method"])) .for-http { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="server"])) .for-dns { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="count"])) .for-ping { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="topic"])) .for-mqtt { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="insecure"])) .for-certificate { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="database"])) .for-database { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="tls"])) .for-tls-option { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="host_key"])) .for-ssh { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="site"])) .for-unifi { display: none; }
 .remote-check:not(:has(option[value="heartbeat"]:checked)) .for-heartbeat { display: none; }
 .remote-check:has(option[value="heartbeat"]:checked) .not-for-heartbeat { display: none; }
 .remote-check:not(:has(select[name="host_id"] option[value=""]:checked)) .for-new-host { display: none; }
-.remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="redis"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)) .for-stats { display: none; }
-.remote-check:not(:has(option[value="postgres"]:checked)):not(:has(option[value="mysql"]:checked)):not(:has(option[value="redis"]:checked)):not(:has(option[value="mongodb"]:checked)):not(:has(option[value="clickhouse"]:checked)):not(:has(option[value="ssh"]:checked)):not(:has(option[value="smtp"]:checked)):not(:has(option[value="imap"]:checked)):not(:has(option[value="pop3"]:checked)):not(:has(option[value="ftp"]:checked)):not(:has(option[value="ldap"]:checked)):not(:has(option[value="mqtt"]:checked)) .for-sign-in { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="stats"])) .for-stats { display: none; }
+.remote-check:not(:has(option:checked[data-takes~="sign_in"])) .for-sign-in { display: none; }
 /* Only the boxes for the way of signing in chosen. */
 .for-sign-in .password-fields, .for-sign-in .key-fields { display: contents; }
 .for-sign-in:not(:has(option[value="password"]:checked)) .password-fields,

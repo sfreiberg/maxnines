@@ -32,7 +32,7 @@
   <label>Kind
     <select name="kind">
       {% for kind in kinds %}
-      <option value="{{ kind }}"{% if kind == check.kind %} selected{% endif %}>{% if kind == "http" %}Website (http){% elif kind == "tcp" %}Port (tcp){% elif kind == "tls" %}Certificate (tls){% elif kind == "dns" %}DNS (dns){% elif kind == "ping" %}Ping (ping){% elif kind == "postgres" %}PostgreSQL{% elif kind == "mysql" %}MySQL or MariaDB{% elif kind == "redis" %}Redis{% elif kind == "memcached" %}Memcached{% elif kind == "mongodb" %}MongoDB{% elif kind == "clickhouse" %}ClickHouse{% elif kind == "ssh" %}SSH{% elif kind == "smtp" %}Mail sending (SMTP){% elif kind == "imap" %}Mailbox (IMAP){% elif kind == "pop3" %}Mailbox (POP3){% elif kind == "ftp" %}FTP or FTPS{% elif kind == "ldap" %}Directory (LDAP){% elif kind == "mqtt" %}MQTT broker{% elif kind == "unifi" %}UniFi console{% else %}Heartbeat (pinged by scheduled work){% endif %}</option>
+      <option value="{{ kind.value }}" data-takes="{{ kind.takes }}"{% if kind.value == check.kind %} selected{% endif %}>{{ kind.label }}</option>
       {% endfor %}
     </select>
   </label>

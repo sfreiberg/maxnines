@@ -656,29 +656,280 @@ impl CheckKind {
         }
     }
 
+    /// What it's called where people choose one.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Http => "Website (http)",
+            Self::Tcp => "Port (tcp)",
+            Self::Tls => "Certificate (tls)",
+            Self::Dns => "DNS (dns)",
+            Self::Ping => "Ping (ping)",
+            Self::Postgres => "PostgreSQL",
+            Self::Mysql => "MySQL or MariaDB",
+            Self::Redis => "Redis",
+            Self::Memcached => "Memcached",
+            Self::Mongodb => "MongoDB",
+            Self::Clickhouse => "ClickHouse",
+            Self::Ssh => "SSH",
+            Self::Smtp => "Mail sending (SMTP)",
+            Self::Imap => "Mailbox (IMAP)",
+            Self::Pop3 => "Mailbox (POP3)",
+            Self::Ftp => "FTP or FTPS",
+            Self::Ldap => "Directory (LDAP)",
+            Self::Mqtt => "MQTT broker",
+            Self::Unifi => "UniFi console",
+            Self::Heartbeat => "Heartbeat (pinged by scheduled work)",
+            Self::Unknown => "A newer kind",
+        }
+    }
+
+    /// What it's given as its target.
+    pub fn target(self) -> Target {
+        match self {
+            Self::Http => Target::Url,
+            Self::Unifi => Target::Console,
+            Self::Dns | Self::Ping | Self::Unknown => Target::Hostname,
+            Self::Heartbeat => Target::None,
+            Self::Tcp
+            | Self::Tls
+            | Self::Postgres
+            | Self::Mysql
+            | Self::Redis
+            | Self::Memcached
+            | Self::Mongodb
+            | Self::Clickhouse
+            | Self::Ssh
+            | Self::Smtp
+            | Self::Imap
+            | Self::Pop3
+            | Self::Ftp
+            | Self::Ldap
+            | Self::Mqtt => Target::HostPort,
+        }
+    }
+
+    /// The options it can have, beyond its name, target and timing.
+    pub fn options(self) -> &'static [CheckOption] {
+        use CheckOption::{
+            Body, Count, Database, DomainExpiry, HostKey, Insecure, Method, Record, Regex, Server,
+            Site, Tls, Topic,
+        };
+        match self {
+            Self::Http => &[Method, Body, Regex, DomainExpiry, Insecure],
+            Self::Tls => &[Insecure],
+            Self::Dns => &[Server, Record],
+            Self::Ping => &[Count],
+            Self::Postgres | Self::Mongodb => &[Database, Tls, Insecure],
+            Self::Mysql
+            | Self::Redis
+            | Self::Memcached
+            | Self::Clickhouse
+            | Self::Smtp
+            | Self::Imap
+            | Self::Pop3
+            | Self::Ftp
+            | Self::Ldap => &[Tls, Insecure],
+            Self::Mqtt => &[Tls, Insecure, Topic],
+            Self::Ssh => &[HostKey],
+            Self::Unifi => &[Site, Insecure],
+            Self::Tcp | Self::Heartbeat | Self::Unknown => &[],
+        }
+    }
+
+    /// Whether it can have `option`.
+    pub fn takes(self, option: CheckOption) -> bool {
+        self.options().contains(&option)
+    }
+
+    /// What it needs to sign in with a username and password, or a key for ssh,
+    /// for a kind that can.
+    pub fn sign_in(self) -> Option<SignInNeeds> {
+        let both = SignInNeeds {
+            username: true,
+            password: true,
+            password_in_clear: false,
+        };
+        match self {
+            Self::Mongodb
+            | Self::Clickhouse
+            | Self::Ssh
+            | Self::Smtp
+            | Self::Imap
+            | Self::Pop3
+            | Self::Ftp
+            | Self::Ldap => Some(both),
+            // Either can let an account in without a password.
+            Self::Postgres | Self::Mysql => Some(SignInNeeds {
+                password: false,
+                ..both
+            }),
+            // Redis before version 6 has a password and no usernames.
+            Self::Redis => Some(SignInNeeds {
+                username: false,
+                password_in_clear: true,
+                ..both
+            }),
+            // A broker can let a username in alone.
+            Self::Mqtt => Some(SignInNeeds {
+                password: false,
+                password_in_clear: true,
+                ..both
+            }),
+            Self::Tcp
+            | Self::Http
+            | Self::Tls
+            | Self::Dns
+            | Self::Ping
+            | Self::Memcached
+            | Self::Heartbeat
+            | Self::Unifi
+            | Self::Unknown => None,
+        }
+    }
+
     /// Whether it can sign in, with a username and password, or a key for ssh.
     pub fn signs_in(self) -> bool {
-        matches!(
-            self,
-            Self::Postgres
-                | Self::Mysql
-                | Self::Redis
-                | Self::Mongodb
-                | Self::Clickhouse
-                | Self::Ssh
-                | Self::Smtp
-                | Self::Imap
-                | Self::Pop3
-                | Self::Ftp
-                | Self::Ldap
-                | Self::Mqtt
-        )
+        self.sign_in().is_some()
+    }
+
+    /// What only this kind reports, of what a check reports, by field name. The
+    /// rest, such as `up` and the time each stage took, any kind can report.
+    pub fn reports(self) -> &'static [&'static str] {
+        const WEB: &[&str] = &[
+            "first_byte_secs",
+            "download_secs",
+            "content_length",
+            "status",
+        ];
+        match self {
+            Self::Http => &[
+                "first_byte_secs",
+                "download_secs",
+                "content_length",
+                "status",
+                "domain_days_left",
+            ],
+            Self::Unifi => WEB,
+            Self::Dns => &["records"],
+            Self::Ping => &[
+                "packet_loss_percent",
+                "rtt_min_secs",
+                "rtt_max_secs",
+                "rtt_stddev_secs",
+            ],
+            Self::Ssh => &["password_sign_in"],
+            Self::Memcached => &[
+                "hit_rate_percent",
+                "memory_used_bytes",
+                "memory_limit_bytes",
+                "evictions",
+                "connections",
+            ],
+            Self::Ldap => &["search_secs"],
+            Self::Mqtt => &["round_trip_secs"],
+            Self::Tcp
+            | Self::Tls
+            | Self::Postgres
+            | Self::Mysql
+            | Self::Redis
+            | Self::Mongodb
+            | Self::Clickhouse
+            | Self::Smtp
+            | Self::Imap
+            | Self::Pop3
+            | Self::Ftp
+            | Self::Heartbeat
+            | Self::Unknown => &[],
+        }
     }
 
     /// One of the kinds this build knows, by its name.
     pub fn parse(text: &str) -> Option<Self> {
         Self::KNOWN.into_iter().find(|kind| kind.as_str() == text)
     }
+}
+
+/// What a kind of check is given as its target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    /// `host:port`.
+    HostPort,
+    /// An address starting `http://` or `https://`.
+    Url,
+    /// A UniFi console's own address, which is only ever HTTPS, with nothing after
+    /// it, as the API's paths are added to it.
+    Console,
+    /// A hostname or an address, with no port.
+    Hostname,
+    /// Nothing, for a heartbeat, which is pinged rather than reaching anything.
+    None,
+}
+
+/// An option a check can have, beyond its name, target and timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckOption {
+    Method,
+    Body,
+    Regex,
+    DomainExpiry,
+    Insecure,
+    Server,
+    Record,
+    Count,
+    Database,
+    Tls,
+    HostKey,
+    Site,
+    Topic,
+}
+
+impl CheckOption {
+    pub const ALL: [Self; 13] = [
+        Self::Method,
+        Self::Body,
+        Self::Regex,
+        Self::DomainExpiry,
+        Self::Insecure,
+        Self::Server,
+        Self::Record,
+        Self::Count,
+        Self::Database,
+        Self::Tls,
+        Self::HostKey,
+        Self::Site,
+        Self::Topic,
+    ];
+
+    /// Its field's name, as a check is written.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Method => "method",
+            Self::Body => "body",
+            Self::Regex => "regex",
+            Self::DomainExpiry => "domain_expiry",
+            Self::Insecure => "insecure",
+            Self::Server => "server",
+            Self::Record => "record",
+            Self::Count => "count",
+            Self::Database => "database",
+            Self::Tls => "tls",
+            Self::HostKey => "host_key",
+            Self::Site => "site",
+            Self::Topic => "topic",
+        }
+    }
+}
+
+/// What a kind of check needs to sign in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignInNeeds {
+    /// Whether it needs a username.
+    pub username: bool,
+    /// Whether it needs a password, or for ssh a password or a key.
+    pub password: bool,
+    /// Whether it takes a password as it is, with nothing to hide it, and can't
+    /// upgrade to TLS, so a password is only sent without TLS to its own host.
+    pub password_in_clear: bool,
 }
 
 /// A Windows performance counter, by its English path, like
@@ -769,114 +1020,63 @@ impl Check {
             !target.chars().any(|c| c.is_whitespace() || c.is_control()),
             "check {name:?} has spaces in its target"
         );
-        match self.kind {
-            CheckKind::Unknown => anyhow::bail!(
-                "check {name:?} needs a kind this version knows: {}",
-                CheckKind::KNOWN.map(CheckKind::as_str).join(", ")
-            ),
-            CheckKind::Tcp
-            | CheckKind::Tls
-            | CheckKind::Postgres
-            | CheckKind::Mysql
-            | CheckKind::Redis
-            | CheckKind::Memcached
-            | CheckKind::Mongodb
-            | CheckKind::Clickhouse
-            | CheckKind::Ssh
-            | CheckKind::Smtp
-            | CheckKind::Imap
-            | CheckKind::Pop3
-            | CheckKind::Ftp
-            | CheckKind::Ldap
-            | CheckKind::Mqtt => ensure!(
+        ensure!(
+            self.kind != CheckKind::Unknown,
+            "check {name:?} needs a kind this version knows: {}",
+            CheckKind::KNOWN.map(CheckKind::as_str).join(", ")
+        );
+        match self.kind.target() {
+            Target::HostPort => ensure!(
                 has_port(target),
                 "check {name:?} needs a target like host:port"
             ),
-            CheckKind::Http => ensure!(
+            Target::Url => ensure!(
                 target.starts_with("http://") || target.starts_with("https://"),
                 "check {name:?} needs a target starting with http:// or https://"
             ),
-            // The Network API is only ever offered over HTTPS, at the console's
-            // own address, which the API's paths are added to.
-            CheckKind::Unifi => ensure!(
+            Target::Console => ensure!(
                 target.strip_prefix("https://").is_some_and(|rest| {
                     !rest.is_empty() && !rest.contains(['/', '?', '#', '@'])
                 }),
                 "check {name:?} needs the console's address, such as https://192.168.1.1"
             ),
-            CheckKind::Dns | CheckKind::Ping => ensure!(
+            Target::Hostname => ensure!(
                 is_plain_name(target, ":"),
                 "check {name:?} needs a hostname as its target"
             ),
-            CheckKind::Heartbeat => {}
+            Target::None => {}
         }
         self.validate_options()
     }
 
+    /// Whether `option` is set.
+    fn has(&self, option: CheckOption) -> bool {
+        match option {
+            CheckOption::Method => self.method.is_some(),
+            CheckOption::Body => self.body.is_some(),
+            CheckOption::Regex => self.regex.is_some(),
+            CheckOption::DomainExpiry => self.domain_expiry.is_some(),
+            CheckOption::Insecure => self.insecure.is_some(),
+            CheckOption::Server => self.server.is_some(),
+            CheckOption::Record => self.record.is_some(),
+            CheckOption::Count => self.count.is_some(),
+            CheckOption::Database => self.database.is_some(),
+            CheckOption::Tls => self.tls.is_some(),
+            CheckOption::HostKey => self.host_key.is_some(),
+            CheckOption::Site => self.site.is_some(),
+            CheckOption::Topic => self.topic.is_some(),
+        }
+    }
+
     fn validate_options(&self) -> Result<()> {
         let name = &self.name;
-        let only_for = |set: bool, option: &str, kinds: &[CheckKind]| {
+        for option in CheckOption::ALL {
             ensure!(
-                !set || kinds.contains(&self.kind),
-                "check {name:?} can't use {option}"
+                !self.has(option) || self.kind.takes(option),
+                "check {name:?} can't use {}",
+                option.as_str()
             );
-            Ok(())
-        };
-        only_for(self.method.is_some(), "method", &[CheckKind::Http])?;
-        only_for(self.body.is_some(), "body", &[CheckKind::Http])?;
-        only_for(self.regex.is_some(), "regex", &[CheckKind::Http])?;
-        only_for(
-            self.insecure.is_some(),
-            "insecure",
-            &[
-                CheckKind::Http,
-                CheckKind::Unifi,
-                CheckKind::Tls,
-                CheckKind::Postgres,
-                CheckKind::Mysql,
-                CheckKind::Redis,
-                CheckKind::Memcached,
-                CheckKind::Mongodb,
-                CheckKind::Clickhouse,
-                CheckKind::Smtp,
-                CheckKind::Imap,
-                CheckKind::Pop3,
-                CheckKind::Ftp,
-                CheckKind::Ldap,
-                CheckKind::Mqtt,
-            ],
-        )?;
-        only_for(
-            self.database.is_some(),
-            "database",
-            &[CheckKind::Postgres, CheckKind::Mongodb],
-        )?;
-        only_for(
-            self.tls.is_some(),
-            "tls",
-            &[
-                CheckKind::Postgres,
-                CheckKind::Mysql,
-                CheckKind::Redis,
-                CheckKind::Memcached,
-                CheckKind::Mongodb,
-                CheckKind::Clickhouse,
-                CheckKind::Smtp,
-                CheckKind::Imap,
-                CheckKind::Pop3,
-                CheckKind::Ftp,
-                CheckKind::Ldap,
-                CheckKind::Mqtt,
-            ],
-        )?;
-        only_for(self.host_key.is_some(), "host_key", &[CheckKind::Ssh])?;
-        only_for(
-            self.domain_expiry.is_some(),
-            "domain_expiry",
-            &[CheckKind::Http],
-        )?;
-        only_for(self.site.is_some(), "site", &[CheckKind::Unifi])?;
-        only_for(self.topic.is_some(), "topic", &[CheckKind::Mqtt])?;
+        }
         if let Some(topic) = &self.topic {
             // A wildcard would subscribe to more than the test message, and a topic
             // starting with $ is the broker's own.
@@ -919,9 +1119,6 @@ impl Check {
                  ssh-keygen -l prints it"
             );
         }
-        only_for(self.server.is_some(), "server", &[CheckKind::Dns])?;
-        only_for(self.record.is_some(), "record", &[CheckKind::Dns])?;
-        only_for(self.count.is_some(), "count", &[CheckKind::Ping])?;
 
         validate_check_timing(name, self.timeout, self.interval)?;
         if let Some(method) = &self.method {
@@ -1746,6 +1943,57 @@ mod tests {
         .unwrap();
         let refused = config.validate_sent().unwrap_err().to_string();
         assert!(refused.contains("heartbeat"), "{refused}");
+    }
+
+    /// Each option is named as its field is written, and set on a check of a kind
+    /// that doesn't take it, is turned down by that name.
+    #[test]
+    fn options_are_named_as_written_and_only_taken_where_described() {
+        let mut every = Check::new("all", CheckKind::Http, "https://example.com/");
+        every.method = Some("GET".to_string());
+        every.body = Some(String::new());
+        every.regex = Some("x".to_string());
+        every.domain_expiry = Some(false);
+        every.insecure = Some(true);
+        every.server = Some("8.8.8.8".to_string());
+        every.record = Some("A".to_string());
+        every.count = Some(1);
+        every.database = Some("postgres".to_string());
+        every.tls = Some(true);
+        every.host_key = Some("SHA256:x".to_string());
+        every.site = Some("default".to_string());
+        every.topic = Some("t".to_string());
+        let written = serde_json::to_value(&every).unwrap();
+        for option in CheckOption::ALL {
+            assert!(every.has(option), "{option:?}");
+            assert!(written.get(option.as_str()).is_some(), "{option:?}");
+        }
+        for kind in CheckKind::KNOWN {
+            for option in CheckOption::ALL {
+                let mut check = Check::new("one", kind, "");
+                match option.as_str() {
+                    "count" => check.count = Some(1),
+                    name => {
+                        let mut fields = serde_json::to_value(&check).unwrap();
+                        fields[name] = written[name].clone();
+                        check = serde_json::from_value(fields).unwrap();
+                    }
+                }
+                let refused = check.validate_options().err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .ends_with(&format!("use {}", option.as_str()))
+                });
+                assert_eq!(refused, !kind.takes(option), "{kind:?} {option:?}");
+            }
+        }
+        // Every option is some kind's.
+        for option in CheckOption::ALL {
+            assert!(
+                CheckKind::KNOWN.iter().any(|kind| kind.takes(option)),
+                "{option:?}"
+            );
+        }
     }
 
     #[test]

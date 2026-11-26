@@ -44,7 +44,7 @@ use hyper::header::{
 };
 use hyper::{Method, Request, Response, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use maxnines_protocol::{Check, CheckKind, DEFAULT_CHECK_TIMEOUT};
+use maxnines_protocol::{Check, CheckKind, DEFAULT_CHECK_TIMEOUT, Target};
 use regex_lite::Regex;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -90,32 +90,18 @@ const DNS_BUFFER_BYTES: usize = 4096;
 /// a name is in lower case, as hostnames are.
 pub fn host_reached(check: &Check) -> String {
     let target = check.target.as_str();
-    let host = match check.kind {
-        CheckKind::Http | CheckKind::Unifi => Uri::from_str(target)
+    let host = match check.kind.target() {
+        Target::Url | Target::Console => Uri::from_str(target)
             .ok()
             .and_then(|uri| uri.host().map(String::from))
             .unwrap_or_else(|| target.to_string()),
-        CheckKind::Tcp
-        | CheckKind::Tls
-        | CheckKind::Postgres
-        | CheckKind::Mysql
-        | CheckKind::Redis
-        | CheckKind::Memcached
-        | CheckKind::Mongodb
-        | CheckKind::Clickhouse
-        | CheckKind::Ssh
-        | CheckKind::Smtp
-        | CheckKind::Imap
-        | CheckKind::Pop3
-        | CheckKind::Ftp
-        | CheckKind::Ldap
-        | CheckKind::Mqtt => target
+        Target::HostPort => target
             .rsplit_once(':')
             .map_or(target, |(host, _port)| host)
             .to_string(),
-        CheckKind::Dns | CheckKind::Ping | CheckKind::Unknown => target.to_string(),
+        Target::Hostname => target.to_string(),
         // It reaches nothing, so its host is named after the work it watches.
-        CheckKind::Heartbeat => check.name.clone(),
+        Target::None => check.name.clone(),
     };
     host.trim_start_matches('[')
         .trim_end_matches(']')

@@ -22,7 +22,7 @@ use lber::structures::{ASNTag, Boolean, Enumerated, Integer, OctetString};
 use maxnines_protocol::Check;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::sign_in::{Credentials, Password, TLS_NOT_OFFERED, username_and_password};
+use crate::sign_in::{Credentials, TLS_NOT_OFFERED, username_and_password};
 use crate::{Findings, certificate_verdict, connect, elapsed_secs, host_and_port, resolve, secure};
 
 const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
@@ -76,7 +76,7 @@ pub(crate) async fn check_ldap(
 ) -> Result<()> {
     // A simple bind with an empty password signs in as nobody, which most servers
     // accept, so it isn't a login.
-    let login = username_and_password(credentials, Password::Needed)?;
+    let login = username_and_password(credentials, check.kind)?;
     let (host, port) = host_and_port(&check.target)?;
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;
