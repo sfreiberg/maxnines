@@ -18,3 +18,20 @@ pub(crate) fn acceptor() -> TlsAcceptor {
         .unwrap();
     TlsAcceptor::from(Arc::new(config))
 }
+
+/// A server that reads the first of what it's sent, then hangs up without a word,
+/// as a port that only takes TLS often does with what isn't.
+pub(crate) async fn hangs_up() -> std::net::SocketAddr {
+    use tokio::io::AsyncReadExt;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 1024];
+                let _ = socket.read(&mut request).await;
+            });
+        }
+    });
+    address
+}

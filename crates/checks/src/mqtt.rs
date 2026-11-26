@@ -23,7 +23,8 @@ use tokio::time::timeout_at;
 
 use crate::sign_in::{Credentials, TLS_NEEDED_ELSEWHERE, is_loopback, username_and_password};
 use crate::{
-    Findings, certificate_verdict, connect, elapsed_secs, host_and_port, limit, resolve, secure,
+    Closed, Findings, TLS_ANSWER, TLS_ONLY, certificate_verdict, connect, elapsed_secs,
+    host_and_port, hung_up, limit, resolve, secure, starts_as_tls,
 };
 
 const NOT_MQTT: &str = "it didn't answer as an MQTT broker does";
@@ -113,8 +114,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
         if let Some((username, password)) = login {
             hello.set_login(username, password);
         }
-        self.send(Packet::Connect(hello)).await?;
-        let answer = self.conn_ack().await?;
+        let hello = async {
+            self.send(Packet::Connect(hello)).await?;
+            self.conn_ack().await
+        };
+        let answered = hello.await;
+        let plain = check.tls != Some(true);
+        let answer = match answered {
+            // Hung up on before a word, or answered in TLS, as a broker that only
+            // takes TLS does.
+            Err(error) if plain && self.buffer.is_empty() && hung_up(&error) => bail!(TLS_ONLY),
+            Err(_) if plain && starts_as_tls(&self.buffer) => bail!(TLS_ANSWER),
+            answered => answered?,
+        };
         let needs_login = matches!(
             answer.code,
             ConnectReturnCode::BadUserNamePassword | ConnectReturnCode::NotAuthorized
@@ -216,7 +228,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
     async fn conn_ack(&mut self) -> Result<ConnAck> {
         while self.buffer.len() < 2 {
             let read = self.stream.read_buf(&mut self.buffer).await?;
-            ensure!(read > 0, "it closed the connection");
+            ensure!(read > 0, Closed);
         }
         ensure!(self.buffer[..2] == [0x20, 0x02], NOT_MQTT);
         match self.packet().await? {
@@ -269,7 +281,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
                 }
             }
             let read = self.stream.read_buf(&mut self.buffer).await?;
-            ensure!(read > 0, "it closed the connection");
+            ensure!(read > 0, Closed);
         }
     }
 }
@@ -508,6 +520,22 @@ mod tests {
         let result = run_signed_in(&strict, None).await;
         assert_eq!(result["up"], 0, "{result}");
         assert!(result["cert_days_left"].is_i64(), "{result}");
+    }
+
+    /// A broker's TLS port reached without tls set answers in TLS, or hangs up
+    /// without a word, as Mosquitto's does, and either is said to be why.
+    #[tokio::test]
+    async fn a_tls_port_without_tls_set_says_so() {
+        let (address, leaked) = fake(Broker { tls: true, ..OPEN }).await;
+        let silent = crate::test_tls::hangs_up().await;
+        for (address, why) in [(address, crate::TLS_ANSWER), (silent, crate::TLS_ONLY)] {
+            let mut check = check(address, OPEN);
+            check.topic = Some("monitoring".to_string());
+            let result = run_signed_in(&check, Some(&login("s3cret"))).await;
+            assert_eq!(result["up"], 0, "{result}");
+            assert_eq!(result["error"], why, "{result}");
+        }
+        assert!(!leaked.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

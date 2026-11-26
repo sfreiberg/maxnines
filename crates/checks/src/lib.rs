@@ -181,6 +181,49 @@ struct Findings {
     rtt_stddev_secs: Option<f64>,
 }
 
+/// A server closing the connection where an answer was due.
+#[derive(Debug)]
+pub(crate) struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("it closed the connection")
+    }
+}
+
+impl std::error::Error for Closed {}
+
+/// What a check without TLS says of a server that hung up on its first request
+/// without answering it, which is what a port that only takes TLS does.
+pub(crate) const TLS_ONLY: &str = "it closed the connection without answering, which a port that only takes TLS does \
+     when tls isn't set";
+
+/// What a check without TLS says of a server that answered it in TLS.
+pub(crate) const TLS_ANSWER: &str = "it answered in TLS, so it needs tls set";
+
+/// Whether `bytes` start as a TLS record does, which is how a port that only takes
+/// TLS answers what isn't, with an alert.
+pub(crate) fn starts_as_tls(bytes: &[u8]) -> bool {
+    // An alert's content type, then the record's version, 3.x.
+    bytes.starts_with(&[0x15, 0x03])
+}
+
+/// Whether `error` is the server hanging up, by closing the connection or
+/// resetting it.
+pub(crate) fn hung_up(error: &anyhow::Error) -> bool {
+    use std::io::ErrorKind;
+    error.is::<Closed>()
+        || error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::UnexpectedEof
+            )
+        })
+}
+
 fn elapsed_secs(since: Instant) -> f64 {
     since.elapsed().as_secs_f64()
 }

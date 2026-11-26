@@ -23,7 +23,10 @@ use maxnines_protocol::Check;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::sign_in::{Credentials, TLS_NOT_OFFERED, username_and_password};
-use crate::{Findings, certificate_verdict, connect, elapsed_secs, host_and_port, resolve, secure};
+use crate::{
+    Closed, Findings, TLS_ANSWER, TLS_ONLY, certificate_verdict, connect, elapsed_secs,
+    host_and_port, hung_up, resolve, secure, starts_as_tls,
+};
 
 const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
 const BUSY: &str = "it's too busy, or unavailable";
@@ -84,21 +87,32 @@ pub(crate) async fn check_ldap(
         return Ldap::new(secured.stream, 1).look(login, findings).await;
     }
     let mut ldap = Ldap::new(socket, 1);
-    let offered = ldap.start_tls().await?;
+    let offered = match ldap.start_tls().await {
+        Err(_) if ldap.answered_in_tls => bail!(TLS_ANSWER),
+        offered => offered?,
+    };
     findings.tls_offered = Some(offered == StartTls::Offered);
     match offered {
         StartTls::Offered => {}
+        // Some servers and proxies hang up on an operation they don't know, which
+        // says nothing about the rest, so it's looked at again without asking. One
+        // that hangs up on that too without a word isn't speaking LDAP in the clear.
+        StartTls::HungUp => {
+            let socket = connect(&addresses, findings).await?;
+            let mut plain = Ldap::new(socket, 1);
+            let looked = plain.look(None, findings).await;
+            if !plain.answered && looked.as_ref().is_err_and(hung_up) {
+                findings.tls_offered = None;
+                bail!(TLS_ONLY);
+            }
+            ensure!(login.is_none(), TLS_NOT_OFFERED);
+            return looked;
+        }
         _ if login.is_some() => {
             ldap.unbind().await;
             bail!(TLS_NOT_OFFERED);
         }
         StartTls::Refused => return ldap.look(None, findings).await,
-        // Some servers and proxies hang up on an operation they don't know, which
-        // says nothing about the rest, so it's looked at again without asking.
-        StartTls::HungUp => {
-            let socket = connect(&addresses, findings).await?;
-            return Ldap::new(socket, 1).look(None, findings).await;
-        }
     }
     // Nothing more comes before the TLS handshake, so nothing is left unread.
     ensure!(ldap.buffer.is_empty(), NOT_LDAP);
@@ -117,6 +131,10 @@ struct Ldap<S> {
     buffer: BytesMut,
     /// Each request on a connection has an ID of its own, which its answers carry.
     next_id: i64,
+    /// Whether anything's been read on the connection.
+    answered: bool,
+    /// Whether the first that was read started as TLS does.
+    answered_in_tls: bool,
 }
 
 /// How a server answered being asked to upgrade to TLS.
@@ -146,12 +164,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             stream,
             buffer: BytesMut::new(),
             next_id,
+            answered: false,
+            answered_in_tls: false,
         }
     }
 
     /// Signs in where given a login, and reads the root entry and, signed in, the
     /// entry the data starts at. Always leaves, whatever happened.
-    async fn look(mut self, login: Option<(&str, &str)>, findings: &mut Findings) -> Result<()> {
+    async fn look(&mut self, login: Option<(&str, &str)>, findings: &mut Findings) -> Result<()> {
         let looked = self.look_around(login, findings).await;
         self.unbind().await;
         looked
@@ -207,7 +227,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         match self.answer(id, EXTENDED_RESPONSE).await {
             Ok((SUCCESS, _)) => Ok(StartTls::Offered),
             Ok(_) => Ok(StartTls::Refused),
-            Err(error) if error.is::<std::io::Error>() || error.is::<Disconnected>() => {
+            Err(error)
+                if error.is::<std::io::Error>() || error.is::<Closed>() || error.is::<Ended>() =>
+            {
                 Ok(StartTls::HungUp)
             }
             Err(error) => Err(error),
@@ -393,7 +415,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         };
         let answers = universal_integer(answers).context(NOT_LDAP)?;
         if answers == 0 {
-            return Err(Disconnected::Ended.into());
+            return Err(Ended.into());
         }
         ensure!(answers == id, NOT_LDAP);
         Ok(op)
@@ -416,31 +438,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             }
             let read = self.stream.read_buf(&mut self.buffer).await?;
             if read == 0 {
-                return Err(Disconnected::Closed.into());
+                return Err(Closed.into());
             }
+            if !self.answered {
+                self.answered_in_tls = starts_as_tls(&self.buffer);
+            }
+            self.answered = true;
         }
     }
 }
 
-/// How a server hung up.
+/// A server sending a notice of disconnection, as it does before closing.
 #[derive(Debug)]
-enum Disconnected {
-    /// It closed the connection.
-    Closed,
-    /// It sent a notice of disconnection, as it does before closing.
-    Ended,
-}
+struct Ended;
 
-impl std::fmt::Display for Disconnected {
+impl std::fmt::Display for Ended {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Closed => "it closed the connection",
-            Self::Ended => "it ended the session",
-        })
+        f.write_str("it ended the session")
     }
 }
 
-impl std::error::Error for Disconnected {}
+impl std::error::Error for Ended {}
 
 /// A BER header at the start of `bytes`: its tag byte, how long the header is, and
 /// how long what follows it is. None until enough has come to say, and an error
@@ -946,6 +964,24 @@ mod tests {
         let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
         assert_eq!(result["up"], 0, "{result}");
         assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
+        assert!(!seen.leaked.load(Ordering::Relaxed));
+    }
+
+    /// An LDAPS port reached without tls set answers in TLS, or hangs up without
+    /// a word, as OpenLDAP's does, and either is said to be why.
+    #[tokio::test]
+    async fn an_ldaps_port_without_tls_set_says_so() {
+        let (address, seen) = fake(Tls::Implicit, Anonymous::Allowed).await;
+        let silent = crate::test_tls::hangs_up().await;
+        for (address, why) in [(address, crate::TLS_ANSWER), (silent, crate::TLS_ONLY)] {
+            let ldap = check(address, Tls::Never);
+            for login in [None, Some(login(ACCOUNT, "s3cret"))] {
+                let result = run_signed_in(&ldap, login.as_ref()).await;
+                assert_eq!(result["up"], 0, "{result}");
+                assert_eq!(result["error"], why, "{result}");
+                assert!(result.get("tls_offered").is_none(), "{result}");
+            }
+        }
         assert!(!seen.leaked.load(Ordering::Relaxed));
     }
 

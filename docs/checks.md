@@ -135,7 +135,8 @@ that fails counts as down unless **Don't count a bad certificate as down** is ti
 `tls_offered` says whether it agreed. A server that hangs up rather than answer, as
 some proxies do with a request they don't know, is checked again without asking,
 and doesn't offer TLS. For LDAPS, usually on port 636, tick **Use TLS from the
-start**.
+start**. Without it, a check of an LDAPS port says it answered in TLS, or closed
+the connection without answering, which is how such a port takes what isn't TLS.
 
 It then reads the directory's root entry, which says where its data starts and,
 for some servers such as 389 Directory Server, what it is, in `server_version`.
@@ -165,8 +166,8 @@ counts as down if it isn't let in. Without them, a broker that needs signing in
 still counts as up, as it answered as a broker.
 
 MQTT has no way to upgrade to TLS, so for a broker using TLS, usually on port 8883,
-tick **Use TLS from the start**, and its certificate is read as a website's is. A
-broker takes a password as it is, so as for Redis, a check only sends one without
+tick **Use TLS from the start**, and its certificate is read as a website's is.
+Without it, a check of such a port says so, as for LDAPS. A broker takes a password as it is, so as for Redis, a check only sends one without
 TLS to a broker on its own host, and a check that would send one elsewhere is turned
 down when it's saved.
 
