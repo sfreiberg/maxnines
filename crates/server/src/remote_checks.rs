@@ -308,7 +308,11 @@ impl SignIn {
                 if kind != CheckKind::Redis {
                     ensure!(self.username.is_some(), "signing in needs a username");
                 }
-                if kind != CheckKind::Postgres && kind != CheckKind::Mysql {
+                // An MQTT broker can let a client sign in with its username alone.
+                if !matches!(
+                    kind,
+                    CheckKind::Postgres | CheckKind::Mysql | CheckKind::Mqtt
+                ) {
                     ensure!(
                         self.password.is_some() || self.password_env.is_some(),
                         "signing in needs a password"
@@ -368,6 +372,13 @@ fn default_enabled() -> bool {
 pub fn check_input(input: &RemoteCheckInput) -> Result<()> {
     input.check.validate()?;
     input.sign_in.validate(input.check.kind)?;
+    let sign_in = &input.sign_in;
+    let password = sign_in.password.is_some() || sign_in.password_env.is_some();
+    if let Some(why) =
+        maxnines_checks::sign_in_problem(&input.check, sign_in.username.is_some(), password)
+    {
+        bail!("{why}");
+    }
     ensure!(
         input.check.interval.is_none(),
         "a remote check's interval goes beside the check, as interval_secs"
@@ -815,6 +826,31 @@ mod tests {
         let mut inside = input(second * 60);
         inside.check.interval = Some(second * 300);
         assert!(check_input(&inside).is_err());
+    }
+
+    #[test]
+    fn a_sign_in_that_can_never_work_is_refused() {
+        let mut broker = input(Duration::from_secs(60));
+        broker.check = Check::new("broker", CheckKind::Mqtt, "mqtt.example.com:1883");
+        // A broker can take a username alone.
+        broker.sign_in.username = Some("monitor".to_string());
+        check_input(&broker).unwrap();
+
+        // A password goes as it is, so only over TLS or to the server's own host.
+        broker.sign_in.password = Some("s3cret".to_string());
+        let error = check_input(&broker).unwrap_err().to_string();
+        assert!(error.contains("only sent without TLS"), "{error}");
+        broker.check.tls = Some(true);
+        check_input(&broker).unwrap();
+        broker.check = Check::new("broker", CheckKind::Mqtt, "127.0.0.1:1883");
+        check_input(&broker).unwrap();
+
+        let mut directory = input(Duration::from_secs(60));
+        directory.check = Check::new("directory", CheckKind::Ldap, "ldap.example.com:389");
+        directory.sign_in.username = Some("cn=monitor,dc=example,dc=com".to_string());
+        assert!(check_input(&directory).is_err());
+        directory.sign_in.password_env = Some("MAXNINES_SECRET_LDAP".to_string());
+        check_input(&directory).unwrap();
     }
 
     #[test]

@@ -166,7 +166,7 @@
 
   <label class="for-mqtt">Test message topic
     <input type="text" name="topic" value="{{ check.topic }}" maxlength="255" spellcheck="false" placeholder="monitoring/maxnines">
-    <small>Optional. The check subscribes to it, sends a message there and times how long it takes to come back. Leave empty to only connect. No <code>+</code> or <code>#</code> wildcards.</small>
+    <small>Optional. The check subscribes to it, sends a message there and times how long it takes to come back. Leave empty to only connect. No <code>+</code> or <code>#</code> wildcards, and it can't start with <code>$</code>, which is the broker's own.</small>
   </label>
 
   <label class="for-ping">Packets to send

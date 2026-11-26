@@ -1330,6 +1330,8 @@ async fn only_a_database_check_reads_stats() {
     // Redis is read by its template, as every kind of database is.
     let mut redis = request("redis", "db:6379");
     redis["check"]["name"] = json!("sessions");
+    // Redis takes a password as it is, so it's only sent elsewhere over TLS.
+    redis["check"]["tls"] = json!(true);
     let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &redis).await;
     assert_eq!(status, 201, "{body}");
     // MongoDB is read by its template, as every kind of database is.

@@ -11,7 +11,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use maxnines_protocol::Check;
+use maxnines_protocol::{Check, CheckKind};
 use rustls::ClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -39,6 +39,69 @@ impl fmt::Debug for Credentials {
 impl Credentials {
     pub(crate) fn is_empty(&self) -> bool {
         self.username.is_none() && self.password.is_none() && self.private_key.is_none()
+    }
+}
+
+/// What a check says when a server won't upgrade to TLS, rather than send it a
+/// password in the clear.
+pub(crate) const TLS_NOT_OFFERED: &str = "it doesn't offer TLS, so the password wasn't sent";
+
+/// What a check of a server that can't upgrade to TLS, and takes a password as it
+/// is, says for one that isn't on its own host and isn't set to use TLS.
+pub(crate) const TLS_NEEDED_ELSEWHERE: &str =
+    "a password is only sent without TLS to the host itself, so set tls for one elsewhere";
+
+/// Whether a check needs a password with its username, or can sign in with a
+/// username alone, as an MQTT broker can let it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Password {
+    Needed,
+    Optional,
+}
+
+/// The username and password a check signs in with, if it was given any. An empty
+/// one is none, and a password left out where it's optional is empty.
+pub(crate) fn username_and_password(
+    credentials: Option<&Credentials>,
+    password: Password,
+) -> Result<Option<(&str, &str)>> {
+    let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
+        return Ok(None);
+    };
+    let username = credentials
+        .username
+        .as_deref()
+        .filter(|username| !username.is_empty())
+        .context("signing in needs a username")?;
+    let given = credentials
+        .password
+        .as_deref()
+        .filter(|password| !password.is_empty());
+    let password = match (given, password) {
+        (Some(given), _) => given,
+        (None, Password::Optional) => "",
+        (None, Password::Needed) => bail!("signing in needs a password"),
+    };
+    Ok(Some((username, password)))
+}
+
+/// Why a check can never sign in with what it's given, if it can't, so the mistake
+/// is turned down when it's saved, rather than failing every time the check runs.
+/// `username` and `password` say whether each is given.
+pub fn sign_in_problem(check: &Check, username: bool, password: bool) -> Option<&'static str> {
+    let on_its_own_host = || host_and_port(&check.target).is_ok_and(|(host, _)| is_loopback(&host));
+    match check.kind {
+        // A simple bind with no password signs in as nobody.
+        CheckKind::Ldap if username && !password => Some("signing in needs a password"),
+        CheckKind::Ldap | CheckKind::Mqtt if password && !username => {
+            Some("signing in needs a username")
+        }
+        CheckKind::Mqtt | CheckKind::Redis
+            if password && check.tls != Some(true) && !on_its_own_host() =>
+        {
+            Some(TLS_NEEDED_ELSEWHERE)
+        }
+        _ => None,
     }
 }
 
@@ -294,10 +357,7 @@ pub(crate) fn redis_client(
             .password
             .as_deref()
             .context("signing in needs a password")?;
-        ensure!(
-            tls || is_loopback(&host),
-            "a password is only sent without TLS to the host itself, so set tls for one elsewhere"
-        );
+        ensure!(tls || is_loopback(&host), TLS_NEEDED_ELSEWHERE);
         settings = settings.set_password(password);
         if let Some(username) = &credentials.username {
             settings = settings.set_username(username);

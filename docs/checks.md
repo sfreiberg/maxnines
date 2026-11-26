@@ -140,8 +140,12 @@ root entry without signing in still counts as up, as it answered as LDAP.
 
 Given a username and password, it signs in with a simple bind and reads the entry
 the directory's data starts at, such as `dc=example,dc=com`, asking for none of its
-attributes, which shows the directory's database is working. How long that takes is
-`search_secs`, on **Directory search time**. The username is the account's DN, such
+attributes, which shows the directory's database is working. That's Active
+Directory's own domain, or the first of the server's naming contexts the account can
+read, as a server can list one of its own first, such as OpenLDAP's `cn=accesslog`.
+How long that takes is `search_secs`, on **Directory search time**. Signed in, a
+check that can't read the root entry, or finds no naming contexts in it, counts as
+down, saying why. The username is the account's DN, such
 as `cn=monitor,ou=services,dc=example,dc=com`, or for Active Directory
 `monitor@example.com`. Like a mail check, it never sends a password without TLS, so
 signing in to a server that doesn't offer it counts as down without the password
@@ -151,13 +155,15 @@ being sent. It never writes anything.
 
 An MQTT check connects to the broker in MQTT 3.1.1, which every broker speaks, with
 a clean session, so the broker keeps nothing for it after it leaves. Given a username
-and password, it signs in, and counts as down if they aren't accepted. Without them,
+and password, or a username alone for a broker that takes that, it signs in, and
+counts as down if it isn't let in. Without them,
 a broker that needs signing in still counts as up, as it answered as a broker.
 
 MQTT has no way to upgrade to TLS, so for a broker using TLS, usually on port 8883,
 tick **Use TLS from the start**, and its certificate is read as a website's is. A
 broker takes a password as it is, so as for Redis, a check only sends one without
-TLS to a broker on its own host.
+TLS to a broker on its own host, and a check that would send one elsewhere is turned
+down when it's saved.
 
 Given a **Test message topic**, such as `monitoring/maxnines`, the check subscribes
 to it, sends a message there that no other would, and waits for it to come back.

@@ -156,6 +156,17 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path)
             definition.password.is_none() || definition.private_key_file.is_none(),
             problem("has a password or a private key, not both")
         );
+        let username = definition
+            .username
+            .as_deref()
+            .is_some_and(|username| !username.is_empty());
+        let password = definition
+            .password
+            .as_deref()
+            .is_some_and(|password| !password.is_empty());
+        if let Some(why) = maxnines_checks::sign_in_problem(&check, username, password) {
+            return Err(problem(&format!("can never sign in: {why}")));
+        }
         ensure!(
             definition.private_key_file.is_none() || check.kind == CheckKind::Ssh,
             problem("can only sign in with a private key if it's an SSH check")
@@ -495,6 +506,18 @@ mod tests {
                 "give it as a database block",
             ),
             (defined("imap", "noport"), "host:port"),
+            // A broker that can't upgrade to TLS is only sent a password on this host.
+            (
+                defined("mqtt", "mqtt.example.com:1883"),
+                "can never sign in: a password is only sent without TLS",
+            ),
+            (
+                CheckDefinition {
+                    password: None,
+                    ..defined("ldap", "ldap.example.com:389")
+                },
+                "can never sign in: signing in needs a password",
+            ),
             (
                 CheckDefinition {
                     username: None,

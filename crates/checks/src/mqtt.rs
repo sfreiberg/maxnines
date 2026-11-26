@@ -12,29 +12,31 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use bytes::BytesMut;
 use maxnines_protocol::Check;
 use rumqttc::mqttbytes::v4::{ConnAck, ConnectReturnCode, Packet, SubscribeReasonCode};
-use rumqttc::mqttbytes::{Error as PacketError, QoS};
+use rumqttc::mqttbytes::{Error as PacketError, QoS, check as check_frame};
 use rumqttc::{Connect, Publish, Subscribe};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout_at;
 
-use crate::sign_in::{Credentials, is_loopback};
+use crate::sign_in::{
+    Credentials, Password, TLS_NEEDED_ELSEWHERE, is_loopback, username_and_password,
+};
 use crate::{
     Findings, certificate_verdict, connect, elapsed_secs, host_and_port, limit, resolve, secure,
 };
 
 const NOT_MQTT: &str = "it didn't answer as an MQTT broker does";
-const NO_TLS: &str =
-    "a password is only sent without TLS to the host itself, so set tls for one elsewhere";
 
 /// Far more than anything a broker answers the check with. A message someone else
 /// sends to the test topic can be bigger, and is skipped without being kept.
 const MAX_PACKET: usize = 64 * 1024;
-/// How long the broker waits to hear from the check before giving up on it.
-const KEEP_ALIVE_SECS: u16 = 30;
+/// How long the broker waits to hear from the check, which never pings, before
+/// giving up on it. A broker gives it half as long again, which is far longer than
+/// a check's minute at most, so the broker never hangs up while the check waits.
+const KEEP_ALIVE_SECS: u16 = 60;
 /// What's left of the check's time when the test message is given up on, so that
 /// it's reported as never coming back rather than the whole check timing out.
 const MESSAGE_MARGIN: Duration = Duration::from_millis(250);
@@ -42,34 +44,18 @@ const MESSAGE_MARGIN: Duration = Duration::from_millis(250);
 /// check's own.
 const MAX_OTHER_MESSAGES: usize = 1000;
 
-/// The username and password the check signs in with, if it was given them. MQTT
-/// lets a client give a username alone, but never a password alone.
-fn login(credentials: Option<&Credentials>) -> Result<Option<(&str, &str)>> {
-    let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
-        return Ok(None);
-    };
-    let username = credentials
-        .username
-        .as_deref()
-        .filter(|username| !username.is_empty())
-        .context("signing in needs a username")?;
-    Ok(Some((
-        username,
-        credentials.password.as_deref().unwrap_or_default(),
-    )))
-}
-
 pub(crate) async fn check_mqtt(
     check: &Check,
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
     let deadline = Instant::now() + limit(check).saturating_sub(MESSAGE_MARGIN);
-    let login = login(credentials)?;
+    // MQTT lets a client give a username alone, but never a password alone.
+    let login = username_and_password(credentials, Password::Optional)?;
     let (host, port) = host_and_port(&check.target)?;
     let tls = check.tls == Some(true);
     if login.is_some_and(|(_, password)| !password.is_empty()) {
-        ensure!(tls || is_loopback(&host), NO_TLS);
+        ensure!(tls || is_loopback(&host), TLS_NEEDED_ELSEWHERE);
     }
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;
@@ -121,9 +107,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
         deadline: Instant,
         findings: &mut Findings,
     ) -> Result<()> {
-        // The ID only has to be unique for as long as the check is connected, and
-        // 23 characters is all a broker has to take.
-        let client_id = format!("maxnines-{:012x}", rand::random::<u64>() >> 16);
+        // The ID only has to be unique for as long as the check is connected. Up to
+        // 23 letters and digits is all a broker has to take, so it has no hyphen.
+        let client_id = format!("maxnines{:012x}", rand::random::<u64>() >> 16);
         let mut hello = Connect::new(client_id);
         hello.keep_alive = KEEP_ALIVE_SECS;
         if let Some((username, password)) = login {
@@ -155,8 +141,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
             _ => bail!(NOT_MQTT),
         }
         if let Some(topic) = &check.topic {
-            let started = Instant::now();
-            timeout_at(deadline.into(), self.round_trip(topic))
+            let round_trip = timeout_at(deadline.into(), self.round_trip(topic))
                 .await
                 .map_err(|_| {
                     anyhow!(
@@ -164,15 +149,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
                          account isn't allowed to send to the topic or read it"
                     )
                 })??;
-            findings.round_trip_secs = Some(elapsed_secs(started));
+            findings.round_trip_secs = Some(round_trip);
         }
         Ok(())
     }
 
     /// Subscribes to `topic`, then sends a message there that no one else would and
-    /// waits for it. Both are at most once, so the broker keeps nothing for later,
-    /// and it isn't retained, so nothing's left on the topic.
-    async fn round_trip(&mut self, topic: &str) -> Result<()> {
+    /// waits for it, giving how long that took from sending it, in seconds. Both are
+    /// at most once, so the broker keeps nothing for later, and it isn't retained,
+    /// so nothing's left on the topic.
+    async fn round_trip(&mut self, topic: &str) -> Result<f64> {
         let mut subscribe = Subscribe::new(topic, QoS::AtMostOnce);
         subscribe.pkid = 1;
         self.send(Packet::Subscribe(subscribe)).await?;
@@ -194,6 +180,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
             }
         }
         let payload = format!("MaxNines check {:016x}", rand::random::<u64>());
+        let sent = Instant::now();
         self.send(Packet::Publish(Publish::new(
             topic,
             QoS::AtMostOnce,
@@ -203,7 +190,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
         for _ in 0..MAX_OTHER_MESSAGES {
             match self.packet().await? {
                 Packet::Publish(message) if message.payload == payload.as_bytes() => {
-                    return Ok(());
+                    return Ok(elapsed_secs(sent));
                 }
                 Packet::Publish(_) => {}
                 _ => bail!(NOT_MQTT),
@@ -251,13 +238,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
                 match Packet::read(&mut self.buffer, MAX_PACKET) {
                     Ok(packet) => return Ok(packet),
                     Err(PacketError::InsufficientBytes(_)) => {}
-                    Err(PacketError::PayloadSizeLimitExceeded(length)) => {
-                        // Only a message can be this big: its header, then the rest.
+                    Err(PacketError::PayloadSizeLimitExceeded(_)) => {
+                        // Only a message can be this big. Without a limit, its header
+                        // says how long it is in all, or how much of it is still to
+                        // come.
                         ensure!(
                             self.buffer.first().is_some_and(|byte| byte >> 4 == 3),
                             NOT_MQTT
                         );
-                        skipping = header_length(length) + length;
+                        skipping = match check_frame(self.buffer.iter(), usize::MAX) {
+                            Ok(header) => header.frame_length(),
+                            Err(PacketError::InsufficientBytes(missing)) => {
+                                self.buffer.len() + missing
+                            }
+                            Err(_) => bail!(NOT_MQTT),
+                        };
                         continue;
                     }
                     Err(_) => bail!(NOT_MQTT),
@@ -267,18 +262,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Mqtt<S> {
             ensure!(read > 0, "it closed the connection");
         }
     }
-}
-
-/// How long a packet's fixed header is with `remaining` bytes after it: a byte for
-/// its type, then the length in 7-bit pieces.
-fn header_length(remaining: usize) -> usize {
-    let mut pieces = 1;
-    let mut left = remaining >> 7;
-    while left > 0 {
-        pieces += 1;
-        left >>= 7;
-    }
-    1 + pieces
 }
 
 #[cfg(test)]
@@ -457,7 +440,7 @@ mod tests {
         let mut elsewhere = Check::new("broker", CheckKind::Mqtt, "192.0.2.1:1883");
         elsewhere.timeout = Some(Duration::from_secs(1));
         let result = run_signed_in(&elsewhere, Some(&login("s3cret"))).await;
-        assert_eq!(result["error"], NO_TLS, "{result}");
+        assert_eq!(result["error"], TLS_NEEDED_ELSEWHERE, "{result}");
         assert!(result.get("connect_secs").is_none(), "{result}");
     }
 
@@ -518,13 +501,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_header_is_as_long_as_its_length_needs() {
-        assert_eq!(header_length(0), 2);
-        assert_eq!(header_length(127), 2);
-        assert_eq!(header_length(128), 3);
-        assert_eq!(header_length(16_383), 3);
-        assert_eq!(header_length(16_384), 4);
-        assert_eq!(header_length(2_097_152), 5);
+    /// A broker may write a length in more bytes than it needs, which has to be
+    /// skipped by what it says, not by how long it would be written shortest.
+    #[tokio::test]
+    async fn a_message_too_big_to_keep_is_skipped_however_its_length_is_written() {
+        let (mut broker, client) = tokio::io::duplex(1 << 20);
+        // 70,000 bytes, which takes 3 bytes, in 4.
+        let mut bytes = vec![0x30, 0xf0, 0xa2, 0x84, 0x00];
+        bytes.extend([0x00, 0x01, b't']);
+        bytes.resize(5 + 70_000, b'x');
+        // Then the broker's answer to connecting, which has to be read whole.
+        bytes.extend([0x20, 0x02, 0x00, 0x00]);
+        broker.write_all(&bytes).await.unwrap();
+        let mut mqtt = Mqtt::new(client);
+        assert!(matches!(mqtt.packet().await.unwrap(), Packet::ConnAck(_)));
     }
 }

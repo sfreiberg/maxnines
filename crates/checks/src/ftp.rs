@@ -11,10 +11,9 @@ use maxnines_protocol::Check;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::sign_in::Credentials;
+use crate::sign_in::{Credentials, Password, TLS_NOT_OFFERED, username_and_password};
 use crate::{Findings, certificate_verdict, connect, host_and_port, resolve, secure};
 
-const NO_TLS: &str = "it doesn't offer TLS, so the password wasn't sent";
 const NOT_FTP: &str = "it didn't answer as an FTP server does";
 
 /// A line longer than this isn't a server being reasonable, and nor are this many
@@ -22,28 +21,12 @@ const NOT_FTP: &str = "it didn't answer as an FTP server does";
 const MAX_LINE: u64 = 1024;
 const MAX_LINES: usize = 100;
 
-/// The username and password the check signs in with, if it was given them.
-fn login(credentials: Option<&Credentials>) -> Result<Option<(&str, &str)>> {
-    let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
-        return Ok(None);
-    };
-    let username = credentials
-        .username
-        .as_deref()
-        .context("signing in needs a username")?;
-    let password = credentials
-        .password
-        .as_deref()
-        .context("signing in needs a password")?;
-    Ok(Some((username, password)))
-}
-
 pub(crate) async fn check_ftp(
     check: &Check,
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = login(credentials)?;
+    let login = username_and_password(credentials, Password::Needed)?;
     let (host, port) = host_and_port(&check.target)?;
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;
@@ -62,7 +45,7 @@ pub(crate) async fn check_ftp(
     if !offered {
         if login.is_some() {
             ftp.quit().await;
-            bail!(NO_TLS);
+            bail!(TLS_NOT_OFFERED);
         }
         return ftp.sign_in(None, findings).await;
     }
@@ -352,7 +335,7 @@ mod tests {
 
         let result = run_signed_in(&ftp, Some(&login("s3cret"))).await;
         assert_eq!(result["up"], 0, "{result}");
-        assert_eq!(result["error"], NO_TLS, "{result}");
+        assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
         assert!(
             !leaked.load(Ordering::Relaxed),
             "sent a password in the clear"

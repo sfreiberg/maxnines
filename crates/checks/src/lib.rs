@@ -21,7 +21,7 @@ pub mod templates;
 mod test_tls;
 pub mod unifi;
 
-pub use sign_in::Credentials;
+pub use sign_in::{Credentials, sign_in_problem};
 
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};

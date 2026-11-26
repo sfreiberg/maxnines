@@ -534,6 +534,25 @@ const PHASES: [(&str, &str); 8] = [
     ("check.round_trip", "Test message"),
 ];
 
+/// Whether a check of `kind` can report `metric`. Most of what checks report
+/// comes from any kind that gets that far, and these are a kind's own.
+fn can_report(metric: &str, kind: CheckKind) -> bool {
+    match metric {
+        "check.first_byte" | "check.download" | "check.size" | "check.status" => {
+            matches!(kind, CheckKind::Http | CheckKind::Unifi)
+        }
+        "check.domain_days" => kind == CheckKind::Http,
+        "check.records" => kind == CheckKind::Dns,
+        "check.packet_loss" => kind == CheckKind::Ping,
+        "check.password_sign_in" => kind == CheckKind::Ssh,
+        "check.hit_rate" | "check.memory_used" | "check.memory_usage" | "check.evictions"
+        | "check.connections" => kind == CheckKind::Memcached,
+        "check.search" => kind == CheckKind::Ldap,
+        "check.round_trip" => kind == CheckKind::Mqtt,
+        _ => true,
+    }
+}
+
 /// A chart on a check's page.
 #[derive(Serialize)]
 struct CheckChart {
@@ -549,13 +568,15 @@ async fn charts(
     state: &AppState,
     host_id: &str,
     name: &str,
+    kind: CheckKind,
     range: TimeRange,
     range_key: &str,
 ) -> Result<Vec<CheckChart>> {
-    // What checks report is named in code, as they're the server's own.
+    // What checks report is named in code, as they're the server's own, and only
+    // what this kind of check can report is asked for.
     let about_checks: Vec<Arc<Metric>> = metrics::built_in()
         .iter()
-        .filter(|metric| metric.collector == "checks")
+        .filter(|metric| metric.collector == "checks" && can_report(&metric.name, kind))
         .cloned()
         .collect();
     let mut queries = tokio::task::JoinSet::new();
@@ -779,7 +800,15 @@ async fn page(
     let heartbeat = input.check.kind == CheckKind::Heartbeat;
     let (selected, _, length) = selected_range(params);
     let range = time_range(length).context("no such time range")?;
-    let charts = charts(state, &input.host_id, name, range, selected).await?;
+    let charts = charts(
+        state,
+        &input.host_id,
+        name,
+        input.check.kind,
+        range,
+        selected,
+    )
+    .await?;
     let now = times::now();
 
     let hosts = host_choices(state).await;
@@ -1257,6 +1286,42 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each metric only some kinds report is one the server has, so a misspelt
+    /// name can't leave a kind's chart out, and a website reports its own.
+    #[test]
+    fn only_a_kind_s_own_metrics_are_asked_for() {
+        let own = [
+            "check.first_byte",
+            "check.download",
+            "check.size",
+            "check.status",
+            "check.domain_days",
+            "check.records",
+            "check.packet_loss",
+            "check.password_sign_in",
+            "check.hit_rate",
+            "check.memory_used",
+            "check.memory_usage",
+            "check.evictions",
+            "check.connections",
+            "check.search",
+            "check.round_trip",
+        ];
+        for name in own {
+            assert!(metrics::find(name).is_some(), "{name}");
+            assert!(
+                CheckKind::KNOWN.iter().any(|&kind| can_report(name, kind))
+                    && !CheckKind::KNOWN.iter().all(|&kind| can_report(name, kind)),
+                "{name}"
+            );
+        }
+        assert!(can_report("check.search", CheckKind::Ldap));
+        assert!(!can_report("check.search", CheckKind::Http));
+        assert!(can_report("check.round_trip", CheckKind::Mqtt));
+        assert!(can_report("check.response", CheckKind::Mqtt));
+        assert!(can_report("check.first_byte", CheckKind::Http));
+    }
 
     fn input() -> RemoteCheckInput {
         let mut check = Check::new("site", CheckKind::Http, "https://example.com/");

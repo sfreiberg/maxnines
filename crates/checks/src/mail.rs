@@ -15,33 +15,15 @@ use maxnines_protocol::Check;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-use crate::sign_in::{Credentials, short};
+use crate::sign_in::{Credentials, Password, TLS_NOT_OFFERED, short, username_and_password};
 use crate::{Findings, certificate_verdict, connect, host_and_port, resolve, secure};
-
-/// The username and password a mail check signs in with, if it was given them.
-fn login(credentials: Option<&Credentials>) -> Result<Option<(&str, &str)>> {
-    let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
-        return Ok(None);
-    };
-    let username = credentials
-        .username
-        .as_deref()
-        .context("signing in needs a username")?;
-    let password = credentials
-        .password
-        .as_deref()
-        .context("signing in needs a password")?;
-    Ok(Some((username, password)))
-}
-
-const NO_TLS: &str = "it doesn't offer TLS, so the password wasn't sent";
 
 pub(crate) async fn check_smtp(
     check: &Check,
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = login(credentials)?;
+    let login = username_and_password(credentials, Password::Needed)?;
     let (host, socket) = open(check, findings).await?;
     let local = socket.local_addr().ok();
     if check.tls == Some(true) {
@@ -60,9 +42,9 @@ pub(crate) async fn check_smtp(
     if login.is_none() {
         return smtp.sign_in(None, &offers, findings).await;
     }
-    ensure!(offered, NO_TLS);
+    ensure!(offered, TLS_NOT_OFFERED);
     let (code, _) = smtp.command("STARTTLS").await?;
-    ensure!(code == 220, NO_TLS);
+    ensure!(code == 220, TLS_NOT_OFFERED);
     // Nothing more comes before the TLS handshake, so nothing is left unread.
     let socket = smtp.reader.into_inner();
     let secured = secure(&host, socket, &[], findings).await?;
@@ -192,7 +174,7 @@ pub(crate) async fn check_imap(
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = login(credentials)?;
+    let login = username_and_password(credentials, Password::Needed)?;
     let (host, socket) = open(check, findings).await?;
     if check.tls == Some(true) {
         let secured = secure(&host, socket, &[], findings).await?;
@@ -206,11 +188,11 @@ pub(crate) async fn check_imap(
     let Some(login) = login else {
         return Ok(());
     };
-    ensure!(offered, NO_TLS);
+    ensure!(offered, TLS_NOT_OFFERED);
     client
         .run_command_and_check_ok("STARTTLS", None)
         .await
-        .map_err(|_| anyhow!(NO_TLS))?;
+        .map_err(|_| anyhow!(TLS_NOT_OFFERED))?;
     let secured = secure(&host, client.into_inner(), &[], findings).await?;
     certificate_verdict(check, secured.problem)?;
     imap_sign_in(
@@ -308,7 +290,7 @@ pub(crate) async fn check_pop3(
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = login(credentials)?;
+    let login = username_and_password(credentials, Password::Needed)?;
     let (host, socket) = open(check, findings).await?;
     if check.tls == Some(true) {
         let secured = secure(&host, socket, &[], findings).await?;
@@ -325,8 +307,10 @@ pub(crate) async fn check_pop3(
         let _ = pop.command("QUIT").await;
         return Ok(());
     }
-    ensure!(offered, NO_TLS);
-    pop.command("STLS").await.map_err(|_| anyhow!(NO_TLS))?;
+    ensure!(offered, TLS_NOT_OFFERED);
+    pop.command("STLS")
+        .await
+        .map_err(|_| anyhow!(TLS_NOT_OFFERED))?;
     // Nothing more comes before the TLS handshake, so nothing is left unread.
     let socket = pop.reader.into_inner();
     let secured = secure(&host, socket, &[], findings).await?;
@@ -722,7 +706,7 @@ mod tests {
             assert_eq!(result["tls_offered"], false, "{kind:?}: {result}");
             let result = run(&mail, Some(&login("s3cret"))).await;
             assert_eq!(result["up"], 0, "{kind:?}: {result}");
-            assert_eq!(result["error"], NO_TLS, "{kind:?}: {result}");
+            assert_eq!(result["error"], TLS_NOT_OFFERED, "{kind:?}: {result}");
             assert!(
                 !leaked.load(Ordering::Relaxed),
                 "{kind:?} sent a password in the clear"

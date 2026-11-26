@@ -22,10 +22,9 @@ use lber::structures::{ASNTag, Boolean, Enumerated, Integer, OctetString};
 use maxnines_protocol::Check;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::sign_in::Credentials;
+use crate::sign_in::{Credentials, Password, TLS_NOT_OFFERED, username_and_password};
 use crate::{Findings, certificate_verdict, connect, elapsed_secs, host_and_port, resolve, secure};
 
-const NO_TLS: &str = "it doesn't offer TLS, so the password wasn't sent";
 const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
 const BUSY: &str = "it's too busy, or unavailable";
 
@@ -37,8 +36,11 @@ const MAX_MESSAGE: usize = 64 * 1024;
 /// How deep an answer's structures can go. The check's own go 5 deep, and a deeper
 /// one could only be meant to use up the stack that reads it.
 const MAX_NESTING: usize = 16;
-/// A search of one entry finds one, so more is a server not being reasonable.
+/// A search of one entry finds one, and refers elsewhere for it at most a few
+/// times, so more is a server not being reasonable.
 const MAX_ENTRIES: usize = 16;
+/// The most of a directory's naming contexts tried, looking for one to read.
+const MAX_BASES: usize = 8;
 
 /// What each message does, by its application tag.
 const BIND_REQUEST: u64 = 0;
@@ -65,32 +67,14 @@ const OCTET_STRING: u64 = 4;
 const ENUMERATED: u64 = 10;
 const SEQUENCE: u64 = 16;
 
-/// The username and password the check signs in with, if it was given them. A
-/// simple bind with an empty password signs in as nobody, which most servers
-/// accept, so it isn't one.
-fn login(credentials: Option<&Credentials>) -> Result<Option<(&str, &str)>> {
-    let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
-        return Ok(None);
-    };
-    let username = credentials
-        .username
-        .as_deref()
-        .filter(|username| !username.is_empty())
-        .context("signing in needs a username")?;
-    let password = credentials
-        .password
-        .as_deref()
-        .filter(|password| !password.is_empty())
-        .context("signing in needs a password")?;
-    Ok(Some((username, password)))
-}
-
 pub(crate) async fn check_ldap(
     check: &Check,
     credentials: Option<&Credentials>,
     findings: &mut Findings,
 ) -> Result<()> {
-    let login = login(credentials)?;
+    // A simple bind with an empty password signs in as nobody, which most servers
+    // accept, so it isn't a login.
+    let login = username_and_password(credentials, Password::Needed)?;
     let (host, port) = host_and_port(&check.target)?;
     let addresses = resolve(&host, port, findings).await?;
     let socket = connect(&addresses, findings).await?;
@@ -105,7 +89,7 @@ pub(crate) async fn check_ldap(
     if !offered {
         if login.is_some() {
             ldap.unbind().await;
-            bail!(NO_TLS);
+            bail!(TLS_NOT_OFFERED);
         }
         return ldap.look(None, findings).await;
     }
@@ -131,9 +115,10 @@ struct Ldap<S> {
 /// What a directory's root entry says about it.
 #[derive(Debug, Default)]
 struct RootEntry {
-    /// Where its data starts, such as `dc=example,dc=com`: Active Directory's own
-    /// domain, or the first of the server's naming contexts.
-    base: Option<String>,
+    /// Where its data might start, such as `dc=example,dc=com`: Active Directory's
+    /// own domain first, then each of the server's naming contexts, as a server can
+    /// list one of its own, such as OpenLDAP's `cn=accesslog`, before its data.
+    bases: Vec<String>,
     /// What it says it is, which OpenLDAP and Active Directory don't.
     version: Option<String>,
 }
@@ -171,16 +156,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             }
         }
         let root = self.root_entry().await?;
-        findings.server_version = root.version;
         // Reading the data is what shows its database works, and only an account
         // can be expected to be let in to it.
-        if login.is_some()
-            && let Some(base) = root.base
-        {
-            let started = Instant::now();
-            self.read_entry(&base).await?;
-            findings.search_secs = Some(elapsed_secs(started));
+        if login.is_none() {
+            findings.server_version = root.and_then(|root| root.version);
+            return Ok(());
         }
+        let root = root.context("the account isn't allowed to read the directory's root entry")?;
+        findings.server_version = root.version;
+        ensure!(
+            !root.bases.is_empty(),
+            "its root entry doesn't say where its data is, so it couldn't be read"
+        );
+        let started = Instant::now();
+        self.read_data(&root.bases).await?;
+        findings.search_secs = Some(elapsed_secs(started));
         Ok(())
     }
 
@@ -213,9 +203,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
     }
 
     /// Reads the root entry, which anyone may, though some servers won't let in
-    /// someone who hasn't signed in. That still answers as LDAP, and says nothing
-    /// about the server.
-    async fn root_entry(&mut self) -> Result<RootEntry> {
+    /// someone who hasn't signed in, which gives none. That still answers as LDAP.
+    async fn root_entry(&mut self) -> Result<Option<RootEntry>> {
         let attributes = [
             "namingContexts",
             "defaultNamingContext",
@@ -226,38 +215,55 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         match code {
             SUCCESS => {}
             BUSY_CODE | UNAVAILABLE => bail!(BUSY),
-            _ => return Ok(RootEntry::default()),
+            _ => return Ok(None),
         }
         let Some(entry) = entries.into_iter().next() else {
-            return Ok(RootEntry::default());
+            return Ok(Some(RootEntry::default()));
         };
-        let first = |name: &str| {
+        let values = |name: &str| -> Vec<String> {
             entry
                 .iter()
-                .find(|(attribute, _)| attribute.eq_ignore_ascii_case(name))
-                .and_then(|(_, values)| values.first().cloned())
+                .filter(|(attribute, _)| attribute.eq_ignore_ascii_case(name))
+                .flat_map(|(_, values)| values.iter().cloned())
                 .filter(|value| !value.is_empty())
+                .collect()
         };
+        let first = |name: &str| values(name).into_iter().next();
         let version = match (first("vendorName"), first("vendorVersion")) {
             (_, Some(version)) => Some(version),
             (name, None) => name,
         };
-        Ok(RootEntry {
-            base: first("defaultNamingContext").or_else(|| first("namingContexts")),
-            version,
-        })
+        let mut bases = values("defaultNamingContext");
+        for base in values("namingContexts") {
+            if !bases.iter().any(|known| known.eq_ignore_ascii_case(&base)) {
+                bases.push(base);
+            }
+        }
+        bases.truncate(MAX_BASES);
+        Ok(Some(RootEntry { bases, version }))
     }
 
-    /// Reads one entry, asking for none of its attributes, which is enough for the
-    /// server to have found it in its database.
-    async fn read_entry(&mut self, base: &str) -> Result<()> {
-        let (code, _) = self.search(base, &["1.1"]).await?;
-        match code {
-            SUCCESS => Ok(()),
-            NO_SUCH_OBJECT => bail!("the entry its data starts at wasn't found"),
-            INSUFFICIENT_ACCESS => bail!("the account isn't allowed to read the directory"),
-            BUSY_CODE | UNAVAILABLE => bail!(BUSY),
-            code => bail!("searching it failed, with result code {code}"),
+    /// Reads the entry the directory's data starts at, asking for none of its
+    /// attributes, which is enough for the server to have found it in its database.
+    /// Each of `bases` is tried in turn until one can be read, and when none can,
+    /// it's the first that says why.
+    async fn read_data(&mut self, bases: &[String]) -> Result<()> {
+        let mut first_failure = None;
+        for base in bases {
+            let (code, _) = self.search(base, &["1.1"]).await?;
+            match code {
+                SUCCESS => return Ok(()),
+                BUSY_CODE | UNAVAILABLE => bail!(BUSY),
+                code => {
+                    first_failure.get_or_insert(code);
+                }
+            }
+        }
+        match first_failure {
+            Some(NO_SUCH_OBJECT) => bail!("the entry its data starts at wasn't found"),
+            Some(INSUFFICIENT_ACCESS) => bail!("the account isn't allowed to read the directory"),
+            Some(code) => bail!("searching it failed, with result code {code}"),
+            None => bail!("its root entry doesn't say where its data is, so it couldn't be read"),
         }
     }
 
@@ -292,6 +298,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
         );
         let id = self.send(request).await?;
         let mut entries = Vec::new();
+        let mut references = 0;
         loop {
             let op = self.message(id).await?;
             ensure!(op.class == TagClass::Application, NOT_LDAP);
@@ -300,7 +307,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
                     ensure!(entries.len() < MAX_ENTRIES, NOT_LDAP);
                     entries.push(read_attributes(op).context(NOT_LDAP)?);
                 }
-                SEARCH_REFERENCE => {}
+                // Somewhere else to look, which the check never follows.
+                SEARCH_REFERENCE => {
+                    references += 1;
+                    ensure!(references <= MAX_ENTRIES, NOT_LDAP);
+                }
                 SEARCH_DONE => return Ok((result_code(&op).context(NOT_LDAP)?, entries)),
                 _ => bail!(NOT_LDAP),
             }
@@ -610,13 +621,18 @@ mod tests {
         Implicit,
     }
 
-    /// How a fake server treats someone who hasn't signed in.
+    /// Who a fake server lets search.
     #[derive(Clone, Copy, PartialEq, Debug)]
     enum Anonymous {
-        /// Lets them read the root entry, as most servers do.
+        /// Anyone may read the root entry, as most servers let them.
         Allowed,
-        /// Turns down every search, as a server set to need signing in does.
+        /// Only an account that's signed in, as a server set to need that does.
         Refused,
+        /// No one may read the root entry, though a signed-in account may read
+        /// the data.
+        RootClosed,
+        /// It answers every search with nothing but places to look elsewhere.
+        Referrals,
     }
 
     struct Fake {
@@ -740,14 +756,33 @@ mod tests {
                     SEARCH_REQUEST => {
                         let base = text(op.expect_constructed().unwrap().remove(0)).unwrap();
                         let mut answer = BytesMut::new();
-                        let code = if self.anonymous == Anonymous::Refused && !session.signed_in {
+                        let refused = match self.anonymous {
+                            Anonymous::Allowed => false,
+                            Anonymous::Refused => !session.signed_in,
+                            Anonymous::RootClosed => base.is_empty(),
+                            Anonymous::Referrals => {
+                                let elsewhere = constructed(
+                                    TagClass::Application,
+                                    SEARCH_REFERENCE,
+                                    vec![octets(b"ldap://elsewhere.example.com/")],
+                                );
+                                for _ in 0..100 {
+                                    answer.extend(reply(id, elsewhere.clone()));
+                                }
+                                false
+                            }
+                        };
+                        let code = if refused {
                             INSUFFICIENT_ACCESS
                         } else if base.is_empty() {
+                            // Its own log comes first, which no account can read,
+                            // as OpenLDAP's accesslog can.
                             answer.extend(reply(
                                 id,
                                 entry(
                                     "",
                                     &[
+                                        ("namingContexts", "cn=accesslog"),
                                         ("namingContexts", BASE),
                                         ("vendorName", "Fake Directory"),
                                         ("vendorVersion", "Fake Directory 2.1"),
@@ -758,6 +793,8 @@ mod tests {
                         } else if base == BASE {
                             answer.extend(reply(id, entry(BASE, &[])));
                             SUCCESS
+                        } else if base == "cn=accesslog" {
+                            INSUFFICIENT_ACCESS
                         } else {
                             NO_SUCH_OBJECT
                         };
@@ -833,7 +870,7 @@ mod tests {
 
         let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
         assert_eq!(result["up"], 0, "{result}");
-        assert_eq!(result["error"], NO_TLS, "{result}");
+        assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
         assert!(
             !leaked.load(Ordering::Relaxed),
             "sent a password in the clear"
@@ -846,6 +883,30 @@ mod tests {
         let result = run_signed_in(&check(address, Tls::Upgrade), Some(&login(ACCOUNT, ""))).await;
         assert_eq!(result["up"], 0, "{result}");
         assert_eq!(result["error"], "signing in needs a password", "{result}");
+    }
+
+    #[tokio::test]
+    async fn an_account_that_cannot_read_the_root_entry_is_down() {
+        let (address, _) = fake(Tls::Upgrade, Anonymous::RootClosed).await;
+        let ldap = check(address, Tls::Upgrade);
+        let result = run_signed_in(&ldap, None).await;
+        assert_eq!(result["up"], 1, "{result}");
+
+        let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["signed_in"], true, "{result}");
+        assert_eq!(
+            result["error"], "the account isn't allowed to read the directory's root entry",
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn endless_referrals_are_not_taken_for_an_answer() {
+        let (address, _) = fake(Tls::Never, Anonymous::Referrals).await;
+        let result = run_signed_in(&check(address, Tls::Never), None).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], NOT_LDAP, "{result}");
     }
 
     #[tokio::test]

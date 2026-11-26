@@ -882,7 +882,7 @@ impl Check {
             // starting with $ is the broker's own.
             ensure!(
                 !topic.is_empty()
-                    && topic.len() <= MAX_SETTING_LEN
+                    && topic.chars().count() <= MAX_SETTING_LEN
                     && !topic.starts_with('$')
                     && !topic
                         .chars()
@@ -1765,6 +1765,9 @@ mod tests {
         }
         mqtt.topic = Some("x".repeat(MAX_SETTING_LEN + 1));
         assert!(mqtt.validate().is_err());
+        // Counted in characters, as the form's box is.
+        mqtt.topic = Some("é".repeat(MAX_SETTING_LEN));
+        mqtt.validate().unwrap();
 
         let mut ldap = Check::new("directory", CheckKind::Ldap, "ldap.example.com:389");
         ldap.validate().unwrap();
