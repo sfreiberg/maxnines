@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::models::{ConfigRule, RuleInput};
-use crate::rule_engine::{CompiledRule, Condition, ConfigRules, Host, ResolvedConfig};
+use crate::rule_engine::{CompiledRule, ConfigRules, Host, ResolvedConfig};
 
 /// Enough to see the pattern without a page that never ends. Counts still cover
 /// every agent, and the agents that change come first.
@@ -64,11 +64,6 @@ pub fn preview(
         before: ConfigRules::new(rules.iter().cloned())?,
         after: ConfigRules::new(with_rule(rules, id, rule))?,
         rule: CompiledRule::new(tried)?,
-        condition: rule
-            .applies_to
-            .as_deref()
-            .map(Condition::compile)
-            .transpose()?,
     };
     let mut previews: Vec<HostPreview> = hosts
         .iter()
@@ -121,7 +116,7 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
     all
 }
 
-/// The rules before and after, and the rule's own condition, compiled once for every
+/// The rules before and after, and the rule being tried, compiled once for every
 /// host.
 struct Compiled {
     before: ConfigRules,
@@ -129,15 +124,11 @@ struct Compiled {
     /// The rule being tried, on whether or not it's turned on, to say which hosts
     /// it's for as saving it would: by operating system and template too.
     rule: CompiledRule,
-    condition: Option<Condition>,
 }
 
 fn preview_host(compiled: &Compiled, host: &PreviewHost) -> HostPreview {
     let shown = Host::new(&host.facts, &host.id);
-    let check = match &compiled.condition {
-        Some(condition) => condition.check(&shown),
-        None => Ok(true),
-    };
+    let check = compiled.rule.condition_holds(&shown);
     let matches = compiled.rule.matches(&shown);
 
     let reported = host.facts.as_object().is_some_and(|f| !f.is_empty());

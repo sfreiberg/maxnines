@@ -201,6 +201,14 @@ impl CompiledRule {
             || family.is_some_and(|family| systems.iter().any(|system| system == family))
     }
 
+    /// Whether its condition is true of the host, or why it couldn't be checked.
+    /// One with no condition is true of every host.
+    pub fn condition_holds(&self, host: &Host) -> Result<bool> {
+        self.condition
+            .as_ref()
+            .map_or(Ok(true), |condition| condition.check(host))
+    }
+
     /// A condition that can't be evaluated doesn't match. That's the normal case
     /// for a rule about a fact this agent doesn't have.
     pub fn matches(&self, host: &Host) -> bool {
