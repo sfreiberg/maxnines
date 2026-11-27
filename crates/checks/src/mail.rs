@@ -193,6 +193,7 @@ pub(crate) async fn check_imap(
     let offered = imap_offers_starttls(&mut client).await?;
     findings.tls_offered = Some(offered);
     let Some(login) = login else {
+        imap_log_out(&mut client).await;
         return Ok(());
     };
     ensure!(offered, TLS_NOT_OFFERED);
@@ -272,6 +273,15 @@ where
     }
 }
 
+/// Says goodbye before hanging up, as a connection that just drops can count
+/// against the address it came from, as fail2ban counts them.
+async fn imap_log_out<T>(client: &mut async_imap::Client<T>)
+where
+    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
+{
+    let _ = client.run_command_and_check_ok("LOGOUT", None).await;
+}
+
 async fn imap_sign_in<T>(
     client: async_imap::Client<T>,
     login: Option<(&str, &str)>,
@@ -281,6 +291,8 @@ where
     T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
 {
     let Some((username, password)) = login else {
+        let mut client = client;
+        imap_log_out(&mut client).await;
         return Ok(());
     };
     match client.login(username, password).await {
@@ -750,6 +762,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Without a login, it still says goodbye before hanging up.
+    #[tokio::test]
+    async fn an_imap_check_without_a_login_logs_out() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (said, heard) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut conn = BufReader::new(socket);
+            conn.get_mut().write_all(b"* OK ready\r\n").await.unwrap();
+            let mut line = String::new();
+            while conn.read_line(&mut line).await.unwrap_or_default() > 0 {
+                let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                let reply = match command {
+                    "CAPABILITY" => format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n"),
+                    "LOGOUT" => {
+                        let bye = format!("* BYE\r\n{tag} OK bye\r\n");
+                        let _ = conn.get_mut().write_all(bye.as_bytes()).await;
+                        let _ = said.send(());
+                        return;
+                    }
+                    _ => format!("{tag} BAD unknown\r\n"),
+                };
+                conn.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                line.clear();
+            }
+        });
+
+        let result = run(&check(CheckKind::Imap, address, false), None).await;
+
+        assert_eq!(result["up"], 1, "{result}");
+        heard.await.expect("it hung up without logging out");
     }
 
     /// One that greets with BYE, as for too many connections, isn't up.
