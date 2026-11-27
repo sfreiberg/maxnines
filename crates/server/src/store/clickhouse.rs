@@ -381,7 +381,7 @@ impl Memory {
                                 value: Some(text.to_string()),
                             });
                             self.text_series
-                                .entry((host.to_string(), collector.clone()))
+                                .entry((host.to_string(), text_owner(collector).to_string()))
                                 .or_default()
                                 .insert(
                                     print,
@@ -398,7 +398,7 @@ impl Memory {
 
             // Something that was reported and isn't any more, like a check's error. A
             // sample may only cover some items, so only the ones in it can have changed.
-            let key = (host.to_string(), collector.clone());
+            let key = (host.to_string(), text_owner(collector).to_string());
             if let Some(current) = self.text_series.get_mut(&key) {
                 current.retain(|print, series| {
                     let gone = items.contains(&series.item) && !reported.contains(print);
@@ -480,6 +480,13 @@ fn labels_of(labels: &Labels) -> Vec<(String, String)> {
 
 /// `argMax` skips nothing-values, and text that's cleared is one, so they go in a tuple
 /// to count as the newest value.
+/// Whose text a sample's is, by what its metrics' names start with, as that's all a
+/// stored row says after a restart: a built-in collector's own name, or for a
+/// template's collector, `template.<key>`, its key, as its metrics are `<key>.<name>`.
+fn text_owner(collector: &str) -> &str {
+    collector.strip_prefix("template.").unwrap_or(collector)
+}
+
 async fn load_memory(client: &Client) -> Result<Memory> {
     let mut memory = Memory::default();
     let series: Vec<SeriesRow> = client
@@ -510,6 +517,7 @@ async fn load_memory(client: &Client) -> Result<Memory> {
         let item = labels_key(&labels_of(&row.labels));
         let print = fingerprint(&row.host_id, &row.metric, &item);
         let collector = row.metric.split('.').next().unwrap_or_default().to_string();
+        // As `text_owner` gives it for the collector that sent it.
         memory.texts.insert(print, row.value);
         let series = TextSeries {
             metric: row.metric,
@@ -1684,6 +1692,20 @@ impl MetricsReader for ClickHouseReader {
             collectors,
             total_rows: i64::try_from(size.rows).ok(),
         })
+    }
+}
+
+#[cfg(test)]
+mod owners {
+    use super::text_owner;
+
+    /// A collector's text is found by what its stored metrics start with.
+    #[test]
+    fn a_templates_text_is_its_keys() {
+        assert_eq!(text_owner("template.myapp"), "myapp");
+        assert_eq!(text_owner("checks"), "checks");
+        let metric = "myapp.last_error";
+        assert_eq!(metric.split('.').next(), Some(text_owner("template.myapp")));
     }
 }
 
