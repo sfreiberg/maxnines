@@ -60,6 +60,18 @@ async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<Metr
     row.map(to_page).transpose()
 }
 
+/// A page as it is now, held until the transaction ends so nothing else changes or
+/// deletes it meanwhile. Held by its ID, which on MySQL locks that one row and never
+/// the gaps around it that a new page goes in.
+async fn load_held<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<MetricsPage>> {
+    let row = metrics_page::Entity::find_by_id(id)
+        .lock_exclusive()
+        .one(connection)
+        .await
+        .context("loading metrics page")?;
+    row.map(to_page).transpose()
+}
+
 async fn of_host<C: ConnectionTrait>(connection: &C, host_id: &str) -> Result<Vec<MetricsPage>> {
     let rows = metrics_page::Entity::find()
         .filter(metrics_page::Column::HostId.eq(host_id))
@@ -72,9 +84,9 @@ async fn of_host<C: ConnectionTrait>(connection: &C, host_id: &str) -> Result<Ve
 
 /// A host's pages, with the host held until the transaction ends, so two pages
 /// saved at once are checked against each other rather than both against what
-/// was there before. The pages are read as they are now, past anything this
-/// transaction read before, as MySQL would otherwise keep showing what was there
-/// when it first read.
+/// was there before. Every page is saved holding its host, so once it's held the
+/// pages can be read plainly. Nothing before this may read anything plainly, as
+/// MySQL keeps showing what was there at a transaction's first plain read.
 async fn of_host_held<C: ConnectionTrait>(
     connection: &C,
     host_id: &str,
@@ -88,14 +100,7 @@ async fn of_host_held<C: ConnectionTrait>(
         .await
         .context("loading host")?;
     ensure!(held.is_some(), "there's no host {host_id}");
-    let rows = metrics_page::Entity::find()
-        .filter(metrics_page::Column::HostId.eq(host_id))
-        .order_by_asc(metrics_page::Column::Url)
-        .lock_exclusive()
-        .all(connection)
-        .await
-        .context("loading metrics pages")?;
-    rows.into_iter().map(to_page).collect()
+    of_host(connection, host_id).await
 }
 
 /// Records how a page changed from `before`, reading it as it is now. A password
@@ -171,7 +176,7 @@ impl Database {
             .begin()
             .await
             .context("saving metrics page")?;
-        let Some(before) = load(&transaction, id).await? else {
+        let Some(before) = load_held(&transaction, id).await? else {
             return Ok(false);
         };
         let input = input.keeping_secrets_of(&before.input, None);
@@ -196,7 +201,7 @@ impl Database {
             .begin()
             .await
             .context("deleting metrics page")?;
-        let before = load(&transaction, id).await?;
+        let before = load_held(&transaction, id).await?;
         let result = metrics_page::Entity::delete_by_id(id)
             .exec(&transaction)
             .await
