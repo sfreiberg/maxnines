@@ -24,7 +24,7 @@ reports how old they are so lists that have stopped being refreshed are noticed.
 | openSUSE and SLES | `zypper --no-refresh list-updates` | `zypper --no-refresh list-patches --category security`, counting patches | A newer kernel installed |
 | Arch | `checkupdates --nosync`, from pacman-contrib | Not published by Arch | A newer kernel installed |
 | Alpine | `apk --no-network list --upgradable` | Not published by Alpine | A newer kernel installed |
-| FreeBSD | `pkg version -vURl '<'` | Not counted: `pkg audit` gives packages with known vulnerabilities instead | The installed kernel differs from the running one |
+| FreeBSD | `pkg version -qURl '<'` | Not counted: `pkg audit` gives packages with known vulnerabilities instead | The installed kernel differs from the running one |
 | macOS | `softwareupdate -l --no-scan`, what macOS's own daily check last found | Not counted | Not reported |
 | Windows | Windows Update, searching what it last found | Updates with a Microsoft security rating, or in the Security Updates category | Windows Update or Windows' servicing says a reboot is waiting |
 

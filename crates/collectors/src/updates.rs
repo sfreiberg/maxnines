@@ -86,7 +86,10 @@ fn parse_dnf_security(text: &str) -> u64 {
     packages.len() as u64
 }
 
-/// `pkg version -qRL=` lists each package whose version differs from the catalog's.
+/// `pkg version -qURl '<'` lists each package older than the catalog's, as the
+/// daily `pkg update` left it: `-U` keeps it from fetching the catalog itself, over
+/// the network, every time it's asked. Ones the catalog hasn't got, or has older,
+/// aren't waiting for an update.
 #[cfg(any(target_os = "freebsd", test))]
 fn parse_pkg(text: &str) -> u64 {
     text.lines().filter(|line| !line.trim().is_empty()).count() as u64
@@ -197,7 +200,7 @@ pub async fn pending_updates() -> Option<Updates> {
 #[cfg(target_os = "freebsd")]
 pub async fn pending_updates() -> Option<Updates> {
     let output =
-        crate::system::run_with_timeout("pkg", &["version", "-qRL="], UPDATES_TIMEOUT).await?;
+        crate::system::run_with_timeout("pkg", &["version", "-qURl", "<"], UPDATES_TIMEOUT).await?;
     output.status.success().then(|| Updates {
         pending: parse_pkg(&String::from_utf8_lossy(&output.stdout)),
         security: None,
