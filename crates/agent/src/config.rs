@@ -163,7 +163,7 @@ impl Config {
         load_check_definitions(&mut config.checks, folder)?;
         check_actions(&config.actions)?;
         check_page_definitions(&config.metrics_pages)?;
-        check_database_definitions(&config.databases)?;
+        check_database_definitions(&mut config.databases)?;
         Ok(config)
     }
 }

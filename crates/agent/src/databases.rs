@@ -91,27 +91,35 @@ impl DatabaseDefinition {
 /// The databases the agent's config allows, by name.
 pub type DatabaseDefinitions = BTreeMap<String, DatabaseDefinition>;
 
-pub fn check_database_definitions(definitions: &DatabaseDefinitions) -> Result<()> {
+/// Checks each definition, so a mistake stops the agent starting rather than the
+/// database never being read.
+pub fn check_database_definitions(definitions: &mut DatabaseDefinitions) -> Result<()> {
     ensure!(
         definitions.len() <= MAX_DEFINED,
         "the config can define at most {MAX_DEFINED} databases"
     );
-    for (name, definition) in definitions {
+    for (name, definition) in definitions.iter_mut() {
         let problem = |what: &str| anyhow!("database {name:?} in the agent's config {what}");
         ensure!(is_page_name(name), problem("needs a name without spaces"));
+        // An empty one, as from an environment variable that isn't set, is none, so
+        // it's never sent.
+        for given in [&mut definition.username, &mut definition.password] {
+            if given.as_deref() == Some("") {
+                *given = None;
+            }
+        }
         let database = definition
             .database(name)
             .map_err(|error| problem(&format!("has a problem: {error:#}")))?;
+        let username = definition.username.is_some();
         // MongoDB and Redis can be read without signing in, where they allow it,
         // and Redis before 6 has a password and no usernames.
         if !matches!(database.check.kind, CheckKind::Mongodb | CheckKind::Redis) {
-            ensure!(
-                definition
-                    .username
-                    .as_deref()
-                    .is_some_and(|username| !username.is_empty()),
-                problem("needs a username")
-            );
+            ensure!(username, problem("needs a username"));
+        }
+        let password = definition.password.is_some();
+        if let Some(why) = maxnines_checks::sign_in_problem(&database.check, username, password) {
+            return Err(problem(&format!("can never be signed in to: {why}")));
         }
     }
     Ok(())
@@ -136,7 +144,8 @@ mod tests {
     #[test]
     fn a_defined_database_has_a_kind_an_address_and_someone_to_sign_in_as() {
         let one = |name: &str, definition: DatabaseDefinition| {
-            check_database_definitions(&DatabaseDefinitions::from([(name.to_string(), definition)]))
+            let mut definitions = DatabaseDefinitions::from([(name.to_string(), definition)]);
+            check_database_definitions(&mut definitions).map(|()| definitions)
         };
         one("orders", defined("postgres", "127.0.0.1:5432")).unwrap();
         one("cache", defined("mysql", "db:3306")).unwrap();
@@ -186,10 +195,46 @@ mod tests {
                 },
                 "can't use database",
             ),
+            // An unset environment variable's empty username is none.
+            (
+                "orders",
+                DatabaseDefinition {
+                    username: Some(String::new()),
+                    ..defined("postgres", "a:1")
+                },
+                "needs a username",
+            ),
+            // ClickHouse's password goes as it is, so only over TLS elsewhere.
+            (
+                "events",
+                defined("clickhouse", "db.example.com:8123"),
+                "TLS",
+            ),
         ] {
             let error = format!("{:#}", one(name, definition).unwrap_err());
             assert!(error.contains(why), "{name}: {error}");
         }
         assert!(!format!("{:?}", defined("postgres", "a:1")).contains("s3cret"));
+    }
+
+    #[test]
+    fn an_empty_password_is_none_and_clickhouse_on_its_own_host_or_over_tls_is_fine() {
+        let check = |name: &str, definition: DatabaseDefinition| {
+            let mut definitions = DatabaseDefinitions::from([(name.to_string(), definition)]);
+            check_database_definitions(&mut definitions).unwrap();
+            definitions.remove(name).unwrap()
+        };
+        let unset = DatabaseDefinition {
+            password: Some(String::new()),
+            ..defined("postgres", "db:5432")
+        };
+        let read = check("orders", unset).database("orders").unwrap();
+        assert_eq!(read.credentials.password, None);
+        check("events", defined("clickhouse", "127.0.0.1:8123"));
+        let tls = DatabaseDefinition {
+            tls: Some(true),
+            ..defined("clickhouse", "db.example.com:8443")
+        };
+        check("events", tls);
     }
 }
