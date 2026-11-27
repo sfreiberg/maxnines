@@ -85,12 +85,17 @@ impl Server {
 
     /// Adds a config rule that applies over every other, as built-in rules can't be
     /// changed and someone's own shouldn't be, giving its ID to delete it by.
+    /// One left by a run that was stopped before it could delete it goes first.
     pub fn add_rule_over_all(&self, name: &str, settings: Value) -> Result<i64> {
         let rules = self.get_json("/api/v1/rules")?;
+        let rules = rules.as_array().cloned().unwrap_or_default();
+        for left in rules.iter().filter(|rule| rule["name"] == name) {
+            let id = left["id"].as_i64().context("a rule without an ID")?;
+            self.delete_rule(id)?;
+        }
         let highest = rules
-            .as_array()
-            .into_iter()
-            .flatten()
+            .iter()
+            .filter(|rule| rule["name"] != name)
             .filter_map(|rule| rule["priority"].as_i64())
             .max()
             .unwrap_or(0);
