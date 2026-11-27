@@ -17,17 +17,22 @@ pub fn to_hcl(template: &Template) -> String {
     indent_heredocs(&text)
 }
 
+/// Text as a heredoc where it reads back exactly as it is, and otherwise quoted,
+/// with escapes. A heredoc always ends in a newline, and `<<-` takes away the
+/// indent its lines share, so it's only for text ending in one, with a line that
+/// starts at the edge, and nothing but plain spaces before any line's words.
 fn text(value: &str) -> Expression {
+    let lines = || value.lines();
     let heredoc = value.contains('\n')
+        && value.ends_with('\n')
+        && !value.contains(['\r', '\t'])
         && !value.contains("${")
         && !value.contains("%{")
-        && !value.lines().any(|line| line.trim() == "EOT");
+        && lines().any(|line| !line.starts_with(' ') && !line.is_empty())
+        && !lines().any(|line| line.trim() == "EOT")
+        && !lines().any(|line| !line.is_empty() && line.trim().is_empty());
     if heredoc {
-        let mut body = value.to_string();
-        if !body.ends_with('\n') {
-            body.push('\n');
-        }
-        let heredoc = Heredoc::new(Identifier::unchecked("EOT"), body)
+        let heredoc = Heredoc::new(Identifier::unchecked("EOT"), value.to_string())
             .with_strip_mode(HeredocStripMode::Indent);
         return Expression::TemplateExpr(Box::new(TemplateExpr::Heredoc(heredoc)));
     }

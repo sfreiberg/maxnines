@@ -758,3 +758,28 @@ fn a_redis_command_is_its_words_sent_as_a_list() {
         assert!(work::check_statement("q", refused).is_err(), "{refused}");
     }
 }
+
+/// SQL of any shape comes back as it went: without a last newline, indented all
+/// through, with blank or space-only lines, tabs, or carriage returns.
+#[test]
+fn any_multi_line_text_goes_to_hcl_and_back_unchanged() {
+    let base = parse(POSTGRES).unwrap();
+    for sql in [
+        "SELECT 1\nFROM t",
+        "SELECT 1\nFROM t\n",
+        "  SELECT 1\n  FROM t\n",
+        "\tSELECT 1\n\tFROM t\n",
+        "SELECT 1\n\nFROM t\n",
+        "SELECT 1\n   \nFROM t\n",
+        "SELECT 1\r\nFROM t\r\n",
+        "SELECT 1\nFROM t\n\n",
+        "\nSELECT 1\n",
+        "SELECT 1 -- EOT\nEOT\n",
+    ] {
+        let mut template = base.clone();
+        template.queries[0].sql = sql.to_string();
+        let written = to_hcl(&template);
+        let again = parse(&written).unwrap_or_else(|error| panic!("{error:#}\n{written}"));
+        assert_eq!(again.queries[0].sql, sql, "{written}");
+    }
+}
