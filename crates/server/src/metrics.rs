@@ -1592,26 +1592,6 @@ pub const METRICS: &[StaticMetric] = &[
         source: Source::Fields(&[("Failed", Reading::Field("$.failed_services"))]),
         chart: ShowChart::WithData,
     },
-    // Looked at every 15 minutes, from the host's own package lists.
-    StaticMetric {
-        name: "system.updates",
-        title: "Updates waiting",
-        unit: Unit::Number,
-        collector: "system",
-        source: Source::Fields(&[
-            ("All", Reading::Field("$.pending_updates")),
-            ("Security", Reading::Field("$.security_updates")),
-        ]),
-        chart: ShowChart::WithData,
-    },
-    StaticMetric {
-        name: "system.reboot_required",
-        title: "Restart needed",
-        unit: Unit::Number,
-        collector: "system",
-        source: Source::Fields(&[("Restart needed", Reading::Field("$.reboot_required"))]),
-        chart: ShowChart::WithData,
-    },
     StaticMetric {
         name: "system.tcp_total",
         title: "All TCP connections",

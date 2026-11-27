@@ -12,7 +12,6 @@ pub mod interface_drops;
 pub mod system;
 pub mod tcp;
 pub mod time_sync;
-pub mod updates;
 #[cfg(windows)]
 mod windows_text;
 

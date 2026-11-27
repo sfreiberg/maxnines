@@ -268,18 +268,6 @@ fn the_top_processes_are_each_a_series_by_name() {
 }
 
 #[test]
-fn updates_and_a_waiting_restart_read_what_the_agent_sends() {
-    let mut store = in_memory();
-    let system = json!({ "pending_updates": 14, "security_updates": 3, "reboot_required": 1 });
-    write_metric(&mut store, "a", 1000, "system", system);
-
-    let updates = query(&store, "a", "system.updates", 8);
-    assert_eq!(names(&updates), ["All", "Security"]);
-    assert_eq!(averages(&updates.series[1]), [3.0]);
-    assert_eq!(averages(&query(&store, "a", "system.reboot_required", 8).series[0]), [1.0]);
-}
-
-#[test]
 fn the_connection_tracking_table_is_a_share_of_its_limit() {
     let mut store = in_memory();
     write_metric(&mut store, "a", 1000, "system", json!({ "conntrack": 196_608, "max_conntrack": 262_144 }));

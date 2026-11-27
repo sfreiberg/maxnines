@@ -250,22 +250,9 @@ both these and the watched services.
 
 ## Updates
 
-The `system` collector, on by default, reports updates waiting to be installed, from
-the host's own package lists, looked at every 15 minutes. Nothing is fetched, so
-they're as current as the host's own update schedule keeps them.
-
-| Metric | Unit | Series | What it is |
-| --- | --- | --- | --- |
-| `system.updates` | Number | `All`, `Security` | Updates waiting, and how many are security fixes |
-| `system.reboot_required` | 1 or 0 | One | Whether an installed update is waiting for a restart |
-
-- **Updates** come from `apt-get` on Debian and Ubuntu, `dnf` or `yum` on Red Hat and
-  Fedora, and `pkg` on FreeBSD. FreeBSD doesn't say which are security fixes, and
-  Windows and macOS don't report updates yet.
-- **Restart needed** is 1 on Debian and Ubuntu when the system has said so, on Red Hat
-  and Fedora from `needs-restarting`, on Windows when Windows Update or servicing is
-  waiting, and on FreeBSD when a newer kernel is installed than the one running.
-  macOS has no such flag.
+Updates waiting, security updates among them, and a restart waiting to finish one
+are the [updates collector](collectors-updates.md)'s, which the Host template turns
+on.
 
 ## Logins and open files
 
