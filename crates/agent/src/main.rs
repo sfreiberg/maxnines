@@ -556,12 +556,21 @@ impl Monitoring {
         let mut finished = None;
         if let Collecting::Away(task, since) = &mut self.collecting {
             let left = TAKE_BACK_LIMIT.saturating_sub(since.elapsed());
-            let Ok(Ok((collectors, sample, panicked))) = timeout(left, &mut *task).await else {
-                return None;
-            };
-            finished = Some(sample);
-            self.note_panicked(&panicked);
-            self.collecting = Collecting::Ready(collectors);
+            match timeout(left, &mut *task).await {
+                Err(_) => return None,
+                Ok(Ok((collectors, sample, panicked))) => {
+                    finished = Some(sample);
+                    self.note_panicked(&panicked);
+                    self.collecting = Collecting::Ready(collectors);
+                }
+                // Its collectors went with it, so there's nothing to carry on with,
+                // and the finished task is never waited on again.
+                Ok(Err(error)) => {
+                    error!(%error, "collecting stopped, so everything is made again");
+                    self.made.clear();
+                    self.collecting = Collecting::Ready(Vec::new());
+                }
+            }
         }
         let Collecting::Ready(collectors) =
             std::mem::replace(&mut self.collecting, Collecting::Ready(Vec::new()))
