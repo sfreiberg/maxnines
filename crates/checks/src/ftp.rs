@@ -121,10 +121,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ftp<S> {
     /// Signs in where given a login, then leaves.
     async fn sign_in(mut self, login: Option<(&str, &str)>, findings: &mut Findings) -> Result<()> {
         if let Some((username, password)) = login {
-            // A 4xx reply, such as 421 for too many users, is a refusal for now,
-            // which says nothing about the login.
+            // A refusal for now, such as 421 for too many users, says nothing about
+            // the login. 430 is a wrong username or password, which some servers
+            // give in place of 530.
             let reply = |code: u16| -> Result<u16> {
-                ensure!(!(400..500).contains(&code), crate::BUSY);
+                ensure!(!matches!(code, 421 | 450..=452), crate::BUSY);
                 Ok(code)
             };
             let accepted = match reply(self.command(&format!("USER {username}")).await?.0)? {
@@ -251,6 +252,9 @@ mod tests {
                         "230 Signed in.\r\n"
                     } else if argument == "busy" {
                         "421 Too many users, try again later.\r\n"
+                    } else if argument == "guess" {
+                        // As some servers say a wrong password.
+                        "430 Invalid username or password.\r\n"
                     } else {
                         "530 Login incorrect.\r\n"
                     }

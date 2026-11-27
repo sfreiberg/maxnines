@@ -139,10 +139,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Smtp<S> {
                 .map(|ways| ways.split_whitespace().collect())
                 .unwrap_or_default();
             let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
-            // A 4xx reply, such as 454, is a refusal for now, which says nothing
-            // about the login.
+            // A refusal for now, such as 454's temporary failure, says nothing about
+            // the login. Others, such as 432 for a password that has to be changed,
+            // are about it.
             let step = |code: u16, wanted: u16| -> Result<bool> {
-                ensure!(!(400..500).contains(&code), crate::BUSY);
+                ensure!(!matches!(code, 421 | 450..=452 | 454), crate::BUSY);
                 Ok(code == wanted)
             };
             let accepted = if ways.contains(&"PLAIN") {
@@ -293,10 +294,15 @@ where
 }
 
 /// Whether IMAP's NO says it can't take a login just now, by the response codes
-/// RFC 5530 gives that: UNAVAILABLE, or INUSE.
+/// RFC 5530 gives that: `[UNAVAILABLE]` or `[INUSE]`. Only the code in brackets
+/// counts, never the words, which a wrong password's can share, as
+/// `[AUTHENTICATIONFAILED] Authentication unavailable` does. The driver leaves a code
+/// it doesn't know in the words.
 fn is_busy_imap(said: &str) -> bool {
     let said = said.to_ascii_uppercase();
-    said.contains("UNAVAILABLE") || said.contains("INUSE")
+    ["[UNAVAILABLE]", "[INUSE]"]
+        .iter()
+        .any(|busy| said.contains(busy))
 }
 
 pub(crate) async fn check_pop3(
@@ -577,7 +583,9 @@ mod tests {
                             } else if command.contains("\"busy\"") {
                                 format!("{tag} NO [UNAVAILABLE] try again later\r\n")
                             } else {
-                                format!("{tag} NO wrong\r\n")
+                                format!(
+                                    "{tag} NO [AUTHENTICATIONFAILED] Authentication unavailable\r\n"
+                                )
                             }
                         }
                         "LOGOUT" => {
