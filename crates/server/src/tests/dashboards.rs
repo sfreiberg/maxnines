@@ -725,6 +725,17 @@ mod variables {
         );
         let data = format!("/api/v1/dashboards/{id}/widgets/{widget}");
         assert_eq!(api(&server, "GET", &data, &Value::Null).await.0, 422);
+
+        // One without a title of its own is called by its metric's, as it would be
+        // with a host to show.
+        let path = format!("/api/v1/dashboards/{id}/widgets");
+        let untitled = json!({ "metric": "cpu.usage", "group_by": "host", "filter": "$host" });
+        let (status, created) = api(&server, "POST", &path, &untitled).await;
+        assert_eq!(status, 201, "{created}");
+        let untitled = created["id"].as_i64().unwrap();
+        let path = format!("/dashboards/{id}/widgets/{untitled}");
+        let drawn = browser.get(&server, &path).await;
+        assert!(drawn.body.contains("CPU usage"), "{}", drawn.body);
     }
 
     #[tokio::test]

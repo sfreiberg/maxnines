@@ -179,6 +179,17 @@ impl WidgetInput {
             None => question.metric.title.clone(),
         }
     }
+
+    /// Its title when there's no question to ask, as when a variable has nothing to
+    /// pick or the widget can't be read: its own, filled in, or its metric's.
+    pub fn title_without_question(&self, catalog: &Catalog, picks: &Picks) -> String {
+        match &self.title {
+            Some(title) => picks.fill_title(title),
+            None => catalog
+                .find_known(&self.metric)
+                .map_or_else(|| self.metric.clone(), |metric| metric.title.clone()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -286,25 +297,26 @@ pub async fn view(
     zone: Tz,
 ) -> WidgetView {
     let input = &widget.input;
+    let catalog = state.catalog();
+    let failed = || failed_view(input, input.title_without_question(&catalog, picks));
     let filter = match picks.fill_filter(input.filter.as_deref()) {
         Ok(filter) => filter,
         Err(missing) => {
             return WidgetView {
-                title: picks.fill_title(input.title.as_deref().unwrap_or_default()),
                 missing: Some(missing),
                 failed: false,
-                ..failed_view(input)
+                ..failed()
             };
         }
     };
-    let question = match input.question_for(&state.catalog(), filter.as_deref()) {
+    let question = match input.question_for(&catalog, filter.as_deref()) {
         Ok(question) => question,
         Err(error) => {
             warn!(
                 widget = widget.id,
                 error, "a saved widget doesn't make sense"
             );
-            return failed_view(input);
+            return failed();
         }
     };
     match calculations::answer(&state.sources(), &question, range, input.max_lines()).await {
@@ -331,15 +343,15 @@ pub async fn view(
         Err(error) => {
             let error = format!("{error:#}");
             warn!(widget = widget.id, error, "reading a widget failed");
-            failed_view(input)
+            failed()
         }
     }
 }
 
-fn failed_view(input: &WidgetInput) -> WidgetView {
+fn failed_view(input: &WidgetInput, title: String) -> WidgetView {
     WidgetView {
         kind: input.kind.clone(),
-        title: input.title.clone().unwrap_or_default(),
+        title,
         chart: None,
         hidden: 0,
         failed: true,
