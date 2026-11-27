@@ -33,9 +33,10 @@ const MAX_CONTAINERS: usize = 64;
 /// How long one call to Docker can take, in seconds.
 const TIMEOUT_SECS: u64 = 10;
 
-/// How long a whole round can take: listing, then reading each container at once.
+/// How long a whole round can take: listing, then reading each container at once,
+/// which is inspecting it and then reading its use, so three calls one after another.
 /// A Docker that stalls past it gives no containers, rather than the last ones.
-const ROUND_LIMIT: Duration = Duration::from_secs(2 * TIMEOUT_SECS);
+const ROUND_LIMIT: Duration = Duration::from_secs(3 * TIMEOUT_SECS);
 
 /// Where Docker and Podman listen, in the order they're tried. `DOCKER_HOST` comes
 /// first when it names a socket.
@@ -53,6 +54,7 @@ impl ContainerCollector {
         // from one read to the next.
         let mut cpu = HashMap::new();
         let mut background = Background::new();
+        let told = complained.clone();
         let round = move || {
             let socket = socket.clone();
             let complained = complained.clone();
@@ -70,19 +72,20 @@ impl ContainerCollector {
                         Value::Array(containers)
                     }
                     Err(error) => {
-                        // Once for each new problem, as it's checked every interval.
-                        let error = format!("{error:#}");
-                        let mut said = complained.lock().unwrap_or_else(PoisonError::into_inner);
-                        if said.as_deref() != Some(&error) {
-                            warn!(error, "can't read containers");
-                            *said = Some(error);
-                        }
+                        complain(&complained, format!("{error:#}"));
                         Value::Null
                     }
                 }
             }
         };
         let settle = move |containers: Option<Value>| {
+            if containers.is_none() {
+                let limit = ROUND_LIMIT.as_secs();
+                complain(
+                    &told,
+                    format!("reading them didn't finish within {limit} seconds"),
+                );
+            }
             let mut containers = containers.unwrap_or_default();
             let mut seen = HashMap::new();
             if let Value::Array(rows) = &mut containers {
@@ -105,6 +108,16 @@ impl Collector for ContainerCollector {
 
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.latest().pop().unwrap_or_default())
+    }
+}
+
+/// Logs why containers can't be read, once for each new reason, as they're read
+/// every interval.
+fn complain(complained: &Mutex<Option<String>>, error: String) {
+    let mut said = complained.lock().unwrap_or_else(PoisonError::into_inner);
+    if said.as_deref() != Some(&error) {
+        warn!(error, "can't read containers");
+        *said = Some(error);
     }
 }
 
