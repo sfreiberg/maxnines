@@ -189,8 +189,14 @@ impl Options {
         if self.interval.is_zero() {
             bail!("--interval has to be longer than nothing");
         }
-        if self.backlog_gap.is_zero() {
-            bail!("--backlog-gap has to be longer than nothing");
+        for (name, every) in [
+            ("--backlog-gap", self.backlog_gap),
+            ("--facts-every", self.facts_every),
+            ("--page-every", self.page_every),
+        ] {
+            if every.is_zero() {
+                bail!("{name} has to be longer than nothing");
+            }
         }
         for (name, percent) in [
             ("--churn", self.churn),
@@ -347,6 +353,8 @@ mod tests {
         for bad in [
             "--agents 0",
             "--interval 0s",
+            "--facts-every 0s",
+            "--page-every 0s",
             "--churn 101",
             "--hot-agents -1",
         ] {
