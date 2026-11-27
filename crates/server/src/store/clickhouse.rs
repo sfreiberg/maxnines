@@ -1047,14 +1047,16 @@ impl Naming<'_> {
 
 /// One reading of a metric as rows of `agent`, `t`, `series` and `v`, with `t` the time
 /// it was taken. `scope` narrows
-/// down the rows, and is always worked out here.
+/// down the rows, and is always worked out here. Samples are read FINAL, as one sent
+/// again, as after a reconnect, is only dropped when ClickHouse merges, and would
+/// otherwise count twice in a chart, a calculation or a rollup until then.
 fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope: &str) -> String {
     let series = naming.expression();
     let filter = naming.filter();
     match reading {
         Reading::Field(path) | Reading::Rate(path) => format!(
             "SELECT host_id, time AS t, {series} AS series, value AS v
-             FROM samples WHERE metric = {name} {filter} AND {scope}",
+             FROM samples FINAL WHERE metric = {name} {filter} AND {scope}",
             name = quoted(&stored_name(metric, path)),
         ),
         Reading::Percent { part, whole } => {
@@ -1063,7 +1065,7 @@ fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope:
             format!(
                 "SELECT host_id, time AS t, {series} AS series,
                         avgIf(value, metric = {part}) / nullIf(avgIf(value, metric = {whole}), 0) * 100 AS v
-                 FROM samples WHERE metric IN ({part}, {whole}) {filter} AND {scope}
+                 FROM samples FINAL WHERE metric IN ({part}, {whole}) {filter} AND {scope}
                  GROUP BY host_id, t, series
                  HAVING countIf(metric = {part}) > 0 AND countIf(metric = {whole}) > 0"
             )
@@ -1088,7 +1090,7 @@ fn readings(metric: &Metric, scope: &str) -> String {
         }
         Source::Labelled(Labelled { field, labels, .. }) => format!(
             "SELECT host_id, time AS t, {series} AS series, value AS v
-             FROM samples WHERE metric = {name} AND {scope}",
+             FROM samples FINAL WHERE metric = {name} AND {scope}",
             series = Naming::Labels(labels).expression(),
             name = quoted(&stored_name(metric, field)),
         ),
@@ -1782,6 +1784,45 @@ mod tests {
         wait(store.client.query("OPTIMIZE TABLE samples FINAL").execute()).unwrap();
 
         assert_eq!(count(&store, "SELECT count() FROM samples"), 2);
+    }
+
+    /// Before it's merged, a sample sent twice still counts once, in what's charted
+    /// and in what's rolled up.
+    #[test]
+    fn a_sample_sent_twice_counts_once_before_merging() {
+        let mut store = in_memory();
+        wait(store.client.query("SYSTEM STOP MERGES samples").execute()).unwrap();
+        for usage in [5.0, 5.0] {
+            write_metric(
+                &mut store,
+                "a",
+                1000,
+                "cpu",
+                json!({ "usage_percent": usage }),
+            );
+        }
+        write_metric(
+            &mut store,
+            "a",
+            2000,
+            "cpu",
+            json!({ "usage_percent": 7.0 }),
+        );
+        assert_eq!(count(&store, "SELECT count() FROM samples"), 3);
+
+        // 5 and 7, not 5, 5 and 7.
+        let result = store
+            .reader()
+            .unwrap()
+            .series(&SeriesQuery {
+                host_id: "a",
+                metric: &find("cpu.usage").unwrap(),
+                range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
+                max_series: 8,
+                only: None,
+            })
+            .unwrap();
+        assert_eq!(result.series[0].points[0].avg, 6.0, "{result:?}");
     }
 
     #[test]
