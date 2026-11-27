@@ -60,7 +60,7 @@ impl HostKind {
 }
 
 /// How long a host's name can be, which is what the database's column holds.
-const MAX_HOSTNAME_LEN: usize = 255;
+pub const MAX_HOSTNAME_LEN: usize = 255;
 
 /// A host's name, tidied, or why it won't do: one typed for a host with no agent, or
 /// the one an agent says its host has, checked as it arrives.

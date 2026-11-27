@@ -60,20 +60,15 @@ async fn keep_devices(check: &RemoteCheck, devices: &[Device], to: &Running<'_>)
     let mut listed = BTreeSet::new();
     for device in devices {
         listed.insert(device.id.as_str());
-        let host = known
-            .get(&device.id)
-            .and_then(|id| to.registry.read(|hosts| hosts.get(id).cloned()));
-        let host = match host {
-            Some(host) => host,
-            None => add_host(check, device, to).await?,
-        };
-        let facts = flatten(&facts(device))?;
-        to.database
-            .record_facts(&host.id, &facts, times::now())
-            .await?;
-        save(to, &host, sample(device)).await;
-        to.presence
-            .reached(&host.id, Reached::Device(check.id), device.is_online());
+        // One device that can't be kept says why, and the rest are kept anyway.
+        if let Err(error) = keep_device(check, device, known.get(&device.id), to).await {
+            warn!(
+                check = check.id,
+                device = device.id,
+                error = format!("{error:#}"),
+                "keeping a UniFi device failed"
+            );
+        }
     }
     for (device, host_id) in &known {
         if listed.contains(device.as_str()) {
@@ -86,6 +81,29 @@ async fn keep_devices(check: &RemoteCheck, devices: &[Device], to: &Running<'_>)
         to.presence
             .reached(&host.id, Reached::Device(check.id), false);
     }
+    Ok(())
+}
+
+/// Keeps one device as its host, made for it if `host_id` is none.
+async fn keep_device(
+    check: &RemoteCheck,
+    device: &Device,
+    host_id: Option<&String>,
+    to: &Running<'_>,
+) -> Result<()> {
+    let host = host_id.and_then(|id| to.registry.read(|hosts| hosts.get(id).cloned()));
+    let host = match host {
+        Some(host) => host,
+        None => add_host(check, device, to).await?,
+    };
+    // Its numbers and whether it's there are kept even if its facts can't be.
+    let facts = flatten(&facts(device));
+    save(to, &host, sample(device)).await;
+    to.presence
+        .reached(&host.id, Reached::Device(check.id), device.is_online());
+    to.database
+        .record_facts(&host.id, &facts?, times::now())
+        .await?;
     Ok(())
 }
 
@@ -111,7 +129,13 @@ async fn add_host(check: &RemoteCheck, device: &Device, to: &Running<'_>) -> Res
 fn hostname(device: &Device) -> String {
     let name = device.name.trim();
     if !name.is_empty() && !name.chars().any(char::is_control) {
-        return name.chars().take(255).collect();
+        // As long as a hostname can be, which is counted in bytes, cut between
+        // characters.
+        let mut end = name.len().min(crate::registration::MAX_HOSTNAME_LEN);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        return name[..end].to_string();
     }
     let model = device.model.trim();
     match (model.is_empty(), device.mac.is_empty()) {
@@ -229,6 +253,18 @@ mod tests {
                 },
             }),
         }
+    }
+
+    #[test]
+    fn a_long_name_is_cut_to_what_a_hostname_holds_between_characters() {
+        let long = Device {
+            name: "交換機".repeat(100),
+            ..device()
+        };
+        let name = hostname(&long);
+        assert!(name.len() <= crate::registration::MAX_HOSTNAME_LEN);
+        assert!(crate::registration::checked_hostname(&name).is_ok());
+        assert!(name.starts_with("交換機"));
     }
 
     #[test]
