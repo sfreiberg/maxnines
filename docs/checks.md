@@ -372,7 +372,10 @@ Without signing in, an SSH check reports the server's host key, as its SHA-256
 fingerprint, and the ways it offers to sign in, such as `publickey, password`. **SSH
 offers password sign-in** is 1 while a password is accepted, to alert on for servers
 that should only take keys. A server offering `keyboard-interactive` counts, as that's
-how a password is usually asked for through PAM, as FreeBSD does by default.
+how a password is usually asked for through PAM, as FreeBSD does by default. From
+outside, it can't be told from a server that uses it only for a one-time code after a
+key, which counts too: there, set `KbdInteractiveAuthentication no` if it isn't needed,
+or alert only on servers that never use it that way.
 
 Put the fingerprint the check's page shows under **Expected host key** to have any
 other key count as down, as it would after a reinstall, or with someone in the
