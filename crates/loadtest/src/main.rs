@@ -282,7 +282,7 @@ async fn run_rule_change(
     server: Server,
     plan: Arc<Plan>,
     measurements: Arc<Measurements>,
-    original: Arc<Mutex<Option<(i64, Value)>>>,
+    added: Arc<Mutex<Option<i64>>>,
 ) {
     sleep(at).await;
     let online = plan.counters.online.load(Relaxed);
@@ -290,16 +290,13 @@ async fn run_rule_change(
     let began = Instant::now();
 
     let saved = {
-        let original = original.clone();
+        let added = added.clone();
         tokio::task::spawn_blocking(move || {
-            let (id, rule) = server.first_rule()?;
-            let mut changed = rule.clone();
-            let every = rule["settings"]["facts_interval_secs"]
-                .as_u64()
-                .unwrap_or(3600);
-            changed["settings"]["facts_interval_secs"] = json!(every + 1);
-            *lock(&original) = Some((id, rule));
-            server.save_rule(id, &changed)
+            // A setting no rule is likely to have, so every agent's config changes.
+            let settings = json!({ "facts_interval_secs": 3593 });
+            let id = server.add_rule_over_all("Load test rule change", settings)?;
+            *lock(&added) = Some(id);
+            anyhow::Ok(())
         })
         .await
     };
@@ -315,7 +312,7 @@ async fn run_rule_change(
         }
     }
 
-    measurements.event("A config rule changed".to_string());
+    measurements.event("A config rule was added".to_string());
     while began.elapsed() < WAIT_FOR_RECOVERY {
         if plan.counters.configs.load(Relaxed) >= before + online {
             measurements.event(format!(
@@ -582,14 +579,14 @@ async fn run(options: Options) -> Result<Outcome> {
             wanted,
         ));
     }
-    let original_rule = Arc::new(Mutex::new(None));
+    let added_rule = Arc::new(Mutex::new(None));
     if let Some(at) = options.rule_change_at {
         tokio::spawn(run_rule_change(
             at,
             server.clone(),
             plan.clone(),
             measurements.clone(),
-            original_rule.clone(),
+            added_rule.clone(),
         ));
     }
 
@@ -635,12 +632,12 @@ async fn run(options: Options) -> Result<Outcome> {
     }
     drain(&server, &measurements).await;
 
-    let restore = lock(&original_rule).take();
-    if let Some((id, rule)) = restore {
+    let added = lock(&added_rule).take();
+    if let Some(id) = added {
         let client = server.clone();
-        match tokio::task::spawn_blocking(move || client.save_rule(id, &rule)).await {
+        match tokio::task::spawn_blocking(move || client.delete_rule(id)).await {
             Ok(Ok(())) => {}
-            _ => eprintln!("Warning: the config rule couldn't be put back"),
+            _ => eprintln!("Warning: the load test's config rule {id} couldn't be deleted"),
         }
     }
     if options.revoke {

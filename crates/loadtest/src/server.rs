@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use serde_json::{Value, json};
 use ureq::Agent;
 
 const REQUEST_LIMIT: Duration = Duration::from_secs(60);
@@ -83,28 +83,43 @@ impl Server {
         self.post(&format!("/api/v1/hosts/{id}/revoke"))
     }
 
-    /// The first config rule, for changing and putting back.
-    pub fn first_rule(&self) -> Result<(i64, Value)> {
+    /// Adds a config rule that applies over every other, as built-in rules can't be
+    /// changed and someone's own shouldn't be, giving its ID to delete it by.
+    pub fn add_rule_over_all(&self, name: &str, settings: Value) -> Result<i64> {
         let rules = self.get_json("/api/v1/rules")?;
-        let id = rules[0]["id"]
-            .as_i64()
-            .context("the server has no config rules")?;
-        let mut rule = self.get_json(&format!("/api/v1/rules/{id}"))?;
-        if let Some(fields) = rule.as_object_mut() {
-            fields.remove("id");
-        }
-        Ok((id, rule))
-    }
-
-    pub fn save_rule(&self, id: i64, rule: &Value) -> Result<()> {
-        let path = format!("/api/v1/rules/{id}");
-        let response = self
+        let highest = rules
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|rule| rule["priority"].as_i64())
+            .max()
+            .unwrap_or(0);
+        let rule = json!({ "name": name, "priority": highest + 1, "settings": settings });
+        let path = "/api/v1/rules";
+        let mut response = self
             .client
-            .put(format!("{}{path}", self.base))
+            .post(format!("{}{path}", self.base))
             .header("Authorization", self.bearer())
             .header("Content-Type", "application/json")
             .send(rule.to_string())
-            .with_context(|| format!("saving {path}"))?;
+            .with_context(|| format!("posting to {path}"))?;
+        if !response.status().is_success() {
+            bail!("{path} gave {}", response.status());
+        }
+        let made: Value = serde_json::from_str(&response.body_mut().read_to_string()?)?;
+        made["id"]
+            .as_i64()
+            .context("the server didn't say what the rule is")
+    }
+
+    pub fn delete_rule(&self, id: i64) -> Result<()> {
+        let path = format!("/api/v1/rules/{id}");
+        let response = self
+            .client
+            .delete(format!("{}{path}", self.base))
+            .header("Authorization", self.bearer())
+            .call()
+            .with_context(|| format!("deleting {path}"))?;
         if !response.status().is_success() {
             bail!("{path} gave {}", response.status());
         }

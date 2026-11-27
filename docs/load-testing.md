@@ -25,7 +25,7 @@ JSON. Run `maxnines-loadtest --help` for everything that can be adjusted, includ
 | `--churn` | Percent of agents reconnecting each minute |
 | `--backlog` | Saved samples each agent starts with, as if after an outage |
 | `--outage-at`, `--outage-for` | Drop every connection during the test |
-| `--rule-change-at` | Send every agent a new config during the test |
+| `--rule-change-at` | Send every agent a new config during the test, by adding a config rule of its own that it deletes at the end |
 | `--fact-changes`, `--facts-every` | How much facts change, and how often they're sent |
 | `--hot-agents` | Percent of agents at 99% CPU, to set off alert rules you've made |
 | `--viewers`, `--page-every` | People loading pages during the test |
