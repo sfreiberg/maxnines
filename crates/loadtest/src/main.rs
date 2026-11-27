@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use futures_util::{StreamExt, stream};
 use maxnines_protocol::RegistrationStatus;
@@ -120,6 +121,8 @@ struct Measurements {
     peak_online: AtomicU64,
     generator_cpu: Mutex<Vec<f64>>,
     began: Instant,
+    /// When it began, by the clock, for the report.
+    began_at: DateTime<Utc>,
 }
 
 #[derive(Default)]
@@ -509,6 +512,7 @@ async fn run(options: Options) -> Result<Outcome> {
         peak_online: AtomicU64::new(0),
         generator_cpu: Mutex::default(),
         began: Instant::now(),
+        began_at: maxnines_protocol::time::now(),
     });
 
     // Before any load, so everything the test sends is counted. The first reading in
@@ -695,7 +699,7 @@ async fn run(options: Options) -> Result<Outcome> {
     let checks = judge(&connections, &samples, &pages, &timeline.points, generator);
     let outcome = overall(&checks);
     let report = Report {
-        started_at: maxnines_protocol::time::now() - Duration::from_secs_f64(ran_for),
+        started_at: measurements.began_at,
         ran_for_secs: ran_for,
         stopped_early,
         outcome,
