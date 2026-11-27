@@ -121,11 +121,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ftp<S> {
     /// Signs in where given a login, then leaves.
     async fn sign_in(mut self, login: Option<(&str, &str)>, findings: &mut Findings) -> Result<()> {
         if let Some((username, password)) = login {
-            let accepted = match self.command(&format!("USER {username}")).await?.0 {
+            // A 4xx reply, such as 421 for too many users, is a refusal for now,
+            // which says nothing about the login.
+            let reply = |code: u16| -> Result<u16> {
+                ensure!(!(400..500).contains(&code), crate::BUSY);
+                Ok(code)
+            };
+            let accepted = match reply(self.command(&format!("USER {username}")).await?.0)? {
                 // Signed in on the username alone.
                 230 => true,
                 331 => matches!(
-                    self.command(&format!("PASS {password}")).await?.0,
+                    reply(self.command(&format!("PASS {password}")).await?.0)?,
                     230 | 202
                 ),
                 _ => false,
@@ -243,6 +249,8 @@ mod tests {
                     leaked.fetch_or(!conn.secure(), Ordering::Relaxed);
                     if argument == "s3cret" {
                         "230 Signed in.\r\n"
+                    } else if argument == "busy" {
+                        "421 Too many users, try again later.\r\n"
                     } else {
                         "530 Login incorrect.\r\n"
                     }
@@ -317,6 +325,11 @@ mod tests {
             assert_eq!(result["up"], 0, "{tls:?} with a wrong password: {result}");
             assert_eq!(result["signed_in"], false, "{tls:?}: {result}");
             assert!(!result.to_string().contains("guess"), "{result}");
+
+            // Turned down for now, which says nothing about the login.
+            let result = run_signed_in(&ftp, Some(&login("busy"))).await;
+            assert_eq!(result["error"], crate::BUSY, "{tls:?}: {result}");
+            assert!(result.get("signed_in").is_none(), "{tls:?}: {result}");
             assert!(
                 !leaked.load(Ordering::Relaxed),
                 "{tls:?} sent a password in the clear"

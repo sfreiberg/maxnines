@@ -139,13 +139,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Smtp<S> {
                 .map(|ways| ways.split_whitespace().collect())
                 .unwrap_or_default();
             let encode = |text: &str| base64::engine::general_purpose::STANDARD.encode(text);
+            // A 4xx reply, such as 454, is a refusal for now, which says nothing
+            // about the login.
+            let step = |code: u16, wanted: u16| -> Result<bool> {
+                ensure!(!(400..500).contains(&code), crate::BUSY);
+                Ok(code == wanted)
+            };
             let accepted = if ways.contains(&"PLAIN") {
                 let both = encode(&format!("\0{username}\0{password}"));
-                self.command(&format!("AUTH PLAIN {both}")).await?.0 == 235
+                step(self.command(&format!("AUTH PLAIN {both}")).await?.0, 235)?
             } else if ways.contains(&"LOGIN") {
-                self.command("AUTH LOGIN").await?.0 == 334
-                    && self.command(&encode(username)).await?.0 == 334
-                    && self.command(&encode(password)).await?.0 == 235
+                step(self.command("AUTH LOGIN").await?.0, 334)?
+                    && step(self.command(&encode(username)).await?.0, 334)?
+                    && step(self.command(&encode(password)).await?.0, 235)?
             } else {
                 bail!("it offers no way to sign in that the check knows")
             };
@@ -273,16 +279,24 @@ where
             let _ = session.logout().await;
             Ok(())
         }
-        Err((error, _)) => {
-            findings.signed_in = Some(false);
-            match error {
-                async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_) => {
-                    bail!("it didn't accept the username and password")
-                }
-                other => Err(short(other)),
+        Err((error, _)) => match error {
+            // A refusal for now, with the response code that says so, says nothing
+            // about the login.
+            async_imap::error::Error::No(said) if is_busy_imap(&said) => bail!(crate::BUSY),
+            async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_) => {
+                findings.signed_in = Some(false);
+                bail!("it didn't accept the username and password")
             }
-        }
+            other => Err(short(other)),
+        },
     }
+}
+
+/// Whether IMAP's NO says it can't take a login just now, by the response codes
+/// RFC 5530 gives that: UNAVAILABLE, or INUSE.
+fn is_busy_imap(said: &str) -> bool {
+    let said = said.to_ascii_uppercase();
+    said.contains("UNAVAILABLE") || said.contains("INUSE")
 }
 
 pub(crate) async fn check_pop3(
@@ -365,6 +379,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
             .ok_or_else(|| anyhow!("refused"))
     }
 
+    /// Whether a step of signing in was taken. One turned down for now, with RFC
+    /// 3206's IN-USE or SYS/TEMP, says nothing about the login.
+    async fn login_step(&mut self, command: &str) -> Result<bool> {
+        let stream = self.reader.get_mut();
+        stream.write_all(command.as_bytes()).await?;
+        stream.write_all(b"\r\n").await?;
+        let answer = self.line().await?;
+        if answer.starts_with("+OK") {
+            return Ok(true);
+        }
+        let said = answer.to_ascii_uppercase();
+        ensure!(
+            !said.contains("[IN-USE]") && !said.contains("[SYS/TEMP]"),
+            crate::BUSY
+        );
+        Ok(false)
+    }
+
     /// Whether CAPA lists STLS. A server that doesn't know CAPA doesn't offer it.
     async fn offers_stls(&mut self) -> bool {
         if self.command("CAPA").await.is_err() {
@@ -386,8 +418,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Pop3<S> {
         findings: &mut Findings,
     ) -> Result<()> {
         if let Some((username, password)) = login {
-            let accepted = self.command(&format!("USER {username}")).await.is_ok()
-                && self.command(&format!("PASS {password}")).await.is_ok();
+            let accepted = self.login_step(&format!("USER {username}")).await?
+                && self.login_step(&format!("PASS {password}")).await?;
             findings.signed_in = Some(accepted);
             ensure!(accepted, "it didn't accept the username and password");
         }
@@ -513,6 +545,8 @@ mod tests {
                         leaked.fetch_or(!conn.secure(), Ordering::Relaxed);
                         if line.ends_with(" s3cret") {
                             "+OK in\r\n"
+                        } else if line.ends_with(" busy") {
+                            "-ERR [IN-USE] the mailbox is locked\r\n"
                         } else {
                             "-ERR no\r\n"
                         }
@@ -540,6 +574,8 @@ mod tests {
                             leaked.fetch_or(!conn.secure(), Ordering::Relaxed);
                             if command.contains("\"monitor\" \"s3cret\"") {
                                 format!("{tag} OK in\r\n")
+                            } else if command.contains("\"busy\"") {
+                                format!("{tag} NO [UNAVAILABLE] try again later\r\n")
                             } else {
                                 format!("{tag} NO wrong\r\n")
                             }
@@ -584,6 +620,8 @@ mod tests {
                                             .unwrap_or_default();
                                         if decoded == b"\0monitor\0s3cret" {
                                             "235 in\r\n"
+                                        } else if decoded == b"\0monitor\0busy" {
+                                            "454 4.7.0 try again later\r\n"
                                         } else {
                                             "535 wrong\r\n"
                                         }
@@ -684,6 +722,11 @@ mod tests {
                 );
                 assert_eq!(result["signed_in"], false, "{kind:?}: {result}");
                 assert!(!result.to_string().contains("guess"), "{result}");
+                // Turned down for now, which says nothing about the login.
+                let result = run(&mail, Some(&login("busy"))).await;
+                assert_eq!(result["up"], 0, "{kind:?} busy: {result}");
+                assert_eq!(result["error"], crate::BUSY, "{kind:?}: {result}");
+                assert!(result.get("signed_in").is_none(), "{kind:?}: {result}");
                 assert!(
                     !leaked.load(Ordering::Relaxed),
                     "{kind:?} sent a password in the clear"

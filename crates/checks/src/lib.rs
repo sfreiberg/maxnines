@@ -195,6 +195,10 @@ impl std::error::Error for Closed {}
 
 /// What a check without TLS says of a server that hung up on its first request
 /// without answering it, which is what a port that only takes TLS does.
+/// Why a server that said it can't take a login just now says nothing about the
+/// login, which a temporary refusal never does.
+pub(crate) const BUSY: &str = "it's too busy, or unavailable";
+
 pub(crate) const TLS_ONLY: &str = "it closed the connection without answering, which a port that only takes TLS does \
      when tls isn't set";
 

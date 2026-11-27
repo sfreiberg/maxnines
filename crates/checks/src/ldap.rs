@@ -24,12 +24,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::sign_in::{Credentials, TLS_NOT_OFFERED, username_and_password};
 use crate::{
-    Closed, Findings, TLS_ANSWER, TLS_ONLY, certificate_verdict, connect, elapsed_secs,
+    BUSY, Closed, Findings, TLS_ANSWER, TLS_ONLY, certificate_verdict, connect, elapsed_secs,
     host_and_port, hung_up, resolve, secure, starts_as_tls,
 };
 
 const NOT_LDAP: &str = "it didn't answer as an LDAP server does";
-const BUSY: &str = "it's too busy, or unavailable";
 
 /// StartTLS's extended operation.
 const START_TLS: &str = "1.3.6.1.4.1.1466.20037";
