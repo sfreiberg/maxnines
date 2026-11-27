@@ -260,9 +260,14 @@ fn performance_data(text: &str) -> Vec<(String, f64)> {
             let Some(end) = end else { break };
             (label, &quoted[end..])
         } else {
-            match rest.find('=') {
+            let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            match rest[..token_end].find('=') {
                 Some(at) => (rest[..at].to_string(), &rest[at..]),
-                None => break,
+                // A word with no value isn't part of the next one's label.
+                None => {
+                    rest = rest[token_end..].trim_start();
+                    continue;
+                }
             }
         };
         let Some(after) = after.strip_prefix('=') else {
@@ -350,6 +355,12 @@ mod tests {
     fn odd_performance_data_is_left_out_but_the_rest_kept() {
         let values = performance_data("a=U b=12xyz c= 'it''s'=3s d=-1.5 'unclosed=4");
         assert_eq!(values, [("it's".to_string(), 3.0), ("d".to_string(), -1.5)]);
+        // A word without a value is left out alone, not joined to the next label.
+        let values = performance_data("junk pl=5% rta=0.1ms");
+        assert_eq!(
+            values,
+            [("pl".to_string(), 5.0), ("rta".to_string(), 0.0001)]
+        );
         assert!(performance_data("no values here").is_empty());
     }
 
