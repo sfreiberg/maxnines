@@ -4681,6 +4681,22 @@ async fn a_pagerduty_channel_keeps_its_region() {
     assert_eq!(status, 422, "{answer}");
 }
 
+/// A token is sent as it's saved, so one with a line break pasted after it would
+/// fail every send.
+#[tokio::test]
+async fn a_slack_token_with_spaces_in_it_is_refused() {
+    let server = start().await;
+    for (credential, app_token) in [("xoxb-1\n", None), ("xoxb-1", Some("xapp-1 "))] {
+        let body = json!({
+            "name": "Chat", "kind": "slack", "target": "#alerts",
+            "credential": credential, "app_token": app_token,
+        });
+        let (status, answer) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+        assert_eq!(status, 422, "{answer}");
+        assert!(answer.to_string().contains("no spaces"), "{answer}");
+    }
+}
+
 #[tokio::test]
 async fn an_on_call_channel_takes_critical_alerts_only_unless_told_otherwise() {
     let server = start().await;
