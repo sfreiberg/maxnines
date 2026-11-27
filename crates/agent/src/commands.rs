@@ -272,9 +272,11 @@ fn performance_data(text: &str) -> Vec<(String, f64)> {
                 }
             }
         };
-        // A quoted label with no value is left out on its own, as a word is.
+        // A quoted label with no value is left out up to the next space, as a word
+        // is, so what follows a quote closed too early isn't read as its own value.
         let Some(after) = after.strip_prefix('=') else {
-            rest = after.trim_start();
+            let end = after.find(char::is_whitespace).unwrap_or(after.len());
+            rest = after[end..].trim_start();
             continue;
         };
         let end = after.find(char::is_whitespace).unwrap_or(after.len());
@@ -366,6 +368,8 @@ mod tests {
             [("pl".to_string(), 5.0), ("rta".to_string(), 0.0001)]
         );
         let values = performance_data("'some note' pl=5%");
+        assert_eq!(values, [("pl".to_string(), 5.0)]);
+        let values = performance_data("'disk /'used=5 pl=5%");
         assert_eq!(values, [("pl".to_string(), 5.0)]);
         assert!(performance_data("no values here").is_empty());
         // Unquoted spaces give one label twice, which keeps its first value.
