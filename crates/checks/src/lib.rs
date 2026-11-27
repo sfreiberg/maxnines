@@ -1016,18 +1016,33 @@ fn dns_query(check: &Check, id: u16) -> Result<Vec<u8>> {
     message.to_vec().map_err(|_| anyhow!("invalid query"))
 }
 
-fn dns_answers(bytes: &[u8], id: u16) -> Result<usize> {
+/// What a DNS answer says: how many records, or that it was cut short to fit in a
+/// datagram, to be asked again over TCP.
+#[derive(Debug, PartialEq)]
+enum DnsAnswer {
+    Records(usize),
+    Truncated,
+}
+
+fn dns_answers(bytes: &[u8], id: u16) -> Result<DnsAnswer> {
     let message = Message::from_vec(bytes).map_err(|_| anyhow!("unreadable DNS answer"))?;
     ensure!(
         message.metadata.id == id,
         "the DNS answer didn't match the question"
     );
+    if message.metadata.truncation {
+        return Ok(DnsAnswer::Truncated);
+    }
     match message.metadata.response_code {
-        ResponseCode::NoError => Ok(message.answers.len()),
+        ResponseCode::NoError => Ok(DnsAnswer::Records(message.answers.len())),
         ResponseCode::NXDomain => bail!("the name wasn't found"),
         _ => bail!("the DNS server refused"),
     }
 }
+
+/// How long a question over UDP waits for its answer before it's asked again, as a
+/// datagram can be lost, until the check's own limit runs out.
+const DNS_ASK_AGAIN: Duration = Duration::from_secs(1);
 
 /// A DNS server is a name or address, with a port only when written as `host:port`
 /// or `[v6]:port`. A bare IPv6 address has colons of its own and no port.
@@ -1064,18 +1079,45 @@ async fn query_server(check: &Check, server: &str, findings: &mut Findings) -> R
 
     // Not for secrecy: this only has to tell one answer from another.
     let id = (Utc::now().timestamp_subsec_nanos() & 0xffff) as u16;
+    let query = dns_query(check, id)?;
     let started = Instant::now();
-    socket
-        .send(&dns_query(check, id)?)
-        .await
-        .map_err(|_| anyhow!("couldn't connect"))?;
     let mut buffer = vec![0; DNS_BUFFER_BYTES];
-    let size = socket
-        .recv(&mut buffer)
-        .await
-        .map_err(|_| anyhow!("couldn't connect"))?;
+    let size = loop {
+        socket
+            .send(&query)
+            .await
+            .map_err(|_| anyhow!("couldn't connect"))?;
+        if let Ok(received) = timeout(DNS_ASK_AGAIN, socket.recv(&mut buffer)).await {
+            break received.map_err(|_| anyhow!("couldn't connect"))?;
+        }
+    };
+    let answer = match dns_answers(&buffer[..size], id)? {
+        // Too big for a datagram, so asked again where it fits.
+        DnsAnswer::Truncated => dns_over_tcp(address, &query, id).await?,
+        answer => answer,
+    };
     findings.dns_secs = Some(elapsed_secs(started));
-    dns_answers(&buffer[..size], id)
+    match answer {
+        DnsAnswer::Records(count) => Ok(count),
+        DnsAnswer::Truncated => bail!("the DNS answer was cut short even over TCP"),
+    }
+}
+
+/// Asks over TCP, as an answer too big for UDP has to be: each message after its
+/// length, in two bytes.
+async fn dns_over_tcp(address: SocketAddr, query: &[u8], id: u16) -> Result<DnsAnswer> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = TcpStream::connect(address)
+        .await
+        .map_err(|_| anyhow!("couldn't connect to the DNS server over TCP"))?;
+    let length = u16::try_from(query.len()).context("the DNS question is too long")?;
+    let mut sent = length.to_be_bytes().to_vec();
+    sent.extend_from_slice(query);
+    stream.write_all(&sent).await?;
+    let length = usize::from(stream.read_u16().await?);
+    let mut answer = vec![0; length];
+    stream.read_exact(&mut answer).await?;
+    dns_answers(&answer, id)
 }
 
 /// Linux, macOS and FreeBSD only let programs with the rights send pings, which
@@ -1880,6 +1922,84 @@ mod tests {
     fn an_unknown_name_from_a_dns_server_is_down() {
         let output = run(&dns_check(serve_dns(ResponseCode::NXDomain, 0)));
         assert_eq!(output["error"], "the name wasn't found");
+    }
+
+    /// An answer for `question` with `answers` A records.
+    fn dns_answer(question: &Message, answers: usize) -> Message {
+        let mut answer = Message::new(question.metadata.id, MessageType::Response, OpCode::Query);
+        for query in &question.queries {
+            answer.add_query(query.clone());
+            for index in 0..answers {
+                answer.add_answer(hickory_proto::rr::Record::from_rdata(
+                    query.name.clone(),
+                    60,
+                    hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A::new(
+                        10,
+                        0,
+                        0,
+                        index as u8,
+                    )),
+                ));
+            }
+        }
+        answer
+    }
+
+    /// A datagram can be lost, so the question is asked again.
+    #[test]
+    fn a_dns_question_that_goes_unanswered_is_asked_again() {
+        let socket = StdUdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = socket.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let mut buffer = [0; 512];
+            // The first is lost.
+            socket.recv_from(&mut buffer).unwrap();
+            let (size, from) = socket.recv_from(&mut buffer).unwrap();
+            let question = Message::from_vec(&buffer[..size]).unwrap();
+            let answer = dns_answer(&question, 1).to_vec().unwrap();
+            socket.send_to(&answer, from).unwrap();
+        });
+        let output = run(&dns_check(address));
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["records"], 1);
+    }
+
+    /// One too big for a datagram comes over TCP, as it's said to be cut short.
+    #[test]
+    fn a_dns_answer_cut_short_is_asked_for_over_tcp() {
+        // A UDP and a TCP socket on one port, which another program can have one of.
+        let (socket, listener) = (0..50)
+            .find_map(|_| {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let socket = StdUdpSocket::bind(listener.local_addr().ok()?).ok()?;
+                Some((socket, listener))
+            })
+            .unwrap();
+        let address = socket.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut buffer = [0; 512];
+            let (size, from) = socket.recv_from(&mut buffer).unwrap();
+            let question = Message::from_vec(&buffer[..size]).unwrap();
+            let mut cut = dns_answer(&question, 0);
+            cut.metadata.truncation = true;
+            socket.send_to(&cut.to_vec().unwrap(), from).unwrap();
+        });
+        thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut length = [0; 2];
+            stream.read_exact(&mut length).unwrap();
+            let mut question = vec![0; usize::from(u16::from_be_bytes(length))];
+            stream.read_exact(&mut question).unwrap();
+            let question = Message::from_vec(&question).unwrap();
+            let answer = dns_answer(&question, 40).to_vec().unwrap();
+            let mut sent = u16::try_from(answer.len()).unwrap().to_be_bytes().to_vec();
+            sent.extend(answer);
+            stream.write_all(&sent).unwrap();
+        });
+        let output = run(&dns_check(address.to_string()));
+        assert_eq!(output["up"], 1, "{output}");
+        assert_eq!(output["records"], 40);
     }
 
     #[test]
