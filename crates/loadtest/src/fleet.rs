@@ -36,7 +36,8 @@ pub struct Counters {
     pub live_samples: AtomicU64,
     pub saved_samples: AtomicU64,
     pub bytes: AtomicU64,
-    pub configs: AtomicU64,
+    /// Agents that have had the config with the load test's rule change in it.
+    pub changed_configs: AtomicU64,
     /// How long connecting took, from opening the socket to having a config.
     pub connect_times: Mutex<Vec<Duration>>,
     pub errors: Mutex<BTreeMap<String, u64>>,
@@ -179,7 +180,13 @@ pub struct SimulatedAgent {
     saved_unconfirmed: Option<DateTime<Utc>>,
     next_churn: Option<Instant>,
     build: u64,
+    /// Whether it's had the config with the rule change in it.
+    changed: bool,
 }
+
+/// How often the load test's rule change has facts reported, which no rule is
+/// likely to have already, so every agent's config changes and it can be told.
+pub const CHANGED_FACTS_INTERVAL: Duration = Duration::from_secs(3593);
 
 impl SimulatedAgent {
     pub fn new(index: usize, identity: Identity, hostname: String, plan: &Plan) -> Self {
@@ -204,6 +211,7 @@ impl SimulatedAgent {
             saved_unconfirmed: None,
             next_churn: next_churn(plan.churn_percent),
             build: 0,
+            changed: false,
         }
     }
 
@@ -295,7 +303,7 @@ impl SimulatedAgent {
                                 self.unconfirmed.retain(|taken_at| *taken_at != time);
                             }
                         }
-                        Ok(ServerMessage::Config { version, .. }) => {
+                        Ok(ServerMessage::Config { version, config }) => {
                             if !timed {
                                 timed = true;
                                 counters
@@ -304,7 +312,11 @@ impl SimulatedAgent {
                                     .unwrap_or_else(PoisonError::into_inner)
                                     .push(began.elapsed());
                             }
-                            counters.configs.fetch_add(1, Relaxed);
+                            // Once for each agent, however often it reconnects.
+                            if !self.changed && config.facts_interval == CHANGED_FACTS_INTERVAL {
+                                self.changed = true;
+                                counters.changed_configs.fetch_add(1, Relaxed);
+                            }
                             let result = AgentMessage::ConfigResult {
                                 version,
                                 error: None,

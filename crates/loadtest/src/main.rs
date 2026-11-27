@@ -286,14 +286,13 @@ async fn run_rule_change(
 ) {
     sleep(at).await;
     let online = plan.counters.online.load(Relaxed);
-    let before = plan.counters.configs.load(Relaxed);
     let began = Instant::now();
 
     let saved = {
         let added = added.clone();
         tokio::task::spawn_blocking(move || {
-            // A setting no rule is likely to have, so every agent's config changes.
-            let settings = json!({ "facts_interval_secs": 3593 });
+            let facts = fleet::CHANGED_FACTS_INTERVAL.as_secs();
+            let settings = json!({ "facts_interval_secs": facts });
             let id = server.add_rule_over_all("Load test rule change", settings)?;
             *lock(&added) = Some(id);
             anyhow::Ok(())
@@ -314,7 +313,7 @@ async fn run_rule_change(
 
     measurements.event("A config rule was added".to_string());
     while began.elapsed() < WAIT_FOR_RECOVERY {
-        if plan.counters.configs.load(Relaxed) >= before + online {
+        if plan.counters.changed_configs.load(Relaxed) >= online {
             measurements.event(format!(
                 "All agents had the new config after {:.1} seconds",
                 began.elapsed().as_secs_f64()
