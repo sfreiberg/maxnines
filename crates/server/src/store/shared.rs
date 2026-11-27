@@ -49,13 +49,13 @@ pub fn shortened(text: &str) -> &str {
     &text[..end]
 }
 
-/// A series of a collector, as its ID, field name, data type and label.
-pub type StoredSeries = (i64, String, DataType, Option<(String, String)>);
+/// A series of a collector, as its ID, field name, data type and labels, by name.
+pub type StoredSeries = (i64, String, DataType, BTreeMap<String, String>);
 
-/// One thing a collector reported on, as its label and its fields.
+/// One thing a collector reported on, as its labels and its fields.
 #[derive(Default)]
 struct Item {
-    label: Option<(String, String)>,
+    labels: BTreeMap<String, String>,
     fields: serde_json::Map<String, Value>,
 }
 
@@ -66,27 +66,27 @@ pub fn rebuilt_output(
     numbers: &HashMap<i64, f64>,
     texts: &HashMap<i64, String>,
 ) -> Option<Value> {
-    // An item with no number in the latest sample wasn't in it.
-    let current: HashSet<&Option<(String, String)>> = series
+    // An item with no number in the latest sample wasn't in it. Each item is one set
+    // of labels, all of them together.
+    let current: HashSet<&BTreeMap<String, String>> = series
         .iter()
         .filter(|(id, ..)| numbers.contains_key(id))
-        .map(|(_, _, _, label)| label)
+        .map(|(_, _, _, labels)| labels)
         .collect();
 
-    let mut items: BTreeMap<String, (i64, Item)> = BTreeMap::new();
-    let current_series = series.iter().filter(|(.., label)| current.contains(label));
-    for (id, field, data_type, label) in current_series {
+    let mut items: BTreeMap<&BTreeMap<String, String>, (i64, Item)> = BTreeMap::new();
+    let current_series = series
+        .iter()
+        .filter(|(.., labels)| current.contains(labels));
+    for (id, field, data_type, labels) in current_series {
         let value = match (numbers.get(id), texts.get(id)) {
             (Some(number), _) => stored_number(*number, *data_type),
             (None, Some(text)) => Value::from(text.clone()),
             (None, None) => continue,
         };
-        let key = label
-            .as_ref()
-            .map_or_else(String::new, |(_, value)| value.clone());
-        let (first, item) = items.entry(key).or_insert_with(|| {
+        let (first, item) = items.entry(labels).or_insert_with(|| {
             let item = Item {
-                label: label.clone(),
+                labels: labels.clone(),
                 ..Item::default()
             };
             (*id, item)
@@ -100,11 +100,11 @@ pub fn rebuilt_output(
 
     let mut items: Vec<(i64, Item)> = items.into_values().collect();
     items.sort_by_key(|(first, _)| *first);
-    if items.len() == 1 && items[0].1.label.is_none() {
+    if items.len() == 1 && items[0].1.labels.is_empty() {
         return items.pop().map(|(_, item)| Value::Object(item.fields));
     }
     let rebuilt = items.into_iter().map(|(_, mut item)| {
-        if let Some((name, value)) = item.label {
+        for (name, value) in item.labels {
             item.fields.insert(name, Value::from(value));
         }
         Value::Object(item.fields)

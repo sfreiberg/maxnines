@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -15,7 +15,8 @@ use super::rollups::{
     hours_to_redo, is_due, kept_since, tier_for,
 };
 use super::shared::{
-    MAX_NAME_BYTES, MAX_SERIES_PER_HOST, labels_key, rebuilt_output, shortened, top_of,
+    MAX_NAME_BYTES, MAX_SERIES_PER_HOST, StoredSeries, labels_key, rebuilt_output, shortened,
+    top_of,
 };
 use super::{CollectorStats, MetricsReader, NewSample, Store, StoreStats, can_store};
 use crate::calculations::{Calculation, CalculationQuery, SMALLEST_STEP, numbered};
@@ -1398,7 +1399,17 @@ impl MetricsReader for DuckDbReader {
                 label,
             ))
         })?;
-        let series: Vec<_> = rows.collect::<Result<_, _>>()?;
+        // A row for each of a series' labels, in order of series, gathered into one.
+        let mut series: Vec<StoredSeries> = Vec::new();
+        for row in rows {
+            let (id, field, data_type, label) = row?;
+            if series.last().is_none_or(|(last, ..)| *last != id) {
+                series.push((id, field, data_type, BTreeMap::new()));
+            }
+            if let (Some((name, value)), Some((.., labels))) = (label, series.last_mut()) {
+                labels.insert(name, value);
+            }
+        }
         let Some(ids) = series
             .iter()
             .map(|(id, ..)| id.to_string())

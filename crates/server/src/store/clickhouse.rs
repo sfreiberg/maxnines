@@ -1464,9 +1464,12 @@ impl MetricsReader for ClickHouseReader {
             .map(|(place, series)| {
                 let place = place as i64;
                 let data_type = data_types.get(&place).copied().unwrap_or(DataType::Text);
-                let label = series.labels.iter().next();
-                let label = label.map(|(name, value)| (name.clone(), value.clone()));
-                (place, field(&series.metric), data_type, label)
+                (
+                    place,
+                    field(&series.metric),
+                    data_type,
+                    series.labels.clone(),
+                )
             })
             .collect();
         Ok(rebuilt_output(&series, &numbers, &texts))

@@ -1917,3 +1917,38 @@ fn a_metric_of_a_template_added_later_is_rolled_up_from_what_is_stored() {
     // And what was rolled up before is as it was.
     assert_eq!(averages(&chart_of(&store, "a", "cpu.usage", range, HOUR).series[0]), [10.0]);
 }
+
+#[test]
+fn the_latest_output_keeps_each_set_of_labels_its_own() {
+    let mut store = in_memory();
+    let _catalog = with_shop(&mut store);
+    let rows = shop_rows(&[
+        (&[("instance", "main"), ("region", "north")], json!({ "waiting": 4 })),
+        (&[("instance", "main"), ("region", "south")], json!({ "waiting": 9 })),
+        (&[("instance", "spare"), ("region", "north")], json!({ "waiting": 1 })),
+        (&[("instance", "main")], json!({ "tills": 3 })),
+    ]);
+    write_metric(&mut store, "a", 1000, "template.shop", rows);
+
+    // In the order first seen on DuckDB, which ClickHouse, keeping no series
+    // numbers, can't tell, so they're compared in any order.
+    let output = latest_output(&store, "a", "template.shop").unwrap();
+    let mut items: Vec<String> = output
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(Value::to_string)
+        .collect();
+    items.sort();
+    let mut expected: Vec<String> = [
+        json!({ "instance": "main", "region": "north", "waiting": 4 }),
+        json!({ "instance": "main", "region": "south", "waiting": 9 }),
+        json!({ "instance": "spare", "region": "north", "waiting": 1 }),
+        json!({ "instance": "main", "tills": 3 }),
+    ]
+    .iter()
+    .map(Value::to_string)
+    .collect();
+    expected.sort();
+    assert_eq!(items, expected);
+}
