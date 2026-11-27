@@ -26,24 +26,52 @@ fn parse_apt(text: &str) -> Updates {
         .lines()
         .filter(|line| line.starts_with("Inst "))
         .collect();
-    let security = installs
-        .iter()
-        .filter(|line| line.to_lowercase().contains("security"))
-        .count();
+    let security = installs.iter().filter(|line| from_security(line)).count();
     Updates {
         pending: installs.len() as u64,
         security: Some(security as u64),
     }
 }
 
+/// Whether an `Inst` line's new version comes from a security archive, as
+/// `Ubuntu:22.04/jammy-security` or `Debian-Security:12/stable-security`, named in
+/// brackets after the package, whose own name may say security too.
+#[cfg(any(target_os = "linux", test))]
+fn from_security(line: &str) -> bool {
+    let Some((_, sources)) = line.split_once('(') else {
+        return false;
+    };
+    let sources = sources.split(')').next().unwrap_or_default();
+    // The new version, then each archive it's in, separated by commas.
+    sources.split(',').any(|source| {
+        let archive = source.split_whitespace().find(|word| word.contains(':'));
+        archive.is_some_and(|archive| {
+            let (origin, rest) = archive.split_once(':').unwrap_or_default();
+            let suite = rest.rsplit('/').next().unwrap_or_default();
+            origin.eq_ignore_ascii_case("Debian-Security") || suite.ends_with("-security")
+        })
+    })
+}
+
 /// `dnf check-update` lists a package a line, as name, version and repository, then
-/// any packages being replaced under a heading of their own.
+/// any packages being replaced under a heading of their own. A name too long for its
+/// column is on a line of its own, with the version and repository on the next.
 #[cfg(any(target_os = "linux", test))]
 fn parse_dnf(text: &str) -> u64 {
-    text.lines()
+    let mut count = 0;
+    let mut name_alone = false;
+    for line in text
+        .lines()
         .take_while(|line| !line.starts_with("Obsoleting"))
-        .filter(|line| line.split_whitespace().count() == 3)
-        .count() as u64
+    {
+        match line.split_whitespace().count() {
+            3 => count += 1,
+            2 if name_alone => count += 1,
+            _ => {}
+        }
+        name_alone = line.split_whitespace().count() == 1 && !line.starts_with(' ');
+    }
+    count
 }
 
 /// `dnf updateinfo list --security` lists an advisory a line, with the package it fixes
@@ -193,12 +221,13 @@ Reading package lists...
 Inst openssl [3.0.2-0ubuntu1.10] (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates, Ubuntu:22.04/jammy-security [amd64])
 Inst tzdata [2024a-0ubuntu0.22.04] (2024a-0ubuntu0.22.04.1 Ubuntu:22.04/jammy-updates [all])
 Inst libc6 [2.36-9] (2.36-9+deb12u4 Debian-Security:12/stable-security [amd64])
+Inst libsecurity-perl [1.0-1] (1.0-2 Debian:12/stable [all])
 Conf openssl (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates [amd64])
 ";
         assert_eq!(
             parse_apt(output),
             Updates {
-                pending: 3,
+                pending: 4,
                 security: Some(2),
             }
         );
@@ -210,10 +239,12 @@ Conf openssl (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates [amd64])
         let output = "
 kernel.x86_64                  6.8.9-300.fc40           updates
 openssl-libs.x86_64            1:3.2.1-6.fc40           updates
+python3-some-package-with-a-very-long-name.noarch
+                               1.2.3-1.fc40             updates
 Obsoleting Packages
 grub2-tools.x86_64             1:2.06-120.fc40          updates
 ";
-        assert_eq!(parse_dnf(output), 2);
+        assert_eq!(parse_dnf(output), 3);
     }
 
     #[test]
