@@ -215,6 +215,16 @@ fn pages_to_view(host_id: &str) -> Vec<(String, String)> {
     pages
 }
 
+/// Sleeps for `wait`, a little at a time, so a run that's finished isn't held up.
+fn wait_unless_finished(wait: Duration, finished: &AtomicBool) {
+    let until = Instant::now() + wait;
+    while Instant::now() < until && !finished.load(Relaxed) {
+        thread::sleep(
+            Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())),
+        );
+    }
+}
+
 fn view_pages(
     server: Server,
     pages: Vec<(String, String)>,
@@ -222,7 +232,7 @@ fn view_pages(
     measurements: Arc<Measurements>,
     finished: Arc<AtomicBool>,
 ) {
-    thread::sleep(every.mul_f64(rand::random()));
+    wait_unless_finished(every.mul_f64(rand::random()), &finished);
     while !finished.load(Relaxed) {
         let round = Instant::now();
         for (label, path) in &pages {
@@ -233,11 +243,7 @@ fn view_pages(
             times.bytes = load.bytes.max(times.bytes);
             times.errors += usize::from(!load.ok);
         }
-        let wait = every.saturating_sub(round.elapsed());
-        let until = Instant::now() + wait;
-        while Instant::now() < until && !finished.load(Relaxed) {
-            thread::sleep(Duration::from_millis(100));
-        }
+        wait_unless_finished(every.saturating_sub(round.elapsed()), &finished);
     }
 }
 
