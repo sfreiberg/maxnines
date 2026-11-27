@@ -1180,10 +1180,18 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
                 .collect();
             // Pings give milliseconds.
             let seconds: Vec<f64> = numbers.iter().map(|ms| ms / 1000.0).collect();
-            if let [min, _, max, stddev] = seconds[..] {
-                findings.rtt_min_secs = Some(min);
-                findings.rtt_max_secs = Some(max);
-                findings.rtt_stddev_secs = Some(stddev);
+            // BusyBox, as on Alpine, gives no standard deviation.
+            match seconds[..] {
+                [min, _, max, stddev] => {
+                    findings.rtt_min_secs = Some(min);
+                    findings.rtt_max_secs = Some(max);
+                    findings.rtt_stddev_secs = Some(stddev);
+                }
+                [min, _, max] => {
+                    findings.rtt_min_secs = Some(min);
+                    findings.rtt_max_secs = Some(max);
+                }
+                _ => {}
             }
         }
     }
@@ -2086,6 +2094,14 @@ mod tests {
         read_ping_summary(bsd, &mut findings);
         assert_eq!(findings.packet_loss_percent, Some(0.0));
         assert!((findings.rtt_min_secs.unwrap() - 0.0001).abs() < 1e-12);
+
+        let busybox = "3 packets transmitted, 3 packets received, 0% packet loss\n\
+                       round-trip min/avg/max = 0.064/0.084/0.105 ms\n";
+        let mut findings = Findings::default();
+        read_ping_summary(busybox, &mut findings);
+        assert!(close(findings.rtt_min_secs, 0.000064), "{findings:?}");
+        assert!(close(findings.rtt_max_secs, 0.000105), "{findings:?}");
+        assert_eq!(findings.rtt_stddev_secs, None);
     }
 
     #[cfg(unix)]
