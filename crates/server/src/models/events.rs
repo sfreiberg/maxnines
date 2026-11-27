@@ -23,9 +23,13 @@ use crate::times::Timestamp;
 
 /// The most of a host's events a timeline holds, newest first.
 pub const MAX_TIMELINE: u64 = 500;
-/// How many annotations in a range are looked at to find a host's, as each one's
-/// filter is checked against it.
-const MAX_CANDIDATES: u64 = 10_000;
+/// How many annotations in a range are loaded at a time to find a host's, as each
+/// one's filter is checked against it, until there are enough or none are left.
+#[cfg(not(test))]
+const CANDIDATES_AT_ONCE: u64 = 1_000;
+/// Few, so tests go through several pages.
+#[cfg(test)]
+const CANDIDATES_AT_ONCE: u64 = 3;
 
 fn snapshot(row: &event::Model) -> Snapshot {
     let fields = json!({
@@ -205,30 +209,52 @@ impl Database {
         let mut timeline = Vec::new();
 
         // Two recorded in the same moment are newest first by when they were added,
-        // as the list of annotations has them, and the sort below keeps that.
-        let recorded = event::Entity::find()
-            .filter(event::Column::OccurredAt.gte(from))
-            .filter(event::Column::OccurredAt.lte(to))
-            .order_by_desc(event::Column::OccurredAt)
-            .order_by_desc(event::Column::Id)
-            .limit(MAX_CANDIDATES)
-            .all(&self.connection)
-            .await
-            .context("loading events")?;
-        timeline.extend(
-            recorded
-                .into_iter()
-                .filter(|row| picks(row.filter.as_deref()))
-                .take(MAX_TIMELINE as usize)
-                .map(|row| TimelineEvent {
-                    occurred_at: row.occurred_at,
-                    kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
-                    title: row.title,
-                    detail: row.detail,
-                    created_by: (row.created_by != SERVER).then_some(row.created_by),
-                    id: Some(row.id),
-                }),
-        );
+        // as the list of annotations has them, and the sort below keeps that. They're
+        // read a page at a time, each after the last one read, as however many
+        // other hosts' there are, this host's own mustn't be missed.
+        let mut after: Option<(Timestamp, i64)> = None;
+        while timeline.len() < MAX_TIMELINE as usize {
+            let mut page = event::Entity::find()
+                .filter(event::Column::OccurredAt.gte(from))
+                .filter(event::Column::OccurredAt.lte(to));
+            if let Some((occurred_at, id)) = after {
+                page = page.filter(
+                    Condition::any()
+                        .add(event::Column::OccurredAt.lt(occurred_at))
+                        .add(
+                            Condition::all()
+                                .add(event::Column::OccurredAt.eq(occurred_at))
+                                .add(event::Column::Id.lt(id)),
+                        ),
+                );
+            }
+            let rows = page
+                .order_by_desc(event::Column::OccurredAt)
+                .order_by_desc(event::Column::Id)
+                .limit(CANDIDATES_AT_ONCE)
+                .all(&self.connection)
+                .await
+                .context("loading events")?;
+            let full = rows.len() as u64 == CANDIDATES_AT_ONCE;
+            after = rows.last().map(|row| (row.occurred_at, row.id));
+            let room = MAX_TIMELINE as usize - timeline.len();
+            timeline.extend(
+                rows.into_iter()
+                    .filter(|row| picks(row.filter.as_deref()))
+                    .take(room)
+                    .map(|row| TimelineEvent {
+                        occurred_at: row.occurred_at,
+                        kind: EventKind::parse(&row.kind).unwrap_or(EventKind::Note),
+                        title: row.title,
+                        detail: row.detail,
+                        created_by: (row.created_by != SERVER).then_some(row.created_by),
+                        id: Some(row.id),
+                    }),
+            );
+            if !full {
+                break;
+            }
+        }
 
         let in_range =
             |column: alert::Column| Condition::all().add(column.gte(from)).add(column.lte(to));

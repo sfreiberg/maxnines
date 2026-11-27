@@ -269,6 +269,39 @@ async fn a_timeline_gives_the_newest_of_what_it_holds_from_and_to_included() {
     assert_eq!(titles(events.as_array().unwrap()), ["second"]);
 }
 
+/// Annotations are looked through a few at a time in tests, so a host's own are
+/// found past many of other hosts', including ones made in the same moment.
+#[tokio::test]
+async fn a_hosts_annotations_are_found_past_many_of_other_hosts() {
+    let server = start().await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let same = "2026-11-20T09:30:00Z";
+    let mut made = vec![("web oldest", "role=web", "2026-11-20T09:00:00Z")];
+    for n in 0..4 {
+        made.push((["db a", "db b", "db c", "db d"][n], "role=db", same));
+    }
+    made.push(("web same moment", "role=web", same));
+    for n in 0..4 {
+        made.push((["db e", "db f", "db g", "db h"][n], "role=db", same));
+    }
+    made.push(("db newest", "role=db", "2026-11-20T09:59:00Z"));
+    for (title, filter, occurred_at) in made {
+        let annotation = json!({ "title": title, "filter": filter, "occurred_at": occurred_at });
+        let (status, answer) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
+        assert_eq!(status, 201, "{answer}");
+    }
+
+    let path = format!(
+        "/api/v1/hosts/{}/events?from=2026-11-20T08:00:00Z&to=2026-11-20T11:00:00Z",
+        web.id()
+    );
+    let (_, events) = api(&server, "GET", &path, &Value::Null).await;
+    assert_eq!(
+        titles(events.as_array().unwrap()),
+        ["web same moment", "web oldest"]
+    );
+}
+
 /// Asked for without a `to`, a timeline runs up to now, now included, so what was
 /// added in the same millisecond as the question is there.
 #[tokio::test]
