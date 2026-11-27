@@ -301,6 +301,13 @@ pub async fn run_signed_in(check: &Check, credentials: Option<&Credentials>) -> 
     let result = timeout(limit(check), work)
         .await
         .unwrap_or_else(|_| Err(timed_out()));
+    // A database that turned the login down says so as other kinds do.
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<sign_in::LoginRefused>())
+    {
+        findings.signed_in = Some(false);
+    }
     if result.is_ok() {
         findings.response_secs = Some(elapsed_secs(started));
     }

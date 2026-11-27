@@ -116,6 +116,28 @@ pub fn sign_in_problem(check: &Check, username: bool, secret: bool) -> Option<&'
 pub const SIGN_IN_REQUIRED: &str = "a MySQL or MariaDB check has to sign in with a username, \
     as MySQL counts a check that only reads its greeting toward blocking the host it's checked from";
 
+/// A database turning down the account and password it was given, as opposed to
+/// anything else going wrong, so the check says the login was refused, as mail, SSH,
+/// LDAP and MQTT checks do.
+#[derive(Debug)]
+pub(crate) struct LoginRefused(String);
+
+impl fmt::Display for LoginRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LoginRefused {}
+
+/// `error` as it's said, marked as a refused login when it's one.
+fn login_refused_if(refused: bool, error: anyhow::Error) -> anyhow::Error {
+    match refused {
+        true => anyhow::Error::new(LoginRefused(error.to_string())),
+        false => error,
+    }
+}
+
 /// TLS for a driver: the certificate checked as for a site, or not at all for a
 /// check told not to mind.
 fn driver_tls(insecure: bool) -> Result<ClientConfig> {
@@ -237,7 +259,17 @@ pub(crate) async fn postgres_client(
     }
     let tls =
         tokio_postgres_rustls::MakeRustlsConnect::new(driver_tls(check.insecure == Some(true))?);
-    let (client, connection) = config.connect(tls).await.map_err(pg_short)?;
+    let (client, connection) = config.connect(tls).await.map_err(|error| {
+        use tokio_postgres::error::SqlState;
+        let refused = error.as_db_error().is_some_and(|database| {
+            [
+                SqlState::INVALID_PASSWORD,
+                SqlState::INVALID_AUTHORIZATION_SPECIFICATION,
+            ]
+            .contains(database.code())
+        });
+        login_refused_if(refused, pg_short(error))
+    })?;
     let running = tokio::spawn(async move {
         let _ = connection.await;
     });
@@ -284,7 +316,14 @@ pub(crate) async fn check_clickhouse(
                 .await
         }
         Some(credentials) => {
-            let version = Clickhouse::new(check, credentials)?.version().await?;
+            let version = Clickhouse::new(check, credentials)?
+                .version()
+                .await
+                .map_err(|error| {
+                    // Such as "default: Authentication failed: password is incorrect".
+                    let refused = error.to_string().contains("Authentication failed");
+                    login_refused_if(refused, error)
+                })?;
             findings.server_version = Some(version);
             findings.signed_in = Some(true);
             Ok(())
@@ -313,7 +352,11 @@ pub(crate) async fn mysql_connection(
             .with_danger_accept_invalid_certs(check.insecure == Some(true));
         options = options.ssl_opts(tls);
     }
-    mysql_async::Conn::new(options).await.map_err(short)
+    mysql_async::Conn::new(options).await.map_err(|error| {
+        // Access denied, by password or, over the socket, by who's asking.
+        let refused = matches!(&error, mysql_async::Error::Server(server) if matches!(server.code, 1045 | 1698));
+        login_refused_if(refused, short(error))
+    })
 }
 
 /// Whether a host is this machine itself, which a password can be sent to without
@@ -380,7 +423,11 @@ pub(crate) async fn check_redis(
     let mut connection = client
         .get_multiplexed_async_connection_with_config(&config)
         .await
-        .map_err(short)?;
+        .map_err(|error| {
+            let refused = error.kind() == redis::ErrorKind::AuthenticationFailed
+                || error.code() == Some("WRONGPASS");
+            login_refused_if(refused, short(error))
+        })?;
     let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut connection).await;
     match pong {
         Ok(_) => {}
@@ -499,9 +546,10 @@ pub(crate) fn mongodb_client(
 pub(crate) fn mongodb_error(error: &mongodb::error::Error) -> anyhow::Error {
     use mongodb::error::ErrorKind;
     match &*error.kind {
-        ErrorKind::Authentication { message, .. } => {
-            short(format!("it didn't accept the login: {message}"))
-        }
+        ErrorKind::Authentication { message, .. } => login_refused_if(
+            true,
+            short(format!("it didn't accept the login: {message}")),
+        ),
         // The message repeats the whole command, which says nothing more.
         ErrorKind::Command(command) if command.code == 13 => {
             anyhow!("the account isn't allowed to ({})", command.code_name)
@@ -833,6 +881,7 @@ mod tests {
         )
         .await;
         assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["signed_in"], false, "{result}");
         assert!(!result.to_string().contains("guess"), "{result}");
     }
 
@@ -968,20 +1017,29 @@ mod tests {
             ("MAXNINES_TEST_CHECK_POSTGRES", CheckKind::Postgres),
             ("MAXNINES_TEST_CHECK_MYSQL", CheckKind::Mysql),
             ("MAXNINES_TEST_CHECK_MONGODB", CheckKind::Mongodb),
+            ("MAXNINES_TEST_CHECK_CLICKHOUSE", CheckKind::Clickhouse),
         ] {
             let Some((target, credentials)) = real(variable) else {
                 continue;
             };
             let check = Check::new("real", kind, &target);
             let result = run(&check, None).await;
-            assert_eq!(result["up"], 1, "{variable} without signing in: {result}");
+            // MySQL is never checked without signing in.
+            let up = u8::from(kind != CheckKind::Mysql);
+            assert_eq!(result["up"], up, "{variable} without signing in: {result}");
             let result = run(&check, Some(&credentials)).await;
             assert_eq!(result["signed_in"], true, "{variable}: {result}");
             assert!(result["server_version"].is_string(), "{result}");
+            // MySQL answers a user it hasn't got with a way of signing in the driver
+            // doesn't know, so it's told a wrong password for one it has.
             let mut wrong = credentials.clone();
-            wrong.username = Some("nobody_at_all".to_string());
+            if kind != CheckKind::Mysql {
+                wrong.username = Some("nobody_at_all".to_string());
+            }
+            wrong.password = Some("wrong".to_string());
             let result = run(&check, Some(&wrong)).await;
             assert_eq!(result["up"], 0, "{variable} as nobody: {result}");
+            assert_eq!(result["signed_in"], false, "{variable} as nobody: {result}");
         }
     }
 
