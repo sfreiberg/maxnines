@@ -273,6 +273,9 @@ impl Rules {
     }
 }
 
+/// How long an agent waiting for approval is kept without trying to connect.
+pub const PENDING_LIFETIME: chrono::TimeDelta = chrono::TimeDelta::days(7);
+
 pub struct Registry {
     /// Only ever held for a moment, never while waiting on the database.
     hosts: RwLock<BTreeMap<String, HostRecord>>,
@@ -284,6 +287,9 @@ pub struct Registry {
     refusing: Mutex<()>,
     /// When each waiting agent last tried to connect. In memory, as it asks again.
     asked: std::sync::Mutex<BTreeMap<String, Timestamp>>,
+    /// When the server started, from which a waiting agent it hasn't heard from
+    /// since has its whole [`PENDING_LIFETIME`] to try again.
+    started_at: Timestamp,
     rules: Rules,
     max_pending: usize,
     database: Database,
@@ -303,6 +309,7 @@ impl Registry {
             changing: Mutex::new(()),
             refusing: Mutex::new(()),
             asked: std::sync::Mutex::default(),
+            started_at: times::now(),
             rules,
             max_pending,
             database,
@@ -579,6 +586,49 @@ impl Registry {
         Ok(Some(host))
     }
 
+    /// Deletes the waiting agents that haven't tried to connect for
+    /// [`PENDING_LIFETIME`], so a pending list filled by anyone who can reach the
+    /// port empties itself. One that tries again is waiting anew. Gives the IDs
+    /// deleted.
+    pub async fn clear_stale_pending(&self, now: Timestamp) -> Result<Vec<String>> {
+        let _changing = self.changing.lock().await;
+        let stale: Vec<String> = {
+            let asked = self.asked.lock().unwrap_or_else(PoisonError::into_inner);
+            self.read(|hosts| {
+                hosts
+                    .values()
+                    .filter(|host| host.state == HostState::Pending && !host.is_agentless())
+                    .filter(|host| {
+                        let heard = [Some(host.first_seen_at), Some(self.started_at)]
+                            .into_iter()
+                            .chain([asked.get(&host.id).copied()])
+                            .flatten()
+                            .max()
+                            .unwrap_or(now);
+                        now - heard >= PENDING_LIFETIME
+                    })
+                    .map(|host| host.id.clone())
+                    .collect()
+            })
+        };
+        for id in &stale {
+            self.database.delete_host(id).await?;
+            self.write().remove(id);
+            self.asked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(id);
+            info!(
+                host_id = id,
+                "deleted a host that waited for approval and stopped asking"
+            );
+        }
+        if !stale.is_empty() {
+            self.revisions.send_modify(|revision| *revision += 1);
+        }
+        Ok(stale)
+    }
+
     /// Takes a deleted agent off the list. If it connects again, it's new.
     pub async fn forget(&self, id: &str) {
         let _changing = self.changing.lock().await;
@@ -648,6 +698,8 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use chrono::TimeDelta;
 
     use crate::config::Config;
 
@@ -980,6 +1032,48 @@ mod tests {
         }
 
         assert_eq!(registry.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_stops_asking_to_be_approved_is_cleared_after_a_week() {
+        let registry = registry(SUBNET_RULE).await;
+        let now = times::now();
+        registry
+            .admit(&request("asked", "web-1", "1.2.3.4"))
+            .await
+            .unwrap();
+        registry
+            .admit(&request("approved", "web-2", "10.0.0.1"))
+            .await
+            .unwrap();
+        // Waiting from long before the server started, which it can't have heard
+        // from since, so it has a whole week from the start.
+        let mut old = registry.get("asked").await.unwrap();
+        old.id = "old".to_string();
+        old.first_seen_at = now - TimeDelta::days(30);
+        registry.insert_for_test(old).await;
+
+        let early = now + PENDING_LIFETIME - TimeDelta::minutes(1);
+        assert!(
+            registry
+                .clear_stale_pending(early)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let late = now + PENDING_LIFETIME + TimeDelta::minutes(1);
+        let mut cleared = registry.clear_stale_pending(late).await.unwrap();
+        cleared.sort();
+        assert_eq!(cleared, ["asked", "old"]);
+        let left: Vec<String> = registry.list().await.into_iter().map(|h| h.id).collect();
+        assert_eq!(left, ["approved"]);
+        let saved = registry.database.load_hosts().await.unwrap();
+        assert!(saved.iter().all(|host| host.id != "asked"));
+
+        // Asking again, it waits anew.
+        let status = registry.admit(&request("asked", "web-1", "1.2.3.4")).await;
+        assert_eq!(status.unwrap(), RegistrationStatus::Pending);
     }
 
     #[tokio::test]

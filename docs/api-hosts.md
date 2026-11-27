@@ -2,7 +2,8 @@
 
 A host is a computer whose agent reports to this server, or something with no agent
 that the server reads from itself. Its `kind` says which: `agent` or `agentless`. A
-host's `state` is `pending`, `approved` or `revoked`. Its `health` is `critical`,
+host's `state` is `pending`, `approved` or `revoked`. A pending host whose agent stops
+trying to connect is deleted after 7 days, and waits again if it comes back. Its `health` is `critical`,
 `warning`, `offline`, `online` or `not_read`, and problems outrank being online. A
 host with no agent is `not_read` while it has no page being read or check being run,
 as it's then neither online nor offline. Its `public_key` is `null`, as it has no agent

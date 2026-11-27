@@ -96,7 +96,9 @@ database {
 }
 
 registration {
-  # New agents waiting for approval, after which new requests are ignored.
+  # New agents waiting for approval, after which new requests are ignored,
+  # except from agents a rule approves. One that stops trying to connect is
+  # deleted after 7 days, and waits anew if it comes back.
   max_pending = 1000
 
   # Rules run in order and the first match decides. With no match, an agent

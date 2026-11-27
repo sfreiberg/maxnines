@@ -62,6 +62,23 @@ mod two_factor;
 mod unifi;
 mod views;
 
+/// Once an hour, deletes the agents that waited for approval and stopped asking.
+fn spawn_pending_clearing(state: AppState) {
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            every.tick().await;
+            if let Err(error) = state.clear_stale_pending(crate::times::now()).await {
+                warn!(
+                    error = format!("{error:#}"),
+                    "couldn't clear agents that stopped asking to be approved"
+                );
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -72,7 +89,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{info, warn};
 
 use alert_evaluator::Evaluator;
 use app_state::{AppState, Heartbeat};
@@ -502,6 +519,7 @@ async fn serve(path: &Path) -> Result<()> {
     )
     .spawn();
     server_stats::spawn_recorder(state.clone());
+    spawn_pending_clearing(state.clone());
     templates::own_database::start(&database_url, state.database.clone(), state.writer.clone());
     // The server is always online to itself, so nothing reads it as missing.
     state

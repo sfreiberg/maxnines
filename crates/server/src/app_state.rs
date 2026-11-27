@@ -191,6 +191,16 @@ impl AppState {
         Ok(HostDeletion::Deleted)
     }
 
+    /// Deletes the agents that waited for approval and stopped trying to connect, as
+    /// [`Registry::clear_stale_pending`](crate::registration::Registry::clear_stale_pending)
+    /// says.
+    pub async fn clear_stale_pending(&self, now: Timestamp) -> Result<()> {
+        for id in self.registry.clear_stale_pending(now).await? {
+            self.presence.forget(&id);
+        }
+        Ok(())
+    }
+
     /// Where calculations get their answers.
     pub fn sources(&self) -> Sources<'_> {
         Sources {
