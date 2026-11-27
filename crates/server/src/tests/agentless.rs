@@ -1097,6 +1097,11 @@ async fn a_checks_password_is_kept_but_never_given_back() {
     let slower = check(json!({ "username": "maxnines", "interval_secs": 300 }));
     assert_eq!(api(&server, "PUT", &path, &slower).await.0, 204);
     assert_eq!(saved().await.password.as_deref(), Some("s3cret"));
+    // Never for another server, where whoever changed it could read it.
+    let mut moved = slower.clone();
+    moved["check"]["target"] = json!("127.0.0.2:1");
+    assert_eq!(api(&server, "PUT", &path, &moved).await.0, 204);
+    assert_eq!(saved().await.password, None);
     let plain = check(json!({ "sign_in": "none" }));
     assert_eq!(api(&server, "PUT", &path, &plain).await.0, 204);
     assert_eq!(saved().await, crate::remote_checks::SignIn::default());

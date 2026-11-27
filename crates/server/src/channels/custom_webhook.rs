@@ -390,10 +390,11 @@ impl ChannelType for CustomWebhook {
                 .map_err(|error| explain_http("the webhook", &error))?;
             let status = response.status();
             if !status.is_success() {
+                let secrets = secrets(url, &headers);
                 bail!(
                     "the webhook returned status {}{}",
                     status.as_u16(),
-                    reply(response)
+                    reply(response, &secrets)
                 );
             }
             Ok(None)
@@ -405,17 +406,58 @@ impl ChannelType for CustomWebhook {
 /// How much of a refusal to show.
 const MAX_REPLY_LEN: usize = 300;
 
+/// What stands in for a secret a receiver said back.
+const HIDDEN: &str = "[hidden]";
+
+/// The shortest part of a secret that's hidden on its own. Shorter ones, like `api`
+/// in a path, give nothing away.
+const MIN_SECRET_PART: usize = 6;
+
+/// What a receiver may say back that has to stay hidden: the address, which often
+/// holds a token, and the headers' values, as a whole and word by word.
+fn secrets(url: &str, headers: &[(String, String)]) -> Vec<String> {
+    let mut found = vec![url.to_string()];
+    if let Ok(parsed) = url::Url::parse(url) {
+        found.push(parsed.path().to_string());
+        found.extend(parsed.query().map(str::to_string));
+        found.extend(
+            parsed
+                .path_segments()
+                .into_iter()
+                .flatten()
+                .map(str::to_string),
+        );
+        found.extend(parsed.query_pairs().map(|(_, value)| value.into_owned()));
+    }
+    for (_, value) in headers {
+        found.push(value.clone());
+        found.extend(value.split_whitespace().map(str::to_string));
+    }
+    found.retain(|secret| secret.chars().count() >= MIN_SECRET_PART);
+    // The longest first, so none is left half hidden by a part of it.
+    found.sort_by_key(|secret| std::cmp::Reverse(secret.len()));
+    found.dedup();
+    found
+}
+
 /// The start of what a receiver said when it refused a request, which usually
-/// says what was wrong with the body. It's the receiver's own words, so it holds
-/// nothing of the channel's secrets.
-fn reply(response: ureq::http::Response<ureq::Body>) -> String {
+/// says what was wrong with the body. Receivers often say back the path or the
+/// headers they were sent, so `secrets` are hidden in it.
+fn reply(response: ureq::http::Response<ureq::Body>, secrets: &[String]) -> String {
     let mut body = response.into_body();
     let text = body
         .with_config()
         .limit(16 * 1024)
         .read_to_string()
         .unwrap_or_default();
-    let text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    shown_reply(&text, secrets)
+}
+
+fn shown_reply(text: &str, secrets: &[String]) -> String {
+    let mut text: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for secret in secrets {
+        text = text.replace(secret.as_str(), HIDDEN);
+    }
     if text.is_empty() {
         return String::new();
     }
@@ -579,6 +621,28 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("too big"), "{error}");
+    }
+
+    #[test]
+    fn a_refusal_never_says_back_the_address_or_the_headers() {
+        let headers = headers("Authorization: Bearer abc123token\nX-Team: ops").unwrap();
+        let secrets = secrets(
+            "https://hooks.example.com/api/T0K3N-xyz?key=s3cr3tkey",
+            &headers,
+        );
+        for (said, shown) in [
+            ("Cannot POST /api/T0K3N-xyz", ": Cannot POST [hidden]"),
+            (
+                "bad token Bearer abc123token for ops",
+                ": bad token [hidden] for ops",
+            ),
+            ("got abc123token", ": got [hidden]"),
+            ("unknown key s3cr3tkey", ": unknown key [hidden]"),
+            ("missing field \"title\"", ": missing field \"title\""),
+            ("", ""),
+        ] {
+            assert_eq!(shown_reply(said, &secrets), shown, "{said}");
+        }
     }
 
     #[test]

@@ -148,6 +148,9 @@ impl MetricsPageInput {
     /// says to sign in, when it says, as a token has nothing else to go by.
     /// Signing in another way, or not at all, lets go of what was saved.
     pub fn keeping_secrets_of(mut self, saved: &MetricsPageInput, asked: Option<SignIn>) -> Self {
+        if !crate::destinations::same_place(&saved.url, &self.url) {
+            return self;
+        }
         let gives_password = self.password.is_some() || self.password_env.is_some();
         let gives_token = self.token.is_some() || self.token_env.is_some();
         match asked.unwrap_or_else(|| self.sign_in()) {
@@ -614,6 +617,12 @@ mod tests {
         // No username, no login.
         let removed = input().keeping_secrets_of(&saved, None);
         assert_eq!((removed.password, removed.password_env), (None, None));
+
+        // Never for another server, where whoever changed it could read it.
+        let mut moved = with_login(None, None);
+        moved.url = "https://evil.example/metrics".to_string();
+        let moved = moved.keeping_secrets_of(&saved, None);
+        assert_eq!((moved.password, moved.password_env), (None, None));
     }
 
     #[test]

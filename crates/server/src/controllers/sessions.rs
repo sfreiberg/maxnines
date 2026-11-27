@@ -133,15 +133,10 @@ fn redirect(request: &Request, address: &str) -> Response {
 }
 
 /// Only ever a page on this site, so a link can't send someone elsewhere after
-/// signing in. Browsers read `//` and `/\` as the start of another site.
+/// signing in.
 fn safe_next(next: Option<&str>) -> &str {
-    next.filter(|next| {
-        next.starts_with('/')
-            && !next.starts_with("//")
-            && !next.starts_with("/\\")
-            && !next.chars().any(char::is_control)
-    })
-    .unwrap_or(SIGNED_IN_HOME)
+    next.filter(|next| super::on_this_site(next))
+        .unwrap_or(SIGNED_IN_HOME)
 }
 
 fn session_cookie(state: &AppState, value: String, lifetime: TimeDelta) -> Option<HeaderValue> {

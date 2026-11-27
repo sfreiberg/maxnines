@@ -298,7 +298,8 @@ password or key. A password or key is either typed in, and then kept in the serv
 database and never shown again, on any page or through the API, or named as an
 environment variable of the server's. The variable's name has to start with
 `MAXNINES_SECRET_`, as for [metrics pages](agentless-hosts.md#passwords-and-tokens),
-and it's read each time the check runs.
+and it's read each time the check runs. Leaving it empty when editing keeps the one
+saved, unless the target moves to another server, which has to be given it again.
 
 ### On an agent
 

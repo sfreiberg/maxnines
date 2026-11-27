@@ -26,7 +26,9 @@ What comes back has `sign_in`, `username`, `password_env`, `private_key_env` and
 `api_key_env`, and `has_password`, `has_private_key` and `has_api_key`, which say
 whether one is saved. A change that gives none of a password, a key, an API key or
 the variable for one keeps the one saved,
-as long as `sign_in` says, or the fields given show, that it still signs in that way.
+as long as `sign_in` says, or the fields given show, that it still signs in that way,
+and the target is on the same server. A check moved to another server has to be given
+its password, key or API key again, so it's never sent anywhere new by whoever moved it.
 
 It also has `latest`, how the check last went: `up`, `ran_at`, when it ran, and
 `error`, why it was down. It's `null` until the check has run since the server

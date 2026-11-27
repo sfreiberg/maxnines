@@ -123,6 +123,15 @@ const RESPONDING: [&str; 18] = [
 /// or a key doing it would make a sign in that outlives revoking the app or the key.
 const APPROVING_APPS: [&str; 2] = ["/oauth/authorize", "/device"];
 
+/// How someone signs in: their password and two-factor, which only they may change,
+/// at the pages. A key or an app setting up two-factor would get its secret and lock
+/// the person out.
+const SIGNING_IN: [&str; 2] = ["/profile/password", "/profile/two-factor"];
+
+/// Why a key or an app can't change how someone signs in.
+pub const SIGN_IN_IS_FOR_PEOPLE: &str = "Only the person themselves can change their \
+    password or two-factor, on their profile page, not an API key or an app";
+
 /// Making API keys on the pages, which only a person signed in there may do. The API
 /// never makes them, as nothing reaches it but keys and apps.
 const MAKING_KEYS: &str = "/settings/api-keys";
@@ -139,6 +148,9 @@ pub fn refused_via(via: Option<&Via>, method: &Method, route: &str) -> Option<&'
     via?;
     if APPROVING_APPS.iter().any(|prefix| starts(route, prefix)) {
         return Some("Only someone signed in to the pages in a browser can approve an app");
+    }
+    if SIGNING_IN.iter().any(|prefix| starts(route, prefix)) {
+        return Some(SIGN_IN_IS_FOR_PEOPLE);
     }
     let changes = method != Method::GET && method != Method::HEAD;
     if changes && route == MAKING_KEYS {
@@ -313,6 +325,23 @@ mod tests {
             assert!(refused_via(Some(via), &Method::GET, route).is_none());
         }
         assert!(refused_via(None, &Method::POST, route).is_none());
+        for route in [
+            "/profile/password",
+            "/profile/two-factor/start",
+            "/profile/two-factor/qr.png",
+            "/profile/two-factor/confirm",
+            "/profile/two-factor/{change}",
+        ] {
+            for via in [&key, &app] {
+                assert!(
+                    refused_via(Some(via), &Method::POST, route).is_some(),
+                    "{route}"
+                );
+            }
+            assert!(refused_via(None, &Method::POST, route).is_none(), "{route}");
+        }
+        // The rest of their profile is theirs to change however they come.
+        assert!(refused_via(Some(&key), &Method::POST, "/profile/theme").is_none());
         // An app can still revoke a key, or itself.
         assert!(refused_via(Some(&app), &Method::DELETE, "/api-keys/{id}").is_none());
         assert!(refused_via(Some(&app), &Method::DELETE, "/app-sign-ins/{id}").is_none());

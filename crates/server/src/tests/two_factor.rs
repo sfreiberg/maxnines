@@ -294,16 +294,24 @@ async fn someone_sets_it_up_from_their_profile() {
 }
 
 #[tokio::test]
-async fn a_key_acting_as_someone_never_sees_their_qr_code() {
+async fn a_key_acting_as_someone_never_sets_up_or_sees_their_two_factor() {
     let server = start().await;
     let id = server.user_id().await;
     server.state.database.start_two_factor(id).await.unwrap();
 
-    let response = server
-        .http("GET", "/profile/two-factor/qr.png", Some(&server.api_key))
-        .await;
-
-    assert!(response.starts_with("HTTP/1.1 404"), "{response}");
+    for (method, path) in [
+        ("GET", "/profile/two-factor/qr.png"),
+        ("POST", "/profile/two-factor/start"),
+        ("POST", "/profile/two-factor/confirm"),
+        ("POST", "/profile/password"),
+    ] {
+        let response = server.http(method, path, Some(&server.api_key)).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{path}: {response}");
+        assert!(
+            response.contains("Only the person themselves"),
+            "{path}: {response}"
+        );
+    }
 }
 
 #[tokio::test]

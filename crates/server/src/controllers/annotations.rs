@@ -11,7 +11,7 @@ use axum_csrf::CsrfToken;
 use chrono::{NaiveDateTime, TimeDelta};
 use serde::{Deserialize, Serialize};
 
-use super::metrics::{RangeParams, selected_range};
+use super::metrics::{RangeParams, RefusedEvent, host_page, selected_range};
 use super::{CsrfForm, Page, local_time, recorded_by, server_error, viewer_zone};
 use crate::app_state::{AppState, EventRefusal};
 use crate::events::EventInput;
@@ -161,18 +161,13 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     }
 }
 
-/// Back to a host's charts, at the range they were on. A refusal goes along to be
-/// shown above the form.
-fn back_to(host_id: &str, form: &CsrfForm, refusal: Option<&str>) -> String {
+/// Back to a host's charts, at the range they were on.
+fn back_to(host_id: &str, form: &CsrfForm) -> String {
     let params = RangeParams {
         range: form.fields.get("range").cloned(),
     };
     let (range, _, _) = selected_range(&params);
-    let mut query = vec![("range", range)];
-    if let Some(refusal) = refusal {
-        query.push(("event_error", refusal));
-    }
-    let query = serde_urlencoded::to_string(query).unwrap_or_default();
+    let query = serde_urlencoded::to_string([("range", range)]).unwrap_or_default();
     format!("/hosts/{host_id}/metrics?{query}#events")
 }
 
@@ -203,12 +198,20 @@ async fn create_for_host(
         .await
     {
         Ok(_) => {
-            let target = back_to(&host.id, &form, None);
+            let target = back_to(&host.id, &form);
             (form.token, Redirect::to(&target)).into_response()
         }
+        // The page again, with what was typed and why it was turned down. Never
+        // through the address, where a link could put any words on the page.
         Err(EventRefusal::Invalid(message)) => {
-            let target = back_to(&host.id, &form, Some(&message));
-            (form.token, Redirect::to(&target)).into_response()
+            let refused = RefusedEvent {
+                error: message,
+                kind: text("kind"),
+                title: text("title").unwrap_or_default(),
+                detail: text("detail"),
+            };
+            let range = form.fields.get("range").cloned();
+            host_page(&state, &form.token, &host.id, range, Some(refused)).await
         }
         Err(EventRefusal::Failed(error)) => server_error(&error),
     }
@@ -228,7 +231,7 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         Ok(true) => {
             let target = page_host.map_or_else(
                 || "/metrics/annotations".to_string(),
-                |host| back_to(&host.id, &form, None),
+                |host| back_to(&host.id, &form),
             );
             (form.token, Redirect::to(&target)).into_response()
         }

@@ -464,6 +464,25 @@ async fn revoke_row<C: ConnectionTrait>(
     .await
 }
 
+/// Signs out every app a user signed in, as a new password does: an app signed in by
+/// whoever had the old one mustn't go on working.
+pub(super) async fn revoke_all_of<C: ConnectionTrait>(
+    connection: &C,
+    user_id: i64,
+    now: Timestamp,
+) -> Result<()> {
+    let rows = app_sign_in::Entity::find()
+        .filter(app_sign_in::Column::UserId.eq(user_id))
+        .filter(app_sign_in::Column::RevokedAt.is_null())
+        .all(connection)
+        .await
+        .context("loading signed in apps")?;
+    for row in rows {
+        revoke_row(connection, row, now).await?;
+    }
+    Ok(())
+}
+
 /// What the audit log says of the apps a user signed in when the user is deleted,
 /// which they go with.
 pub(super) async fn deleted_with_user<C: ConnectionTrait>(

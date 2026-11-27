@@ -413,6 +413,16 @@ impl<'a> Page<'a> {
     }
 }
 
+/// Whether a page to go back to, sent with a request, is on this site, so a link
+/// can't send someone elsewhere. Browsers read `//` and `/\` as the start of another
+/// site.
+fn on_this_site(page: &str) -> bool {
+    page.starts_with('/')
+        && !page.starts_with("//")
+        && !page.starts_with("/\\")
+        && !page.chars().any(char::is_control)
+}
+
 fn server_error(error: &Error) -> Response {
     error!(error = format!("{error:#}"), "request failed");
     (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong").into_response()

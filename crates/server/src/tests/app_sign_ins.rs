@@ -547,6 +547,58 @@ async fn tokens_expire_and_stop_with_their_owner() {
 }
 
 #[tokio::test]
+async fn a_new_password_signs_out_every_app_and_ends_old_setup_links() {
+    let server = start().await;
+    let database = &server.state.database;
+    let (id, _) = person(&server, "someone@example.com", Role::Responder).await;
+    let now = crate::times::now();
+    let sign_in = || async {
+        database
+            .create_app_sign_in(id, "maxnines-cli", None, None, Role::Responder, now)
+            .await
+            .unwrap()
+            .1
+    };
+    let signed_out = |tokens: crate::models::AppTokens| async move {
+        let refreshed = database
+            .refresh_app_sign_in(&tokens.refresh_token, "maxnines-cli", now)
+            .await
+            .unwrap();
+        let accepted = database.accept_app_token(&tokens.access_token, now);
+        accepted.await.unwrap().is_none() && refreshed == Refreshed::Refused
+    };
+    let hash = crate::passwords::hash_password("another password".to_string())
+        .await
+        .unwrap();
+
+    // Set from a link, as for someone whose password was taken.
+    let tokens = sign_in().await;
+    let link = database.new_setup_link(id, now).await.unwrap().unwrap();
+    assert!(
+        database
+            .use_setup_link(id, &link, &hash, now)
+            .await
+            .unwrap()
+    );
+    assert!(signed_out(tokens).await);
+
+    // Changed by the person, which a link sent before can't then undo.
+    let tokens = sign_in().await;
+    let link = database.new_setup_link(id, now).await.unwrap().unwrap();
+    database
+        .change_password(id, &hash, "this-browser", now)
+        .await
+        .unwrap();
+    assert!(signed_out(tokens).await);
+    assert!(
+        !database
+            .use_setup_link(id, &link, &hash, now)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn signed_in_apps_are_listed_and_revoked() {
     let server = start().await;
     let database = &server.state.database;

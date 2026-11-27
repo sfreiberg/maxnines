@@ -265,12 +265,26 @@ impl ChannelForm {
             .and_then(|mail| mail.server.as_ref())
             .is_some_and(|server| server.username.is_some());
         let typed = self.typed_credential(kind);
+        // A saved password or header only ever goes back where it went.
+        let same_place = |saved: &ChannelInput| match kind {
+            ChannelKind::Email => {
+                let server = |mail: Option<&Mail>| {
+                    mail.and_then(|mail| mail.server.as_ref()).map(|server| {
+                        let hostname = server.hostname.to_ascii_lowercase();
+                        (hostname, server.port, server.security)
+                    })
+                };
+                server(saved.mail.as_ref()) == server(mail.as_ref())
+            }
+            ChannelKind::CustomWebhook => crate::destinations::same_place(&saved.target, &target),
+            _ => true,
+        };
         let credential = match saved {
             _ if !kind.has_credential() => None,
             _ if kind == ChannelKind::Email && !signs_in => None,
             _ if kind == ChannelKind::CustomWebhook && self.remove_headers => None,
             _ if !typed.is_empty() => Some(typed),
-            Some(saved) if saved.kind == kind => saved.credential.clone(),
+            Some(saved) if saved.kind == kind && same_place(saved) => saved.credential.clone(),
             _ => None,
         };
         let typed = self.app_token.trim();
@@ -648,6 +662,34 @@ mod tests {
         let channel = form.to_channel(Some(&saved)).unwrap();
         assert_eq!(channel.credential, None);
         assert_eq!(channel.mail.unwrap().server.unwrap().username, None);
+    }
+
+    #[test]
+    fn a_saved_secret_never_goes_somewhere_new() {
+        let saved = email();
+        for change in [
+            |form: &mut ChannelForm| form.mail_hostname = "smtp.evil.example".to_string(),
+            |form: &mut ChannelForm| form.mail_port = "25".to_string(),
+            |form: &mut ChannelForm| form.mail_security = "starttls".to_string(),
+        ] {
+            let mut form = ChannelForm::from_channel(&saved);
+            change(&mut form);
+            assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
+        }
+        // Who it's to isn't where the password goes.
+        let mut form = ChannelForm::from_channel(&saved);
+        form.target = "oncall@example.com".to_string();
+        let kept = form.to_channel(Some(&saved)).unwrap().credential;
+        assert_eq!(kept.as_deref(), Some("mail-secret"));
+
+        let saved = custom();
+        let mut form = ChannelForm::from_channel(&saved);
+        form.target = "https://hooks.evil.example/secret".to_string();
+        assert_eq!(form.to_channel(Some(&saved)).unwrap().credential, None);
+        // Another path on the same server is the same place.
+        form.target = "https://hooks.example.com/other".to_string();
+        let kept = form.to_channel(Some(&saved)).unwrap().credential;
+        assert_eq!(kept, saved.credential);
     }
 
     #[test]

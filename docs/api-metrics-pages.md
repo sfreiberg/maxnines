@@ -93,6 +93,8 @@ once without waiting out its interval:
   the password it has. Leaving `username` out removes the login.
 - A change with `"sign_in": "token"` but neither `token` nor `token_env` keeps the
   token it has. Leaving all three out removes the token.
+- Neither is kept when `url` moves to another server, which has to be given them
+  again, so they're never sent anywhere new by whoever moved it.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \

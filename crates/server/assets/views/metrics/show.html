@@ -70,21 +70,21 @@
   <h2>Events</h2>
   <p class="hint">What happened to this host in the range shown, also marked on each chart: annotations, restarts, config changes, alerts and updates. Annotations for many hosts at once are under <a href="/metrics/annotations">Metrics &gt; Annotations</a>.</p>
   {% if can_respond %}
-  {% if event_error %}<p class="error" role="alert">{{ event_error }}</p>{% endif %}
+  {% if refused %}<p class="error" role="alert">{{ refused.error }}</p>{% endif %}
   <form id="event-form" method="post" action="/hosts/{{ host_id }}/annotations" class="event-form">
     <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
     <input type="hidden" name="range" value="{{ range }}">
     <label>Kind
       <select name="kind">
         <option value="note">Note</option>
-        <option value="deploy">Deploy</option>
+        <option value="deploy"{% if refused and refused.kind == "deploy" %} selected{% endif %}>Deploy</option>
       </select>
     </label>
     <label>What happened
-      <input type="text" name="title" maxlength="200" required autocomplete="off" placeholder="Upgraded nginx to 1.27">
+      <input type="text" name="title" maxlength="200" required autocomplete="off" placeholder="Upgraded nginx to 1.27"{% if refused %} value="{{ refused.title }}"{% endif %}>
     </label>
     <label>Detail
-      <input type="text" name="detail" maxlength="2000" autocomplete="off" placeholder="Optional">
+      <input type="text" name="detail" maxlength="2000" autocomplete="off" placeholder="Optional"{% if refused and refused.detail %} value="{{ refused.detail }}"{% endif %}>
     </label>
     <button type="submit" class="secondary">Add annotation</button>
   </form>

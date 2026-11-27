@@ -77,7 +77,8 @@ The form shows the boxes for the one chosen.
 A page's password or token can be given two ways:
 
 - **Typed in.** It's kept in the server's database and never shown again, on any
-  page or through the API. Leaving the box empty when editing keeps the one saved.
+  page or through the API. Leaving the box empty when editing keeps the one saved,
+  unless the page's address moves to another server, which has to be given it again.
 - **From an environment variable** of the server, by name. The server reads it each
   time it reads the page, so the password is never in the database, and changing it
   needs no more than restarting the server with the new value. If the variable

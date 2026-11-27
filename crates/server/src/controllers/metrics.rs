@@ -200,11 +200,19 @@ pub(super) async fn one_series(
     Ok(result)
 }
 
-/// What the host page's address can say: its range, and why a note was refused.
+/// What the host page's address can say: its range.
 #[derive(Deserialize, Default)]
 pub(super) struct ShowParams {
     range: Option<String>,
-    event_error: Option<String>,
+}
+
+/// An annotation the host page's form was given and turned down, shown again with why.
+#[derive(Serialize)]
+pub(super) struct RefusedEvent {
+    pub error: String,
+    pub kind: Option<String>,
+    pub title: String,
+    pub detail: Option<String>,
 }
 
 /// One line of a host's Events list.
@@ -326,12 +334,22 @@ async fn show(
     Query(params): Query<ShowParams>,
     token: CsrfToken,
 ) -> Response {
-    let Some(host) = state.registry.get(&id).await else {
+    host_page(&state, &token, &id, params.range, None).await
+}
+
+/// A host's charts at a range, with an annotation its form turned down if there was one.
+pub(super) async fn host_page(
+    state: &AppState,
+    token: &CsrfToken,
+    id: &str,
+    range: Option<String>,
+    refused: Option<RefusedEvent>,
+) -> Response {
+    let (state, token) = (state.clone(), token.clone());
+    let Some(host) = state.registry.get(id).await else {
         return not_found(&state, &token);
     };
-    let range_params = RangeParams {
-        range: params.range.clone(),
-    };
+    let range_params = RangeParams { range };
     let (selected, _, length) = selected_range(&range_params);
     let Some(range) = time_range(length) else {
         return not_found(&state, &token);
@@ -431,7 +449,7 @@ async fn show(
         Err(error) => return server_error(&error),
     };
 
-    Page::new(&state, &token, "metrics/show.html")
+    let page = Page::new(&state, &token, "metrics/show.html")
         .with("checks", &checks)
         .with("custom_metrics", &custom_metrics)
         .with("commands", &commands)
@@ -443,10 +461,13 @@ async fn show(
         .with("hostname", &host.hostname)
         .with("charts", &charts)
         .with("events", &events)
-        .with("event_error", &params.event_error)
+        .with("refused", &refused)
         .with("ranges", &ranges)
-        .with("range", selected)
-        .render()
+        .with("range", selected);
+    match refused {
+        Some(_) => page.with_status(StatusCode::UNPROCESSABLE_ENTITY).render(),
+        None => page.render(),
+    }
 }
 
 /// A chart's data page has it alone, across the whole page and taller than the host

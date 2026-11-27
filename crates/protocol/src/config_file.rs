@@ -148,6 +148,14 @@ pub fn replace(path: &Path, text: &str) -> Result<()> {
     replace_prepared(path, text, |_| Ok(()))
 }
 
+/// As [`replace`], for a secret such as an enrollment token: on Unix only its
+/// owner can read it, from the moment it's written. On Windows it's as private as
+/// the folder it's in, which the installers make only Windows and administrators
+/// can open.
+pub fn replace_secret(path: &Path, text: &str) -> Result<()> {
+    replace_with(path, text, true, |_| Ok(()))
+}
+
 /// As [`replace`], doing `prepare` to the new file before it's swapped in, such
 /// as setting who can open it, so it's never there without that done.
 pub fn replace_prepared(
@@ -155,10 +163,40 @@ pub fn replace_prepared(
     text: &str,
     prepare: impl FnOnce(&Path) -> Result<()>,
 ) -> Result<()> {
+    replace_with(path, text, false, prepare)
+}
+
+fn replace_with(
+    path: &Path,
+    text: &str,
+    secret: bool,
+    prepare: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".new");
     let temporary = PathBuf::from(temporary);
-    std::fs::write(&temporary, text).with_context(|| format!("writing {}", temporary.display()))?;
+    // One left behind keeps whoever could read it, so it goes first.
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("removing {}", temporary.display()));
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if secret {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = secret;
+    let written = options.open(&temporary).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(text.as_bytes())
+    });
+    written.with_context(|| format!("writing {}", temporary.display()))?;
     if let Err(error) = prepare(&temporary) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
@@ -246,6 +284,25 @@ pub fn remembered_for_installer(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_is_only_ever_its_owners_to_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("enrollment.token");
+        // Even where one was left behind that anyone could read.
+        let left = folder.path().join("enrollment.token.new");
+        std::fs::write(&left, "old").unwrap();
+        std::fs::set_permissions(&left, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        replace_secret(&path, "token").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "token");
+        assert!(!left.exists());
+    }
+
     use super::*;
 
     fn agent_url(address: &str) -> String {

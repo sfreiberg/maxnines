@@ -30,7 +30,9 @@ Then start it:
 It creates a key in `state`, logs its host ID, and waits to be approved. Every
 relative path in `agent.hcl`, such as `state_dir`, `token_file`, `ca_file` or a
 check's `private_key_file`, is from the config file's folder, wherever the agent is
-started from. Approve it
+started from. An agent started as root reads all of these before giving root up, so
+they can be files only root can read. `maxnines-agent configure` writes the token file
+so that only its owner can read it. Approve it
 on the Hosts page, or from the command line with an API key:
 
 ```sh

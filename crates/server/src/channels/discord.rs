@@ -58,7 +58,9 @@ fn headline(notice: &Notice, link: &str) -> String {
     } else {
         MAX_CHARS.saturating_sub(link.chars().count())
     };
-    format!("{circle}**{}** {}", notice.label(), notice.summary())
+    // The summary has hostnames and series in it, which agents choose.
+    let summary = super::unlinked(notice.summary());
+    format!("{circle}**{}** {summary}", notice.label())
         .chars()
         .take(max)
         .collect()
@@ -319,5 +321,17 @@ mod tests {
             "{content}"
         );
         assert!(whole_output(&notice, Some(URL)).is_some());
+    }
+
+    #[test]
+    fn a_host_cannot_add_a_link_to_a_discord_message() {
+        let alert = Alert {
+            hostname: "[click](https://evil.example)".to_string(),
+            summary: "Disk on [click](<https://evil.example>) is full".to_string(),
+            ..alert()
+        };
+        let content = body(&notice(Event::Firing, alert), None)["content"].to_string();
+        assert!(!content.contains("](https"), "{content}");
+        assert!(!content.contains("](<https://evil"), "{content}");
     }
 }

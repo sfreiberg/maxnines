@@ -162,15 +162,43 @@ struct Connection {
     configs: mpsc::Sender<ConfigUpdate>,
 }
 
+/// What the agent trusts the server with and by: its enrollment token and the
+/// authority its certificate is checked against. Both are read before an agent
+/// started as root gives that up, so either can be a file only root can read.
+pub struct ServerTrust {
+    token: Option<String>,
+    connector: Connector,
+}
+
+impl ServerTrust {
+    pub fn read(config: &Config) -> Result<Self> {
+        let server = &config.server;
+        Ok(Self {
+            token: server.token_file.as_deref().map(read_token).transpose()?,
+            connector: tls_connector(server.ca_file.as_deref())?,
+        })
+    }
+}
+
 impl ServerLink {
-    pub fn start(config: &Config, hostname: &str, identity: Identity) -> Result<Self> {
-        let (link, connection) = Self::new(config, hostname, identity)?;
+    pub fn start(
+        config: &Config,
+        trust: ServerTrust,
+        hostname: &str,
+        identity: Identity,
+    ) -> Result<Self> {
+        let (link, connection) = Self::new(config, trust, hostname, identity)?;
         tokio::spawn(stay_connected(connection));
         Ok(link)
     }
 
     /// The link, and the connection for a task of its own to keep up.
-    fn new(config: &Config, hostname: &str, identity: Identity) -> Result<(Self, Connection)> {
+    fn new(
+        config: &Config,
+        trust: ServerTrust,
+        hostname: &str,
+        identity: Identity,
+    ) -> Result<(Self, Connection)> {
         let url = config.server.url.clone();
         if url.starts_with("ws://") {
             warn!(
@@ -188,13 +216,8 @@ impl ServerLink {
             url,
             hostname: hostname.to_string(),
             identity,
-            token: config
-                .server
-                .token_file
-                .as_deref()
-                .map(read_token)
-                .transpose()?,
-            connector: tls_connector(config.server.ca_file.as_deref())?,
+            token: trust.token,
+            connector: trust.connector,
             spool: spool.clone(),
             facts: Arc::new(FactsAsked {
                 custom: config.facts.clone(),
@@ -632,6 +655,11 @@ mod tests {
         Identity::from_pkcs8(&Identity::generate().unwrap()).unwrap()
     }
 
+    fn start(config: &Config, hostname: &str, identity: Identity) -> ServerLink {
+        let trust = ServerTrust::read(config).unwrap();
+        ServerLink::start(config, trust, hostname, identity).unwrap()
+    }
+
     fn config(url: &str) -> Config {
         Config {
             server: ServerConfig {
@@ -735,7 +763,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
 
-        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let link = start(&config(&url), "web-1", identity());
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
         accept_agent(&mut socket, &url).await;
@@ -754,7 +782,7 @@ mod tests {
 
         let agent = identity();
         let host_id = agent.id();
-        let link = ServerLink::start(&config(&url), "web-1", agent).unwrap();
+        let link = start(&config(&url), "web-1", agent);
         link.send_sample(sample()).unwrap();
 
         // Let the first connection attempt run and fail.
@@ -975,7 +1003,11 @@ mod tests {
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-        let (_link, connection) = ServerLink::new(&config(&url), "web-1", identity()).unwrap();
+        let (_link, connection) = {
+            let config = config(&url);
+            let trust = ServerTrust::read(&config).unwrap();
+            ServerLink::new(&config, trust, "web-1", identity()).unwrap()
+        };
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = accept_async(stream).await.unwrap();
@@ -1063,7 +1095,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
 
-        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let link = start(&config(&url), "web-1", identity());
         link.send_sample(sample()).unwrap();
 
         let (stream, _) = listener.accept().await.unwrap();
@@ -1090,7 +1122,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let link = start(&config(&url), "web-1", identity());
 
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
@@ -1159,7 +1191,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let link = start(&config(&url), "web-1", identity());
         let mut socket = reconnected(&listener, &url).await;
 
         link.send_sample(sample()).unwrap();
@@ -1181,7 +1213,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let url = format!("ws://{address}/ws");
-        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let link = start(&config(&url), "web-1", identity());
         let mut socket = reconnected(&listener, &url).await;
 
         link.send_sample(sample()).unwrap();
@@ -1205,7 +1237,7 @@ mod tests {
         let saved = serde_json::to_string(&AgentMessage::Sample(sample())).unwrap();
         Spool::open(&settings.sample_queue_folder()).push(saved, taken_at());
 
-        let _link = ServerLink::start(&settings, "web-1", identity()).unwrap();
+        let _link = start(&settings, "web-1", identity());
 
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = accept_async(stream).await.unwrap();
@@ -1221,7 +1253,7 @@ mod tests {
     async fn a_result_waiting_when_the_connection_went_goes_on_the_next() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/ws", listener.local_addr().unwrap());
-        let link = ServerLink::start(&config(&url), "web-1", identity()).unwrap();
+        let link = start(&config(&url), "web-1", identity());
         let socket = reconnected(&listener, &url).await;
         drop(socket);
         until(|| !link.spool.is_online()).await;

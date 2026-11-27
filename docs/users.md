@@ -12,6 +12,10 @@ prints a link for setting a password, which works once and lasts 7 days. After t
 add people on the Settings page, which gives you a link to send them. The same
 command line can recover from a forgotten password with `users setup-link`.
 
+A new password, set from a link or changed on the profile page, signs its person out
+everywhere else, including apps such as the command line, and a link sent before it
+stops working.
+
 Over plain `http://`, passwords cross the network unencrypted, so put anything beyond
 a trusted network behind [HTTPS](https.md).
 

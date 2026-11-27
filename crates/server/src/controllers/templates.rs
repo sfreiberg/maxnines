@@ -1146,15 +1146,10 @@ async fn dismiss_upgrades(State(state): State<AppState>, form: CsrfForm) -> Resp
             let to = form
                 .fields
                 .get("back")
-                .cloned()
-                .unwrap_or_else(|| "/templates".to_string());
-            // Only somewhere on this site.
-            let to = if to.starts_with('/') && !to.starts_with("//") {
-                to
-            } else {
-                "/templates".to_string()
-            };
-            (form.token, Redirect::to(&to)).into_response()
+                .map(String::as_str)
+                .filter(|back| super::on_this_site(back))
+                .unwrap_or("/templates");
+            (form.token, Redirect::to(to)).into_response()
         }
         Err(error) => server_error(&error),
     }

@@ -1248,7 +1248,10 @@ async fn validate(
     saved: Option<&RemoteCheck>,
 ) -> Result<RemoteCheckInput> {
     let (mut input, with) = form.to_input()?;
-    if let Some(saved) = saved {
+    let same_place = |saved: &RemoteCheck| {
+        crate::destinations::same_place(&saved.input.check.target, &input.check.target)
+    };
+    if let Some(saved) = saved.filter(|saved| same_place(saved)) {
         input.sign_in = input
             .sign_in
             .keeping_secrets_of(&saved.input.sign_in, Some(with));

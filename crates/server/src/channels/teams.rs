@@ -26,12 +26,7 @@ pub struct Teams;
 /// link, and agents choose their own names, so that's broken up in what they chose.
 /// Mentions need a list of who's meant, which this never sends.
 fn body(notice: &Notice, web_url: Option<&str>) -> Value {
-    let unlinked = |text: &str| -> String {
-        text.chars()
-            .take(MAX_CHARS)
-            .collect::<String>()
-            .replace("](", "]\u{200b}(")
-    };
+    let unlinked = |text: &str| super::unlinked(&text.chars().take(MAX_CHARS).collect::<String>());
     let colour = match (notice.event, &notice.alert) {
         (Event::Resolved, _) => "Good",
         (Event::Test | Event::Action, _) | (_, None) => "Default",

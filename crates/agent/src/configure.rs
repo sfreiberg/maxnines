@@ -52,7 +52,7 @@ pub fn write(config: &Path, address: &str, token: Option<&str>) -> Result<String
     // Everything is checked before anything is written.
     let text = edit(existing.as_deref(), &folder, &url, token_file.as_deref())?;
     if let (Some(token), Some(path)) = (token, &token_file) {
-        config_file::replace(path, token)?;
+        config_file::replace_secret(path, token)?;
     }
     config_file::replace(&config, &text)?;
     println!("Set the server to {url} in {}.", config.display());

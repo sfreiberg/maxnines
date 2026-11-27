@@ -81,7 +81,9 @@ Settings, then **Notification channels**. Different channels can use different s
   only suits a relay on a trusted network. Leave the port empty for the usual one.
 - **Username** and **password** are for a server that asks you to sign in. They need
   STARTTLS or TLS, so the password is never sent unencrypted. The password is never shown
-  again: leave it empty to keep it, or clear the username to remove both.
+  again: leave it empty to keep it, or clear the username to remove both. Changing the
+  server, its port or its security means typing the password again, so it never goes
+  somewhere new.
 
 Email channels made before each channel had its own mail server need one set before
 they send again. Until then, each notification fails and the channel's problems say so.
@@ -109,7 +111,9 @@ channel for. Choose **Custom webhook** as the type, then set:
 - **Content type**: like `application/json`, which is where most services start.
 - **Headers**: optional, one to a line, like `Authorization: Bearer abc123`. They're
   kept like a password and never shown again, only their names. Leave the box empty to
-  keep them, or type them all again to change one. MaxNines sets `Content-Type`,
+  keep them, or type them all again to change one. A URL on another server needs them
+  typed again. If the service turns a request down, what it says back is shown with the
+  URL and the headers' values hidden. MaxNines sets `Content-Type`,
   `Content-Length` and `Host` itself.
 - **Body**: a [Tera](https://keats.github.io/tera/docs/) template, up to 16 KiB, filled in
   for each notification.

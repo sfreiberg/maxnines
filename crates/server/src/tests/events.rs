@@ -501,28 +501,33 @@ async fn a_note_from_the_host_page_shows_in_its_events() {
 }
 
 #[tokio::test]
-async fn a_refused_note_says_why_on_the_page() {
+async fn a_refused_note_says_why_on_the_page_and_keeps_what_was_typed() {
     let server = start().await;
     let (host, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let page = format!("/hosts/{}/metrics", host.id());
     let mut browser = Browser::default();
 
-    let posted = browser
-        .submit(
-            &server,
-            &page,
-            &format!("/hosts/{}/annotations", host.id()),
-            &[("title", "  ")],
-        )
-        .await;
+    let fields = [("kind", "deploy"), ("title", "  "), ("detail", "v2 <b>")];
+    let annotations = format!("/hosts/{}/annotations", host.id());
+    let shown = browser.submit(&server, &page, &annotations, &fields).await;
 
-    let location = posted.header("location").unwrap().to_string();
-    let shown = browser.get(&server, &location).await;
+    assert_eq!(shown.status, 422, "{}", shown.body);
     assert!(
         shown.body.contains("An event needs a title."),
         "{}",
         shown.body
     );
+    assert!(shown.body.contains(r#"<option value="deploy" selected>"#));
+    assert!(
+        shown.body.contains(r#"value="v2 &lt;b&gt;""#),
+        "{}",
+        shown.body
+    );
+
+    // The address can't put words on the page.
+    let crafted = format!("{page}?event_error=Your+session+expired");
+    let shown = browser.get(&server, &crafted).await;
+    assert!(!shown.body.contains("Your session expired"));
 }
 
 #[tokio::test]

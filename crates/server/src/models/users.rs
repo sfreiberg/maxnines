@@ -377,7 +377,8 @@ impl Database {
     }
 
     /// Sets a password through a setup link, which then stops working. Anyone signed
-    /// in as this user is signed out. Returns false if the link had stopped working.
+    /// in as this user is signed out, apps too. Returns false if the link had stopped
+    /// working.
     pub async fn use_setup_link(
         &self,
         user_id: i64,
@@ -413,6 +414,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("ending sessions")?;
+        super::app_sign_ins::revoke_all_of(&transaction, user_id, now).await?;
         // Whoever has the link is acting as the user it's for.
         let by = before.as_ref().map(as_actor);
         record_user(&transaction, user_id, before.as_ref(), by).await?;
@@ -445,17 +447,27 @@ impl Database {
         }))
     }
 
-    /// Changes a password, and signs the user out everywhere except `keep_session`.
+    /// Changes a password, and signs the user out everywhere except `keep_session`,
+    /// apps included. A setup link sent before stops working, so it can't undo this.
     pub async fn change_password(
         &self,
         id: i64,
         password_hash: &str,
         keep_session: &str,
+        now: Timestamp,
     ) -> Result<()> {
         let transaction = self.connection.begin().await.context("starting a save")?;
         let before = load(&transaction, id).await?;
         user::Entity::update_many()
             .col_expr(user::Column::PasswordHash, Expr::value(password_hash))
+            .col_expr(
+                user::Column::SetupTokenHash,
+                Expr::value(Option::<String>::None),
+            )
+            .col_expr(
+                user::Column::SetupExpiresAt,
+                Expr::value(Option::<Timestamp>::None),
+            )
             .filter(user::Column::Id.eq(id))
             .exec(&transaction)
             .await
@@ -466,6 +478,7 @@ impl Database {
             .exec(&transaction)
             .await
             .context("ending sessions")?;
+        super::app_sign_ins::revoke_all_of(&transaction, id, now).await?;
         record_user(&transaction, id, before.as_ref(), None).await?;
         transaction.commit().await.context("saving a password")
     }

@@ -2290,9 +2290,11 @@ async fn update_remote_check(
     }
     let mut input = request.input;
     input.host_id = request.host_id.unwrap_or(saved.input.host_id);
-    input.sign_in = input
-        .sign_in
-        .keeping_secrets_of(&saved.input.sign_in, request.sign_in);
+    if crate::destinations::same_place(&saved.input.check.target, &input.check.target) {
+        input.sign_in = input
+            .sign_in
+            .keeping_secrets_of(&saved.input.sign_in, request.sign_in);
+    }
     if let Err(error) = state.check_remote_check(&input).await {
         return refused(&error);
     }

@@ -27,10 +27,14 @@ The minute counts from the swap, however often the old one is used in it. So an 
 should keep only the newest, refresh once at a time, and when an answer doesn't arrive,
 try again within the minute.
 
-A signed-in app can do what its role allows, with two exceptions, which apply to API
-keys too: it can't make API keys, and it can't approve another app. Only a person
-signed in to the pages in a browser can do those, so neither an app nor an API key can
-leave behind something that would outlast being revoked.
+A signed-in app can do what its role allows, with three exceptions, which apply to API
+keys too: it can't make API keys, it can't approve another app, and it can't change its
+person's password or two-factor. Only a person signed in to the pages in a browser can
+do those, so neither an app nor an API key can leave behind something that would
+outlast being revoked, or lock its person out.
+
+A new password, whether changed on the profile page or set from a link, signs out every
+app its person signed in, as it does every other browser. Their API keys go on working.
 
 Each app says what it is with a `client_id`. These are MaxNines' own, which the
 approval page and Signed-in apps show by name:

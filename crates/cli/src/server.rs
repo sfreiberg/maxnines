@@ -83,7 +83,9 @@ fn host_of(authority: &str) -> String {
 pub fn is_local_network(host: &str) -> bool {
     let host = host.trim_end_matches('.');
     let Ok(address) = host.parse::<IpAddr>() else {
-        return host == "localhost" || !host.contains('.') || host.ends_with(".local");
+        return host == "localhost"
+            || (!host.contains('.') && !is_number(host))
+            || host.ends_with(".local");
     };
     match address {
         IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
@@ -95,6 +97,16 @@ pub fn is_local_network(host: &str) -> bool {
             v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
         }
     }
+}
+
+/// Whether a host with no dots is a number, which a resolver takes for an IPv4
+/// address, such as `134744072` or `0x08080808` for 8.8.8.8, rather than a name.
+fn is_number(host: &str) -> bool {
+    let hex = host
+        .strip_prefix("0x")
+        .or_else(|| host.strip_prefix("0X"))
+        .is_some_and(|digits| digits.chars().all(|c| c.is_ascii_hexdigit()));
+    hex || host.chars().all(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]
@@ -137,6 +149,9 @@ mod tests {
             "http://8.8.8.8",
             "http://172.32.0.1",
             "http://[2001:db8::1]",
+            // Numbers a resolver reads as an address, which could be anywhere.
+            "http://134744072",
+            "http://0x08080808",
         ] {
             let refused = Server::parse(far).unwrap_err();
             assert_eq!(refused.code, Failure::USAGE, "{far}");
@@ -145,6 +160,10 @@ mod tests {
                 "{far}"
             );
         }
+        for number in ["134744072", "0x08080808", "0X8080808", "010"] {
+            assert!(!is_local_network(number), "{number}");
+        }
+        assert!(is_local_network("nas2"));
     }
 
     #[test]

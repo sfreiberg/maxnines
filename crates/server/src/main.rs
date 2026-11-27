@@ -25,6 +25,7 @@ mod controllers;
 mod csrf;
 mod dashboard_variables;
 mod dashboards;
+mod destinations;
 mod docs;
 mod events;
 mod fact_history;
@@ -228,7 +229,7 @@ fn configure_for_installer(path: &Path, arguments: ConfigureArgs) -> Result<()> 
                         "Get the link to set a password with: maxnines-server users setup-link {id}"
                     ),
                     Some(file) => {
-                        config_file::replace(Path::new(file), &configure::shortcut(&link))?;
+                        config_file::replace_secret(Path::new(file), &configure::shortcut(&link))?;
                     }
                 }
             }

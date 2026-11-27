@@ -148,6 +148,12 @@ where
 }
 
 /// The link to the alerts page, from the address people reach the server at.
+/// Text an agent chose, such as a hostname, with Markdown's `[text](url)` broken up,
+/// so a host can't put a link that looks like it's from MaxNines in a message.
+fn unlinked(text: &str) -> String {
+    text.replace("](", "]\u{200b}(")
+}
+
 pub(crate) fn alerts_link(web_url: &str) -> String {
     format!("{web_url}/alerts")
 }

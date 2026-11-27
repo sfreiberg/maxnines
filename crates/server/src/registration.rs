@@ -362,7 +362,9 @@ impl Registry {
                 .filter(|a| a.state == HostState::Pending)
                 .count()
         });
-        if existing.is_none() && pending >= self.max_pending {
+        // The limit is on hosts left waiting. One a rule approves never waits, so
+        // a list filled by anyone who can reach the port can't keep it out.
+        if existing.is_none() && rule.is_none() && pending >= self.max_pending {
             warn!(
                 host_id = request.id,
                 "too many pending hosts, ignoring request"
@@ -978,6 +980,19 @@ mod tests {
         }
 
         assert_eq!(registry.list().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_full_pending_list_doesnt_keep_out_a_host_a_rule_approves() {
+        let config = format!("max_pending = 2\n{SUBNET_RULE}");
+        let registry = registry(&config).await;
+        for id in ["a", "b", "c"] {
+            registry.admit(&request(id, id, "1.2.3.4")).await.unwrap();
+        }
+
+        let status = registry.admit(&request("d", "web-1", "10.0.0.1")).await;
+        assert_eq!(status.unwrap(), RegistrationStatus::Approved);
+        assert!(registry.is_approved("d").await);
     }
 
     #[tokio::test]

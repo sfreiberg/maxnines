@@ -608,7 +608,7 @@ async fn change_password(
     let session = session_token(&headers).unwrap_or_default();
     match state
         .database
-        .change_password(user.id, &hash, session)
+        .change_password(user.id, &hash, session, crate::times::now())
         .await
     {
         Ok(()) => {

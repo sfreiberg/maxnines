@@ -5,7 +5,8 @@ held up, so you can size a server before depending on it. The agents are simulat
 closely: the same handshake, timers, retries and sample shapes as real ones.
 
 Run it against a test server, because simulated agents are approved and saved like
-real ones.
+real ones. If `--url`, or `--admin-url` where rules are changed and agents approved,
+isn't on the host running the test, it stops unless given `--yes`.
 
 ```sh
 export MAXNINES_API_KEY=$(maxnines-server api-keys create "Load test" --user you@example.com --expires-in 1d)

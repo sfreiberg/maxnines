@@ -208,6 +208,14 @@ impl Options {
                 self.url
             );
         }
+        // Rules are changed and agents approved and revoked through this one.
+        let admin = self.admin_address();
+        if !self.yes && !is_this_host(&admin) {
+            bail!(
+                "{admin} isn't on this host. The test changes rules and approves agents \
+                 there, so use a test server, and add --yes to go ahead"
+            );
+        }
         Ok(())
     }
 
@@ -321,6 +329,11 @@ mod tests {
         let error = options("--url ws://10.0.0.5:9000/ws").check().unwrap_err();
         assert!(error.to_string().contains("--yes"));
         assert!(options("--url ws://10.0.0.5:9000/ws --yes").check().is_ok());
+        // The address it changes rules at counts too.
+        let far = "--url ws://localhost:9000/ws --admin-url https://prod.example.com";
+        let error = options(far).check().unwrap_err();
+        assert!(error.to_string().contains("prod.example.com"), "{error}");
+        assert!(options(&format!("{far} --yes")).check().is_ok());
     }
 
     #[test]

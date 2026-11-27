@@ -63,7 +63,7 @@ use config::Config;
 use maxnines_protocol::stopping::StopSignal;
 use own_usage::OwnUsageCollector;
 use templates::TemplateCollector;
-use websocket::{ConfigUpdate, ServerLink};
+use websocket::{ConfigUpdate, ServerLink, ServerTrust};
 
 #[cfg(windows)]
 static SERVICE: Service = Service {
@@ -585,23 +585,25 @@ impl Monitoring {
 }
 
 /// Reads the config and, if started as root, gives that up before anything else
-/// happens. The config is read first, while it's still certain to be readable.
+/// happens. The config, the enrollment token and the CA file are read first, while
+/// they're still certain to be readable.
 fn run(path: PathBuf) -> Result<()> {
     let config = Config::load(&path)?;
+    let trust = ServerTrust::read(&config)?;
     #[cfg(unix)]
     privileges::split(&config)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let result = runtime.block_on(run_agent(path, Arc::new(config)));
+    let result = runtime.block_on(run_agent(path, Arc::new(config), trust));
     // A sample stuck on a hung drive mustn't keep the agent from stopping.
     runtime.shutdown_background();
     result
 }
 
-async fn run_agent(path: PathBuf, config: Arc<Config>) -> Result<()> {
+async fn run_agent(path: PathBuf, config: Arc<Config>, trust: ServerTrust) -> Result<()> {
     let identity = identity::load_or_create(&config.key_file())?;
-    let mut link = ServerLink::start(&config, &collector::host_name(), identity)?;
+    let mut link = ServerLink::start(&config, trust, &collector::host_name(), identity)?;
     info!(config = %path.display(), "agent started");
 
     // The last good config means monitoring carries on through a server outage.
