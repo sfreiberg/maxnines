@@ -58,25 +58,25 @@ fn from_security(line: &str) -> bool {
 }
 
 /// `dnf check-update` lists a package a line, as name, version and repository, then
-/// any packages being replaced under a heading of their own. A name too long for its
-/// column is on a line of its own, with the version and repository on the next.
+/// any packages being replaced under a heading of their own. A name or version too
+/// long for its column pushes what follows onto the next line, so each package is the
+/// line its `name.arch` starts, which notes and wrapped columns don't.
 #[cfg(any(target_os = "linux", test))]
 fn parse_dnf(text: &str) -> u64 {
-    let mut count = 0;
-    let mut name_alone = false;
-    for line in text
-        .lines()
+    text.lines()
         .take_while(|line| !line.starts_with("Obsoleting"))
-    {
-        match line.split_whitespace().count() {
-            3 => count += 1,
-            2 if name_alone => count += 1,
-            _ => {}
-        }
-        name_alone = line.split_whitespace().count() == 1 && !line.starts_with(' ');
-    }
-    count
+        .filter(|line| {
+            let first = line.split_whitespace().next().unwrap_or_default();
+            ARCHITECTURES.iter().any(|arch| first.ends_with(arch))
+        })
+        .count() as u64
 }
+
+/// The architectures a package's full name ends with.
+#[cfg(any(target_os = "linux", test))]
+const ARCHITECTURES: [&str; 9] = [
+    ".noarch", ".x86_64", ".aarch64", ".i686", ".ppc64le", ".s390x", ".armv7hl", ".src", ".riscv64",
+];
 
 /// `dnf updateinfo list --security` lists an advisory a line, with the package it fixes
 /// last. One package can have several.
@@ -251,10 +251,13 @@ kernel.x86_64                  6.8.9-300.fc40           updates
 openssl-libs.x86_64            1:3.2.1-6.fc40           updates
 python3-some-package-with-a-very-long-name.noarch
                                1.2.3-1.fc40             updates
+texlive-base.noarch            11:svn66984-71.fc40.with.a.long.release
+                                                        updates
+Security: kernel-core-6.8.9-300.fc40.x86_64 is an installed security update
 Obsoleting Packages
 grub2-tools.x86_64             1:2.06-120.fc40          updates
 ";
-        assert_eq!(parse_dnf(output), 3);
+        assert_eq!(parse_dnf(output), 4);
     }
 
     #[test]
