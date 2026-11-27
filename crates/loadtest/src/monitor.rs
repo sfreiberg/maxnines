@@ -54,7 +54,7 @@ impl Snapshot {
             failed: activity["samples_failed"].as_u64().unwrap_or_default(),
             queued: activity["samples_queued"].as_u64().unwrap_or_default(),
             queue_capacity: activity["queue_capacity"].as_u64().unwrap_or_default(),
-            firing: activity["alerts_firing"].as_u64().unwrap_or_default(),
+            firing: activity["alerts_open"].as_u64().unwrap_or_default(),
             alert_pass_age: moment(&activity["last_alert_pass_at"])
                 .map(|time| (now - time).to_std().unwrap_or_default()),
             memory_bytes: process["memory_bytes"].as_u64(),
@@ -163,7 +163,7 @@ mod tests {
             "database": { "size_bytes": 28 },
             "activity": {
                 "samples_written": 10, "samples_failed": 1, "samples_queued": 2,
-                "queue_capacity": 1024, "alerts_firing": 3,
+                "queue_capacity": 1024, "alerts_open": 3,
                 "last_alert_pass_at": "2026-11-19T01:00:05.000Z",
             },
         })
@@ -186,6 +186,7 @@ mod tests {
 
         assert_eq!(snapshot.written, 10);
         assert_eq!(snapshot.queue_capacity, 1024);
+        assert_eq!(snapshot.firing, 3);
         assert_eq!(snapshot.alert_pass_age, Some(Duration::from_secs(2)));
         assert!((snapshot.cpu_cores.unwrap() - 0.6).abs() < 1e-9);
         assert_eq!(snapshot.metrics_bytes, Some(430 * 1024 * 1024));
