@@ -239,7 +239,8 @@ pub enum WriterCommand {
         host_id: String,
         done: oneshot::Sender<Result<(), String>>,
     },
-    /// Finish queued work and close the database cleanly.
+    /// Takes nothing more, finishes everything already queued, and closes the
+    /// database cleanly.
     Stop,
 }
 
@@ -330,11 +331,12 @@ fn run_writer(
     let mut next_tidy = Instant::now();
     let every = store.batch_every();
     let mut next_write = Instant::now();
-    // What's left from last time goes first, without waiting for more.
-    while !stopping
-        && (!queued.is_empty() || commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0)
-    {
-        gather_until(next_write, &mut commands, &mut queued);
+    // What's left from last time goes first, without waiting for more. Once it's
+    // stopping, the queue is closed, so this ends when everything in it is done.
+    while !queued.is_empty() || commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
+        if !stopping {
+            gather_until(next_write, &mut commands, &mut queued);
+        }
         let mut samples = Vec::with_capacity(queued.len());
         // Every acknowledgement each sample owes: a sample sent twice in one batch is
         // stored once, and both copies hear about it only if the batch is saved.
@@ -373,9 +375,11 @@ fn run_writer(
                     }
                 }
                 WriterCommand::DeleteHost { host_id, done } => deletion = Some((host_id, done)),
+                // Sending anything more fails at once, so nothing is dropped
+                // unheard, and what was sent before this is still done.
                 WriterCommand::Stop => {
                     stopping = true;
-                    break;
+                    commands.close();
                 }
             }
         }
@@ -404,7 +408,7 @@ fn run_writer(
             }
             done.send(result).ok();
         }
-        if Instant::now() >= next_tidy {
+        if !stopping && Instant::now() >= next_tidy {
             let more = tidy(store.as_mut());
             next_tidy = Instant::now() + if more { TIDY_PAUSE } else { TIDY_CHECK_EVERY };
         }
@@ -1141,12 +1145,39 @@ mod tests {
         assert_eq!(counts.failed.load(Ordering::Relaxed), 3);
     }
 
+    /// What was queued before it stopped is all done, a host's delete included,
+    /// and anything sent afterwards fails at once rather than going unheard.
     #[test]
-    fn stopping_saves_what_was_queued_first() {
-        let (saved, _) = run_with(vec![save("a", 1), WriterCommand::Stop, save("a", 2)]);
+    fn stopping_finishes_what_was_queued_and_takes_nothing_more() {
+        let saved = Saved::default();
+        let (sender, receiver) = mpsc::channel(WRITE_QUEUE_SIZE);
+        let (deletion, mut finished) = delete("host-1");
+        for command in [
+            save("a", 1),
+            WriterCommand::Stop,
+            deletion,
+            WriterCommand::Save(NewSample {
+                host_id: "host-2".to_string(),
+                hostname: "b".to_string(),
+                sample: Sample {
+                    time: at(2),
+                    metrics: BTreeMap::new(),
+                },
+            }),
+        ] {
+            sender.try_send(command).unwrap();
+        }
+        run_writer(
+            Box::new(MemoryStore(saved.clone())),
+            receiver,
+            &WriteCounts::default(),
+        );
 
-        assert_eq!(timestamps(&saved), [1]);
+        assert_eq!(finished.try_recv().unwrap(), Ok(()));
+        assert_eq!(*saved.deleted.lock().unwrap(), ["host-1"]);
+        assert_eq!(timestamps(&saved), [2]);
         assert!(*saved.closed.lock().unwrap());
+        assert!(sender.try_send(save("a", 3)).is_err());
     }
 
     #[test]
