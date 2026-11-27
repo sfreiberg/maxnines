@@ -367,14 +367,20 @@ impl State {
     }
 
     /// Samples that couldn't be saved stay in memory, behind those sent since, and
-    /// the newest are kept.
+    /// the newest are kept: past the limit, the oldest of them go, as those sent
+    /// since are newer.
     fn keep_unsaved(&mut self, samples: Vec<Entry>) {
         let at = self.unconfirmed;
         for (offset, entry) in samples.into_iter().enumerate() {
             self.memory.insert(at + offset, entry);
         }
         while self.memory.len() > MAX_IN_MEMORY {
-            self.drop_oldest();
+            if self.memory.len() > self.unconfirmed {
+                self.memory.remove(self.unconfirmed);
+                self.note_drops();
+            } else {
+                self.drop_oldest();
+            }
         }
     }
 
@@ -913,6 +919,37 @@ mod tests {
         std::iter::from_fn(|| deliver(spool))
             .map(|time| time.to_string())
             .collect()
+    }
+
+    /// Samples a failed save gives back are older than those sent meanwhile, so
+    /// when there are too many, they're what goes.
+    #[test]
+    fn samples_that_could_not_be_saved_make_way_for_newer_ones() {
+        let (_parent, path) = folder();
+        let spool = unpaced(&path);
+        let entry = |time: u64| Entry {
+            text: sample(time).into(),
+            taken_at: at(time),
+        };
+        let mut state = spool.state();
+        state.memory.clear();
+        // Three sent since the save began, waiting to be confirmed.
+        state.memory.extend([1001, 1002, 1003].map(entry));
+        state.unconfirmed = 3;
+
+        let unsaved: Vec<Entry> = (1..=MAX_IN_MEMORY as u64).map(entry).collect();
+        state.keep_unsaved(unsaved);
+
+        let times: Vec<i64> = state
+            .memory
+            .iter()
+            .map(|e| e.taken_at.timestamp())
+            .collect();
+        assert_eq!(times.len(), MAX_IN_MEMORY);
+        assert_eq!(times[..3], [1001, 1002, 1003].map(|t| at(t).timestamp()));
+        assert_eq!(times[3], at(4).timestamp(), "the oldest went");
+        assert_eq!(*times.last().unwrap(), at(MAX_IN_MEMORY as u64).timestamp());
+        assert_eq!(state.unconfirmed, 3);
     }
 
     #[test]
