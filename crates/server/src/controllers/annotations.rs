@@ -8,23 +8,20 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use chrono::{NaiveDateTime, TimeDelta};
+use chrono::TimeDelta;
 use serde::{Deserialize, Serialize};
 
 use super::metrics::{RangeParams, RefusedEvent, host_page, selected_range};
-use super::{CsrfForm, Page, local_time, recorded_by, server_error, viewer_zone};
+use super::{CsrfForm, Page, local_time, recorded_by, server_error};
 use crate::app_state::{AppState, EventRefusal};
 use crate::events::EventInput;
 use crate::host_filter;
-use crate::maintenance::moment;
-use crate::times::{self, Timestamp};
+use crate::times;
 
 /// How far back the list goes.
 const LIST_DAYS: i64 = 30;
 /// The most the list shows.
 const LIST_LIMIT: u64 = 200;
-/// How a time is written in the form, as the browser's date and time picker sends it.
-const FORM_TIME: &str = "%Y-%m-%dT%H:%M";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -40,8 +37,6 @@ struct AnnotationForm {
     title: String,
     detail: String,
     filter: String,
-    /// In the viewer's time zone. Empty for now.
-    when: String,
 }
 
 #[derive(Serialize)]
@@ -116,19 +111,6 @@ async fn index(
     page(&state, &token, &form, None).await
 }
 
-/// A time from the form, in the viewer's time zone.
-fn when(text: &str) -> Result<Option<Timestamp>, String> {
-    let text = text.trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    let local = NaiveDateTime::parse_from_str(text, FORM_TIME)
-        .map_err(|_| "Give the time as a date and time, or leave it empty for now.".to_string())?;
-    moment(viewer_zone(), local.date(), local.time())
-        .map(Some)
-        .ok_or_else(|| "That time doesn't exist in your time zone.".to_string())
-}
-
 async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
     let text = |name: &str| form.fields.get(name).cloned().unwrap_or_default();
     let filled = AnnotationForm {
@@ -136,17 +118,11 @@ async fn create(State(state): State<AppState>, form: CsrfForm) -> Response {
         title: text("title"),
         detail: text("detail"),
         filter: text("filter"),
-        when: text("when"),
-    };
-    let occurred_at = match when(&filled.when) {
-        Ok(time) => time,
-        Err(error) => return page(&state, &form.token, &filled, Some(&error)).await,
     };
     let input = EventInput {
         kind: Some(filled.kind.clone()),
         title: filled.title.clone(),
         detail: Some(filled.detail.clone()),
-        occurred_at,
         filter: Some(filled.filter.clone()),
     };
     match state
@@ -190,7 +166,6 @@ async fn create_for_host(
         kind: text("kind"),
         title: text("title").unwrap_or_default(),
         detail: text("detail"),
-        occurred_at: None,
         filter: Some(host_filter::only(&host.id)),
     };
     match state
@@ -237,17 +212,5 @@ async fn delete(State(state): State<AppState>, Path(id): Path<i64>, form: CsrfFo
         }
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => server_error(&error),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_empty_time_is_now_and_anything_else_has_to_be_one() {
-        assert_eq!(when(" "), Ok(None));
-        assert!(when("2026-11-10T14:30").unwrap().is_some());
-        assert!(when("yesterday").is_err());
     }
 }

@@ -8,8 +8,10 @@ See [Annotations](annotations.md). Adding and deleting them needs the responder 
 | `kind` | `deploy` or `note`, which is the default. |
 | `title` | What happened, which is required. Up to 200 characters. |
 | `detail` | More about it, up to 2,000 characters. |
-| `occurred_at` | When it happened, as an ISO 8601 time such as `2026-11-19T01:57:17Z`, from a year ago to now. Defaults to now. |
-| `filter` | Which hosts, written as in [Filters](api-filters.md). Leave it out for every host. It's matched when the annotation is added, against the approved hosts that were already there at `occurred_at`, and the annotation stays on those: a host added later doesn't show it, and one whose facts change keeps it. One that matches no such host is refused with `422`. |
+| `filter` | Which hosts, written as in [Filters](api-filters.md). Leave it out for every host. It's matched when the annotation is added, against the approved hosts there are then, and the annotation stays on those: a host added later doesn't show it, and one whose facts change keeps it. One that matches no host is refused with `422`. |
+
+An annotation always happens when it's added: `occurred_at` is the time it was added,
+and one can't be given.
 
 ## Add an annotation
 

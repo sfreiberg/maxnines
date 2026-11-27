@@ -25,13 +25,22 @@ async fn connect_host(server: &TestServer, hostname: &str, facts: Value) -> (Ide
     (host, client)
 }
 
-/// Makes a host look as if it had been there for a long time, so annotations dated
-/// earlier can be for it.
-async fn seen_long_ago(server: &TestServer, host: &Identity) {
-    let registry = &server.state.registry;
-    let mut record = registry.get(&host.id()).await.unwrap();
-    record.first_seen_at = crate::times::now() - TimeDelta::days(365);
-    registry.insert_for_test(record).await;
+/// Records an annotation at a time of the test's choosing, for these hosts, as
+/// people can only add them happening now.
+async fn annotate_at(server: &TestServer, title: &str, hosts: &[&Identity], at: &str) {
+    let at: Timestamp = at.parse().unwrap();
+    let hosts: Vec<String> = hosts.iter().map(|host| host.id()).collect();
+    let new = NewEvent {
+        kind: EventKind::Note,
+        occurred_at: at,
+        title,
+        detail: None,
+        filter: None,
+        hosts: &hosts,
+    };
+    let database = &server.state.database;
+    let id = database.record_event(&new, "ann", at).await.unwrap();
+    assert!(id.is_some(), "{title}");
 }
 
 async fn timeline(server: &TestServer, host: &Identity) -> Vec<Value> {
@@ -145,24 +154,26 @@ async fn an_annotation_of_the_servers_own_kind_or_with_a_broken_filter_is_refuse
     assert_eq!(events, json!([]));
 }
 
+/// An annotation is about what happens to the hosts there are, so it's always now.
 #[tokio::test]
-async fn an_event_can_be_dated_when_it_happened() {
+async fn an_annotation_is_always_recorded_as_happening_now() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    seen_long_ago(&server, &web).await;
     let earlier = crate::times::now() - TimeDelta::hours(2);
 
-    let body =
-        json!({ "title": "Deployed before lunch", "kind": "deploy", "occurred_at": earlier });
+    let dated = json!({ "title": "Deployed before lunch", "occurred_at": earlier });
+    let (status, _) = api(&server, "POST", "/api/v1/annotations", &dated).await;
+    assert_eq!(status, 422);
+    let before = crate::times::now();
+    let body = json!({ "title": "Deployed", "kind": "deploy" });
     let (status, _) = api(&server, "POST", "/api/v1/annotations", &body).await;
-
     assert_eq!(status, 201);
-    assert_eq!(
-        timeline(&server, &web).await[0]["occurred_at"],
-        json!(earlier)
-    );
-    let (_, listed) = api(&server, "GET", "/api/v1/annotations", &Value::Null).await;
-    assert_eq!(listed[0]["occurred_at"], json!(earlier));
+    let after = crate::times::now();
+
+    let events = timeline(&server, &web).await;
+    assert_eq!(titles(&events), ["Deployed"]);
+    let at: Timestamp = serde_json::from_value(events[0]["occurred_at"].clone()).unwrap();
+    assert!((before..=after).contains(&at), "{at}");
 }
 
 #[tokio::test]
@@ -261,7 +272,6 @@ async fn a_list_of_events_has_to_be_one_that_can_be_answered() {
 async fn a_timeline_gives_the_newest_of_what_it_holds_from_and_to_included() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    seen_long_ago(&server, &web).await;
     let (from, to) = ("2026-11-20T09:00:00Z", "2026-11-20T10:00:00Z");
     for (title, occurred_at) in [
         ("before", "2026-11-20T08:59:59.999Z"),
@@ -269,9 +279,7 @@ async fn a_timeline_gives_the_newest_of_what_it_holds_from_and_to_included() {
         ("second", to),
         ("after", "2026-11-20T10:00:00.001Z"),
     ] {
-        let annotation = json!({ "title": title, "occurred_at": occurred_at });
-        let (status, _) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
-        assert_eq!(status, 201);
+        annotate_at(&server, title, &[&web], occurred_at).await;
     }
 
     let path = format!("/api/v1/hosts/{}/events?from={from}&to={to}", web.id());
@@ -288,22 +296,18 @@ async fn a_hosts_annotations_are_found_past_many_of_other_hosts() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let (db, _db_client) = connect_host(&server, "db-1", json!({ "role": "db" })).await;
-    seen_long_ago(&server, &web).await;
-    seen_long_ago(&server, &db).await;
     let same = "2026-11-20T09:30:00Z";
-    let mut made = vec![("web oldest", "role=web", "2026-11-20T09:00:00Z")];
+    let mut made = vec![("web oldest", &web, "2026-11-20T09:00:00Z")];
     for n in 0..4 {
-        made.push((["db a", "db b", "db c", "db d"][n], "role=db", same));
+        made.push((["db a", "db b", "db c", "db d"][n], &db, same));
     }
-    made.push(("web same moment", "role=web", same));
+    made.push(("web same moment", &web, same));
     for n in 0..4 {
-        made.push((["db e", "db f", "db g", "db h"][n], "role=db", same));
+        made.push((["db e", "db f", "db g", "db h"][n], &db, same));
     }
-    made.push(("db newest", "role=db", "2026-11-20T09:59:00Z"));
-    for (title, filter, occurred_at) in made {
-        let annotation = json!({ "title": title, "filter": filter, "occurred_at": occurred_at });
-        let (status, answer) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
-        assert_eq!(status, 201, "{answer}");
+    made.push(("db newest", &db, "2026-11-20T09:59:00Z"));
+    for (title, host, occurred_at) in made {
+        annotate_at(&server, title, &[host], occurred_at).await;
     }
 
     let path = format!(
@@ -651,45 +655,6 @@ async fn deleting_a_host_keeps_annotations_for_others_and_forgets_its_own() {
     );
 }
 
-/// One dated earlier is only on the hosts there were then.
-#[tokio::test]
-async fn an_annotation_dated_earlier_is_only_on_hosts_there_were_then() {
-    let server = start().await;
-    let (early, _early_client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    let then = server
-        .state
-        .registry
-        .get(&early.id())
-        .await
-        .unwrap()
-        .first_seen_at;
-    let (late, _late_client) = connect_host(&server, "web-2", json!({ "role": "web" })).await;
-
-    let body = json!({
-        "title": "Shop v2.3",
-        "filter": "role=web",
-        "occurred_at": then.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-    });
-    let (status, answer) = api(&server, "POST", "/api/v1/annotations", &body).await;
-    assert_eq!(status, 201, "{answer}");
-    let range = "?from=2026-01-01T00:00:00Z";
-    let path = |host: &Identity| format!("/api/v1/hosts/{}/events{range}", host.id());
-    let (_, events) = api(&server, "GET", &path(&early), &Value::Null).await;
-    assert_eq!(titles(events.as_array().unwrap()), ["Shop v2.3"]);
-    let (_, events) = api(&server, "GET", &path(&late), &Value::Null).await;
-    assert_eq!(events, json!([]));
-
-    // Before either was there, it's refused.
-    let earlier = then - TimeDelta::minutes(1);
-    let body = json!({
-        "title": "Too early",
-        "filter": "role=web",
-        "occurred_at": earlier.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
-    });
-    let (status, refusal) = api(&server, "POST", "/api/v1/annotations", &body).await;
-    assert_eq!(status, 422, "{refusal}");
-}
-
 /// Hosts deleted after they were picked are left out, and an event left with none
 /// isn't kept, whoever recorded it.
 #[tokio::test]
@@ -782,18 +747,9 @@ async fn an_annotation_stays_on_the_hosts_its_filter_picked_when_added() {
 }
 
 #[tokio::test]
-async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
+async fn the_annotations_tab_adds_one_for_a_filter() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    seen_long_ago(&server, &web).await;
-    let zone = chrono_tz::America::Chicago;
-    let user = server.user_id().await;
-    server
-        .state
-        .database
-        .set_time_zone(user, zone)
-        .await
-        .unwrap();
     let mut browser = Browser::default();
     let listing = browser.get(&server, "/metrics").await;
     assert!(listing.body.contains(r#"href="/metrics/annotations""#));
@@ -803,7 +759,6 @@ async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
         ("title", "Upgraded Postgres to 17"),
         ("detail", ""),
         ("filter", "role=web"),
-        ("when", "2026-11-10T09:30"),
     ];
     let posted = browser
         .submit(
@@ -822,25 +777,11 @@ async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
         page.body
     );
     assert!(page.body.contains("<code>role=web</code>"));
-    let (_, listed) = api(
-        &server,
-        "GET",
-        "/api/v1/annotations?from=2026-11-10T00:00:00Z&to=2026-11-11T00:00:00Z",
-        &Value::Null,
-    )
-    .await;
-    // 09:30 in Chicago, where the person adding it is.
-    let expected = chrono::TimeZone::from_local_datetime(
-        &zone,
-        &chrono::NaiveDate::from_ymd_opt(2026, 11, 10)
-            .unwrap()
-            .and_hms_opt(9, 30, 0)
-            .unwrap(),
-    )
-    .earliest()
-    .unwrap()
-    .to_utc();
-    assert_eq!(listed[0]["occurred_at"], json!(expected));
+    assert!(!page.body.contains(r#"name="when""#));
+    assert_eq!(
+        titles(&timeline(&server, &web).await),
+        ["Upgraded Postgres to 17"]
+    );
 }
 
 #[tokio::test]
@@ -852,7 +793,6 @@ async fn the_annotations_tab_keeps_what_was_typed_when_it_refuses() {
         ("kind", "note"),
         ("title", "Kept title"),
         ("filter", "role=\"oops"),
-        ("when", ""),
     ];
     let refused = browser
         .submit(

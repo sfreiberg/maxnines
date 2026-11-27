@@ -21,7 +21,7 @@ automations add; the server records the rest by itself.
 
 Under **Metrics > Annotations**, say what happened, choose Deploy or Note,
 and give a filter for which hosts it's for, written as in the Hosts list, such as
-`role=web`. Leave the filter empty for every host, and the time empty for now. The
+`role=web`. Leave the filter empty for every host. It's marked as happening now. The
 list below has the last 30 days of them, and each can be deleted.
 
 On a host's own metrics page, the form under its charts adds one for that host
@@ -40,7 +40,8 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   that were already there at the time it's for, and the annotation stays on those. A web host added next week
   doesn't show last week's deploy, and one that stops being `role=web` keeps showing
   it, as it was there for it. A filter that matches no host is refused.
-- **`occurred_at`** records something that happened earlier, up to a year back.
+- **An annotation happens when it's added.** It can't be dated earlier, as the hosts
+  it's for are the ones there are then.
 - **Adding and deleting annotations needs the responder role,** and both are kept in the
   [audit log](audit-log.md). What the server records itself isn't.
 - **Deleting a host** deletes what was recorded for it alone. Annotations for many

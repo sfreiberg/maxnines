@@ -13,10 +13,6 @@ use crate::times::Timestamp;
 pub const MAX_TITLE_LEN: usize = 200;
 pub const MAX_DETAIL_LEN: usize = 2000;
 pub const MAX_FILTER_LEN: usize = 500;
-/// How long ago an event can be said to have happened, such as a deploy recorded late.
-const LONGEST_AGO: TimeDelta = TimeDelta::days(366);
-/// A script's clock can be a little ahead of the server's.
-const FURTHEST_AHEAD: TimeDelta = TimeDelta::hours(1);
 /// Who the server's own events are by.
 pub const SERVER: &str = "server";
 
@@ -87,12 +83,6 @@ pub struct EventInput {
     pub title: String,
     #[serde(default)]
     pub detail: Option<String>,
-    /// When it happened. Defaults to now.
-    #[serde(
-        default,
-        deserialize_with = "crate::times::optional_moment::deserialize"
-    )]
-    pub occurred_at: Option<Timestamp>,
     /// Which hosts, as a host filter, matched when it's recorded. None means every
     /// host there is then.
     #[serde(default, deserialize_with = "crate::text::optional")]
@@ -114,7 +104,7 @@ impl EventInput {
 
     /// Checks everything that doesn't need the database, and says what's wrong in a
     /// way that can be shown to whoever sent it.
-    pub fn check(&self, now: Timestamp) -> Result<EventKind, String> {
+    pub fn check(&self) -> Result<EventKind, String> {
         let kind = match self.kind.as_deref() {
             None | Some("") => EventKind::Note,
             Some(text) => EventKind::parse(text)
@@ -137,11 +127,6 @@ impl EventInput {
             return Err(format!(
                 "Detail can be at most {MAX_DETAIL_LEN} characters."
             ));
-        }
-        if let Some(time) = self.occurred_at
-            && !(now - LONGEST_AGO..=now + FURTHEST_AHEAD).contains(&time)
-        {
-            return Err("An event's time has to be within the last year.".into());
         }
         if let Some(filter) = &self.filter {
             if filter.chars().count() > MAX_FILTER_LEN {
@@ -217,12 +202,12 @@ mod tests {
 
     #[test]
     fn an_event_is_a_note_unless_it_says_it_is_a_deploy() {
-        assert_eq!(input("x").check(now()), Ok(EventKind::Note));
+        assert_eq!(input("x").check(), Ok(EventKind::Note));
         let deploy = EventInput {
             kind: Some("deploy".into()),
             ..input("x")
         };
-        assert_eq!(deploy.check(now()), Ok(EventKind::Deploy));
+        assert_eq!(deploy.check(), Ok(EventKind::Deploy));
     }
 
     #[test]
@@ -234,7 +219,7 @@ mod tests {
                 kind: Some(kind.into()),
                 ..input("x")
             };
-            assert!(event.check(now()).is_err(), "{kind}");
+            assert!(event.check().is_err(), "{kind}");
         }
     }
 
@@ -242,21 +227,9 @@ mod tests {
     fn a_title_is_needed_and_limited() {
         let mut blank = input("   ");
         blank.tidy();
-        assert!(blank.check(now()).is_err());
-        assert!(input(&"x".repeat(MAX_TITLE_LEN)).check(now()).is_ok());
-        assert!(input(&"x".repeat(MAX_TITLE_LEN + 1)).check(now()).is_err());
-    }
-
-    #[test]
-    fn an_event_can_be_recorded_late_but_not_far_off() {
-        let at = |time| EventInput {
-            occurred_at: Some(time),
-            ..input("x")
-        };
-        assert!(at(now() - DAY * 30).check(now()).is_ok());
-        assert!(at(now() + TimeDelta::minutes(1)).check(now()).is_ok());
-        assert!(at(now() - DAY * 400).check(now()).is_err());
-        assert!(at(now() + DAY).check(now()).is_err());
+        assert!(blank.check().is_err());
+        assert!(input(&"x".repeat(MAX_TITLE_LEN)).check().is_ok());
+        assert!(input(&"x".repeat(MAX_TITLE_LEN + 1)).check().is_err());
     }
 
     #[test]
@@ -265,9 +238,9 @@ mod tests {
             filter: Some(filter.into()),
             ..input("x")
         };
-        assert!(filtered("role=web").check(now()).is_ok());
-        assert!(filtered("").check(now()).is_ok());
-        assert!(filtered("role=\"unclosed").check(now()).is_err());
+        assert!(filtered("role=web").check().is_ok());
+        assert!(filtered("").check().is_ok());
+        assert!(filtered("role=\"unclosed").check().is_err());
     }
 
     #[test]
