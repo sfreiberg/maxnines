@@ -184,8 +184,8 @@ pub(crate) async fn check_imap(
     let login = username_and_password(credentials, check.kind)?;
     let (host, socket) = open(check, findings).await?;
     if check.tls == Some(true) {
-        let secured = secure(&host, socket, &[], findings).await?;
-        certificate_verdict(check, secured.problem)?;
+        let mut secured = secure(&host, socket, &[], findings).await?;
+        imap_trusts(check, secured.problem, &mut secured.stream).await?;
         let client = imap_greeted(async_imap::Client::new(secured.stream)).await?;
         return imap_sign_in(client, login, findings).await;
     }
@@ -205,8 +205,8 @@ pub(crate) async fn check_imap(
         imap_log_out(client.get_mut()).await;
         bail!(TLS_NOT_OFFERED);
     }
-    let secured = secure(&host, client.into_inner(), &[], findings).await?;
-    certificate_verdict(check, secured.problem)?;
+    let mut secured = secure(&host, client.into_inner(), &[], findings).await?;
+    imap_trusts(check, secured.problem, &mut secured.stream).await?;
     imap_sign_in(
         async_imap::Client::new(secured.stream),
         Some(login),
@@ -283,6 +283,19 @@ where
 async fn imap_log_out<T: AsyncWrite + Unpin>(stream: &mut T) {
     let _ = stream.write_all(b"z LOGOUT\r\n").await;
     let _ = stream.flush().await;
+}
+
+/// Fails if the certificate isn't to be trusted, saying goodbye first.
+async fn imap_trusts<T: AsyncWrite + Unpin>(
+    check: &Check,
+    problem: Option<&'static str>,
+    stream: &mut T,
+) -> Result<()> {
+    let verdict = certificate_verdict(check, problem);
+    if verdict.is_err() {
+        imap_log_out(stream).await;
+    }
+    verdict
 }
 
 async fn imap_sign_in<T>(
@@ -821,6 +834,95 @@ mod tests {
         let result = run(&imap, Some(&login("s3cret"))).await;
         assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
         assert_eq!(heard.recv().await, Some(true), "when it can't sign in");
+    }
+
+    /// An IMAP server over TLS, from the start or after STARTTLS, that turns every
+    /// login down and never answers LOGOUT. It says whether each connection logged
+    /// out over TLS before it ended.
+    async fn imap_turning_logins_down(
+        implicit: bool,
+    ) -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<bool>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (said, heard) = tokio::sync::mpsc::unbounded_channel();
+        let tls = acceptor();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let (tls, said) = (tls.clone(), said.clone());
+                tokio::spawn(async move {
+                    let mut conn = if implicit {
+                        let Ok(stream) = tls.accept(socket).await else {
+                            return;
+                        };
+                        Conn::Tls(Box::new(BufReader::new(stream)))
+                    } else {
+                        Conn::Plain(BufReader::new(socket))
+                    };
+                    conn.send("* OK ready\r\n").await;
+                    let mut logged_out = false;
+                    while let Some(line) = conn.line().await {
+                        let (tag, command) = line.split_once(' ').unwrap_or((&line, ""));
+                        let verb = command.split(' ').next().unwrap_or_default();
+                        match verb.to_uppercase().as_str() {
+                            "CAPABILITY" => {
+                                let reply =
+                                    format!("* CAPABILITY IMAP4rev1 STARTTLS\r\n{tag} OK done\r\n");
+                                conn.send(&reply).await;
+                            }
+                            "STARTTLS" if !conn.secure() => {
+                                conn.send(&format!("{tag} OK begin\r\n")).await;
+                                let Conn::Plain(reader) = std::mem::replace(
+                                    &mut conn,
+                                    Conn::Plain(BufReader::new(dummy().await)),
+                                ) else {
+                                    return;
+                                };
+                                let Ok(stream) = tls.accept(reader.into_inner()).await else {
+                                    return;
+                                };
+                                conn = Conn::Tls(Box::new(BufReader::new(stream)));
+                            }
+                            "LOGIN" => {
+                                let reply = format!("{tag} NO [AUTHENTICATIONFAILED] no\r\n");
+                                conn.send(&reply).await;
+                            }
+                            // Never answered.
+                            "LOGOUT" => logged_out = conn.secure(),
+                            _ => conn.send(&format!("{tag} BAD unknown\r\n")).await,
+                        }
+                    }
+                    let _ = said.send(logged_out);
+                });
+            }
+        });
+        (address, heard)
+    }
+
+    /// It says goodbye over TLS too, when a login is turned down and when the
+    /// certificate isn't to be trusted.
+    #[tokio::test]
+    async fn an_imap_check_logs_out_over_tls_when_turned_down() {
+        for implicit in [false, true] {
+            let (address, mut heard) = imap_turning_logins_down(implicit).await;
+            let mut imap = check(CheckKind::Imap, address, implicit);
+            let result = run(&imap, Some(&login("guess"))).await;
+            assert_eq!(result["signed_in"], false, "{implicit}: {result}");
+            assert_eq!(
+                heard.recv().await,
+                Some(true),
+                "{implicit}: a wrong password"
+            );
+
+            imap.insecure = None;
+            let result = run(&imap, Some(&login("s3cret"))).await;
+            assert_eq!(result["up"], 0, "{implicit}: {result}");
+            assert!(result.get("signed_in").is_none(), "{implicit}: {result}");
+            assert_eq!(
+                heard.recv().await,
+                Some(true),
+                "{implicit}: an untrusted certificate"
+            );
+        }
     }
 
     /// One that greets with BYE, as for too many connections, isn't up.
