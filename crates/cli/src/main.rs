@@ -338,6 +338,25 @@ fn connect(folder: &Path, name: Option<&str>) -> Result<Api> {
 /// What to tell someone when the server couldn't be told a sign-in has ended.
 const REVOKE_BY_HAND: &str = "Revoke it in MaxNines under Settings, then Signed-in apps.";
 
+/// What a context for `server` is called when the sign-in doesn't say: its short
+/// name, or with `-2`, `-3` and so on after it if a context of another server has
+/// that, so signing in to one server never takes the place of another's.
+fn unused_name(config: &Config, server: &Server) -> String {
+    let short = server.short_name();
+    let free = |name: &str| {
+        config.contexts.get(name).is_none_or(|context| {
+            Server::parse(&context.server).is_ok_and(|theirs| theirs.root == server.root)
+        })
+    };
+    (1..)
+        .map(|n| match n {
+            1 => short.clone(),
+            n => format!("{short}-{n}"),
+        })
+        .find(|name| free(name))
+        .unwrap_or(short)
+}
+
 /// Signs in, to the server `args` names, or else the context `--context` names or
 /// the current one, again.
 fn login(folder: &Path, args: LoginArgs, context: Option<&str>) -> Result<u8> {
@@ -356,7 +375,10 @@ fn login(folder: &Path, args: LoginArgs, context: Option<&str>) -> Result<u8> {
         _ => unreachable!("clap allows at most two"),
     };
     let server = Server::parse(&address)?;
-    let name = name.unwrap_or_else(|| server.short_name());
+    let name = match name {
+        Some(name) => name,
+        None => unused_name(&config, &server),
+    };
     let device = gethostname::gethostname().to_string_lossy().into_owned();
     let role = args.role.map(Role::as_str);
     let http = http::Http::new();
@@ -848,6 +870,31 @@ fn page(api: &Api, kind: Kind, name: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_servers_context_never_takes_another_servers_name() {
+        let mut config = Config::default();
+        let context = |server: &str| config::Context {
+            server: server.to_string(),
+            key_env: None,
+        };
+        let prod = Server::parse("https://monitor.prod.example.com").unwrap();
+        assert_eq!(unused_name(&config, &prod), "monitor");
+        config.contexts.insert(
+            "monitor".to_string(),
+            context("https://monitor.prod.example.com"),
+        );
+        // The same server signs in to its own context again.
+        assert_eq!(unused_name(&config, &prod), "monitor");
+        let staging = Server::parse("https://monitor.staging.example.com").unwrap();
+        assert_eq!(unused_name(&config, &staging), "monitor-2");
+        config.contexts.insert(
+            "monitor-2".to_string(),
+            context("https://monitor.staging.example.com"),
+        );
+        let test = Server::parse("https://monitor.test.example.com").unwrap();
+        assert_eq!(unused_name(&config, &test), "monitor-3");
+    }
 
     #[test]
     fn lengths_are_read_in_their_units() {

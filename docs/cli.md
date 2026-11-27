@@ -70,7 +70,9 @@ your own role. With `--device` it shows an address and a code to enter on any de
 for a machine without a browser. The code works for as long as the server says, and
 a network that drops while you type it only means maxnines asks again.
 
-Each server is a context, by name. The last one signed in to is the one used, until
+Each server is a context, by name. Signing in without one names it after the first part
+of the server's name, such as `monitor` for `monitor.example.com`, with `-2`, `-3` and
+so on after it when another server's context has that. The last one signed in to is the one used, until
 `maxnines config use` or `--context` says otherwise. `login` with no server signs in
 to that context again, so `maxnines --context prod login` signs in to prod. Signing
 in to a context again revokes its earlier sign-in on the server:
