@@ -57,6 +57,9 @@ pub fn preview(
 ) -> Result<Preview> {
     let mut tried = proposed(rules, id, rule);
     tried.rule.enabled = true;
+    if let Some(template) = &mut tried.template {
+        template.enabled = true;
+    }
     let compiled = Compiled {
         before: ConfigRules::new(rules.iter().cloned())?,
         after: ConfigRules::new(with_rule(rules, id, rule))?,
@@ -140,8 +143,11 @@ fn preview_host(compiled: &Compiled, host: &PreviewHost) -> HostPreview {
     let reported = host.facts.as_object().is_some_and(|f| !f.is_empty());
     let mut note = match check {
         _ if !reported => Some("Hasn't reported any facts yet".to_string()),
-        Ok(_) => None,
-        Err(error) => Some(format!("Couldn't check this host: {error:#}")),
+        // Only when the condition is why it doesn't match.
+        Err(error) if !matches && compiled.rule.runs_on(&shown) => {
+            Some(format!("Couldn't check this host: {error:#}"))
+        }
+        _ => None,
     };
 
     let before = compiled.before.resolve(&shown);
@@ -433,6 +439,22 @@ mod tests {
         assert_eq!(preview.hosts[0].hostname, "web-1");
         assert!(preview.hosts[0].matches);
         assert!(!preview.hosts[1].matches);
+    }
+
+    #[test]
+    fn a_template_turned_off_still_shows_which_hosts_its_rule_is_for() {
+        let mut saved_rule = saved(2, "Web", 0, WEB, json!({ "interval_secs": 5 }));
+        saved_rule.template = Some(crate::models::RuleTemplate {
+            id: 7,
+            enabled: false,
+            host_ids: Vec::new(),
+        });
+        let rules = [default_rule(), saved_rule.clone()];
+        let hosts = [host("web-1", "web"), host("db-1", "db")];
+
+        let preview = preview(&rules, Some(2), &saved_rule.rule, &hosts).unwrap();
+
+        assert_eq!(preview.matching, 1, "{preview:?}");
     }
 
     #[test]

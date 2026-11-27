@@ -192,21 +192,22 @@ impl CompiledRule {
         Ok(Self { rule, condition })
     }
 
+    /// Whether the host runs one of the operating systems the rule is for, if it
+    /// names any.
+    pub fn runs_on(&self, host: &Host) -> bool {
+        let systems = &self.rule.rule.operating_systems;
+        let family = host.facts["os"]["family"].as_str();
+        systems.is_empty()
+            || family.is_some_and(|family| systems.iter().any(|system| system == family))
+    }
+
     /// A condition that can't be evaluated doesn't match. That's the normal case
     /// for a rule about a fact this agent doesn't have.
     pub fn matches(&self, host: &Host) -> bool {
-        if !self.rule.in_force() {
+        if !self.rule.in_force() || !self.runs_on(host) {
             return false;
         }
         let rule = &self.rule.rule;
-        if !rule.operating_systems.is_empty() {
-            let family = host.facts["os"]["family"].as_str();
-            let listed =
-                |family: &str| rule.operating_systems.iter().any(|system| system == family);
-            if !family.is_some_and(listed) {
-                return false;
-            }
-        }
         // A built-in rule is for the hosts its template is for, as the template
         // says which: those given it by hand, and those its condition picks, or
         // only those given it by hand when it has no condition.
