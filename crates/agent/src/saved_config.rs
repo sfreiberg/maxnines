@@ -36,7 +36,26 @@ pub fn load(path: &Path) -> Option<ConfigUpdate> {
     }
 }
 
-/// Writes a new file then renames it, so a crash can't leave half a config.
+/// Puts `new`, written in full, in the place of `path`, so that once this returns a
+/// power cut leaves one or the other, never an empty file: the new file's contents
+/// are on disk before the rename, and the rename is before its folder's listing.
+pub fn replace(new: &Path, path: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new().write(true).open(new)?.sync_all()?;
+    fs::rename(new, path)?;
+    // Windows writes the rename through itself, and can't open a folder this way.
+    #[cfg(unix)]
+    if let Some(folder) = path.parent() {
+        let folder = if folder.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            folder
+        };
+        fs::File::open(folder)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Writes a new file then puts it in place, so a crash can't leave half a config.
 pub fn save(path: &Path, update: &ConfigUpdate) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
@@ -49,7 +68,7 @@ pub fn save(path: &Path, update: &ConfigUpdate) -> Result<()> {
     let temporary = path.with_extension("json.new");
     fs::write(&temporary, serde_json::to_string_pretty(&saved)?)
         .with_context(|| format!("writing {}", temporary.display()))?;
-    fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+    replace(&temporary, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 #[cfg(test)]
