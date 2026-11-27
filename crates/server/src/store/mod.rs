@@ -177,8 +177,8 @@ pub struct StoreStats {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CollectorStats {
     pub name: String,
-    /// Over all time, where the store can say cheaply. ClickHouse only counts the
-    /// last hour, so it leaves this out.
+    /// Over all time, where the store can say cheaply. Neither store can without
+    /// reading every sample, so both count only the last hour and leave this out.
     pub rows: Option<i64>,
     pub rows_last_hour: i64,
     pub oldest_sample_at: Timestamp,

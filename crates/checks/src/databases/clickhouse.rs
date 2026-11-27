@@ -22,6 +22,9 @@ use crate::{Credentials, Findings, Login, WebConnection, decompress, host_and_po
 /// What a query got back, or ClickHouse's own reason it didn't.
 struct Failure {
     message: String,
+    /// Whether ClickHouse turned the query down itself, rather than not being
+    /// reached.
+    answered: bool,
 }
 
 impl std::fmt::Display for Failure {
@@ -156,6 +159,7 @@ impl Clickhouse {
         check.timeout = self.timeout;
         let failed = |error: anyhow::Error| Failure {
             message: format!("{error:#}"),
+            answered: false,
         };
         let mut findings = Findings::default();
         let kept = match self.connection.take() {
@@ -176,6 +180,7 @@ impl Clickhouse {
             decompress(&answer.body)
                 .ok_or(Failure {
                     message: "its answer couldn't be unpacked".to_string(),
+                    answered: false,
                 })?
                 .0
         } else {
@@ -211,7 +216,10 @@ impl Clickhouse {
     /// A template's statement's rows, each cell as the type ClickHouse says its
     /// column is: true or false, a number, text, or nothing.
     pub(crate) async fn typed_rows(&mut self, sql: &str) -> Result<Vec<Row>> {
-        let answer = self.answer(sql).await.map_err(|error| anyhow!("{error}"))?;
+        let answer = self
+            .answer(sql)
+            .await
+            .map_err(|error| crate::templates::answered_if(error.answered, anyhow!("{error}")))?;
         let columns: Vec<(String, String)> = answer["meta"]
             .as_array()
             .into_iter()
@@ -256,10 +264,14 @@ impl Clickhouse {
             } else {
                 message.chars().take(200).collect()
             };
-            return Err(Failure { message });
+            return Err(Failure {
+                message,
+                answered: true,
+            });
         }
         serde_json::from_str(&body).map_err(|_| Failure {
             message: "it didn't answer as ClickHouse does".to_string(),
+            answered: false,
         })
     }
 
@@ -267,6 +279,7 @@ impl Clickhouse {
     async fn one(&mut self, sql: &str) -> Result<Map<String, Value>, Failure> {
         self.query(sql).await?.into_iter().next().ok_or(Failure {
             message: "it gave nothing back".to_string(),
+            answered: false,
         })
     }
 

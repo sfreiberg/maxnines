@@ -52,6 +52,7 @@ fn query(store: &TestStore, host_id: &str, metric: &str, max_series: usize) -> S
             metric: &find(metric).unwrap(),
             range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
             max_series,
+            only: None,
         })
         .unwrap()
 }
@@ -382,6 +383,26 @@ fn an_idle_interface_is_shown_at_zero() {
     let result = query(&store, "a", "network.received", 1);
     assert_eq!(names(&result), ["en0"]);
     assert_eq!(result.hidden, 1);
+
+    // Asked for by name, the quiet one is read alone, however many there are.
+    let alone = |name| {
+        store
+            .reader()
+            .unwrap()
+            .series(&SeriesQuery {
+                host_id: "a",
+                metric: &find("network.received").unwrap(),
+                range: TimeRange::new(at(0), at(HOUR_MS)).unwrap(),
+                max_series: 1,
+                only: Some(name),
+            })
+            .unwrap()
+    };
+    let result = alone("utun3");
+    assert_eq!(names(&result), ["utun3"]);
+    assert_eq!(averages(&result.series[0]), [0.0, 0.0]);
+    assert_eq!(result.hidden, 0);
+    assert!(alone("nothing").series.is_empty());
 }
 
 #[test]
@@ -1263,6 +1284,21 @@ fn stats_work_on_an_empty_database() {
 }
 
 #[test]
+fn stats_count_the_last_hour_by_collector() {
+    let mut store = in_memory();
+    for time in [1000, 2 * HOUR_MS, 2 * HOUR_MS + 1000] {
+        write_metric(&mut store, "a", time, "cpu", json!({ "usage_percent": 1.0 }));
+    }
+
+    let stats = store.reader().unwrap().stats(at(2 * HOUR_MS)).unwrap();
+
+    let cpu = &stats.collectors[0];
+    assert_eq!((cpu.name.as_str(), cpu.rows_last_hour), ("cpu", 2));
+    assert_eq!(cpu.oldest_sample_at, at(2 * HOUR_MS));
+    assert_eq!(cpu.newest_sample_at, at(2 * HOUR_MS + 1000));
+}
+
+#[test]
 fn something_no_longer_reported_is_left_out_of_the_latest_output() {
     let mut store = in_memory();
     let failing = json!([
@@ -1459,6 +1495,7 @@ fn chart_of(
             metric: &find(metric).unwrap(),
             range: TimeRange { from, to, step },
             max_series: 8,
+            only: None,
         })
         .unwrap()
 }
@@ -1698,6 +1735,7 @@ fn chart_in(
             metric: catalog.find(metric).unwrap(),
             range: TimeRange { from, to, step },
             max_series: 8,
+            only: None,
         })
         .unwrap()
 }

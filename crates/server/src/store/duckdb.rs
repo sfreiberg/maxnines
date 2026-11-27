@@ -1089,7 +1089,8 @@ fn cells_sql(
     Ok(cells)
 }
 
-/// Parameters: from, to, and how many series to keep.
+/// Parameters: from, to, how many series to keep, and the one series to read, or
+/// null for all.
 fn series_sql(
     connection: &Connection,
     metric: &Metric,
@@ -1102,16 +1103,19 @@ fn series_sql(
     // without it looks like it isn't being read.
     Ok(format!(
         "WITH cells AS ({cells}),
+         picked AS (
+             SELECT * FROM cells WHERE $4::VARCHAR IS NULL OR series = $4::VARCHAR
+         ),
          ranked AS (
              SELECT series,
                     row_number() OVER (ORDER BY sum(summed) / sum(samples) DESC, series)
                         AS position,
                     count(*) OVER () AS total
-             FROM cells GROUP BY series
+             FROM picked GROUP BY series
          )
          SELECT series, {bucket} AS bucket,
                 sum(summed) / sum(samples), min(low), max(high), total
-         FROM cells JOIN ranked USING (series)
+         FROM picked JOIN ranked USING (series)
          WHERE position <= $3::BIGINT
          GROUP BY series, bucket, total
          ORDER BY series, bucket",
@@ -1305,6 +1309,7 @@ impl MetricsReader for DuckDbReader {
                 timestamp(range.from),
                 timestamp(range.to),
                 i64::try_from(query.max_series)?,
+                query.only,
             ],
             |row| {
                 let point = Point {
@@ -1572,13 +1577,21 @@ impl MetricsReader for DuckDbReader {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
 
+        // Every row is what the tables say they hold, rather than counted, and only
+        // the last hour is counted by collector, as the sorted table is in time order,
+        // so the rest is skipped: the page is opened often, and counting every sample
+        // each time would read them all.
+        let total_rows: i64 = connection.query_row(
+            "SELECT coalesce(sum(estimated_size), 0)::BIGINT FROM duckdb_tables()
+             WHERE schema_name = 'main' AND table_name IN ('samples', 'samples_recent')",
+            [],
+            |row| row.get(0),
+        )?;
         let mut statement = connection.prepare(
-            "SELECT c.name, sum(total)::BIGINT, sum(recent)::BIGINT, min(oldest), max(newest)
+            "SELECT c.name, sum(recent)::BIGINT, min(oldest), max(newest)
              FROM (
-                 SELECT metric_id, count(*) AS total,
-                        count(*) FILTER (WHERE time >= $1::TIMESTAMP) AS recent,
-                        min(time) AS oldest, max(time) AS newest
-                 FROM all_samples GROUP BY metric_id
+                 SELECT metric_id, count(*) AS recent, min(time) AS oldest, max(time) AS newest
+                 FROM all_samples WHERE time >= $1::TIMESTAMP GROUP BY metric_id
              ) counted
              JOIN metrics m ON m.id = counted.metric_id
              JOIN collectors c ON c.id = m.collector_id
@@ -1587,10 +1600,10 @@ impl MetricsReader for DuckDbReader {
         let rows = statement.query_map([timestamp(hour_ago)], |row| {
             Ok(CollectorStats {
                 name: row.get(0)?,
-                rows: Some(row.get(1)?),
-                rows_last_hour: row.get(2)?,
-                oldest_sample_at: row.get(3)?,
-                newest_sample_at: row.get(4)?,
+                rows: None,
+                rows_last_hour: row.get(1)?,
+                oldest_sample_at: row.get(2)?,
+                newest_sample_at: row.get(3)?,
             })
         })?;
 
@@ -1601,7 +1614,7 @@ impl MetricsReader for DuckDbReader {
             memory_used,
             memory_limit,
             collectors: rows.collect::<Result<_, _>>()?,
-            total_rows: None,
+            total_rows: Some(total_rows),
         })
     }
 }
@@ -1636,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn stats_count_what_each_collector_has_stored() {
+    fn stats_count_every_row_and_the_last_hour_by_collector() {
         let mut store = in_memory();
         let cpu = || json!({ "usage_percent": 1.0 });
         write_metric(&mut store, "a", 1000, "cpu", cpu());
@@ -1649,24 +1662,17 @@ mod tests {
 
         assert_eq!(stats.engine, "DuckDB");
         assert!(!stats.memory_limit.is_empty());
+        assert_eq!(stats.total_rows, Some(4));
+        // The disk sent nothing in the last hour.
         assert_eq!(
             stats.collectors,
-            [
-                CollectorStats {
-                    name: "cpu".to_string(),
-                    rows: Some(3),
-                    rows_last_hour: 2,
-                    oldest_sample_at: at(1000),
-                    newest_sample_at: at(9000),
-                },
-                CollectorStats {
-                    name: "disk".to_string(),
-                    rows: Some(1),
-                    rows_last_hour: 0,
-                    oldest_sample_at: at(2000),
-                    newest_sample_at: at(2000),
-                },
-            ]
+            [CollectorStats {
+                name: "cpu".to_string(),
+                rows: None,
+                rows_last_hour: 2,
+                oldest_sample_at: at(5000),
+                newest_sample_at: at(9000),
+            }]
         );
     }
 

@@ -2566,3 +2566,50 @@ async fn only_a_built_in_template_has_agent_settings() {
     // Its HCL leaves them to its config rule, so it can be copied into one's own.
     assert!(!stored.hcl().contains("config {"), "{}", stored.hcl());
 }
+
+#[tokio::test]
+async fn a_change_to_one_template_runs_as_reading_them_all_again_would() {
+    let database = Database::for_test().await;
+    let now = crate::times::now();
+    database
+        .sync_templates(&built_in::all().unwrap(), now)
+        .await
+        .unwrap();
+    let app = database
+        .create_template(&parse(APP).unwrap(), now)
+        .await
+        .unwrap();
+    let running = |database: &Database| {
+        let templates = database.running_templates();
+        templates
+            .all()
+            .iter()
+            .map(|assigned| assigned.running.clone())
+            .map(|running| (running.id, running.template, running.host_ids))
+            .collect::<Vec<_>>()
+    };
+
+    // Only the changed one is read again, and the rest are as they were.
+    assert!(
+        database
+            .set_template_enabled(app, false, now)
+            .await
+            .unwrap()
+    );
+    let hosts = std::collections::BTreeSet::from([crate::remote_checks::LOCAL_HOST_ID.to_string()]);
+    assert!(
+        database
+            .set_template_hosts(app, None, &hosts, now)
+            .await
+            .unwrap()
+    );
+    let changed = running(&database);
+    database.refresh_catalog().await.unwrap();
+    assert_eq!(changed, running(&database));
+    let mine = changed.iter().find(|(id, ..)| *id == app).unwrap();
+    assert_eq!(mine.2, hosts);
+
+    // A deleted one stops running.
+    assert!(database.delete_template(app, now).await.unwrap());
+    assert!(running(&database).iter().all(|(id, ..)| *id != app));
+}

@@ -98,13 +98,26 @@ pub(crate) async fn check_ldap(
         // says nothing about the rest, so it's looked at again without asking. One
         // that hangs up on that too without a word isn't speaking LDAP in the clear.
         StartTls::HungUp => {
-            let socket = connect(&addresses, findings).await?;
-            let mut plain = Ldap::new(socket, 1);
-            let looked = plain.look(None, findings).await;
-            if !plain.answered && looked.as_ref().is_err_and(hung_up) {
-                findings.tls_offered = None;
-                bail!(TLS_ONLY);
-            }
+            // With a login, the check fails whatever the second look finds, which
+            // only chooses what it says, so what it reads is set aside.
+            let mut aside = Findings::default();
+            let looking = if login.is_some() {
+                &mut aside
+            } else {
+                &mut *findings
+            };
+            let looked = match connect(&addresses, looking).await {
+                Ok(socket) => {
+                    let mut plain = Ldap::new(socket, 1);
+                    let looked = plain.look(None, looking).await;
+                    if !plain.answered && looked.as_ref().is_err_and(hung_up) {
+                        findings.tls_offered = None;
+                        bail!(TLS_ONLY);
+                    }
+                    looked
+                }
+                Err(error) => Err(error),
+            };
             ensure!(login.is_none(), TLS_NOT_OFFERED);
             return looked;
         }
@@ -961,9 +974,12 @@ mod tests {
         assert_eq!(result["tls_offered"], false, "{result}");
         assert_eq!(result["server_version"], "Fake Directory 2.1", "{result}");
 
+        // With a login, the second look only chooses what's said, and nothing it
+        // read is reported as the check's.
         let result = run_signed_in(&ldap, Some(&login(ACCOUNT, "s3cret"))).await;
         assert_eq!(result["up"], 0, "{result}");
         assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
+        assert!(result.get("server_version").is_none(), "{result}");
         assert!(!seen.leaked.load(Ordering::Relaxed));
     }
 

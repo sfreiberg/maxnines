@@ -1941,7 +1941,7 @@ impl Database {
             }
         };
         transaction.commit().await.context("importing template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok((id, outcome))
     }
 
@@ -1950,6 +1950,7 @@ impl Database {
     /// Everything here that changes a template, turns one or a part of one on or off,
     /// or changes which hosts it's for, ends with this, so nothing waits for a restart.
     pub async fn refresh_catalog(&self) -> Result<()> {
+        let _refreshing = self.template_refresh.lock().await;
         let rows = template::Entity::find()
             .filter(template::Column::DeletedAt.is_null())
             .order_by_asc(template::Column::Id)
@@ -1975,12 +1976,62 @@ impl Database {
                 host_ids: given.remove(&row.id).unwrap_or_default(),
             });
         }
+        self.publish_templates(templates);
+        Ok(())
+    }
+
+    /// As [`refresh_catalog`](Self::refresh_catalog), reading again only the
+    /// templates one change touched, and keeping the rest as they run, as reading
+    /// every template takes many queries each.
+    async fn refresh_templates(&self, ids: &[i64]) -> Result<()> {
+        let _refreshing = self.template_refresh.lock().await;
+        let mut running: BTreeMap<i64, Running> = self
+            .templates
+            .get()
+            .all()
+            .iter()
+            .map(|assigned| (assigned.id(), assigned.running.clone()))
+            .collect();
+        for &id in ids {
+            running.remove(&id);
+            let row = template::Entity::find_by_id(id)
+                .filter(template::Column::DeletedAt.is_null())
+                .one(&self.connection)
+                .await
+                .context("loading a template")?;
+            let Some(row) = row else {
+                continue;
+            };
+            let host_ids = template_host::Entity::find()
+                .filter(template_host::Column::TemplateId.eq(id))
+                .all(&self.connection)
+                .await
+                .context("loading a template's hosts")?
+                .into_iter()
+                .map(|given| given.host_id)
+                .collect();
+            let template = read_template(&self.connection, &row, Reading::AsRun).await?;
+            running.insert(
+                id,
+                Running {
+                    id,
+                    template,
+                    host_ids,
+                },
+            );
+        }
+        self.publish_templates(running.into_values().collect());
+        Ok(())
+    }
+
+    /// Puts templates in place as they run, in the order they were added, with the
+    /// catalog of metrics made from them, and tells agents' connections.
+    fn publish_templates(&self, templates: Vec<Running>) {
         self.catalog.set(Catalog::with_templates(
             templates.iter().map(|t| &t.template),
         ));
         self.templates.set(RunningTemplates::new(templates));
         self.template_changes.send_modify(|revision| *revision += 1);
-        Ok(())
     }
 
     /// Built-in, imported and people's own, sorted by name.
@@ -2067,7 +2118,7 @@ impl Database {
         write_rules(&transaction, id, template, Origin::Own, now).await?;
         record_template(&transaction, id, None).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(id)
     }
 
@@ -2108,7 +2159,7 @@ impl Database {
         write_rules(&transaction, id, template, Origin::Own, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2126,7 +2177,7 @@ impl Database {
         }
         delete_in(&transaction, &stored, now).await?;
         transaction.commit().await.context("deleting template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2160,7 +2211,7 @@ impl Database {
             .context("saving template")?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2183,7 +2234,7 @@ impl Database {
         .context("saving template")?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2241,7 +2292,7 @@ impl Database {
         }
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2469,7 +2520,7 @@ impl Database {
         touch(&transaction, id, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2526,7 +2577,7 @@ impl Database {
         touch(&transaction, id, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 
@@ -2598,7 +2649,7 @@ impl Database {
         touch(&transaction, id, now).await?;
         record_template(&transaction, id, Some(&before)).await?;
         transaction.commit().await.context("saving template")?;
-        self.refresh_catalog().await?;
+        self.refresh_templates(&[id]).await?;
         Ok(true)
     }
 

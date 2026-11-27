@@ -78,11 +78,20 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
 
     // Every instance any metric's counter has, in order.
     let mut names: Vec<&String> = Vec::new();
+    let mut listed = HashSet::new();
     for metric in &work.metrics {
         for (name, _) in readings.counters.get(&metric.counter).into_iter().flatten() {
-            if !names.contains(&name) {
+            if listed.insert(name) {
                 names.push(name);
             }
+        }
+    }
+    // Each counter's value by instance, looked up once for every instance and metric.
+    let mut values: HashMap<&str, HashMap<&str, f64>> = HashMap::new();
+    for (counter, read) in &readings.counters {
+        let by_instance = values.entry(counter).or_default();
+        for (name, value) in read {
+            by_instance.entry(name).or_insert(*value);
         }
     }
 
@@ -106,7 +115,7 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
         }
         let mut grouped = true;
         for (group, counter) in &work.groups {
-            match value_of(readings, counter, name) {
+            match value_of(&values, counter, name) {
                 Some(value) => {
                     labels.insert(group.clone(), group_value(value));
                 }
@@ -127,7 +136,7 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
         }
         let metrics = series.entry(labels).or_default();
         for metric in &work.metrics {
-            let Some(value) = value_of(readings, &metric.counter, name) else {
+            let Some(value) = value_of(&values, &metric.counter, name) else {
                 continue;
             };
             metrics
@@ -182,13 +191,15 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
     read
 }
 
-fn value_of(readings: &Readings, counter: &str, instance: &str) -> Option<f64> {
-    readings
-        .counters
+fn value_of(
+    values: &HashMap<&str, HashMap<&str, f64>>,
+    counter: &str,
+    instance: &str,
+) -> Option<f64> {
+    values
         .get(counter)?
-        .iter()
-        .find(|(name, _)| name == instance)
-        .map(|(_, value)| *value)
+        .get(instance)
+        .copied()
         .filter(|value| value.is_finite())
 }
 

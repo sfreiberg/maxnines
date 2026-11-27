@@ -233,6 +233,9 @@ pub struct Database {
     templates: SharedTemplates,
     /// Bumped each time they're made again.
     template_changes: Arc<tokio::sync::watch::Sender<u64>>,
+    /// Held while the templates as they run are read again, so two changes at once
+    /// can't each put back what the other replaced.
+    template_refresh: Arc<tokio::sync::Mutex<()>>,
     /// What templates' discovery found, kept in memory once read until it changes,
     /// with how many times it has, so a read that overlapped a change isn't kept.
     discovered: DiscoveredCache,
@@ -329,6 +332,7 @@ impl Database {
             catalog: SharedCatalog::default(),
             templates: SharedTemplates::default(),
             template_changes: Arc::new(tokio::sync::watch::Sender::new(0)),
+            template_refresh: Arc::default(),
             discovered: DiscoveredCache::default(),
         };
         database.refresh_catalog().await?;

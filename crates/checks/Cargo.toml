@@ -8,6 +8,7 @@ license.workspace = true
 # A UniFi console of its own, for tests here and in the server.
 rcgen = { version = "0.14", optional = true }
 anyhow.workspace = true
+futures-util.workspace = true
 chrono.workspace = true
 base64 = "0.22"
 flate2 = "1"

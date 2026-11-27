@@ -54,7 +54,11 @@ pub(super) async fn run(connection: &mut MultiplexedConnection, text: &str) -> R
     for word in &words[1..] {
         command.arg(word);
     }
-    let value: redis::Value = command.query_async(connection).await.map_err(short)?;
+    let value: redis::Value = command.query_async(connection).await.map_err(|error| {
+        // An error with a code is Redis' own answer, such as NOPERM.
+        let answered = error.code().is_some();
+        super::answered_if(answered, short(error))
+    })?;
     let reply = reply(&words, value);
     Ok(vec![vec![(
         REPLY.to_string(),

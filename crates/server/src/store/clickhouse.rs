@@ -1308,7 +1308,7 @@ impl MetricsReader for ClickHouseReader {
                                     sum(summed) / sum(samples) AS mean_v,
                                     min(low) AS low_v, max(high) AS high_v,
                                     sum(summed) AS sum_v, sum(samples) AS rows_v
-                             FROM ({cells})
+                             FROM ({cells}) {only}
                              GROUP BY series, bucket
                          )
                      )
@@ -1319,6 +1319,10 @@ impl MetricsReader for ClickHouseReader {
             cells = cells(query.metric, &host, (range.from, range.to), tier, done),
             bucket = bucket_of("t", range.step),
             max_series = query.max_series,
+            only = query.only.map_or_else(String::new, |name| format!(
+                "WHERE series = {}",
+                quoted(name)
+            )),
         );
         let rows: Vec<PointRow> = wait(self.client.query_raw(&sql).fetch_all())?;
 

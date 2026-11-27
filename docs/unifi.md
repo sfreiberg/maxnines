@@ -116,4 +116,5 @@ Each run asks, under `https://<console>/proxy/network/integration/v1`:
 | `GET /sites/{site}/devices/{device}/statistics/latest` | Each online device's latest statistics |
 
 Every request carries the key in the `X-API-KEY` header, on one connection kept open
-between them.
+between them, except devices' statistics, which are asked for four at a time, each on
+a connection of its own, so a console with hundreds of devices answers in time.

@@ -11,7 +11,7 @@ mod parse;
 pub mod work;
 mod write;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -758,10 +758,12 @@ pub fn format_duration(secs: u64) -> String {
     humantime::format_duration(Duration::from_secs(secs)).to_string()
 }
 
+/// Where a query's SQL asks for a fill, as `{{ name }}`, with the name.
+static PLACE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}").expect("valid"));
+
 /// The names `{{ name }}` in a query's SQL asks fills for.
 pub fn fill_names(sql: &str) -> Vec<String> {
-    static PLACE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}").expect("valid"));
     let mut names = Vec::new();
     for captures in PLACE.captures_iter(sql) {
         let name = captures[1].to_string();
@@ -786,19 +788,19 @@ pub fn fill(query: &Query, at: Option<&Version>) -> String {
         });
         chosen.or_else(|| fill.older.clone()).unwrap_or_default()
     };
-    let mut sql = query.sql.clone();
+    let mut filled: HashMap<&str, String> = HashMap::new();
     for fill in &query.fills {
-        let filled = pick(fill);
-        let re = Regex::new(&format!(
-            r"\{{\{{\s*{}\s*\}}\}}",
-            regex_lite::escape(&fill.key)
-        ))
-        .expect("a key is a name");
-        sql = re
-            .replace_all(&sql, regex_lite::NoExpand(&filled))
-            .into_owned();
+        filled.entry(&fill.key).or_insert_with(|| pick(fill));
     }
-    sql
+    // In one pass, so what's filled in is never filled in again.
+    PLACE
+        .replace_all(&query.sql, |found: &regex_lite::Captures<'_>| {
+            filled
+                .get(&found[1])
+                .cloned()
+                .unwrap_or_else(|| found[0].to_string())
+        })
+        .into_owned()
 }
 
 /// The SQL each version range would run, with every fill filled: once with each

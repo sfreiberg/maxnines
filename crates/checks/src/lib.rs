@@ -342,6 +342,7 @@ async fn domain_expiry(check: &Check, left: Duration, findings: &mut Findings) {
 
 /// What a page that asks who's reading is sent: a username and password, or a
 /// token, as the header that carries them.
+#[derive(Clone)]
 pub struct Login {
     name: HeaderName,
     value: HeaderValue,

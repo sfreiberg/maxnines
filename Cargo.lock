@@ -4009,6 +4009,7 @@ dependencies = [
  "bytes",
  "chrono",
  "flate2",
+ "futures-util",
  "hickory-proto",
  "http-body-util",
  "hyper",

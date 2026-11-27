@@ -14,6 +14,7 @@ use futures_util::FutureExt;
 use maxnines_protocol::actions::ActionOutcome;
 use serde::Serialize;
 use serde_json::{Value, json};
+use tokio::sync::OnceCell;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, timeout};
 use tracing::{error, info, warn};
@@ -412,6 +413,10 @@ async fn guarded<T>(
     }
 }
 
+/// An alert's chart, drawn by the first send of a pass that needs it, for the rest
+/// to use too: nothing if there's none to draw.
+type SharedChart = OnceCell<Option<Arc<Vec<u8>>>>;
+
 #[derive(Clone)]
 pub struct Notifier {
     database: Database,
@@ -548,8 +553,9 @@ impl Notifier {
         let due = self.database.due_deliveries(now, BATCH_SIZE).await?;
 
         let mut sends = JoinSet::new();
-        // Each chart is drawn once a pass, however many channels it goes to.
-        let mut charts: HashMap<(i64, Event), Option<Arc<Vec<u8>>>> = HashMap::new();
+        // Each chart is drawn once a pass, however many channels it goes to, by the
+        // first send that needs it, so sends start at once and draw side by side.
+        let mut charts: HashMap<(i64, Event), Arc<SharedChart>> = HashMap::new();
         for delivery in due {
             // What an action printed is about the problem too.
             let tells_of_a_problem = matches!(
@@ -584,21 +590,20 @@ impl Notifier {
                     }
                 }
             }
-            let chart = if shows_chart(&delivery) {
+            let chart = shows_chart(&delivery).then(|| {
                 let key = (delivery.alert.id, delivery.event);
-                match charts.get(&key) {
-                    Some(drawn) => drawn.clone(),
-                    None => {
-                        let drawn = self.chart_for(&delivery, now).await;
-                        charts.insert(key, drawn.clone());
-                        drawn
-                    }
-                }
-            } else {
-                None
-            };
+                charts.entry(key).or_default().clone()
+            });
             let senders = self.senders.clone();
+            let notifier = self.clone();
             sends.spawn(async move {
+                let chart = match chart {
+                    Some(chart) => {
+                        let drawing = notifier.chart_for(&delivery, now);
+                        chart.get_or_init(|| drawing).await.clone()
+                    }
+                    None => None,
+                };
                 let notice = Notice {
                     chart,
                     ..Notice::for_delivery(&delivery)

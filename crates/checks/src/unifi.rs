@@ -159,6 +159,9 @@ async fn read_console(
     }
 
     let mut devices = Vec::new();
+    // Where each online device's statistics are, as the console gives them one
+    // device at a time.
+    let mut wanted = Vec::new();
     for site in sites {
         let listed: Vec<Listed> = session.all(&format!("/sites/{}/devices", site.id)).await?;
         let clients: Vec<ClientRow> = session.all(&format!("/sites/{}/clients", site.id)).await?;
@@ -169,7 +172,7 @@ async fn read_console(
             }
         }
         for row in listed {
-            let mut device = Device {
+            let device = Device {
                 clients: through.get(&row.id).copied().unwrap_or_default(),
                 id: row.id,
                 mac: row.mac_address,
@@ -187,12 +190,53 @@ async fn read_console(
             // has none for yet isn't a failure of the check.
             if device.is_online() {
                 let path = format!("/sites/{}/devices/{}/statistics/latest", site.id, device.id);
-                device.statistics = session.get(&path).await?;
+                wanted.push((devices.len(), path));
             }
             devices.push(device);
         }
     }
+    for (index, statistics) in statistics_of(session, wanted).await? {
+        devices[index].statistics = statistics;
+    }
     Ok(devices)
+}
+
+/// How many devices' statistics are asked for at once, each over a connection of
+/// its own, so a console with hundreds of devices answers within the check's limit.
+const AT_ONCE: usize = 4;
+
+/// The statistics at each path, shared out between [`AT_ONCE`] sessions, the first
+/// the one already open, by where each device is in the list.
+async fn statistics_of(
+    first: Session<'_>,
+    wanted: Vec<(usize, String)>,
+) -> Result<Vec<(usize, Option<Statistics>)>> {
+    let count = AT_ONCE.min(wanted.len()).max(1);
+    let mut sessions = vec![first];
+    while sessions.len() < count {
+        let session = Session {
+            check: sessions[0].check,
+            login: sessions[0].login.clone(),
+            connection: None,
+        };
+        sessions.push(session);
+    }
+    let mut shares = vec![Vec::new(); count];
+    for (n, item) in wanted.into_iter().enumerate() {
+        shares[n % count].push(item);
+    }
+    let asked = sessions
+        .iter_mut()
+        .zip(shares)
+        .map(|(session, share)| async move {
+            let mut found = Vec::with_capacity(share.len());
+            for (index, path) in share {
+                found.push((index, session.get(&path).await?));
+            }
+            anyhow::Ok(found)
+        });
+    let found = futures_util::future::try_join_all(asked).await?;
+    Ok(found.into_iter().flatten().collect())
 }
 
 #[derive(Deserialize)]

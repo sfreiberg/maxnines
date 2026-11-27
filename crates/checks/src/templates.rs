@@ -166,6 +166,11 @@ impl Session {
     async fn run_or_reconnect(&mut self, sql: &str) -> Result<Vec<Row>> {
         let reused = self.open.is_some();
         let outcome = self.run_once(sql).await;
+        // The database turning the statement down says it's there, with nothing
+        // more to ask it.
+        if outcome.as_ref().is_err_and(|error| error.is::<Answered>()) {
+            return outcome;
+        }
         if outcome.is_err() && !self.alive().await {
             self.open = None;
             if reused {
@@ -298,10 +303,10 @@ async fn run_mongodb(client: &mongodb::Client, text: &str) -> Result<Vec<Row>> {
         command.insert("maxTimeMS", limit);
     }
     let database = client.database(&database);
-    let reply = database
-        .run_command(command)
-        .await
-        .map_err(|error| mongodb_error(&error))?;
+    let reply = database.run_command(command).await.map_err(|error| {
+        let answered = matches!(*error.kind, mongodb::error::ErrorKind::Command(_));
+        answered_if(answered, mongodb_error(&error))
+    })?;
     let cursor = reply.get_document("cursor").ok();
     let open = cursor.and_then(|cursor| match cursor.get("id") {
         Some(Bson::Int64(id)) if *id != 0 => Some(*id),
@@ -505,6 +510,35 @@ fn is(value: &mongodb::bson::Bson, wanted: &str) -> bool {
     }
 }
 
+/// A statement the database turned down itself, such as for a privilege the account
+/// hasn't got, which says the connection is fine.
+#[derive(Debug)]
+pub(crate) struct Answered(String);
+
+impl std::fmt::Display for Answered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for Answered {}
+
+/// `error` as it's said, marked as the database's own answer when it is one.
+pub(crate) fn answered_if(answered: bool, error: anyhow::Error) -> anyhow::Error {
+    match answered {
+        true => anyhow::Error::new(Answered(error.to_string())),
+        false => error,
+    }
+}
+
+fn pg_statement(error: tokio_postgres::Error) -> anyhow::Error {
+    answered_if(error.as_db_error().is_some(), pg_short(error))
+}
+
+fn mysql_statement(error: mysql_async::Error) -> anyhow::Error {
+    answered_if(matches!(error, mysql_async::Error::Server(_)), short(error))
+}
+
 async fn run_postgres(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<Row>> {
     client
         .batch_execute(&format!(
@@ -514,8 +548,8 @@ async fn run_postgres(client: &tokio_postgres::Client, sql: &str) -> Result<Vec<
         .await
         .map_err(pg_short)?;
     let outcome = async {
-        let statement = client.prepare(sql).await.map_err(pg_short)?;
-        let rows = client.query(&statement, &[]).await.map_err(pg_short)?;
+        let statement = client.prepare(sql).await.map_err(pg_statement)?;
+        let rows = client.query(&statement, &[]).await.map_err(pg_statement)?;
         let names: Vec<String> = statement
             .columns()
             .iter()
@@ -642,7 +676,7 @@ async fn run_mysql(connection: &mut mysql_async::Conn, sql: &str) -> Result<Vec<
         true => connection.query(sql).await,
         false => connection.exec(sql, ()).await,
     }
-    .map_err(short);
+    .map_err(mysql_statement);
     let ended = connection.query_drop("ROLLBACK").await.map_err(short);
     let read = outcome?;
     ended?;
@@ -732,17 +766,18 @@ pub fn picked(rows: Vec<Row>, query: &QueryWork) -> Vec<Row> {
     if query.columns.is_empty() {
         return rows;
     }
-    let labels = |row: &Row| -> Vec<Cell> {
+    let labels = |row: &Row| -> Vec<LabelKey> {
         query
             .labels
             .iter()
             .map(|label| {
                 let found = row.iter().find(|(name, _)| name == label);
-                found.map_or(Cell::Null, |(_, cell)| cell.clone())
+                found.map_or(LabelKey::Null, |(_, cell)| LabelKey::of(cell))
             })
             .collect()
     };
-    let mut picked: Vec<Row> = Vec::new();
+    // By their labels, so rows to add up are found at once however many there are.
+    let mut picked: IndexMap<Vec<LabelKey>, Row> = IndexMap::new();
     for row in rows {
         let one: Row = query
             .columns
@@ -759,18 +794,46 @@ pub fn picked(rows: Vec<Row>, query: &QueryWork) -> Vec<Row> {
                 (name.clone(), cell)
             })
             .collect();
-        match picked.iter_mut().find(|seen| labels(seen) == labels(&one)) {
-            Some(seen) => {
-                for ((_, total), (_, cell)) in seen.iter_mut().zip(one) {
+        match picked.entry(labels(&one)) {
+            indexmap::map::Entry::Occupied(mut seen) => {
+                for ((_, total), (_, cell)) in seen.get_mut().iter_mut().zip(one) {
                     if let (Cell::Number(total), Cell::Number(more)) = (total, cell) {
                         *total += more;
                     }
                 }
             }
-            None => picked.push(one),
+            indexmap::map::Entry::Vacant(new) => {
+                new.insert(one);
+            }
         }
     }
-    picked
+    picked.into_values().collect()
+}
+
+/// A label's cell as something rows can be grouped by, equal where the cells are.
+#[derive(PartialEq, Eq, Hash)]
+enum LabelKey {
+    Null,
+    Bool(bool),
+    Number(u64),
+    Seconds(u64),
+    Text(String),
+    Other,
+}
+
+impl LabelKey {
+    fn of(cell: &Cell) -> Self {
+        // Zero is zero whatever its sign, as the cells compare.
+        let bits = |number: f64| if number == 0.0 { 0 } else { number.to_bits() };
+        match cell {
+            Cell::Null => Self::Null,
+            Cell::Bool(value) => Self::Bool(*value),
+            Cell::Number(number) => Self::Number(bits(*number)),
+            Cell::Seconds(seconds) => Self::Seconds(bits(*seconds)),
+            Cell::Text(text) => Self::Text(text.clone()),
+            Cell::Other | Cell::Reply(_) => Self::Other,
+        }
+    }
 }
 
 /// Whether rows are a MongoDB command's reply.
@@ -1100,6 +1163,45 @@ mod tests {
             from_reply(sql.clone(), &named(&[("one", "two")]), None),
             sql
         );
+    }
+
+    /// A statement PostgreSQL turns down is its answer, which needs no ping to see
+    /// the connection is still there. A real one, from
+    /// `MAXNINES_TEST_CHECK_POSTGRES`, as `host:port username [password]`.
+    #[tokio::test]
+    async fn a_statement_the_database_turns_down_is_its_answer() {
+        let Ok(value) = std::env::var("MAXNINES_TEST_CHECK_POSTGRES") else {
+            return;
+        };
+        let mut words = value.split_whitespace();
+        let target = words.next().unwrap();
+        let mut session = Session::new(Database {
+            check: maxnines_protocol::Check::new("real", CheckKind::Postgres, target),
+            credentials: Credentials {
+                username: words.next().map(String::from),
+                password: words.next().map(String::from),
+                private_key: None,
+            },
+        });
+        session.run("SELECT 1", LIMIT).await.unwrap();
+        for _ in 0..2 {
+            let error = session
+                .run("SELECT * FROM no_such_table", LIMIT)
+                .await
+                .unwrap_err();
+            assert!(error.is::<Answered>(), "{error:#}");
+            assert!(error.to_string().contains("no_such_table"), "{error:#}");
+        }
+        session.run("SELECT 1", LIMIT).await.unwrap();
+        assert_eq!(session.connections(), 1);
+
+        // One that can't be reached never is.
+        let mut nowhere = Session::new(Database {
+            check: maxnines_protocol::Check::new("nowhere", CheckKind::Postgres, "127.0.0.1:1"),
+            credentials: Credentials::default(),
+        });
+        let error = nowhere.run("SELECT 1", LIMIT).await.unwrap_err();
+        assert!(!error.is::<Answered>(), "{error:#}");
     }
 
     /// A real MongoDB, from `MAXNINES_TEST_CHECK_MONGODB`, as `host:port [username

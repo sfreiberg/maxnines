@@ -21,7 +21,7 @@
 //! database is now somewhere else, or signed in to differently, starts again.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -91,6 +91,24 @@ const ACCOUNT_EVERY: Duration = Duration::from_secs(5 * 60);
 type Told = (TemplateWork, Duration);
 
 /// One database's task.
+/// A database's one connection, shared by every template that reads it, with
+/// when what its account may do was last read, so that's read once for them all.
+struct Shared {
+    session: Session,
+    /// The connection it was read on, as [`Session::connections`] counts them,
+    /// and when.
+    account_read: Option<(u64, Instant)>,
+}
+
+impl Shared {
+    fn new(database: Database) -> Self {
+        Self {
+            session: Session::new(database),
+            account_read: None,
+        }
+    }
+}
+
 struct Task {
     told: watch::Sender<Told>,
     /// Where it reads, and how it signs in, as it was started with.
@@ -162,6 +180,8 @@ pub struct Reader {
     /// Why each template and database that can't be read can't, as last said, so
     /// it's said once until it changes.
     unreadable: HashMap<(String, String), String>,
+    /// Each database's connection, by name, as long as a task reads it.
+    sessions: HashMap<String, (Database, Weak<tokio::sync::Mutex<Shared>>)>,
 }
 
 impl Reader {
@@ -238,7 +258,7 @@ impl Reader {
                     let running = runtime.spawn(run(
                         listening,
                         name.clone(),
-                        Session::new(database.clone()),
+                        self.shared(name, database),
                         self.results.clone(),
                     ));
                     self.tasks.insert(
@@ -268,6 +288,25 @@ impl Reader {
                 }
             }
         }
+    }
+
+    /// The connection to `name` that the templates reading it share, made anew if
+    /// none reads it or it's somewhere else now.
+    fn shared(&mut self, name: &str, database: &Database) -> Arc<tokio::sync::Mutex<Shared>> {
+        self.sessions
+            .retain(|_, (_, shared)| shared.strong_count() > 0);
+        let kept = self
+            .sessions
+            .get(name)
+            .filter(|(kept, _)| kept == database)
+            .and_then(|(_, shared)| shared.upgrade());
+        kept.unwrap_or_else(|| {
+            let shared = Arc::new(tokio::sync::Mutex::new(Shared::new(database.clone())));
+            let weak = Arc::downgrade(&shared);
+            self.sessions
+                .insert(name.to_string(), (database.clone(), weak));
+            shared
+        })
     }
 }
 
@@ -409,7 +448,7 @@ impl Schedule {
 async fn run(
     mut told: watch::Receiver<Told>,
     database: String,
-    mut session: Session,
+    shared: Arc<tokio::sync::Mutex<Shared>>,
     results: Results,
 ) {
     let start = Instant::now();
@@ -427,6 +466,13 @@ async fn run(
     let mut account_at = start;
 
     loop {
+        // Held for the round, as the templates reading a database take turns on
+        // its one connection.
+        let mut held = shared.lock().await;
+        let Shared {
+            session,
+            account_read,
+        } = &mut *held;
         let now = Instant::now();
         let Schedule {
             work,
@@ -464,7 +510,11 @@ async fn run(
                 discover_at.iter_mut().for_each(|block| block.at = now);
                 account_at = now;
             }
-            if account_at <= now && session.is_up() {
+            // Once for every template reading it, on each connection and every
+            // few minutes.
+            let account_due = account_read
+                .is_none_or(|(on, at)| on != session.connections() || now >= at + ACCOUNT_EVERY);
+            if account_at <= now && session.is_up() && account_due {
                 match session.privileges().await {
                     Ok(privileges) => {
                         account = Some(privileges);
@@ -472,8 +522,11 @@ async fn run(
                     }
                     Err(error) => note(work, &database, ACCOUNT, &error, &mut errors),
                 }
+                *account_read = Some((session.connections(), now));
                 account_at = now + ACCOUNT_EVERY;
                 check_at = now + every;
+            } else if account_at <= now {
+                account_at = now + ACCOUNT_EVERY;
             }
             for (block, discover) in discover_at.iter_mut().zip(&work.discover) {
                 // A database's discover blocks all have SQL, as work is checked.
@@ -587,6 +640,7 @@ async fn run(
             // Nothing runs until it answers again.
             false => retry_at,
         };
+        drop(held);
         tokio::select! {
             () = sleep_until(next) => {}
             changed = told.changed() => {
@@ -737,6 +791,32 @@ mod tests {
         output["template.pg"]
             .as_array()
             .is_some_and(|rows| rows.iter().any(|row| row["up"] == up))
+    }
+
+    #[tokio::test]
+    async fn templates_reading_one_database_share_its_connection() {
+        let database = Database {
+            check: Check::new("main", CheckKind::Postgres, "127.0.0.1:1"),
+            credentials: Credentials::default(),
+        };
+        let mut other = work("main");
+        other.template = "other".to_string();
+        let mut reader = reading(&[work("main"), other], Duration::from_secs(60), &database);
+        let shared = || reader.sessions["main"].1.strong_count();
+        assert_eq!(shared(), 2);
+
+        // Somewhere else, it's a connection of its own.
+        let moved = Database {
+            check: Check::new("main", CheckKind::Postgres, "127.0.0.1:2"),
+            ..database
+        };
+        reader.update(
+            &[work("main")],
+            Duration::from_secs(60),
+            &Handle::current(),
+            |_| Ok(moved.clone()),
+        );
+        assert!(reader.sessions["main"].0 == moved);
     }
 
     #[tokio::test]

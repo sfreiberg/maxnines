@@ -6,12 +6,17 @@
 //! server alone never makes agents look old.
 
 use std::cmp::Ordering;
+use std::sync::LazyLock;
 
 use semver::Version;
 use serde::Serialize;
 
 /// The version of the agent released alongside this server.
 pub const NEWEST_AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// [`NEWEST_AGENT_VERSION`] read once, as every host on every list is compared with it.
+static NEWEST: LazyLock<Option<Version>> =
+    LazyLock::new(|| Version::parse(NEWEST_AGENT_VERSION).ok());
 
 /// How an agent's version compares with the newest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -27,9 +32,9 @@ pub enum VersionState {
 /// Nothing for a version that isn't a version, as nothing useful can be said about it.
 /// Build details after a `+` don't count, as they don't make one version newer.
 pub fn compare(reported: &str) -> Option<VersionState> {
+    let newest = NEWEST.as_ref()?;
     let reported = Version::parse(reported).ok()?;
-    let newest = Version::parse(NEWEST_AGENT_VERSION).ok()?;
-    Some(match reported.cmp_precedence(&newest) {
+    Some(match reported.cmp_precedence(newest) {
         Ordering::Less => VersionState::Outdated,
         Ordering::Equal => VersionState::Current,
         Ordering::Greater => VersionState::NewerThanServer,

@@ -28,18 +28,14 @@ const OS_FACT: &str = "os.family";
 enum Term {
     /// Text anywhere in the host name, in lower case.
     Text(String),
-    Host {
-        pattern: String,
-        negated: bool,
-    },
+    /// Patterns are made once, when the filter is read, as each is tried against
+    /// every host on a list.
+    Host { pattern: WildMatch, negated: bool },
     /// The agent's ID, or the start of it with a wildcard.
-    Id {
-        pattern: String,
-        negated: bool,
-    },
+    Id { pattern: WildMatch, negated: bool },
     Fact {
         name: String,
-        pattern: String,
+        pattern: WildMatch,
         negated: bool,
     },
 }
@@ -47,10 +43,6 @@ enum Term {
 #[derive(Debug, Default)]
 pub struct HostFilter {
     terms: Vec<Term>,
-}
-
-fn matches(pattern: &str, text: &str) -> bool {
-    WildMatch::new_case_insensitive(pattern).matches(text)
 }
 
 /// Splits on spaces, except inside double quotes.
@@ -92,7 +84,7 @@ fn parse_term(text: &str) -> Result<Term, String> {
     if value.is_empty() {
         return Err(format!("{name} needs a value, like {name}=web*."));
     }
-    let pattern = value.to_string();
+    let pattern = WildMatch::new_case_insensitive(value);
     Ok(if name == HOSTNAME {
         Term::Host { pattern, negated }
     } else if name == ID_NAME {
@@ -144,8 +136,8 @@ impl HostFilter {
     pub fn matches(&self, id: &str, hostname: &str, facts: Option<&FlatFacts>) -> bool {
         self.terms.iter().all(|term| match term {
             Term::Text(text) => hostname.to_lowercase().contains(text),
-            Term::Host { pattern, negated } => matches(pattern, hostname) != *negated,
-            Term::Id { pattern, negated } => matches(pattern, id) != *negated,
+            Term::Host { pattern, negated } => pattern.matches(hostname) != *negated,
+            Term::Id { pattern, negated } => pattern.matches(id) != *negated,
             Term::Fact {
                 name,
                 pattern,
@@ -156,13 +148,13 @@ impl HostFilter {
 }
 
 /// A list matches if any item does, as it's stored as `name[0]`, `name[1]` and so on.
-fn fact_matches(facts: &FlatFacts, name: &str, pattern: &str) -> bool {
+fn fact_matches(facts: &FlatFacts, name: &str, pattern: &WildMatch) -> bool {
     let list = format!("{name}[");
     let items = facts
         .range(list.clone()..)
         .take_while(|(item, _)| item.starts_with(&list))
         .map(|(_, value)| value);
-    let value_matches = |value: &Value| matches(pattern, &fact_text(value));
+    let value_matches = |value: &Value| pattern.matches(&fact_text(value));
     facts.get(name).is_some_and(value_matches) || items.into_iter().any(value_matches)
 }
 

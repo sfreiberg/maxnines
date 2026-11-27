@@ -118,6 +118,11 @@ pub fn work_out(
             let Some(row) = row.as_object_mut() else {
                 continue;
             };
+            // Rows of the template's other queries are left alone, before anything
+            // of theirs is copied.
+            if row.get(QUERY_FIELD).and_then(Value::as_str) != Some(query.query.as_str()) {
+                continue;
+            }
             let labels = row
                 .get("labels")
                 .and_then(Value::as_object)
@@ -128,9 +133,6 @@ pub fn work_out(
                 .filter(|(_, value)| value.is_number())
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect();
-            if row.get(QUERY_FIELD).and_then(Value::as_str) != Some(query.query.as_str()) {
-                continue;
-            }
             let database = labels.get(INSTANCE_LABEL).and_then(Value::as_str);
             let mut sent_for = sent
                 .iter()

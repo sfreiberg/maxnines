@@ -11,43 +11,79 @@ use crate::times::Timestamp;
 /// Turns stored versions into what happened and when, in order. Comparing whole
 /// rebuilt states, not rows, means a list reads as one change even though each
 /// of its items is stored separately.
+///
+/// The history is walked once, in time order, keeping the facts at each moment,
+/// and only the groups a moment changed are rebuilt and compared, so a host whose
+/// facts change often costs no more than its changes.
 pub fn describe_history(history: &[FactVersion]) -> BTreeMap<Timestamp, Vec<String>> {
-    let mut times: Vec<Timestamp> = history
-        .iter()
-        .flat_map(|version| [Some(version.valid_from), version.valid_to])
-        .flatten()
-        .collect();
-    times.sort_unstable();
-    times.dedup();
+    // What starts and what ends at each moment.
+    let mut moments: BTreeMap<Timestamp, (Vec<&FactVersion>, Vec<&FactVersion>)> = BTreeMap::new();
+    for version in history {
+        moments
+            .entry(version.valid_from)
+            .or_default()
+            .0
+            .push(version);
+        if let Some(end) = version.valid_to {
+            moments.entry(end).or_default().1.push(version);
+        }
+    }
 
     let mut events = BTreeMap::new();
-    let mut previous: Option<Value> = None;
-
-    for time in times {
-        let facts = facts_at(history, time);
-        let state = unflatten(&facts);
-
-        let changes = match &previous {
-            None => vec![format!("first report, {} facts", facts.len())],
-            Some(before) => {
-                let mut changes = Vec::new();
-                describe_changes("", Some(before), Some(&state), &mut changes);
-                changes
+    let mut current = FlatFacts::new();
+    let mut first = true;
+    for (time, (starting, ending)) in moments {
+        let touched: BTreeSet<&str> = starting
+            .iter()
+            .chain(&ending)
+            .map(|version| group_of(&version.name))
+            .collect();
+        let before = within(&current, &touched);
+        for version in &ending {
+            if current.get(&version.name) == Some(&version.value) {
+                current.remove(&version.name);
             }
+        }
+        for version in &starting {
+            current.insert(version.name.clone(), version.value.clone());
+        }
+
+        let changes = if std::mem::take(&mut first) {
+            vec![format!("first report, {} facts", current.len())]
+        } else {
+            let (before, after) = (unflatten(&before), unflatten(&within(&current, &touched)));
+            let mut changes = Vec::new();
+            describe_changes("", Some(&before), Some(&after), &mut changes);
+            changes
         };
         if !changes.is_empty() {
             events.insert(time, changes);
         }
-        previous = Some(state);
     }
     events
 }
 
-fn facts_at(history: &[FactVersion], time: Timestamp) -> FlatFacts {
-    history
+/// The top-level group a fact is in, such as `custom` for `custom.tags[0]`, which
+/// holds every list the fact could be part of.
+fn group_of(name: &str) -> &str {
+    name.split(['.', '[']).next().unwrap_or(name)
+}
+
+/// The facts in these groups.
+fn within(facts: &FlatFacts, groups: &BTreeSet<&str>) -> FlatFacts {
+    let in_group = |name: &str, group: &str| {
+        name.strip_prefix(group)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+    };
+    groups
         .iter()
-        .filter(|f| f.valid_from <= time && f.valid_to.is_none_or(|end| end > time))
-        .map(|f| (f.name.clone(), f.value.clone()))
+        .flat_map(|group| {
+            facts
+                .range(group.to_string()..)
+                .take_while(move |(name, _)| name.starts_with(group))
+                .filter(move |(name, _)| in_group(name, group))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
         .collect()
 }
 

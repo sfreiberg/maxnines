@@ -2460,6 +2460,9 @@ pub struct SeriesQuery<'a> {
     pub range: TimeRange,
     /// Keep this many series, starting with the highest.
     pub max_series: usize,
+    /// Only the series called this, when given, so one series is never picked out
+    /// of all the others after reading them.
+    pub only: Option<&'a str>,
 }
 
 /// One bucket of a series, at the moment it starts.
@@ -2603,6 +2606,39 @@ impl Metrics {
         range: TimeRange,
         max_series: usize,
     ) -> Result<SeriesResult> {
+        self.read_series(host_id, metric, range, max_series, None)
+            .await
+    }
+
+    /// One series of a metric, by the name it's shown with, or none if the host has
+    /// no such series in the range.
+    pub async fn one_series(
+        &self,
+        host_id: &str,
+        metric: &Arc<Metric>,
+        range: TimeRange,
+        name: &str,
+    ) -> Result<SeriesResult> {
+        // A template's one series for the whole host is stored without a name, and
+        // shown with the metric's.
+        let single = matches!(metric.source, Source::Labelled(_)) && metric.is_single();
+        let stored = if single && name == metric.title {
+            ""
+        } else {
+            name
+        };
+        self.read_series(host_id, metric, range, 1, Some(stored.to_string()))
+            .await
+    }
+
+    async fn read_series(
+        &self,
+        host_id: &str,
+        metric: &Arc<Metric>,
+        range: TimeRange,
+        max_series: usize,
+        only: Option<String>,
+    ) -> Result<SeriesResult> {
         let reader = self.reader.clone();
         let host_id = host_id.to_string();
         let metric = metric.clone();
@@ -2614,6 +2650,7 @@ impl Metrics {
                 metric: &read,
                 range,
                 max_series,
+                only: only.as_deref(),
             })
         })
         .await

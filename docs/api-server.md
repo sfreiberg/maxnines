@@ -7,7 +7,9 @@
 How the server is doing, including its CPU, memory, databases and activity. Each part
 is read on its own, so one that's unavailable is empty and the rest still answer.
 `cpu_percent` is a share of the whole host, and empty on the first request after a
-start. `memory_bytes` can read high on macOS, which counts memory that's been freed
+start. Each of `metrics.collectors` counts its samples over the last hour, with the
+oldest and newest of those, as counting every sample ever kept would read them all;
+`rows` is `null` for that reason, and `total_rows` is what the store says it holds. `memory_bytes` can read high on macOS, which counts memory that's been freed
 until something else needs it. `built_at` is empty for a build that didn't record when
 it was made.
 
@@ -46,12 +48,13 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/server"
     "collectors": [
       {
         "name": "cpu",
-        "rows": 295967,
+        "rows": null,
         "rows_last_hour": 295967,
         "oldest_sample_at": "2026-11-06T03:37:29.223Z",
         "newest_sample_at": "2026-11-06T03:52:18.143Z"
       }
-    ]
+    ],
+    "total_rows": 18540210
   },
   "database": {
     "engine": "SQLite",

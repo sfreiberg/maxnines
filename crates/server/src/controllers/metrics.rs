@@ -180,9 +180,6 @@ struct DataParams {
     series: Option<String>,
 }
 
-/// Enough to hold every series a host has of one metric, for picking one out.
-pub(super) const EVERY_SERIES: usize = 10_000;
-
 /// One series of a metric, or none if the host has no such series in the range.
 pub(super) async fn one_series(
     state: &AppState,
@@ -193,9 +190,8 @@ pub(super) async fn one_series(
 ) -> anyhow::Result<SeriesResult> {
     let mut result = state
         .metrics
-        .series(host_id, metric, range, EVERY_SERIES)
+        .one_series(host_id, metric, range, name)
         .await?;
-    result.series.retain(|series| series.name == name);
     result.hidden = 0;
     Ok(result)
 }
