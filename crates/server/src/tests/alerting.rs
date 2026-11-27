@@ -11521,6 +11521,51 @@ mod actions {
         assert!(problems.is_empty(), "{problems:?}");
     }
 
+    /// A channel whose firing notification was given up on never heard of the
+    /// alert, so it doesn't hear what its action printed either.
+    #[tokio::test]
+    async fn what_an_action_printed_only_goes_to_channels_that_heard_of_the_alert() {
+        use sea_orm::ConnectionTrait;
+
+        let mut test = Harness::with_actions().await;
+        let database = test.database().clone();
+        let ops = webhook_channel("http://127.0.0.1:9/hook");
+        let ops = database.create_channel(&ops).await.unwrap();
+        let gave_up = ChannelInput {
+            name: "Gave up".to_string(),
+            ..webhook_channel("http://127.0.0.1:9/other")
+        };
+        let gave_up = database.create_channel(&gave_up).await.unwrap();
+        let rule = AlertRuleInput {
+            channels: vec![ops, gave_up],
+            ..rule_running(vec![run("top_cpu", RunOn::First)])
+        };
+        database.create_alert_rule(&rule).await.unwrap();
+
+        test.fire().await;
+        let (id, ..) = test.next_request().await;
+        let sql = format!("UPDATE notifications SET state = 'failed' WHERE channel_id = {gave_up}");
+        database
+            .connection()
+            .execute_unprepared(&sql)
+            .await
+            .unwrap();
+        assert_eq!(deliver_by_channel(&test).await, [(ops, Event::Firing)]);
+        test.answer(&id, ActionOutcome::Succeeded, "ok").await;
+        test.finished(id.parse().unwrap()).await;
+
+        let due = database
+            .due_deliveries(everything_due(), 100)
+            .await
+            .unwrap();
+        let told: Vec<i64> = due
+            .iter()
+            .filter(|delivery| delivery.event == Event::Action)
+            .map(|delivery| delivery.channel.id)
+            .collect();
+        assert_eq!(told, [ops], "{due:?}");
+    }
+
     #[tokio::test]
     async fn an_on_call_service_is_not_sent_what_an_action_printed() {
         let mut test = Harness::with_actions().await;

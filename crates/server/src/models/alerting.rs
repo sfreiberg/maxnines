@@ -529,11 +529,16 @@ pub(super) async fn queue_action_output<C: ConnectionTrait>(
     let Some(alert_id) = alert_id.flatten() else {
         return Ok(());
     };
+    // Only channels that heard the alert start, or are about to: one whose firing
+    // notification was given up on never heard of it, and one a silence is holding
+    // it back from mustn't hear of it this way, as with an alert ending.
     let told: Vec<i64> = notification::Entity::find()
         .select_only()
         .column(notification::Column::ChannelId)
         .distinct()
         .filter(notification::Column::AlertId.eq(alert_id))
+        .filter(notification::Column::Event.eq(Event::Firing.as_str()))
+        .filter(notification::Column::State.is_in([SENT, PENDING]))
         .into_tuple()
         .all(connection)
         .await
