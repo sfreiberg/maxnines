@@ -131,7 +131,7 @@ impl fmt::Display for LoginRefused {
 impl std::error::Error for LoginRefused {}
 
 /// `error` as it's said, marked as a refused login when it's one.
-fn login_refused_if(refused: bool, error: anyhow::Error) -> anyhow::Error {
+pub(crate) fn login_refused_if(refused: bool, error: anyhow::Error) -> anyhow::Error {
     match refused {
         true => anyhow::Error::new(LoginRefused(error.to_string())),
         false => error,
@@ -316,14 +316,7 @@ pub(crate) async fn check_clickhouse(
                 .await
         }
         Some(credentials) => {
-            let version = Clickhouse::new(check, credentials)?
-                .version()
-                .await
-                .map_err(|error| {
-                    // Such as "default: Authentication failed: password is incorrect".
-                    let refused = error.to_string().contains("Authentication failed");
-                    login_refused_if(refused, error)
-                })?;
+            let version = Clickhouse::new(check, credentials)?.version().await?;
             findings.server_version = Some(version);
             findings.signed_in = Some(true);
             Ok(())

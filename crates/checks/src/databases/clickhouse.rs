@@ -25,7 +25,15 @@ struct Failure {
     /// Whether ClickHouse turned the query down itself, rather than not being
     /// reached.
     answered: bool,
+    /// Whether it was turned down for who was asking: a user it hasn't got, a wrong
+    /// password, or none where one is needed.
+    refused: bool,
 }
+
+/// ClickHouse's codes for a login it turned down: UNKNOWN_USER, WRONG_PASSWORD,
+/// REQUIRED_PASSWORD and AUTHENTICATION_FAILED, which newer versions give for each
+/// of the others, so as not to say which users there are.
+const REFUSED_CODES: [u32; 4] = [192, 193, 194, 516];
 
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -159,6 +167,7 @@ impl Clickhouse {
         let failed = |error: anyhow::Error| Failure {
             message: format!("{error:#}"),
             answered: false,
+            refused: false,
         };
         let mut findings = Findings::default();
         let kept = match self.connection.take() {
@@ -180,6 +189,7 @@ impl Clickhouse {
                 .ok_or(Failure {
                     message: "its answer couldn't be unpacked".to_string(),
                     answered: false,
+                    refused: false,
                 })?
                 .0
         } else {
@@ -254,6 +264,14 @@ impl Clickhouse {
         if status != 200 {
             // Such as "Code: 497. DB::Exception: maxnines: Not enough privileges…".
             let first = body.lines().next().unwrap_or_default();
+            // "Code: 516." now, "Code: 193," before 22.
+            let code = first.strip_prefix("Code: ").and_then(|rest| {
+                let digits = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                rest[..digits].parse::<u32>().ok()
+            });
+            let refused = status == 401 || code.is_some_and(|code| REFUSED_CODES.contains(&code));
             let message = first
                 .split_once("DB::Exception: ")
                 .map_or(first, |(_, message)| message);
@@ -266,11 +284,13 @@ impl Clickhouse {
             return Err(Failure {
                 message,
                 answered: true,
+                refused,
             });
         }
         serde_json::from_str(&body).map_err(|_| Failure {
             message: "it didn't answer as ClickHouse does".to_string(),
             answered: false,
+            refused: false,
         })
     }
 
@@ -279,15 +299,17 @@ impl Clickhouse {
         self.query(sql).await?.into_iter().next().ok_or(Failure {
             message: "it gave nothing back".to_string(),
             answered: false,
+            refused: false,
         })
     }
 
-    /// The version, which also says it can be signed in to and queried.
+    /// The version, which also says it can be signed in to and queried, or that
+    /// the login was refused.
     pub(crate) async fn version(&mut self) -> Result<String> {
         let row = self
             .one("SELECT version() AS version")
             .await
-            .map_err(|error| anyhow!("{error}"))?;
+            .map_err(|error| crate::sign_in::login_refused_if(error.refused, anyhow!("{error}")))?;
         match row.get("version") {
             Some(Value::String(version)) => Ok(version.clone()),
             _ => bail!("it didn't say its version"),
@@ -393,6 +415,66 @@ mod tests {
             );
         }
         assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    }
+
+    /// A login turned down is known by ClickHouse's code for it, in the words of
+    /// any version, or by being asked for a password, but not by any other
+    /// refusal, as of a user without the right to run a query.
+    #[tokio::test]
+    async fn a_refused_login_is_known_by_its_code() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (status, body, refused) in [
+            (
+                "403 Forbidden",
+                "Code: 516. DB::Exception: default: Authentication failed: password is incorrect, or there is no user with such name. (AUTHENTICATION_FAILED) (version 24.8.1.1)",
+                true,
+            ),
+            (
+                "500 Internal Server Error",
+                "Code: 193, e.displayText() = DB::Exception: Wrong password for user default (version 20.3.8.53)",
+                true,
+            ),
+            ("401 Unauthorized", "", true),
+            (
+                "500 Internal Server Error",
+                "Code: 497. DB::Exception: maxnines: Not enough privileges. (ACCESS_DENIED) (version 24.8.1.1)",
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let answer = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                // The request is a GET, so it ends with its headers.
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                let _ = socket.write_all(answer.as_bytes()).await;
+            });
+            let check = Check::new("refused", CheckKind::Clickhouse, &address.to_string());
+            let credentials = Credentials {
+                username: Some("default".to_string()),
+                password: Some("wrong".to_string()),
+                ..Credentials::default()
+            };
+            let error = Clickhouse::new(&check, &credentials)
+                .unwrap()
+                .version()
+                .await
+                .unwrap_err();
+            let is_refused = error.is::<crate::sign_in::LoginRefused>();
+            assert_eq!(is_refused, refused, "{status} {body}: {error:#}");
+        }
     }
 
     #[test]
