@@ -200,12 +200,11 @@ impl ChannelForm {
 
     /// What's been typed for the credential, which for a custom webhook is its
     /// headers, tidied to one to a line. A token is kept without spaces around it,
-    /// and a password exactly as it's typed, unless it's nothing but spaces.
+    /// and a password is whatever was typed, spaces and all, as on other forms.
     fn typed_credential(&self, kind: ChannelKind) -> String {
         if kind != ChannelKind::CustomWebhook {
-            let trimmed = self.credential.trim();
-            return if kind.credential_is_token() || trimmed.is_empty() {
-                trimmed.to_string()
+            return if kind.credential_is_token() {
+                self.credential.trim().to_string()
             } else {
                 self.credential.clone()
             };
