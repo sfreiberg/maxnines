@@ -652,14 +652,27 @@ async fn run(options: Options) -> Result<Outcome> {
     if options.revoke {
         print!("Revoking agents... ");
         let client = server.clone();
-        tokio::task::spawn_blocking(move || {
+        let failed = tokio::task::spawn_blocking(move || {
+            let mut failed = (0, None);
             for id in &ids {
-                client.revoke(id).ok();
+                if let Err(error) = client.revoke(id) {
+                    failed.0 += 1;
+                    failed.1.get_or_insert(format!("{error:#}"));
+                }
             }
+            failed
         })
-        .await
-        .ok();
-        println!("done");
+        .await;
+        match failed {
+            Ok((0, _)) => println!("done"),
+            Ok((count, first)) => {
+                println!(
+                    "{count} couldn't be revoked, the first as {}",
+                    first.unwrap_or_default()
+                );
+            }
+            Err(error) => println!("stopped: {error}"),
+        }
     }
 
     let online_after = if all_online.is_finished() {
