@@ -16,7 +16,7 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, Interval, interval_at, sleep, timeout};
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
@@ -41,8 +41,6 @@ const SEND_LIMIT: Duration = SERVER_SILENCE_LIMIT;
 /// balancer that accepts the connection and then says nothing would otherwise hold
 /// the agent offline for good.
 const HANDSHAKE_LIMIT: Duration = Duration::from_secs(15);
-/// Configs arrive rarely, and only the newest one matters.
-const CONFIG_QUEUE_SIZE: usize = 8;
 /// The longest an agent the server refused waits before trying again. Trying sooner
 /// wouldn't help, as something has to be upgraded first, and that restarts whichever
 /// side it was. The wait is anywhere from half of this to all of it, so that agents
@@ -88,7 +86,9 @@ struct SentConfig {
 pub struct ServerLink {
     spool: Arc<Spool>,
     outbox: Arc<Outbox>,
-    configs: mpsc::Receiver<ConfigUpdate>,
+    /// Only the newest config matters, so one that arrives replaces any still
+    /// waiting, and receiving one never waits on applying the one before.
+    configs: watch::Receiver<Option<ConfigUpdate>>,
     facts_every: watch::Sender<Duration>,
 }
 
@@ -159,7 +159,7 @@ struct Connection {
     runner: Arc<Runner>,
     outbox: Arc<Outbox>,
     facts_every: watch::Receiver<Duration>,
-    configs: mpsc::Sender<ConfigUpdate>,
+    configs: watch::Sender<Option<ConfigUpdate>>,
 }
 
 /// What the agent trusts the server with and by: its enrollment token and the
@@ -209,7 +209,7 @@ impl ServerLink {
         info!(host_id = identity.id(), "agent identity loaded");
 
         let (facts_every, facts_every_receiver) = watch::channel(DEFAULT_FACTS_INTERVAL);
-        let (config_sender, configs) = mpsc::channel(CONFIG_QUEUE_SIZE);
+        let (config_sender, configs) = watch::channel(None);
         let spool = Arc::new(Spool::open(&config.sample_queue_folder()));
         let outbox = Arc::new(Outbox::default());
         let connection = Connection {
@@ -282,9 +282,15 @@ impl ServerLink {
         self.spool.flush().await;
     }
 
-    /// Waits for the next config from the server.
+    /// Waits for the next config from the server, the newest if several came while
+    /// one was being applied.
     pub async fn next_config(&mut self) -> Option<ConfigUpdate> {
-        self.configs.recv().await
+        loop {
+            self.configs.changed().await.ok()?;
+            if let Some(update) = self.configs.borrow_and_update().clone() {
+                return Some(update);
+            }
+        }
     }
 }
 
@@ -546,9 +552,7 @@ async fn receive(text: &str, connection: &Connection) -> Option<String> {
                 config,
                 sent,
             };
-            if connection.configs.send(update).await.is_err() {
-                error!("config dropped, the agent has stopped");
-            }
+            connection.configs.send_replace(Some(update));
         }
         Ok(ServerMessage::Ack { time }) => connection.spool.acked(time),
         Ok(ServerMessage::Unknown) => debug!("ignoring a message from a newer server"),
@@ -935,6 +939,36 @@ mod tests {
                 skipped_collectors: Vec::new(),
             }
         );
+    }
+
+    /// Only the newest of configs that come faster than they're applied is applied,
+    /// and nothing the server sends meanwhile waits on them.
+    #[tokio::test]
+    async fn configs_that_come_quickly_leave_only_the_newest_waiting() {
+        let (mut link, mut socket) = connected().await;
+        for version in 1..=20 {
+            let message = ServerMessage::Config {
+                version: format!("v{version}"),
+                config: serde_json::from_value(json!({})).unwrap(),
+            };
+            send_to_agent(&mut socket, &message).await;
+        }
+        // Still read, while none of them is applied.
+        let ask = ServerMessage::AskTime {
+            nonce: "after".to_string(),
+        };
+        send_to_agent(&mut socket, &ask).await;
+        let answered = async {
+            loop {
+                if let AgentMessage::Time { nonce, .. } = next_message(&mut socket).await {
+                    return nonce;
+                }
+            }
+        };
+        let answered = tokio::time::timeout(Duration::from_secs(10), answered).await;
+        assert_eq!(answered.expect("the agent stopped reading"), "after");
+
+        assert_eq!(link.next_config().await.unwrap().version, "v20");
     }
 
     #[tokio::test]
