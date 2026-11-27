@@ -1289,8 +1289,15 @@ fn stats_count_the_last_hour_by_collector() {
     for time in [1000, 2 * HOUR_MS, 2 * HOUR_MS + 1000] {
         write_metric(&mut store, "a", time, "cpu", json!({ "usage_percent": 1.0 }));
     }
+    // Each template is a collector of its own.
+    for template in ["template.shop", "template.blog"] {
+        let rows = json!([{ "labels": { "instance": "main" }, "waiting": 1 }]);
+        write_metric(&mut store, "a", 2 * HOUR_MS, template, rows);
+    }
 
     let stats = store.reader().unwrap().stats(at(2 * HOUR_MS)).unwrap();
+    let names: Vec<&str> = stats.collectors.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["cpu", "template.blog", "template.shop"]);
 
     let cpu = &stats.collectors[0];
     assert_eq!((cpu.name.as_str(), cpu.rows_last_hour), ("cpu", 2));

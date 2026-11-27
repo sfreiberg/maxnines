@@ -381,7 +381,7 @@ impl Memory {
                                 value: Some(text.to_string()),
                             });
                             self.text_series
-                                .entry((host.to_string(), text_owner(collector).to_string()))
+                                .entry((host.to_string(), collector.clone()))
                                 .or_default()
                                 .insert(
                                     print,
@@ -398,7 +398,7 @@ impl Memory {
 
             // Something that was reported and isn't any more, like a check's error. A
             // sample may only cover some items, so only the ones in it can have changed.
-            let key = (host.to_string(), text_owner(collector).to_string());
+            let key = (host.to_string(), collector.clone());
             if let Some(current) = self.text_series.get_mut(&key) {
                 current.retain(|print, series| {
                     let gone = items.contains(&series.item) && !reported.contains(print);
@@ -478,15 +478,24 @@ fn labels_of(labels: &Labels) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `argMax` skips nothing-values, and text that's cleared is one, so they go in a tuple
-/// to count as the newest value.
-/// Whose text a sample's is, by what its metrics' names start with, as that's all a
-/// stored row says after a restart: a built-in collector's own name, or for a
-/// template's collector, `template.<key>`, its key, as its metrics are `<key>.<name>`.
-fn text_owner(collector: &str) -> &str {
-    collector.strip_prefix("template.").unwrap_or(collector)
+/// The collector a stored metric is from, as that's all a stored row says: what its
+/// name starts with, which for a template's, stored as `template.<key>.<name>`, is
+/// `template.<key>`.
+fn collector_of(metric: &str) -> &str {
+    let parts = if metric.starts_with("template.") {
+        2
+    } else {
+        1
+    };
+    let end = metric
+        .match_indices('.')
+        .nth(parts - 1)
+        .map_or(metric.len(), |(at, _)| at);
+    &metric[..end]
 }
 
+/// `argMax` skips nothing-values, and text that's cleared is one, so they go in a tuple
+/// to count as the newest value.
 async fn load_memory(client: &Client) -> Result<Memory> {
     let mut memory = Memory::default();
     let series: Vec<SeriesRow> = client
@@ -516,8 +525,7 @@ async fn load_memory(client: &Client) -> Result<Memory> {
     for row in texts {
         let item = labels_key(&labels_of(&row.labels));
         let print = fingerprint(&row.host_id, &row.metric, &item);
-        let collector = row.metric.split('.').next().unwrap_or_default().to_string();
-        // As `text_owner` gives it for the collector that sent it.
+        let collector = collector_of(&row.metric).to_string();
         memory.texts.insert(print, row.value);
         let series = TextSeries {
             metric: row.metric,
@@ -1047,16 +1055,19 @@ impl Naming<'_> {
 
 /// One reading of a metric as rows of `agent`, `t`, `series` and `v`, with `t` the time
 /// it was taken. `scope` narrows
-/// down the rows, and is always worked out here. Samples are read FINAL, as one sent
-/// again, as after a reconnect, is only dropped when ClickHouse merges, and would
-/// otherwise count twice in a chart, a calculation or a rollup until then.
+/// down the rows, and is always worked out here. A sample sent again, as after a
+/// reconnect, is only dropped when ClickHouse merges, so each one is read once, by
+/// its host, labels and time, or it would count twice in a chart, a calculation or a
+/// rollup until then. A percentage takes the average of each part, which a copy
+/// doesn't change.
 fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope: &str) -> String {
     let series = naming.expression();
     let filter = naming.filter();
     match reading {
         Reading::Field(path) | Reading::Rate(path) => format!(
             "SELECT host_id, time AS t, {series} AS series, value AS v
-             FROM samples FINAL WHERE metric = {name} {filter} AND {scope}",
+             FROM samples WHERE metric = {name} {filter} AND {scope}
+             LIMIT 1 BY host_id, labels, time",
             name = quoted(&stored_name(metric, path)),
         ),
         Reading::Percent { part, whole } => {
@@ -1065,7 +1076,7 @@ fn reading_values(metric: &Metric, reading: Reading, naming: &Naming<'_>, scope:
             format!(
                 "SELECT host_id, time AS t, {series} AS series,
                         avgIf(value, metric = {part}) / nullIf(avgIf(value, metric = {whole}), 0) * 100 AS v
-                 FROM samples FINAL WHERE metric IN ({part}, {whole}) {filter} AND {scope}
+                 FROM samples WHERE metric IN ({part}, {whole}) {filter} AND {scope}
                  GROUP BY host_id, t, series
                  HAVING countIf(metric = {part}) > 0 AND countIf(metric = {whole}) > 0"
             )
@@ -1090,7 +1101,8 @@ fn readings(metric: &Metric, scope: &str) -> String {
         }
         Source::Labelled(Labelled { field, labels, .. }) => format!(
             "SELECT host_id, time AS t, {series} AS series, value AS v
-             FROM samples FINAL WHERE metric = {name} AND {scope}",
+             FROM samples WHERE metric = {name} AND {scope}
+             LIMIT 1 BY host_id, labels, time",
             series = Naming::Labels(labels).expression(),
             name = quoted(&stored_name(metric, field)),
         ),
@@ -1665,7 +1677,10 @@ impl MetricsReader for ClickHouseReader {
                 .fetch_one(),
         )?;
         let sql = format!(
-            "SELECT splitByChar('.', metric)[1] AS name, count() AS rows,
+            "SELECT if(startsWith(metric, 'template.'),
+                       arrayStringConcat(arraySlice(splitByChar('.', metric), 1, 2), '.'),
+                       splitByChar('.', metric)[1]) AS name,
+                    count() AS rows,
                     min(time) AS oldest, max(time) AS newest
              FROM samples WHERE time >= {hour_ago}
              GROUP BY name ORDER BY name",
@@ -1699,15 +1714,15 @@ impl MetricsReader for ClickHouseReader {
 
 #[cfg(test)]
 mod owners {
-    use super::text_owner;
+    use super::collector_of;
 
-    /// A collector's text is found by what its stored metrics start with.
+    /// What a stored metric's collector is, which a restart reads it by.
     #[test]
-    fn a_templates_text_is_its_keys() {
-        assert_eq!(text_owner("template.myapp"), "myapp");
-        assert_eq!(text_owner("checks"), "checks");
-        let metric = "myapp.last_error";
-        assert_eq!(metric.split('.').next(), Some(text_owner("template.myapp")));
+    fn a_metric_is_from_its_collector_or_its_template() {
+        assert_eq!(collector_of("template.shop.last_error"), "template.shop");
+        assert_eq!(collector_of("checks.error"), "checks");
+        assert_eq!(collector_of("cpu"), "cpu");
+        assert_eq!(collector_of("template.shop"), "template.shop");
     }
 }
 
@@ -1943,6 +1958,27 @@ mod tests {
         write_metric(&mut store, "a", 4000, "checks", failing);
 
         assert_eq!(count(&store, "SELECT count() FROM texts"), 3, "news again");
+    }
+
+    /// A template's metrics are stored as `template.<key>.<name>`, and its text is
+    /// found under its collector after a restart as before it.
+    #[test]
+    fn a_templates_text_that_stops_is_cleared_after_a_restart() {
+        let database = new_database();
+        let failing = json!([{ "labels": { "instance": "main" }, "error": "boom" }]);
+        let working = json!([{ "labels": { "instance": "main" }, "up": 1 }]);
+        let mut store = opened(&database);
+        write_metric(&mut store, "a", 1000, "template.shop", failing);
+        drop(store);
+
+        let mut store = opened(&database);
+        write_metric(&mut store, "a", 2000, "template.shop", working);
+        let output = store
+            .reader()
+            .unwrap()
+            .latest_output("a", "template.shop", at(0), at(5000))
+            .unwrap();
+        assert!(!output.unwrap_or_default().to_string().contains("boom"));
     }
 
     #[test]
