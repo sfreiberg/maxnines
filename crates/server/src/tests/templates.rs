@@ -2635,3 +2635,18 @@ async fn an_upgrade_can_give_a_new_built_in_template_the_name_of_one_it_drops() 
     let keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
     assert_eq!(keys, ["application"]);
 }
+
+/// A label listed twice is kept twice, and saving it again adds nothing.
+#[tokio::test]
+async fn saving_a_list_with_an_item_twice_keeps_it_as_it_is() {
+    let database = Database::for_test().await;
+    let now = crate::times::now();
+    let twice = SHOP.replace(r#"labels = ["region"]"#, r#"labels = ["region", "region"]"#);
+    let template = parse(&twice).unwrap();
+    let id = database.create_template(&template, now).await.unwrap();
+    for _ in 0..3 {
+        assert!(database.update_template(id, &template, now).await.unwrap());
+    }
+    let saved = database.get_template(id).await.unwrap().unwrap();
+    assert_eq!(saved.template, template);
+}

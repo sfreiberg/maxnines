@@ -42,23 +42,27 @@ macro_rules! list_table {
                 Ok(rows.into_iter().map(|row| row.$key).collect())
             }
 
-            /// Writes the items over the rows there are, each matched by its name.
+            /// Writes the items over the rows there are, each matched by its name, an
+            /// item listed twice to two of them, so writing the same again changes
+            /// nothing.
             pub async fn write<C: ConnectionTrait>(
                 connection: &C,
                 parent: i64,
                 items: &[String],
             ) -> Result<()> {
-                let mut left: HashMap<String, Model> = Entity::find()
+                let mut left: HashMap<String, Vec<Model>> = HashMap::new();
+                let rows = Entity::find()
                     .filter(Column::$Parent.eq(parent))
+                    .order_by_desc(Column::Position)
                     .all(connection)
                     .await
-                    .context(concat!("loading ", $table))?
-                    .into_iter()
-                    .map(|row| (row.$key.clone(), row))
-                    .collect();
+                    .context(concat!("loading ", $table))?;
+                for row in rows {
+                    left.entry(row.$key.clone()).or_default().push(row);
+                }
                 for (position, item) in items.iter().enumerate() {
                     let position = i32::try_from(position)?;
-                    match left.remove(item) {
+                    match left.get_mut(item).and_then(Vec::pop) {
                         Some(row) if row.position == position => {}
                         Some(row) => {
                             let mut active: ActiveModel = row.into();
@@ -81,7 +85,7 @@ macro_rules! list_table {
                         }
                     }
                 }
-                let gone: Vec<i64> = left.into_values().map(|row| row.id).collect();
+                let gone: Vec<i64> = left.into_values().flatten().map(|row| row.id).collect();
                 if !gone.is_empty() {
                     Entity::delete_many()
                         .filter(Column::Id.is_in(gone))
