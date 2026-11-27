@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use maxnines_checks::{Credentials, limit, run_signed_in, timed_out_report};
+use maxnines_checks::{Credentials, failed_report, limit, run_signed_in, timed_out_report};
 use maxnines_protocol::{Check, CheckKind, LocalCheck, MAX_CHECK_NAME_LEN, is_check_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 
 /// How long a check gets to report once its own time limit is up.
@@ -254,6 +254,7 @@ impl CheckCollector {
                 }
             };
             let late = timed_out_report(&check);
+            let broke = failed_report(&check, FAILED_UNEXPECTEDLY);
             let (every, limit) = (every(check.interval, interval), limit(&check) + GRACE);
             let check = Arc::new((check, credentials));
             background.repeat(
@@ -263,7 +264,7 @@ impl CheckCollector {
                     let check = check.clone();
                     async move { run_signed_in(&check.0, check.1.as_ref()).await }
                 },
-                move |found| found.unwrap_or_else(|| late.clone()),
+                move |found| found.unwrap_or_else(|missed| missed.pick(&late, &broke)),
             )?;
         }
         Ok(Self { background })

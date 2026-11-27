@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 
 /// A service manager can stall, but it answers quickly when it's healthy.
@@ -29,6 +29,7 @@ impl ServiceCollector {
         let mut background = Background::new();
         for name in names {
             let late = report(&name, Status::unknown("timed out"));
+            let broke = report(&name, Status::unknown(FAILED_UNEXPECTEDLY));
             let watched = Arc::new(Watched::new(name));
             let reported = watched.clone();
             background.repeat(
@@ -39,7 +40,10 @@ impl ServiceCollector {
                     async move { query(&watched).await }
                 },
                 move |found| {
-                    found.map_or_else(|| late.clone(), |status| report(&reported.name, status))
+                    found.map_or_else(
+                        |missed| missed.pick(&late, &broke),
+                        |status| report(&reported.name, status),
+                    )
                 },
             )?;
         }

@@ -19,7 +19,7 @@ use maxnines_protocol::{check_metrics_pages, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY, Missed};
 use crate::collector::Collector;
 
 /// How many pages the agent's config can define.
@@ -154,7 +154,12 @@ impl OpenMetricsCollector {
                     async move { page.read().await }
                 },
                 move |rows| {
-                    let rows = rows.unwrap_or_else(|| page.failed(TIMED_OUT));
+                    let rows = rows.unwrap_or_else(|missed| {
+                        page.failed(match missed {
+                            Missed::OutOfTime => TIMED_OUT,
+                            Missed::Panicked => FAILED_UNEXPECTEDLY,
+                        })
+                    });
                     Value::Array(totals.settle(rows))
                 },
             )?;

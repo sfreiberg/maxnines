@@ -25,6 +25,29 @@ use tokio::task::AbortHandle;
 use tokio::time::{Instant, Interval, MissedTickBehavior, interval_at, timeout};
 use tracing::error;
 
+/// Why a round has nothing to publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missed {
+    /// It ran past its limit.
+    OutOfTime,
+    /// It panicked, which the agent's log says.
+    Panicked,
+}
+
+/// What's said of a round that panicked, as the error of whatever it reports.
+pub const FAILED_UNEXPECTEDLY: &str =
+    "it failed unexpectedly, which the agent's log says more about";
+
+impl Missed {
+    /// `late` for a round that ran out of time, or `broke` for one that panicked.
+    pub fn pick<T: Clone>(self, late: &T, broke: &T) -> T {
+        match self {
+            Self::OutOfTime => late.clone(),
+            Self::Panicked => broke.clone(),
+        }
+    }
+}
+
 /// How many blocking calls can be stuck at once. Anything beyond this waits.
 const MAX_BLOCKING_THREADS: usize = 8;
 
@@ -94,8 +117,8 @@ impl Background {
     /// Adds an item that runs `round` every `every`, first at a random point in
     /// the first `every`. A round that takes longer than `every` is followed at
     /// once by the next, and the ones after keep to the schedule. `publish` turns
-    /// what a round found into the item's result, and is given `None` for a round
-    /// that ran out of `limit` or panicked. It runs between rounds, so it can keep
+    /// what a round found into the item's result, and is told why there's nothing
+    /// for a round that ran out of `limit` or panicked. It runs between rounds, so it can keep
     /// what it needs from one to the next.
     pub fn repeat<Found, Round, Work, Publish>(
         &mut self,
@@ -108,7 +131,7 @@ impl Background {
         Round: FnMut() -> Work + Send + 'static,
         Work: Future<Output = Found> + Send + 'static,
         Found: Send + 'static,
-        Publish: FnMut(Option<Found>) -> Value + Send + 'static,
+        Publish: FnMut(Result<Found, Missed>) -> Value + Send + 'static,
     {
         self.repeat_from(every, every, limit, round, publish)
     }
@@ -129,7 +152,7 @@ impl Background {
         Round: FnMut() -> Work + Send + 'static,
         Work: Future<Output = Found> + Send + 'static,
         Found: Send + 'static,
-        Publish: FnMut(Option<Found>) -> Value + Send + 'static,
+        Publish: FnMut(Result<Found, Missed>) -> Value + Send + 'static,
     {
         let runtime = runtime()?;
         let slot = {
@@ -145,21 +168,21 @@ impl Background {
                 let found = match catch_unwind(AssertUnwindSafe(&mut round)) {
                     Ok(work) => {
                         let work = AssertUnwindSafe(work).catch_unwind();
-                        match limit {
+                        let finished = match limit {
                             Some(limit) => timeout(limit, work).await.ok(),
                             None => Some(work.await),
+                        };
+                        match finished {
+                            Some(Ok(found)) => Ok(found),
+                            Some(Err(_)) => Err(Missed::Panicked),
+                            None => Err(Missed::OutOfTime),
                         }
                     }
-                    Err(panic) => Some(Err(panic)),
+                    Err(_) => Err(Missed::Panicked),
                 };
-                let found = match found {
-                    Some(Err(_)) => {
-                        error!("a background collector panicked");
-                        None
-                    }
-                    Some(Ok(found)) => Some(found),
-                    None => None,
-                };
+                if matches!(found, Err(Missed::Panicked)) {
+                    error!("a background collector panicked");
+                }
                 match catch_unwind(AssertUnwindSafe(|| publish(found))) {
                     Ok(value) => {
                         results.lock().unwrap_or_else(PoisonError::into_inner)[slot] = value;
@@ -257,7 +280,7 @@ mod tests {
                     let count = counted.fetch_add(1, Ordering::Relaxed) + 1;
                     async move { count }
                 },
-                |found| json!(found),
+                |found| json!(found.ok()),
             )
             .unwrap();
         rounds
@@ -300,7 +323,7 @@ mod tests {
                     let _ = &alive;
                     async { 1 }
                 },
-                |found| json!(found),
+                |found| json!(found.ok()),
             )
             .unwrap();
         wait_until(|| !background.latest()[0].is_null());
@@ -374,15 +397,18 @@ mod tests {
             .unwrap();
 
         wait_until(|| published.lock().unwrap().len() >= 3);
-        assert_eq!(published.lock().unwrap()[..3], [Some(1), None, Some(3)]);
+        assert_eq!(
+            published.lock().unwrap()[..3],
+            [Ok(1), Err(Missed::Panicked), Ok(3)]
+        );
     }
 
     #[test]
-    fn a_round_that_runs_out_of_time_is_published_as_nothing() {
+    fn a_round_that_runs_out_of_time_is_published_as_that() {
         let mut background = Background::new();
         background
             .repeat(SHORT, Some(SHORT), std::future::pending::<u8>, |found| {
-                json!(found.is_none())
+                json!(found == Err(Missed::OutOfTime))
             })
             .unwrap();
         wait_until(|| background.latest()[0] == true);

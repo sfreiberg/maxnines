@@ -24,7 +24,7 @@ use futures_util::future::join_all;
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
-use crate::background::Background;
+use crate::background::{Background, Missed};
 use crate::collector::Collector;
 
 /// No host needs more than this many charted, and each one is its own series.
@@ -78,8 +78,9 @@ impl ContainerCollector {
                 }
             }
         };
-        let settle = move |containers: Option<Value>| {
-            if containers.is_none() {
+        let settle = move |containers: Result<Value, Missed>| {
+            // A panic is in the log already.
+            if containers == Err(Missed::OutOfTime) {
                 let limit = ROUND_LIMIT.as_secs();
                 complain(
                     &told,

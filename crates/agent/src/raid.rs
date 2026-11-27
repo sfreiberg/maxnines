@@ -17,7 +17,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::background::Background;
+use crate::background::{Background, Missed};
 use crate::collector::Collector;
 
 /// An array going wrong is worth knowing about within a minute or two.
@@ -76,16 +76,19 @@ impl Found {
     /// repeated: an array whose state can't be read now may be the one failing, as
     /// a pool whose devices stopped answering holds zpool up, and repeating how it
     /// last was would hide that.
-    fn unfinished() -> Self {
+    fn unfinished(missed: Missed) -> Self {
+        let problem = match missed {
+            Missed::OutOfTime => format!(
+                "The last look at RAID arrays and ZFS pools didn't finish within {} seconds",
+                ROUND_LIMIT.as_secs()
+            ),
+            Missed::Panicked => "The last look at RAID arrays and ZFS pools failed \
+                unexpectedly, which the agent's log says more about"
+                .to_string(),
+        };
         Self {
             arrays: Vec::new(),
-            problems: vec![(
-                "raid",
-                format!(
-                    "The last look at RAID arrays and ZFS pools didn't finish within {} seconds",
-                    ROUND_LIMIT.as_secs()
-                ),
-            )],
+            problems: vec![("raid", problem)],
         }
     }
 
@@ -1983,7 +1986,7 @@ Device Node:          disk4
     /// failing, so it's a problem instead.
     #[test]
     fn a_look_that_doesnt_finish_is_a_problem_and_no_arrays() {
-        let rows = Found::unfinished().to_value();
+        let rows = Found::unfinished(Missed::OutOfTime).to_value();
         let rows = rows.as_array().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["name"], "raid");
@@ -1993,5 +1996,10 @@ Device Node:          disk4
                 .unwrap()
                 .contains("didn't finish within 180 seconds")
         );
+        // One that panicked says so instead, rather than blaming the time.
+        let rows = Found::unfinished(Missed::Panicked).to_value();
+        let problem = rows[0]["problem"].as_str().unwrap();
+        assert!(problem.contains("failed unexpectedly"), "{problem}");
+        assert!(!problem.contains("seconds"), "{problem}");
     }
 }

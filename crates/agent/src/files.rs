@@ -13,7 +13,7 @@ use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{Value, json};
 
-use crate::background::{Background, Busy};
+use crate::background::{Background, Busy, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 
 /// Network drives can hang, which shows as this much delay and then a failure.
@@ -60,11 +60,12 @@ impl FileCollector {
                 busy: Arc::default(),
             });
             let late = timed_out(&watched);
+            let broke = json!({ "path": watched.path, "error": FAILED_UNEXPECTEDLY });
             background.repeat(
                 interval,
                 Some(TIMEOUT),
                 move || check_path(watched.clone()),
-                move |found| found.unwrap_or_else(|| late.clone()),
+                move |found| found.unwrap_or_else(|missed| missed.pick(&late, &broke)),
             )?;
         }
         Ok(Self { background })

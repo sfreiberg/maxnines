@@ -21,7 +21,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::background::Background;
+use crate::background::{Background, Missed};
 use crate::collector::Collector;
 use crate::programs::Ran;
 
@@ -101,15 +101,15 @@ struct Known {
 impl Known {
     /// Every row has a number, `asleep`, and its text, `note`, even when empty, as
     /// the server keeps a row's newest text until it's replaced.
-    fn publish(&mut self, found: Option<Round>) -> Value {
+    fn publish(&mut self, found: Result<Round, Missed>) -> Value {
         match found {
-            // Out of time: what was known still stands.
-            None => {}
-            Some(Round::Problem(problem)) => {
+            // Out of time, or panicked: what was known still stands.
+            Err(_) => {}
+            Ok(Round::Problem(problem)) => {
                 self.rows.clear();
                 return json!([{ "name": "smartctl", "problem": problem, "drives": 0 }]);
             }
-            Some(Round::Drives(drives)) => {
+            Ok(Round::Drives(drives)) => {
                 let mut rows = BTreeMap::new();
                 for drive in drives {
                     let (device, row) = match drive {
@@ -751,11 +751,11 @@ mod tests {
         );
         let mut known = Known::default();
         let awake = row(parse_drive("/dev/sdc", SATA.as_bytes()));
-        known.publish(Some(Round::Drives(vec![Drive::Read {
+        known.publish(Ok(Round::Drives(vec![Drive::Read {
             device: "/dev/sdc".into(),
             row: awake.clone(),
         }])));
-        let published = known.publish(Some(Round::Drives(vec![Drive::Asleep {
+        let published = known.publish(Ok(Round::Drives(vec![Drive::Asleep {
             device: "/dev/sdc".into(),
         }])));
         let mut asleep = awake;
@@ -765,7 +765,7 @@ mod tests {
         // Never seen awake, it's listed with nothing to say.
         let mut fresh = Known::default();
         assert_eq!(
-            fresh.publish(Some(Round::Drives(vec![Drive::Asleep {
+            fresh.publish(Ok(Round::Drives(vec![Drive::Asleep {
                 device: "/dev/sdc".into()
             }]))),
             json!([{ "name": "/dev/sdc", "device": "/dev/sdc", "asleep": 1, "note": "" }])
@@ -795,22 +795,22 @@ mod tests {
             row: json!({ "name": "a" }),
         };
         let read = json!([{ "name": "a", "asleep": 0, "note": "" }]);
-        assert_eq!(known.publish(Some(Round::Drives(vec![drive]))), read);
-        assert_eq!(known.publish(None), read);
+        assert_eq!(known.publish(Ok(Round::Drives(vec![drive]))), read);
+        assert_eq!(known.publish(Err(Missed::OutOfTime)), read);
         let unreadable = Drive::Unreadable {
             device: "/dev/sdd".into(),
             error: "Unknown USB bridge".into(),
         };
         assert_eq!(
-            known.publish(Some(Round::Drives(vec![unreadable]))),
+            known.publish(Ok(Round::Drives(vec![unreadable]))),
             json!([{ "name": "/dev/sdd", "device": "/dev/sdd", "asleep": 0, "note": "Unknown USB bridge" }])
         );
         let problem = Round::Problem("smartctl isn't installed".into());
         assert_eq!(
-            known.publish(Some(problem)),
+            known.publish(Ok(problem)),
             json!([{ "name": "smartctl", "problem": "smartctl isn't installed", "drives": 0 }])
         );
-        assert_eq!(known.publish(None), json!([]));
+        assert_eq!(known.publish(Err(Missed::OutOfTime)), json!([]));
     }
 
     #[test]

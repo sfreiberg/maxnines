@@ -17,7 +17,7 @@ use maxnines_protocol::default_status_page;
 use maxnines_protocol::totals::Change;
 use serde_json::{Map, Value, json};
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY, Missed};
 use crate::collector::Collector;
 
 /// A status page is a few lines served by the host itself, so anything slower
@@ -306,7 +306,13 @@ impl StatusPageCollector {
                 interval,
                 Some(TIMEOUT),
                 move || read_page(page.clone()),
-                move |read| totals.row(&label, read.unwrap_or_else(|| Err(TIMED_OUT.to_string()))),
+                move |read| {
+                    let missed = |missed: Missed| missed.pick(&TIMED_OUT, &FAILED_UNEXPECTEDLY);
+                    totals.row(
+                        &label,
+                        read.unwrap_or_else(|why| Err(missed(why).to_string())),
+                    )
+                },
             )?;
         }
         Ok(Self {

@@ -41,8 +41,8 @@ impl UpdatesCollector {
         let mut background = Background::new();
         let mut last = Value::Null;
         background.repeat_from(FIRST_WITHIN, EVERY, Some(ROUND_LIMIT), read, move |found| {
-            // Out of time: what was known still stands.
-            if let Some(found) = found {
+            // Out of time, or panicked: what was known still stands.
+            if let Ok(found) = found {
                 last = Found::to_value(&found);
             }
             last.clone()

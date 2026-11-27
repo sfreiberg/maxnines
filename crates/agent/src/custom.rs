@@ -23,7 +23,7 @@ use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -112,6 +112,7 @@ impl CustomCollector {
             let limit = metric.limit();
             let wanted = Arc::new((name, metric));
             let late = Value::Array(report(&wanted.0, Err(TIMED_OUT.to_string())));
+            let broke = Value::Array(report(&wanted.0, Err(FAILED_UNEXPECTEDLY.to_string())));
             let reported = wanted.clone();
             background.repeat(
                 interval,
@@ -121,8 +122,8 @@ impl CustomCollector {
                     async move { measure(&wanted.0, &wanted.1, limit).await }
                 },
                 move |found| match found {
-                    Some(result) => Value::Array(report(&reported.0, result)),
-                    None => late.clone(),
+                    Ok(result) => Value::Array(report(&reported.0, result)),
+                    Err(missed) => missed.pick(&late, &broke),
                 },
             )?;
         }

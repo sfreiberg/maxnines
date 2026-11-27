@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 use crate::custom::{Failure, run_command};
 use anyhow::{Result, ensure};
@@ -112,6 +112,7 @@ impl CommandCollector {
                 continue;
             };
             let late = Value::Array(Outcome::problem(&Failure::TimedOut.to_string()).report(&name));
+            let broke = Value::Array(Outcome::problem(FAILED_UNEXPECTEDLY).report(&name));
             let limit = command.limit();
             background.repeat(
                 interval,
@@ -121,8 +122,8 @@ impl CommandCollector {
                     async move { run(&command, limit).await }
                 },
                 move |found| match found {
-                    Some(outcome) => Value::Array(outcome.report(&name)),
-                    None => late.clone(),
+                    Ok(outcome) => Value::Array(outcome.report(&name)),
+                    Err(missed) => missed.pick(&late, &broke),
                 },
             )?;
         }

@@ -33,7 +33,7 @@ impl SystemCollector {
                 );
                 report(&limits.unwrap_or_default(), sessions, tcp, failed)
             },
-            Option::unwrap_or_default,
+            Result::unwrap_or_default,
         )?;
         Ok(Self { background })
     }
