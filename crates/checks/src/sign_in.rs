@@ -392,8 +392,14 @@ pub(crate) async fn check_redis(
     let signing_in = credentials.filter(|given| !given.is_empty());
     let client = redis_client(check, signing_in)?;
     drop(open(check, findings).await?);
+    // The check's own time limit covers it all, rather than the driver's, which
+    // gives connecting a second and each answer half of one, too little for a
+    // server far away or busy saving.
+    let config = redis::AsyncConnectionConfig::new()
+        .set_connection_timeout(None)
+        .set_response_timeout(None);
     let mut connection = client
-        .get_multiplexed_async_connection()
+        .get_multiplexed_async_connection_with_config(&config)
         .await
         .map_err(short)?;
     let pong: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut connection).await;
@@ -771,6 +777,11 @@ mod tests {
 
     /// Enough of Redis for a check: PING, AUTH with one password, and INFO.
     async fn fake_redis(password: Option<&'static str>) -> SocketAddr {
+        slow_redis(password, std::time::Duration::ZERO).await
+    }
+
+    /// As [`fake_redis`], taking `delay` over each answer, as a busy one does.
+    async fn slow_redis(password: Option<&'static str>, delay: std::time::Duration) -> SocketAddr {
         serve(move |socket| async move {
             let (reader, mut writer) = socket.into_split();
             let mut reader = BufReader::new(reader);
@@ -806,6 +817,7 @@ mod tests {
                     }
                     _ => "+OK\r\n".to_string(),
                 };
+                tokio::time::sleep(delay).await;
                 if writer.write_all(reply.as_bytes()).await.is_err() {
                     return;
                 }
@@ -842,6 +854,14 @@ mod tests {
         .await;
         assert_eq!(result["up"], 0, "{result}");
         assert!(!result.to_string().contains("guess"), "{result}");
+    }
+
+    /// Slower than the driver's own half a second, well within the check's limit.
+    #[tokio::test]
+    async fn a_slow_redis_is_up() {
+        let slow = slow_redis(None, std::time::Duration::from_millis(800)).await;
+        let result = run(&check(CheckKind::Redis, slow), None).await;
+        assert_eq!(result["up"], 1, "{result}");
     }
 
     struct TestServer;
