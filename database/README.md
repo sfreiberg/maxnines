@@ -111,6 +111,8 @@ erDiagram
     users ||--o{ app_sign_ins : "signed in"
     users ||--o{ recovery_codes : "can recover with"
     users ||--o{ sign_in_challenges : "is asked"
+    events ||--o{ event_hosts : "is for"
+    hosts ||--o{ event_hosts : "marked with"
 
     hosts {
         string id PK "from its agent's public key, or random"
@@ -227,6 +229,21 @@ erDiagram
         int id PK
         int template_id FK
         string host_id FK "unique with template_id"
+    }
+    events {
+        int id PK
+        timestamp occurred_at
+        string kind "deploy, note, restart or config"
+        string title
+        text detail
+        string filter "as it was written, or NULL for every host"
+        string created_by
+        timestamp created_at
+    }
+    event_hosts {
+        int id PK
+        int event_id FK
+        string host_id FK "unique with event_id, the hosts its filter picked when it was recorded"
     }
     template_discoveries {
         int id PK
@@ -678,16 +695,6 @@ they're settings:
 
 ```mermaid
 erDiagram
-    events {
-        int id PK
-        timestamp occurred_at
-        string kind "deploy, note or restart"
-        string title
-        text detail
-        string filter "which hosts, or NULL for every host"
-        string created_by
-        timestamp created_at
-    }
     location_rules {
         int id PK
         string name
@@ -748,7 +755,7 @@ erDiagram
 | `action_runs` | Every time an action was asked of a host, by an alert or a person, and what it printed. They go with their alert or their host |
 | `notification_channels`, `notifications` | Where alerts are sent, and each delivery with its retries. A deleted channel is kept the same way, so what was sent through it still names it |
 | `silences`, `maintenance_windows` | When notifications are held back |
-| `events` | Annotations people and automations add, and restarts the server notices |
+| `events`, `event_hosts` | Annotations people and automations add, and restarts and config changes the server notices, each with the hosts it was for when it was recorded. An event goes when the host it was for alone does, and its hosts go with it |
 | `dashboards`, `dashboard_widgets`, `dashboard_variables` | Dashboards and what's on them |
 | `location_rules` | Where hosts are on the map |
 | `remote_checks` | Checks the server runs itself, each about a host without an agent, which is made for it if it's added without one, and with a name no other check about that host has. A host's checks go with it, and a check's host stays when the check goes |
@@ -824,6 +831,8 @@ index here starts with.
 | `idx_dashboard_widgets_dashboard` | `dashboard_widgets (dashboard_id)` | A dashboard's widgets |
 | `idx_dashboard_variables_dashboard` | `dashboard_variables (dashboard_id)` | A dashboard's variables |
 | `idx_events_time` | `events (occurred_at)` | Events in a range of time |
+| `idx_event_hosts_event_host` | `event_hosts (event_id, host_id)`, unique | Each host once to an event |
+| `idx_event_hosts_host` | `event_hosts (host_id, event_id)` | A host's timeline |
 
 ## Metrics store: DuckDB
 

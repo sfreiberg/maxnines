@@ -36,9 +36,10 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
   "$MAXNINES_URL/api/v1/annotations"
 ```
 
-- **The filter is matched whenever a chart is drawn,** against each host as it is
-  then. A web host added next week shows last week's deploy, and one that stops
-  being `role=web` stops showing it. A filter that matches no host yet is fine.
+- **The filter is matched when the annotation is added,** against the approved hosts
+  there are then, and the annotation stays on those. A web host added next week
+  doesn't show last week's deploy, and one that stops being `role=web` keeps showing
+  it, as it was there for it. A filter that matches no host is refused.
 - **`occurred_at`** records something that happened earlier, up to a year back.
 - **Adding and deleting annotations needs the responder role,** and both are kept in the
   [audit log](audit-log.md). What the server records itself isn't.

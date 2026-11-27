@@ -12,9 +12,9 @@ use crate::alert_conditions::{Conditions, Names};
 use crate::alerting::{self, AlertRuleInput};
 use crate::calculations::Sources;
 use crate::catalog::Catalog;
-use crate::events::{EventInput, Timeline};
+use crate::controllers::host_list::HostSearch;
+use crate::events::EventInput;
 use crate::facts::unflatten;
-use crate::host_filter::HostFilter;
 use crate::maintenance::{self, MaintenanceWindowInput};
 use crate::metrics::Metrics;
 use crate::metrics_pages::{self, MetricsPageInput, PageReads, SignIn};
@@ -122,8 +122,9 @@ pub enum EventRefusal {
 }
 
 impl AppState {
-    /// Records an annotation, as `by`. Its filter is kept as it is, and matched against each
-    /// host when a chart is drawn, so one that picks nothing yet is fine.
+    /// Records an annotation, as `by`, for the approved hosts its filter picks now. It
+    /// stays on those, and isn't put on hosts added or changed later, as it's about
+    /// what happened to the hosts there were. One that picks none is refused.
     pub async fn record_event(
         &self,
         mut input: EventInput,
@@ -132,40 +133,43 @@ impl AppState {
     ) -> Result<i64, EventRefusal> {
         input.tidy();
         let kind = input.check(now).map_err(EventRefusal::Invalid)?;
+        let search = HostSearch::from_database(&self.database, input.filter.as_deref())
+            .await
+            .map_err(EventRefusal::Failed)?;
+        if let Some(error) = search.error {
+            return Err(EventRefusal::Invalid(error));
+        }
+        let hosts: Vec<String> = self
+            .registry
+            .list()
+            .await
+            .into_iter()
+            .filter(|host| {
+                host.state == HostState::Approved
+                    && !host.is_local()
+                    && search.includes(&host.id, &host.hostname)
+            })
+            .map(|host| host.id)
+            .collect();
+        if hosts.is_empty() {
+            let why = match input.filter {
+                Some(_) => "This filter matches no hosts.",
+                None => "There are no hosts to mark yet.",
+            };
+            return Err(EventRefusal::Invalid(why.to_string()));
+        }
         let new = NewEvent {
             kind,
             occurred_at: input.occurred_at.unwrap_or(now),
             title: &input.title,
             detail: input.detail.as_deref(),
             filter: input.filter.as_deref(),
+            hosts: &hosts,
         };
         self.database
             .record_event(&new, by, now)
             .await
             .map_err(EventRefusal::Failed)
-    }
-
-    /// Everything that happened to a host between two times, newest first, with the
-    /// annotations whose filters pick it by its current facts.
-    pub async fn timeline(
-        &self,
-        host_id: &str,
-        from: Timestamp,
-        to: Timestamp,
-    ) -> Result<Timeline> {
-        let hostname = self
-            .registry
-            .get(host_id)
-            .await
-            .map(|host| host.hostname)
-            .unwrap_or_default();
-        let facts = self.database.facts_of(&[host_id]).await?;
-        let facts = facts.get(host_id);
-        let picks = |filter: Option<&str>| {
-            HostFilter::parse_optional(filter)
-                .is_ok_and(|filter| filter.matches(host_id, &hostname, facts))
-        };
-        self.database.timeline(host_id, from, to, picks).await
     }
 
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if

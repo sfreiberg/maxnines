@@ -25,6 +25,7 @@ mod dashboard_variable;
 mod dashboard_widget;
 mod dashboards;
 mod event;
+mod event_host;
 mod events;
 mod heartbeat;
 mod heartbeats;

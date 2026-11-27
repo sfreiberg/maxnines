@@ -9,7 +9,7 @@ See [Annotations](annotations.md). Adding and deleting them needs the responder 
 | `title` | What happened, which is required. Up to 200 characters. |
 | `detail` | More about it, up to 2,000 characters. |
 | `occurred_at` | When it happened, as an ISO 8601 time such as `2026-11-19T01:57:17Z`, from a year ago to now. Defaults to now. |
-| `filter` | Which hosts, written as in [Filters](api-filters.md). Leave it out for every host. It's matched against each host whenever a chart is drawn, so a host added later shows it too, and one that matches nothing yet is fine. |
+| `filter` | Which hosts, written as in [Filters](api-filters.md). Leave it out for every host. It's matched when the annotation is added, and the annotation stays on the approved hosts it matched then: a host added later doesn't show it, and one whose facts change keeps it. One that matches no host is refused with `422`. |
 
 ## Add an annotation
 
@@ -65,15 +65,12 @@ Returns `204`, or `404` if there's no such annotation.
 `GET /api/v1/hosts/{id}/events`
 
 Everything that happened to one host, newest first, as its page shows them: the
-annotations whose filter matches it, restarts, config changes, alerts starting
+annotations added for it, restarts, config changes, alerts starting
 (`alert`) and ending (`resolved`), and updates. `from` and `to`, ISO 8601 times, choose
 the period, both included, which is the last 24 hours up to now unless given, and `limit` how many, the newest,
 which is 500 unless given. `from` has to be before `to` and at most 366 days before it,
 and `limit` from 1 to 500, or the answer is `400`. Only what was recorded has an `id`,
 and `created_by` is who added an annotation, or `null` for what the server worked out.
-To find the host's own annotations, the newest 100,000 in the period are looked
-through, so a period with more than that may leave out its older ones. The host's
-page says when it has.
 
 ```json
 [

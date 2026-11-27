@@ -269,12 +269,13 @@ async fn a_timeline_gives_the_newest_of_what_it_holds_from_and_to_included() {
     assert_eq!(titles(events.as_array().unwrap()), ["second"]);
 }
 
-/// Annotations are looked through a few at a time in tests, so a host's own are
-/// found past many of other hosts', including ones made in the same moment.
+/// A host's own are found among many of other hosts', and those made in the same
+/// moment are newest first by when they were added.
 #[tokio::test]
 async fn a_hosts_annotations_are_found_past_many_of_other_hosts() {
     let server = start().await;
     let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let _db = connect_host(&server, "db-1", json!({ "role": "db" })).await;
     let same = "2026-11-20T09:30:00Z";
     let mut made = vec![("web oldest", "role=web", "2026-11-20T09:00:00Z")];
     for n in 0..4 {
@@ -300,37 +301,6 @@ async fn a_hosts_annotations_are_found_past_many_of_other_hosts() {
         titles(events.as_array().unwrap()),
         ["web same moment", "web oldest"]
     );
-}
-
-/// Past as many annotations as are looked through, a host's older ones are left out,
-/// and its page says so.
-#[tokio::test]
-async fn a_host_page_says_when_there_were_too_many_annotations_to_look_through() {
-    let server = start().await;
-    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
-    let ago = |minutes: i64| (chrono::Utc::now() - TimeDelta::minutes(minutes)).to_rfc3339();
-    let annotate = async |title: &str, filter: &str, occurred_at: String| {
-        let annotation = json!({ "title": title, "filter": filter, "occurred_at": occurred_at });
-        let (status, answer) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
-        assert_eq!(status, 201, "{answer}");
-    };
-    annotate("web oldest", "role=web", ago(120)).await;
-    // One fewer of other hosts' than tests look through, all newer.
-    for n in 0..14 {
-        annotate(&format!("db {n}"), "role=db", ago(60 - n)).await;
-    }
-    let notice = "more annotations than are looked through";
-    let page = format!("/hosts/{}/metrics?range=6h", web.id());
-    let mut browser = Browser::default();
-    let shown = browser.get(&server, &page).await;
-    assert_eq!(shown.status, 200, "{}", shown.body);
-    assert!(shown.body.contains("web oldest"), "{}", shown.body);
-    assert!(!shown.body.contains(notice), "{}", shown.body);
-
-    annotate("db 14", "role=db", ago(30)).await;
-    let shown = browser.get(&server, &page).await;
-    assert!(!shown.body.contains("web oldest"), "{}", shown.body);
-    assert!(shown.body.contains(notice), "{}", shown.body);
 }
 
 /// Asked for without a `to`, a timeline runs up to now, now included, so what was
@@ -660,32 +630,60 @@ async fn deleting_a_host_keeps_annotations_for_others_and_forgets_its_own() {
     );
 }
 
+/// An annotation is about the hosts there were when it happened, so it isn't put on
+/// one added later, and stays on one whose facts change.
 #[tokio::test]
-async fn an_annotation_follows_its_filter_to_hosts_added_and_changed_later() {
+async fn an_annotation_stays_on_the_hosts_its_filter_picked_when_added() {
     let server = start().await;
     let body = json!({ "kind": "deploy", "title": "Shop v2.4", "filter": "role=web" });
 
-    // Nothing matches yet, which is fine.
-    let (status, _) = api(&server, "POST", "/api/v1/annotations", &body).await;
-    assert_eq!(status, 201);
+    // With nothing for it to be on, it's refused.
+    let (status, refusal) = api(&server, "POST", "/api/v1/annotations", &body).await;
+    assert_eq!(status, 422, "{refusal}");
+    assert!(
+        refusal.to_string().contains("matches no hosts"),
+        "{refusal}"
+    );
+    let everywhere = json!({ "title": "Network change" });
+    let (status, refusal) = api(&server, "POST", "/api/v1/annotations", &everywhere).await;
+    assert_eq!(status, 422, "{refusal}");
+    assert!(refusal.to_string().contains("no hosts"), "{refusal}");
 
-    let (late, mut client) = connect_host(&server, "web-9", json!({ "role": "web" })).await;
-    assert_eq!(titles(&timeline(&server, &late).await), ["Shop v2.4"]);
+    let (early, mut early_client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let (status, answer) = api(&server, "POST", "/api/v1/annotations", &body).await;
+    assert_eq!(status, 201, "{answer}");
+    // A host waiting to be approved isn't one yet.
+    let pending = identity();
+    let mut pending_client = server.connect().await;
+    let status = handshake(&mut pending_client, &pending, "web-2", None).await;
+    assert_eq!(status, RegistrationStatus::Pending);
+    let by_name = json!({ "title": "Web restart", "filter": "hostname=web*" });
+    let (status, answer) = api(&server, "POST", "/api/v1/annotations", &by_name).await;
+    assert_eq!(status, 201, "{answer}");
+
+    let (late, _late_client) = connect_host(&server, "web-9", json!({ "role": "web" })).await;
+    assert!(timeline(&server, &late).await.is_empty());
+    server.approve(&pending).await;
+    assert!(timeline(&server, &pending).await.is_empty());
 
     send(
-        &mut client,
+        &mut early_client,
         &AgentMessage::Facts {
             facts: json!({ "role": "db" }),
         },
     )
     .await;
-    server.wait_for_facts(&late.id(), 2).await;
-    assert!(timeline(&server, &late).await.is_empty());
+    server.wait_for_facts(&early.id(), 2).await;
+    assert_eq!(
+        titles(&timeline(&server, &early).await),
+        ["Web restart", "Shop v2.4"]
+    );
 }
 
 #[tokio::test]
 async fn the_annotations_tab_adds_one_for_a_filter_at_a_time_given() {
     let server = start().await;
+    let _web = connect_host(&server, "web-1", json!({ "role": "web" })).await;
     let zone = chrono_tz::America::Chicago;
     let user = server.user_id().await;
     server

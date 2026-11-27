@@ -2206,6 +2206,50 @@ impl MigrationTrait for CreateTables {
                     .to_owned(),
             )
             .await?;
+        // The hosts an event is for, found when it's recorded, so one is on the hosts
+        // it happened to and not those added or changed later.
+        manager
+            .create_table(
+                Table::create()
+                    .table(EventHosts::Table)
+                    .col(id(EventHosts::Id))
+                    .col(ColumnDef::new(EventHosts::EventId).big_integer().not_null())
+                    .col(ColumnDef::new(EventHosts::HostId).string_len(32).not_null())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_event_hosts_event_id")
+                            .from(EventHosts::Table, EventHosts::EventId)
+                            .to(Events::Table, Events::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk_event_hosts_host_id")
+                            .from(EventHosts::Table, EventHosts::HostId)
+                            .to(Hosts::Table, Hosts::Id)
+                            .on_delete(ForeignKeyAction::Cascade),
+                    )
+                    .to_owned(),
+            )
+            .await?;
+        index_of(
+            manager,
+            Unique,
+            "idx_event_hosts_event_host",
+            "event_hosts",
+            "event_id, host_id",
+            None,
+        )
+        .await?;
+        index_of(
+            manager,
+            Plain,
+            "idx_event_hosts_host",
+            "event_hosts",
+            "host_id, event_id",
+            None,
+        )
+        .await?;
         manager
             .create_table(
                 Table::create()
@@ -2781,6 +2825,14 @@ enum Events {
 }
 
 #[derive(Iden)]
+enum EventHosts {
+    Table,
+    Id,
+    EventId,
+    HostId,
+}
+
+#[derive(Iden)]
 enum AuditLog {
     Table,
     Id,
@@ -3026,8 +3078,9 @@ mod tests {
     }
 
     /// Every table a host or user has rows in.
-    const KEPT_ABOUT_THEM: [&str; 13] = [
+    const KEPT_ABOUT_THEM: [&str; 14] = [
         "host_facts",
+        "event_hosts",
         "host_config_status",
         "host_boots",
         "metrics_pages",
@@ -3059,6 +3112,11 @@ mod tests {
                  VALUES ('h1', 'v1', {AT})"
             ),
             format!("INSERT INTO host_boots (host_id, booted_at) VALUES ('h1', {AT})"),
+            format!(
+                "INSERT INTO events (occurred_at, kind, title, created_by, created_at)
+                 VALUES ({AT}, 'deploy', 'Deployed', 'ann', {AT})"
+            ),
+            "INSERT INTO event_hosts (event_id, host_id) VALUES (1, 'h1')".to_string(),
             "INSERT INTO metrics_pages (host_id, url, interval_secs, enabled)
              VALUES ('h1', 'http://web/metrics', 60, TRUE)"
                 .to_string(),
@@ -3136,6 +3194,22 @@ mod tests {
         .await;
         run(&connection, "DELETE FROM action_runs WHERE id = 1").await;
         assert_eq!(count(&connection, "notifications").await, 1);
+        // An event's hosts go with it.
+        run(
+            &connection,
+            &format!(
+                "INSERT INTO events (occurred_at, kind, title, created_by, created_at)
+                 VALUES ({AT}, 'note', 'Brief', 'ann', {AT})"
+            ),
+        )
+        .await;
+        run(
+            &connection,
+            "INSERT INTO event_hosts (event_id, host_id) VALUES (2, 'h1')",
+        )
+        .await;
+        run(&connection, "DELETE FROM events WHERE id = 2").await;
+        assert_eq!(count(&connection, "event_hosts").await, 1);
 
         run(&connection, "DELETE FROM hosts WHERE id = 'h1'").await;
         run(&connection, "DELETE FROM users WHERE id = 1").await;

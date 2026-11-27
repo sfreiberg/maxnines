@@ -1,6 +1,6 @@
 //! Things that happened to hosts, marked on their charts so a change in a graph can
 //! be matched to what caused it. Annotations, deploys and notes, come from people and
-//! their scripts, for the hosts a filter picks whenever a chart is drawn. The
+//! their scripts, for the hosts a filter picks when they're recorded. The
 //! server records restarts and config changes itself, and alerts and updates come from
 //! what's already kept about them.
 
@@ -93,8 +93,8 @@ pub struct EventInput {
         deserialize_with = "crate::times::optional_moment::deserialize"
     )]
     pub occurred_at: Option<Timestamp>,
-    /// Which hosts, as a host filter, matched whenever a chart is drawn. None means
-    /// every host.
+    /// Which hosts, as a host filter, matched when it's recorded. None means every
+    /// host there is then.
     #[serde(default, deserialize_with = "crate::text::optional")]
     pub filter: Option<String>,
 }
@@ -179,15 +179,6 @@ pub struct TimelineEvent {
     pub detail: Option<String>,
     pub created_by: Option<String>,
     pub id: Option<i64>,
-}
-
-/// What happened to a host over a time, newest first.
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Timeline {
-    pub events: Vec<TimelineEvent>,
-    /// Whether there were more annotations in the time than are looked through
-    /// for a host's own, so some of its older ones may be missing.
-    pub cut_short: bool,
 }
 
 /// Facts whose changes are worth marking, and what to call them.

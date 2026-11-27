@@ -363,8 +363,12 @@ pub(super) async fn host_page(
         Ok(charts) => charts,
         Err(error) => return server_error(&error),
     };
-    let (events, events_cut_short) = match state.timeline(&host.id, range.from, range.to).await {
-        Ok(timeline) => (timeline.events, timeline.cut_short),
+    let events = match state
+        .database
+        .timeline(&host.id, range.from, range.to)
+        .await
+    {
+        Ok(events) => events,
         Err(error) => return server_error(&error),
     };
     let zone = viewer_zone();
@@ -457,7 +461,6 @@ pub(super) async fn host_page(
         .with("hostname", &host.hostname)
         .with("charts", &charts)
         .with("events", &events)
-        .with("events_cut_short", &events_cut_short)
         .with("refused", &refused)
         .with("ranges", &ranges)
         .with("range", selected);
@@ -533,10 +536,14 @@ async fn data(
     let mut wide_chart = build(DATA_FRAME_WIDE);
     let mut narrow_chart = build(DATA_FRAME_NARROW);
     // What happened to the host is marked on both, as on the host's charts.
-    match state.timeline(&host.id, range.from, range.to).await {
-        Ok(timeline) => {
-            metric_charts::mark(&mut wide_chart, &timeline.events, range, zone);
-            metric_charts::mark(&mut narrow_chart, &timeline.events, range, zone);
+    match state
+        .database
+        .timeline(&host.id, range.from, range.to)
+        .await
+    {
+        Ok(events) => {
+            metric_charts::mark(&mut wide_chart, &events, range, zone);
+            metric_charts::mark(&mut narrow_chart, &events, range, zone);
         }
         Err(error) => return server_error(&error),
     }
