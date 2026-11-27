@@ -36,7 +36,7 @@ database "orders" {
 | `database` | PostgreSQL: the database to sign in to, by default `postgres`. MongoDB: the database the account was made in, by default `admin` |
 | `tls` | `true` to only connect over TLS, which for ClickHouse is HTTPS. PostgreSQL uses TLS whenever the server offers it anyway |
 | `insecure` | `true` to accept a certificate that can't be verified |
-| `username`, `password` | Who to sign in as. `env()` reads the password from the agent's environment. MongoDB and Redis can be read without them where they allow that, and Redis with a password alone. ClickHouse and Redis only send a password without TLS to the host itself |
+| `username`, `password` | Who to sign in as. `env()` reads the password from the agent's environment. MongoDB and Redis can be read without them where they allow that, Redis with a password alone, and ClickHouse with a username alone, as its `default` user has no password unless one is set. ClickHouse and Redis only send a password without TLS to the host itself |
 
 The name is what the database's series are called, so it can't have spaces. Restart
 the agent after changing these. The agent tells the server the names and kinds of the

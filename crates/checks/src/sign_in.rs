@@ -745,6 +745,12 @@ mod tests {
         );
         let here = Check::new("ch", CheckKind::Clickhouse, "127.0.0.1:8123");
         assert_eq!(sign_in_problem(&here, true, true), None);
+        // Its `default` user has no password unless one is set, wherever it is.
+        assert_eq!(sign_in_problem(&elsewhere, true, false), None);
+        assert_eq!(
+            login(CheckKind::Clickhouse, &alone),
+            Ok(Some(("monitor", "")))
+        );
     }
 
     #[test]

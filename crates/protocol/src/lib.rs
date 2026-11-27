@@ -754,7 +754,9 @@ impl CheckKind {
         match self {
             Self::Ssh => Some(SignInNeeds { key: true, ..both }),
             // Its password goes as basic authentication, in plain HTTP without TLS.
+            // Its built-in `default` user has none unless one is set.
             Self::Clickhouse => Some(SignInNeeds {
+                password: false,
                 password_in_clear: true,
                 ..both
             }),

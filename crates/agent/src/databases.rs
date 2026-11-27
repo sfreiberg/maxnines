@@ -236,5 +236,13 @@ mod tests {
             ..defined("clickhouse", "db.example.com:8443")
         };
         check("events", tls);
+        // ClickHouse's `default` user has no password unless one is set.
+        let default_user = DatabaseDefinition {
+            username: Some("default".to_string()),
+            password: Some(String::new()),
+            ..defined("clickhouse", "db.example.com:8123")
+        };
+        let read = check("events", default_user).database("events").unwrap();
+        assert_eq!(read.credentials.password, None);
     }
 }
