@@ -106,7 +106,7 @@ impl SlackActions {
         Self {
             database,
             web_url,
-            bot_token: SlackApiToken::new(SlackApiTokenValue(bot_token.trim().to_string())),
+            bot_token: SlackApiToken::new(SlackApiTokenValue(bot_token.to_string())),
             emails: Mutex::default(),
         }
     }
@@ -339,7 +339,7 @@ pub async fn check_app_token<C>(client: &SlackClient<C>, app_token: &str) -> Res
 where
     C: SlackClientHttpConnector + Send + Sync,
 {
-    let token = SlackApiToken::new(SlackApiTokenValue(app_token.trim().to_string()));
+    let token = SlackApiToken::new(SlackApiTokenValue(app_token.to_string()));
     client
         .open_session(&token)
         .apps_connections_open(&SlackApiAppsConnectionOpenRequest::new())
@@ -405,11 +405,7 @@ async fn follow_channels(
         .await?
         .into_iter()
         .filter(|channel| channel.channel.kind == ChannelKind::Slack)
-        .filter_map(|channel| {
-            let app = channel.channel.app_token?.trim().to_string();
-            let bot = channel.channel.credential?.trim().to_string();
-            Some((app, bot))
-        })
+        .filter_map(|channel| Some((channel.channel.app_token?, channel.channel.credential?)))
         .collect();
 
     let gone: Vec<AppTokens> = running

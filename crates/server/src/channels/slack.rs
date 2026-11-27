@@ -546,8 +546,7 @@ impl ChannelType for Slack {
                 && !target.contains(char::is_whitespace),
             "enter a Slack channel, such as #alerts or C0123456789"
         );
-        // Sent as it's saved, so a space or line break pasted with it would fail
-        // every send.
+        // Sent as it's saved, so a space inside it would fail every send.
         let token = channel.credential.as_deref().unwrap_or_default();
         ensure!(
             token.starts_with("xoxb-") && !token.contains(char::is_whitespace),

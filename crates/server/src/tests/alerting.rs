@@ -4681,14 +4681,30 @@ async fn a_pagerduty_channel_keeps_its_region() {
     assert_eq!(status, 422, "{answer}");
 }
 
-/// A token is sent as it's saved, so one with a line break pasted after it would
-/// fail every send.
+/// A token pasted with a line break after it is kept without it, as the pages keep
+/// what's typed, and one with a space inside, which no token has, is refused.
 #[tokio::test]
-async fn a_slack_token_with_spaces_in_it_is_refused() {
+async fn a_slack_token_is_kept_without_spaces_around_it_and_refused_with_one_inside() {
     let server = start().await;
-    for (credential, app_token) in [("xoxb-1\n", None), ("xoxb-1", Some("xapp-1 "))] {
+    let body = json!({
+        "name": "Chat", "kind": "slack", "target": "#alerts",
+        "credential": "xoxb-1\n", "app_token": " xapp-1",
+    });
+    let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 201, "{made}");
+    let channel = server
+        .state
+        .database
+        .get_channel(made["id"].as_i64().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(channel.channel.credential.as_deref(), Some("xoxb-1"));
+    assert_eq!(channel.channel.app_token.as_deref(), Some("xapp-1"));
+
+    for (credential, app_token) in [("xoxb-1 2", None), ("xoxb-1", Some("xapp 1"))] {
         let body = json!({
-            "name": "Chat", "kind": "slack", "target": "#alerts",
+            "name": "Other", "kind": "slack", "target": "#alerts",
             "credential": credential, "app_token": app_token,
         });
         let (status, answer) = api(&server, "POST", "/api/v1/notification-channels", &body).await;

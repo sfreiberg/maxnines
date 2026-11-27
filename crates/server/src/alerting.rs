@@ -947,8 +947,10 @@ impl From<ChannelFields> for ChannelInput {
             name: fields.name,
             kind: fields.kind,
             target: fields.target,
-            credential: fields.credential,
-            app_token: fields.app_token,
+            // A secret pasted with a space or line break around it is kept without,
+            // as the pages keep what's typed.
+            credential: fields.credential.map(|given| given.trim().to_string()),
+            app_token: fields.app_token.map(|given| given.trim().to_string()),
             mail: fields.mail,
             request: fields.request,
             region: fields.region,
