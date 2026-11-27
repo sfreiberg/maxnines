@@ -631,7 +631,13 @@ pub(crate) async fn check_ssh(
                     remaining_methods, ..
                 } => {
                     let names: Vec<&str> = remaining_methods.iter().map(<&str>::from).collect();
-                    findings.password_sign_in = Some(u8::from(names.contains(&"password")));
+                    // Keyboard-interactive is how a password is usually asked for through
+                    // PAM, which FreeBSD and many Linux systems do in place of
+                    // `password`, so either takes one.
+                    let takes_password = names
+                        .iter()
+                        .any(|name| matches!(*name, "password" | "keyboard-interactive"));
+                    findings.password_sign_in = Some(u8::from(takes_password));
                     findings.sign_in_methods = Some(names.join(", "));
                 }
             }
@@ -935,7 +941,13 @@ mod tests {
     }
 
     async fn ssh_server() -> SocketAddr {
+        ssh_server_offering(russh::server::Config::default().methods).await
+    }
+
+    /// One offering only these ways to sign in.
+    async fn ssh_server_offering(methods: russh::MethodSet) -> SocketAddr {
         let config = Arc::new(russh::server::Config {
+            methods,
             keys: vec![russh::keys::decode_secret_key(HOST_KEY, None).unwrap()],
             auth_rejection_time: std::time::Duration::from_millis(1),
             auth_rejection_time_initial: Some(std::time::Duration::ZERO),
@@ -950,6 +962,22 @@ mod tests {
             }
         })
         .await
+    }
+
+    /// A password asked for through PAM, as FreeBSD does by default, counts.
+    #[tokio::test]
+    async fn ssh_that_takes_passwords_through_keyboard_interactive_offers_them() {
+        use russh::MethodKind;
+        let pam = ssh_server_offering(
+            [MethodKind::PublicKey, MethodKind::KeyboardInteractive][..].into(),
+        )
+        .await;
+        let result = run(&check(CheckKind::Ssh, pam), None).await;
+        assert_eq!(result["password_sign_in"], 1, "{result}");
+
+        let keys = ssh_server_offering([MethodKind::PublicKey][..].into()).await;
+        let result = run(&check(CheckKind::Ssh, keys), None).await;
+        assert_eq!(result["password_sign_in"], 0, "{result}");
     }
 
     #[tokio::test]

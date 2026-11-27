@@ -371,7 +371,8 @@ account's first sign-in after the server restarts. Tick **Use TLS** for MySQL 8.
 Without signing in, an SSH check reports the server's host key, as its SHA-256
 fingerprint, and the ways it offers to sign in, such as `publickey, password`. **SSH
 offers password sign-in** is 1 while a password is accepted, to alert on for servers
-that should only take keys.
+that should only take keys. A server offering `keyboard-interactive` counts, as that's
+how a password is usually asked for through PAM, as FreeBSD does by default.
 
 Put the fingerprint the check's page shows under **Expected host key** to have any
 other key count as down, as it would after a reinstall, or with someone in the
