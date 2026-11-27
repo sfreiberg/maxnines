@@ -424,6 +424,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// More than is kept, which is read to the end rather than the pipe closed on
+    /// it, so it ends as it means to and not by the signal that closing sends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plugin_that_prints_a_lot_keeps_its_status() {
+        let script = command(&[
+            "/bin/sh",
+            "-c",
+            "echo 'BIG CRITICAL - broke'; head -c 200000 /dev/zero | tr '\\0' a; echo; exit 2",
+        ]);
+        let outcome = run(&script.command, script.limit()).await;
+        assert_eq!(outcome.status, CRITICAL, "{}", outcome.message);
+    }
+
     #[tokio::test]
     async fn a_plugin_that_cannot_run_or_takes_too_long_is_unknown() {
         let missing = command(&["/no/such/plugin"]);

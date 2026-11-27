@@ -140,6 +140,9 @@ action "restart_nginx" {
 - **Values from the alert** go where an argument names them in braces, like `{disk}`.
   Each stays inside its own argument whatever it holds, and can't start one with a
   dash. The program itself can't be a variable.
+- **It's done when its command ends,** even if something it started, such as the
+  program it restarts, carries on. One that runs out of time is stopped, with
+  whatever it started.
 - **An action that needs more than the agent's user can do uses `sudo`**, as
   [below](#actions-that-need-root).
 - **What it prints goes back to the server**, standard output and then standard

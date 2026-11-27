@@ -343,13 +343,18 @@ fn check_given(needed: &[&str], variables: &BTreeMap<String, String>) -> Result<
     Ok(())
 }
 
-/// Reads until the end or until there's more than is kept, then lets go, so a
-/// command that's still printing isn't left waiting for someone to read it.
+/// Reads until the end, keeping a little more than is shown, and lets up to
+/// [`LET_GO_BYTES`](crate::custom::LET_GO_BYTES) more go unkept rather than unread,
+/// as a command whose output is closed on it is stopped by the signal that says
+/// so, while one printing without end is stopped that way.
 async fn read_some(reader: Option<impl AsyncRead + Unpin>, kept: &mut Vec<u8>) {
-    if let Some(reader) = reader {
+    if let Some(mut reader) = reader {
         let limit = MAX_ACTION_OUTPUT_BYTES as u64 + 1;
         // What was read before an error is still worth having.
-        let _ = reader.take(limit).read_to_end(kept).await;
+        if (&mut reader).take(limit).read_to_end(kept).await.is_ok() {
+            let mut rest = reader.take(crate::custom::LET_GO_BYTES);
+            let _ = tokio::io::copy(&mut rest, &mut tokio::io::sink()).await;
+        }
     }
 }
 
@@ -381,12 +386,23 @@ async fn run_command(command: &[String], limit: Duration) -> Ended {
 
     // Kept out here, so what was printed before running out of time survives.
     let (mut printed, mut complained) = (Vec::new(), Vec::new());
+    // It's done when it ends, even if something it started, such as the program
+    // it restarted, still holds its output: that's read a moment more, then let go.
     let finishing = async {
-        tokio::join!(
-            read_some(stdout, &mut printed),
-            read_some(stderr, &mut complained)
-        );
-        child.wait().await
+        let reading = async {
+            tokio::join!(
+                read_some(stdout, &mut printed),
+                read_some(stderr, &mut complained)
+            )
+        };
+        tokio::pin!(reading);
+        tokio::select! {
+            _ = &mut reading => child.wait().await,
+            status = child.wait() => {
+                let _ = timeout(crate::custom::READ_AFTER_EXIT, &mut reading).await;
+                status
+            }
+        }
     };
     let finished = timeout(limit, finishing).await;
     if finished.is_err() {
@@ -606,6 +622,18 @@ mod tests {
             assert_eq!(result.output, "out\nproblem\n");
             assert!(!result.truncated);
             assert_eq!(result.error, None);
+        }
+
+        /// It ends when it does, though what it started holds on to its output,
+        /// which is left running, as a restart's program has to be.
+        #[tokio::test]
+        async fn an_action_that_leaves_something_running_ends_when_it_does() {
+            let script = "echo restarted; sleep 30 & exit 0";
+            let started = std::time::Instant::now();
+            let result = run(&["/bin/sh", "-c", script], &[], 10).await;
+            assert_eq!(result.outcome, ActionOutcome::Succeeded);
+            assert_eq!(result.output, "restarted\n");
+            assert!(started.elapsed() < Duration::from_secs(5));
         }
 
         #[tokio::test]

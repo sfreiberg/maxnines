@@ -224,17 +224,52 @@ pub(crate) async fn run_command(
     }
 }
 
+/// Reads what a command prints until it ends, keeping up to `max_output` bytes.
+/// Up to [`LET_GO_BYTES`] more is read and let go rather than its output closed
+/// on it at once, as a command whose output is closed is stopped by the signal
+/// that says so, as if it had failed; one printing more than that, as without
+/// end, is stopped that way. A command that ends while something it started still
+/// holds its output, such as a program left running, ends there: what's printed is
+/// only read a moment more.
 async fn finish(child: &mut Child, max_output: u64) -> Result<(ExitStatus, Vec<u8>), ()> {
     let stdout = child.stdout.take().ok_or(())?;
     let mut output = Vec::new();
-    stdout
-        .take(max_output)
-        .read_to_end(&mut output)
-        .await
-        .map_err(|_| ())?;
-    let status = child.wait().await.map_err(|_| ())?;
+    let status = {
+        // Its output is closed as soon as reading stops, which is what stops a
+        // command printing without end.
+        let reading = async {
+            let mut stdout = stdout;
+            (&mut stdout)
+                .take(max_output)
+                .read_to_end(&mut output)
+                .await?;
+            let mut rest = (&mut stdout).take(LET_GO_BYTES);
+            tokio::io::copy(&mut rest, &mut tokio::io::sink()).await?;
+            std::io::Result::Ok(())
+        };
+        tokio::pin!(reading);
+        tokio::select! {
+            read = &mut reading => {
+                read.map_err(|_| ())?;
+                child.wait().await.map_err(|_| ())?
+            }
+            status = child.wait() => {
+                let status = status.map_err(|_| ())?;
+                let _ = timeout(READ_AFTER_EXIT, &mut reading).await;
+                status
+            }
+        }
+    };
     Ok((status, output))
 }
+
+/// How long what a command printed is still read once it has ended, for what was
+/// left in the pipe.
+pub(crate) const READ_AFTER_EXIT: Duration = Duration::from_millis(500);
+
+/// How much more than is kept is read and let go, so a command that prints a lot
+/// can finish, while one that prints without end is stopped.
+pub(crate) const LET_GO_BYTES: u64 = 1024 * 1024;
 
 fn interpret(name: &str, status: ExitStatus, output: &[u8]) -> Result<Reading, String> {
     if output.len() > MAX_OUTPUT_BYTES {
