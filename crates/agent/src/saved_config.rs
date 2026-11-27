@@ -3,9 +3,11 @@
 //! by whichever build loads it, so an upgraded agent runs what an older one couldn't.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use maxnines_protocol::config_file;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
@@ -36,25 +38,6 @@ pub fn load(path: &Path) -> Option<ConfigUpdate> {
     }
 }
 
-/// Puts `new`, written in full, in the place of `path`, so that once this returns a
-/// power cut leaves one or the other, never an empty file: the new file's contents
-/// are on disk before the rename, and the rename is before its folder's listing.
-pub fn replace(new: &Path, path: &Path) -> std::io::Result<()> {
-    fs::OpenOptions::new().write(true).open(new)?.sync_all()?;
-    fs::rename(new, path)?;
-    // Windows writes the rename through itself, and can't open a folder this way.
-    #[cfg(unix)]
-    if let Some(folder) = path.parent() {
-        let folder = if folder.as_os_str().is_empty() {
-            Path::new(".")
-        } else {
-            folder
-        };
-        fs::File::open(folder)?.sync_all()?;
-    }
-    Ok(())
-}
-
 /// Writes a new file then puts it in place, so a crash can't leave half a config.
 pub fn save(path: &Path, update: &ConfigUpdate) -> Result<()> {
     if let Some(parent) = path.parent() {
@@ -66,9 +49,13 @@ pub fn save(path: &Path, update: &ConfigUpdate) -> Result<()> {
         config: update.sent.clone(),
     };
     let temporary = path.with_extension("json.new");
-    fs::write(&temporary, serde_json::to_string_pretty(&saved)?)
-        .with_context(|| format!("writing {}", temporary.display()))?;
-    replace(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+    let text = serde_json::to_string_pretty(&saved)?;
+    let written = fs::File::create(&temporary).and_then(|mut file| {
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    });
+    written.with_context(|| format!("writing {}", temporary.display()))?;
+    config_file::swap_in(&temporary, path).with_context(|| format!("replacing {}", path.display()))
 }
 
 #[cfg(test)]

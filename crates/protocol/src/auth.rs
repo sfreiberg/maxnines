@@ -76,8 +76,9 @@ pub fn new_nonce() -> Result<String> {
     Ok(hex::encode(bytes))
 }
 
-/// Creates a file only its owner can read on Unix. On Windows it gets the
-/// folder's permissions. Fails if the file already exists.
+/// Creates a file only its owner can read on Unix, its contents on disk once this
+/// returns. On Windows it gets the folder's permissions. Fails if the file already
+/// exists.
 pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -86,7 +87,9 @@ pub fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(bytes)
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
 }
 
 fn id_for(public_key: &[u8]) -> String {

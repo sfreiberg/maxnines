@@ -53,7 +53,7 @@ pub fn generate(path: &Path, force: bool) -> Result<Identity> {
         _ => {}
     }
     write_private_file(&new, &bytes).with_context(|| format!("writing {}", new.display()))?;
-    crate::saved_config::replace(&new, path)
+    maxnines_protocol::config_file::swap_in(&new, path)
         .with_context(|| format!("replacing {}", path.display()))?;
     Ok(identity)
 }

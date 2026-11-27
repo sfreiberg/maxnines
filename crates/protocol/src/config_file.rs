@@ -1,6 +1,7 @@
 //! Changing config files for the Windows installers and their Modify button. Only
 //! the values set change: comments and anything else in a file are kept as they
-//! were.
+//! were. Any file the agent or server keeps is put in place here too, so a power
+//! cut can't leave it empty.
 
 use std::path::{Path, PathBuf};
 
@@ -194,14 +195,56 @@ fn replace_with(
     let _ = secret;
     let written = options.open(&temporary).and_then(|mut file| {
         use std::io::Write;
-        file.write_all(text.as_bytes())
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
     });
     written.with_context(|| format!("writing {}", temporary.display()))?;
     if let Err(error) = prepare(&temporary) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
-    std::fs::rename(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+    swap_in(&temporary, path).with_context(|| format!("replacing {}", path.display()))
+}
+
+/// Puts `new`, whose contents are already on disk, in the place of `path`, so that
+/// once this returns a power cut leaves the new one there, whole, never an empty
+/// file or the old one: the rename is on disk before this returns, as is the
+/// folder's listing it changed.
+pub fn swap_in(new: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(new, path)?;
+    sync_folder(path)
+}
+
+/// Syncs the folder `path` is in, where Unix keeps the names of its files.
+#[cfg(unix)]
+fn sync_folder(path: &Path) -> std::io::Result<()> {
+    let folder = match path.parent() {
+        Some(folder) if !folder.as_os_str().is_empty() => folder,
+        _ => Path::new("."),
+    };
+    let synced = std::fs::File::open(folder).and_then(|folder| folder.sync_all());
+    match synced {
+        // Some filesystems, as some network and FUSE ones, can't sync a folder,
+        // and the file is in place regardless.
+        Err(error) if can_be_left_unsynced(&error) => Ok(()),
+        synced => synced,
+    }
+}
+
+/// A folder's sync that the filesystem can't do, as it says by EINVAL or ENOTSUP.
+#[cfg(unix)]
+fn can_be_left_unsynced(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+    )
+}
+
+/// Windows can't open a folder to sync it. NTFS keeps a journal of renames, so a
+/// power cut leaves one file or the other there, whole, but it may be the old one.
+#[cfg(not(unix))]
+fn sync_folder(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Replaces an attribute's value, keeping any comment beside it, or adds it at
@@ -418,6 +461,18 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.as_deref(), Some("three"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "three");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cant_be_synced_leaves_the_file_in_place_all_the_same() {
+        use std::io::{Error, ErrorKind};
+        assert!(can_be_left_unsynced(&Error::from(ErrorKind::Unsupported)));
+        assert!(can_be_left_unsynced(&Error::from(ErrorKind::InvalidInput)));
+        assert!(!can_be_left_unsynced(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!can_be_left_unsynced(&Error::other("input/output error")));
     }
 
     #[test]
