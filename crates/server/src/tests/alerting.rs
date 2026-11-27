@@ -11538,7 +11538,9 @@ mod actions {
     }
 
     /// A channel whose firing notification was given up on never heard of the
-    /// alert, so it doesn't hear what its action printed either.
+    /// alert, so it doesn't hear what its action printed either. One a silence is
+    /// holding the alert back from is queued it, for the notifier to hold with the
+    /// rest until the silence ends.
     #[tokio::test]
     async fn what_an_action_printed_only_goes_to_channels_that_heard_of_the_alert() {
         use sea_orm::ConnectionTrait;
@@ -11552,20 +11554,25 @@ mod actions {
             ..webhook_channel("http://127.0.0.1:9/other")
         };
         let gave_up = database.create_channel(&gave_up).await.unwrap();
+        let held = ChannelInput {
+            name: "Held".to_string(),
+            ..webhook_channel("http://127.0.0.1:9/held")
+        };
+        let held = database.create_channel(&held).await.unwrap();
         let rule = AlertRuleInput {
-            channels: vec![ops, gave_up],
+            channels: vec![ops, gave_up, held],
             ..rule_running(vec![run("top_cpu", RunOn::First)])
         };
         database.create_alert_rule(&rule).await.unwrap();
 
         test.fire().await;
         let (id, ..) = test.next_request().await;
-        let sql = format!("UPDATE notifications SET state = 'failed' WHERE channel_id = {gave_up}");
-        database
-            .connection()
-            .execute_unprepared(&sql)
-            .await
-            .unwrap();
+        let connection = database.connection();
+        for (state, channel) in [("failed", gave_up), ("held", held)] {
+            let sql =
+                format!("UPDATE notifications SET state = '{state}' WHERE channel_id = {channel}");
+            connection.execute_unprepared(&sql).await.unwrap();
+        }
         assert_eq!(deliver_by_channel(&test).await, [(ops, Event::Firing)]);
         test.answer(&id, ActionOutcome::Succeeded, "ok").await;
         test.finished(id.parse().unwrap()).await;
@@ -11579,7 +11586,7 @@ mod actions {
             .filter(|delivery| delivery.event == Event::Action)
             .map(|delivery| delivery.channel.id)
             .collect();
-        assert_eq!(told, [ops], "{due:?}");
+        assert_eq!(told, [ops, held], "{due:?}");
     }
 
     #[tokio::test]
