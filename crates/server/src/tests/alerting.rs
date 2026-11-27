@@ -2810,6 +2810,37 @@ async fn an_offline_host_is_not_reporting_only_if_it_had_stopped_before_it_went(
     assert_eq!(names(test.open().await), ["Gone or quiet"]);
 }
 
+/// After a restart, a host that's still sending isn't taken for a quiet one because
+/// an open alert's rule uses `reporting`, which would end it and start it again.
+#[tokio::test]
+async fn a_restart_leaves_an_alert_about_a_reporting_host_alone() {
+    let mut test = Harness::start().await;
+    let busy = AlertRuleInput {
+        name: "Busy while reporting".to_string(),
+        critical: Some("reporting && cpu.usage > 90".to_string()),
+        hold: TimeDelta::zero(),
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&busy).await.unwrap();
+    let connected = test.connected_at();
+    let sampled = connected + MINUTE;
+    test.script.set(vec![test.reading("CPU", sampled, 95.0)]);
+    test.evaluate_at(sampled, Some(sampled)).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    // A restart before its next sample.
+    test.evaluator = evaluator(&test.server, sampled - MINUTE * 10);
+    test.evaluate_at(sampled + TimeDelta::seconds(10), Some(sampled))
+        .await;
+
+    assert_eq!(test.open().await.len(), 1);
+    assert!(
+        test.resolved().await.is_empty(),
+        "{:?}",
+        test.resolved().await
+    );
+}
+
 #[tokio::test]
 async fn an_offline_agent_is_left_to_the_offline_rule() {
     let mut test = Harness::start().await;

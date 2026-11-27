@@ -898,10 +898,14 @@ impl Evaluator {
     ) -> Option<HashMap<String, Seen>> {
         let last_samples = self.read_last_samples(now).await?;
         // Silences are only held in memory, so after a start, those of alerts still
-        // open carry on from when each began.
+        // open carry on from when each began, for hosts whose samples say they're
+        // quiet: a rule using `reporting` can be about something else, as
+        // `reporting && cpu.usage > 90` is, about a host that's sending.
         if !self.silences_restored {
             for (host_id, began) in quiet_before {
-                self.silences.entry(host_id.clone()).or_insert(*began);
+                if self.looks_quiet(host_id, &last_samples, now).await {
+                    self.silences.entry(host_id.clone()).or_insert(*began);
+                }
             }
             self.silences_restored = true;
         }
@@ -991,6 +995,25 @@ impl Evaluator {
 
     /// How often an agent is set to send a sample, by the config rules that apply to
     /// it now, or nothing if its config can't be worked out.
+    /// Whether a host's newest stored sample is as old as a silence has to be, as
+    /// [`Self::reporting`] tells a quiet host, or there's none from lately.
+    async fn looks_quiet(
+        &self,
+        host_id: &str,
+        last_samples: &BTreeMap<String, Timestamp>,
+        now: Timestamp,
+    ) -> bool {
+        let Some(&taken) = last_samples.get(host_id) else {
+            return true;
+        };
+        let quiet_for = now - taken;
+        quiet_for >= MIN_SILENCE
+            && match self.interval(host_id).await {
+                Some(every) => quiet_for >= every * MISSED_SAMPLES,
+                None => true,
+            }
+    }
+
     async fn interval(&self, host_id: &str) -> Option<TimeDelta> {
         match self.configs.config_for(host_id).await {
             Ok(resolved) => TimeDelta::from_std(resolved.config.interval).ok(),
