@@ -374,13 +374,16 @@ impl State {
         for (offset, entry) in samples.into_iter().enumerate() {
             self.memory.insert(at + offset, entry);
         }
+        // The oldest of those given back go first, all at once.
+        let over = self.memory.len().saturating_sub(MAX_IN_MEMORY);
+        let unsaved = self.memory.len() - self.unconfirmed.min(self.memory.len());
+        let dropped = over.min(unsaved);
+        if dropped > 0 {
+            self.memory.drain(at..at + dropped);
+            self.note_drops();
+        }
         while self.memory.len() > MAX_IN_MEMORY {
-            if self.memory.len() > self.unconfirmed {
-                self.memory.remove(self.unconfirmed);
-                self.note_drops();
-            } else {
-                self.drop_oldest();
-            }
+            self.drop_oldest();
         }
     }
 
