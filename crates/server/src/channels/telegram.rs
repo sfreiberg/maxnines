@@ -240,10 +240,18 @@ fn send(
         Some(chart) if text.encode_utf16().count() <= MAX_CAPTION => {
             send_photo(chart, Some(&text), reply_to)
         }
+        // The words go first, then the chart under them. The words are what count,
+        // so once they're sent, a chart that can't follow is let go, as Slack's is,
+        // rather than the whole notice being tried again and its words sent twice.
         Some(chart) => {
             let message = message(notice, chat, reply_to, web_url);
             let sent = answer(post(&method("sendMessage"), &message))?;
-            send_photo(chart, None, sent.as_deref())?;
+            if let Err(error) = send_photo(chart, None, sent.as_deref()) {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "a Telegram notification's chart couldn't follow its text"
+                );
+            }
             Ok(sent)
         }
         None => {

@@ -10352,7 +10352,7 @@ mod charts {
             .await
             .unwrap()
             .unwrap();
-        let sent = crate::notifier::send(channel, notice, None, senders)
+        let sent = crate::notifier::send(channel.clone(), notice.clone(), None, senders.clone())
             .await
             .unwrap();
 
@@ -10364,6 +10364,20 @@ mod charts {
         assert!(!form.contains(r#"name="caption""#));
         assert!(form.contains(r#""message_id":101"#), "{form}");
         assert_eq!(sent.as_deref(), Some("101"));
+
+        // A chart that can't follow its words is let go, so the words aren't sent
+        // again when the notice is tried again.
+        *telegram.answers.lock().unwrap() = vec![
+            (200, json!({ "ok": true, "result": { "message_id": 201 } })),
+            (
+                429,
+                json!({ "ok": false, "error_code": 429, "description": "Too Many Requests" }),
+            ),
+        ];
+        let sent = crate::notifier::send(channel, notice, None, senders)
+            .await
+            .unwrap();
+        assert_eq!(sent.as_deref(), Some("201"));
     }
 
     #[tokio::test]
