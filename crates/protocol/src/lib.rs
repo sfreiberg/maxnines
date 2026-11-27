@@ -745,6 +745,7 @@ impl CheckKind {
     /// takes one, for a kind that can.
     pub fn sign_in(self) -> Option<SignInNeeds> {
         let both = SignInNeeds {
+            required: false,
             username: true,
             password: true,
             key: false,
@@ -759,8 +760,15 @@ impl CheckKind {
             | Self::Pop3
             | Self::Ftp
             | Self::Ldap => Some(both),
-            // Either can let an account in without a password.
-            Self::Postgres | Self::Mysql => Some(SignInNeeds {
+            // Either can let an account in without a password, as over the socket.
+            Self::Postgres => Some(SignInNeeds {
+                password: false,
+                ..both
+            }),
+            // MySQL counts a client that hangs up before signing in towards blocking
+            // the host it came from, so one never only reads its greeting.
+            Self::Mysql => Some(SignInNeeds {
+                required: true,
                 password: false,
                 ..both
             }),
@@ -921,6 +929,8 @@ impl CheckOption {
 /// What a kind of check needs to sign in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignInNeeds {
+    /// Whether it has to sign in, rather than only being able to.
+    pub required: bool,
     /// Whether it needs a username.
     pub username: bool,
     /// Whether it needs a password, or a key where it takes one.
@@ -1372,6 +1382,15 @@ impl CollectorSettings {
                 "check {:?} reads a UniFi console, which only the server does, so an agent \
                  can't run it",
                 check.name
+            );
+            // The server never has an agent's passwords, so a check it sends can't
+            // sign in.
+            ensure!(
+                !check.kind.sign_in().is_some_and(|needs| needs.required),
+                "check {:?} is a {} check, which has to sign in, so it goes in the agent's \
+                 own config, where its account can be, and is picked here by name",
+                check.name,
+                check.kind.label()
             );
         }
         for check in checks {
@@ -1923,6 +1942,31 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// The server never has an agent's passwords, so a MySQL check, which has to sign
+    /// in, can't be sent; it goes in the agent's own config.
+    #[test]
+    fn a_check_that_has_to_sign_in_is_never_sent_to_an_agent() {
+        let config: AgentConfig = serde_json::from_value(json!({
+            "collectors": { "checks": { "checks": [
+                { "name": "orders", "kind": "mysql", "target": "db1:3306" },
+            ] } },
+        }))
+        .unwrap();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("has to sign in"), "{error}");
+        assert!(config.validate_sent().is_err());
+        assert!(
+            CheckKind::Mysql
+                .sign_in()
+                .is_some_and(|needs| needs.required)
+        );
+        assert!(
+            !CheckKind::Postgres
+                .sign_in()
+                .is_some_and(|needs| needs.required)
+        );
     }
 
     #[test]

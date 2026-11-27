@@ -1112,7 +1112,10 @@ async fn a_checks_password_is_kept_but_never_given_back() {
     let key =
         check(json!({ "username": "a", "private_key": "-----BEGIN OPENSSH PRIVATE KEY-----" }));
     let leaked = check(json!({ "username": "a", "password_env": "DATABASE_URL" }));
-    for refused in [web, key, leaked] {
+    // MySQL counts a check that only reads its greeting toward blocking this host.
+    let mut mysql = check(json!({ "sign_in": "none" }));
+    mysql["check"] = json!({ "name": "orders", "kind": "mysql", "target": "127.0.0.1:3306" });
+    for refused in [web, key, leaked, mysql] {
         let (status, body) = api(&server, "POST", "/api/v1/remote-checks", &refused).await;
         assert_eq!(status, 422, "{refused}: {body}");
     }

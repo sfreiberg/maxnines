@@ -15,7 +15,7 @@ are defined in the agent's own config, as [below](#on-an-agent).
 | **DNS** (`dns`) | A host name | That it resolves, optionally from a given server |
 | **Ping** (`ping`) | A host name | Round trip and packet loss |
 | **PostgreSQL** (`postgres`) | `host:port` | That it answers as PostgreSQL, or that an account can sign in |
-| **MySQL or MariaDB** (`mysql`) | `host:port` | Its version, from its greeting, or that an account can sign in |
+| **MySQL or MariaDB** (`mysql`) | `host:port` | That an account can sign in, and its version. It always signs in, as [below](#mysql-and-mariadb) |
 | **Redis** (`redis`) | `host:port` | That it answers PING, or that an account can sign in, and its version |
 | **Memcached** (`memcached`) | `host:port` | Its version, connections, memory used against its limit, hit rate and evictions |
 | **MongoDB** (`mongodb`) | `host:port` | That it answers as MongoDB, or that an account can sign in, and its version |
@@ -418,6 +418,16 @@ A user with no grants can sign in, which is all a check needs. Name the checking
 host rather than `'%'`, and for a check on the same host use `127.0.0.1`, as
 `localhost` means the Unix socket to MySQL. Keep the limit at 2 or more, as a quick
 reconnect at a limit of 1 can be refused.
+
+A MySQL check always signs in, with a username at least, so it can't be in a config
+rule, which never has an agent's passwords: define it in the agent's config and pick
+it by name. An account with no password works where MySQL lets one in, such as over
+the socket with `auth_socket` or MariaDB's `unix_socket`. A check that only read
+MySQL's greeting and hung up would count, as a load balancer's health check does,
+toward MySQL blocking the host it's checked from once `max_connect_errors` of them
+come in a row with no sign-in between. A `tcp` check of a MySQL port does just that,
+so check MySQL with a `mysql` check instead, unless something on the checking host
+signs in to it often anyway. Connections over loopback aren't counted.
 
 ### Redis
 

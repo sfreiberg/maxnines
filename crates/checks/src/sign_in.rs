@@ -93,7 +93,7 @@ pub(crate) fn username_and_password(
 pub fn sign_in_problem(check: &Check, username: bool, secret: bool) -> Option<&'static str> {
     let needs = check.kind.sign_in()?;
     if !username && !secret {
-        return None;
+        return needs.required.then_some(SIGN_IN_REQUIRED);
     }
     let on_its_own_host = || host_and_port(&check.target).is_ok_and(|(host, _)| is_loopback(&host));
     if needs.username && !username {
@@ -109,6 +109,12 @@ pub fn sign_in_problem(check: &Check, username: bool, secret: bool) -> Option<&'
         None
     }
 }
+
+/// Why a MySQL or MariaDB check has to sign in: one that only reads the greeting and
+/// hangs up counts, as a load balancer's does, toward MySQL blocking the host it's
+/// checked from, after `max_connect_errors` in a row.
+pub const SIGN_IN_REQUIRED: &str = "a MySQL or MariaDB check has to sign in with a username, \
+    as MySQL counts a check that only reads its greeting toward blocking the host it's checked from";
 
 /// TLS for a driver: the certificate checked as for a site, or not at all for a
 /// check told not to mind.
@@ -244,34 +250,7 @@ pub(crate) async fn check_mysql(
     findings: &mut Findings,
 ) -> Result<()> {
     let Some(credentials) = credentials.filter(|given| !given.is_empty()) else {
-        // The server speaks first, saying its version, before anyone signs in.
-        let mut socket = open(check, findings).await?;
-        let mut header = [0u8; 4];
-        socket
-            .read_exact(&mut header)
-            .await
-            .context("it closed the connection without a greeting")?;
-        let length =
-            usize::from(header[0]) | usize::from(header[1]) << 8 | usize::from(header[2]) << 16;
-        ensure!(
-            (1..=1024).contains(&length),
-            "it didn't greet as MySQL does"
-        );
-        let mut greeting = vec![0u8; length];
-        socket.read_exact(&mut greeting).await?;
-        if greeting[0] == 0xff {
-            // An error instead, such as this address not being allowed in.
-            let message = String::from_utf8_lossy(greeting.get(3..).unwrap_or_default());
-            let message: String = message.chars().take(200).collect();
-            bail!("it refused the connection: {message}");
-        }
-        ensure!(greeting[0] == 10, "it didn't greet as MySQL does");
-        let end = greeting[1..]
-            .iter()
-            .position(|byte| *byte == 0)
-            .context("it didn't greet as MySQL does")?;
-        findings.server_version = Some(String::from_utf8_lossy(&greeting[1..=end]).into_owned());
-        return Ok(());
+        bail!(SIGN_IN_REQUIRED);
     };
     drop(open(check, findings).await?);
     let mut connection = mysql_connection(check, credentials).await?;
@@ -751,28 +730,29 @@ mod tests {
         assert_eq!(result["up"], 0, "{result}");
     }
 
+    /// MySQL counts a client that only reads its greeting and hangs up toward
+    /// blocking its host, so a check never does, and is never run without a login.
     #[tokio::test]
-    async fn mysql_says_its_version_before_anyone_signs_in() {
-        let greeting = |payload: &'static [u8]| {
-            move |mut socket: tokio::net::TcpStream| async move {
-                let length = payload.len() as u8;
-                let mut packet = vec![length, 0, 0, 0];
-                packet.extend_from_slice(payload);
-                let _ = socket.write_all(&packet).await;
-            }
-        };
-        let address = serve(greeting(b"\x0a8.4.3\x00\x01\x00\x00\x00")).await;
+    async fn mysql_is_never_checked_without_signing_in() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let greeted = Arc::new(AtomicBool::new(false));
+        let seen = greeted.clone();
+        let address = serve(move |_socket| {
+            let seen = seen.clone();
+            async move { seen.store(true, Ordering::Relaxed) }
+        })
+        .await;
         let result = run(&check(CheckKind::Mysql, address), None).await;
-        assert_eq!(result["up"], 1, "{result}");
-        assert_eq!(result["server_version"], "8.4.3");
-
-        let refused = serve(greeting(b"\xff\x6a\x04Host '10.0.0.9' is not allowed")).await;
-        let result = run(&check(CheckKind::Mysql, refused), None).await;
-        assert_eq!(result["up"], 0);
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], SIGN_IN_REQUIRED);
+        assert!(!greeted.load(Ordering::Relaxed), "it connected");
+        let mysql = check(CheckKind::Mysql, address);
         assert_eq!(
-            result["error"],
-            "it refused the connection: Host '10.0.0.9' is not allowed"
+            sign_in_problem(&mysql, false, false),
+            Some(SIGN_IN_REQUIRED)
         );
+        assert_eq!(sign_in_problem(&mysql, true, false), None);
     }
 
     /// Enough of Redis for a check: PING, AUTH with one password, and INFO.
