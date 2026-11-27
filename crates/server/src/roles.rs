@@ -188,10 +188,12 @@ pub fn required(method: &Method, route: &str) -> Role {
         };
     }
     // Anyone can open a rule or a channel to read it, where saving is what's
-    // refused. A form for something new is only for those who can make one, and so
-    // is a dashboard's editing mode, which saves as widgets are dragged.
-    let for_editing =
-        route.ends_with("/new") || (route.starts_with("/dashboards/") && route.ends_with("/edit"));
+    // refused. A form for something new is only for those who can make one, in any
+    // of its views, as is importing, and so is a dashboard's editing mode, which
+    // saves as widgets are dragged.
+    let for_editing = route.split('/').any(|part| part == "new")
+        || route == "/templates/import"
+        || (route.starts_with("/dashboards/") && route.ends_with("/edit"));
     if reads && !for_editing {
         return Role::Viewer;
     }
@@ -234,6 +236,8 @@ mod tests {
             (Method::POST, "/hosts/{id}/approve"),
             (Method::POST, "/notification-channels/{id}/test"),
             (Method::GET, "/alerts/rules/new"),
+            (Method::GET, "/templates/new/hcl"),
+            (Method::GET, "/templates/import"),
             (Method::GET, "/dashboards/{id}/edit"),
             (Method::GET, "/dashboards/{id}/widgets/{widget}/edit"),
             (Method::POST, "/something/added/later"),
