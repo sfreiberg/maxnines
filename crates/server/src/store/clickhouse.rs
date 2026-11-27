@@ -627,6 +627,13 @@ struct FirstRow {
     first: Option<Timestamp>,
 }
 
+/// A password file's password, without the line break a file usually ends with.
+/// Nothing else is taken off, as a password can start or end with a space.
+fn file_password(text: &str) -> &str {
+    text.strip_suffix('\n')
+        .map_or(text, |text| text.strip_suffix('\r').unwrap_or(text))
+}
+
 impl ClickHouseStore {
     /// Can be called from anywhere, so it does its waiting on a thread of its own.
     pub fn open(
@@ -643,7 +650,7 @@ impl ClickHouseStore {
         if let Some(path) = password_file {
             let password = std::fs::read_to_string(path)
                 .with_context(|| format!("reading password file {}", path.display()))?;
-            client = client.with_password(password.trim());
+            client = client.with_password(file_password(&password));
         }
         let database = database.to_string();
         std::thread::scope(|scope| {
@@ -1739,6 +1746,20 @@ mod quoting {
         assert_eq!(quoted("it's"), r"'it\'s'");
         assert_eq!(quoted(r"back\"), r"'back\\'");
         assert_eq!(quoted(r"\' OR 1=1"), r"'\\\' OR 1=1'");
+    }
+}
+
+#[cfg(test)]
+mod password_files {
+    use super::file_password;
+
+    #[test]
+    fn only_the_line_break_a_file_ends_with_is_taken_off() {
+        assert_eq!(file_password("s3cret\n"), "s3cret");
+        assert_eq!(file_password("s3cret\r\n"), "s3cret");
+        assert_eq!(file_password(" s3cret "), " s3cret ");
+        assert_eq!(file_password(" s3cret \n"), " s3cret ");
+        assert_eq!(file_password("s3cret\n\n"), "s3cret\n");
     }
 }
 
