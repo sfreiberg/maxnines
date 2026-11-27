@@ -107,7 +107,7 @@ registration {
   # Rules run in order and the first match decides. With no match, an agent
   # waits for manual approval. All conditions in a rule must match. Hostnames
   # are reported by the agent, so an "approve" rule also needs a source_cidrs
-  # or token_file condition.
+  # or token_file condition. A hostname matches whatever its case.
   #
   # rule "production-subnet" {
   #   action       = "approve"

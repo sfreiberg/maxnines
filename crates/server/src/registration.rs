@@ -215,7 +215,11 @@ impl Rule {
                 .iter()
                 .map(|text| parse_network(text))
                 .collect::<Result<_>>()?,
-            hostname: config.hostname.as_deref().map(WildMatch::new),
+            // Hostnames are the same whatever their case, as Windows' are capitals.
+            hostname: config
+                .hostname
+                .as_deref()
+                .map(WildMatch::new_case_insensitive),
             token_hash: config.token_file.as_deref().map(read_token).transpose()?,
         })
     }
@@ -1021,6 +1025,20 @@ mod tests {
             registry.admit(&moved).await.unwrap(),
             RegistrationStatus::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn a_rules_hostname_matches_whatever_the_case() {
+        let rule = r#"
+            rule "web" {
+              action       = "approve"
+              hostname     = "web-*"
+              source_cidrs = ["10.0.0.0/8"]
+            }
+        "#;
+        let registry = registry(rule).await;
+        let status = registry.admit(&request("a", "WEB-01", "10.0.0.1")).await;
+        assert_eq!(status.unwrap(), RegistrationStatus::Approved);
     }
 
     #[tokio::test]
