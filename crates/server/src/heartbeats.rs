@@ -188,18 +188,22 @@ pub fn status(check: &RemoteCheck, pings: &Pings, since: Timestamp, now: Timesta
 
 /// Turns away pings that come too fast: to one heartbeat, closer together than a
 /// second, and to addresses that aren't any heartbeat's, too many from one source.
+/// A run's start and its end are counted apart, so a job that takes less than a
+/// second can say both.
 #[derive(Default)]
 pub struct PingLimiter {
-    last: Mutex<HashMap<i64, Instant>>,
+    /// By heartbeat, and whether the ping starts a run.
+    last: Mutex<HashMap<(i64, bool), Instant>>,
     misses: Mutex<HashMap<IpAddr, (Instant, u32)>>,
 }
 
 impl PingLimiter {
     /// Whether a ping to heartbeat `id` now counts.
-    fn allow(&self, id: i64, now: Instant) -> bool {
+    fn allow(&self, id: i64, ping: Ping, now: Instant) -> bool {
+        let key = (id, ping == Ping::Started);
         let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
         if last
-            .get(&id)
+            .get(&key)
             .is_some_and(|then| now.duration_since(*then) < MIN_GAP)
         {
             return false;
@@ -207,7 +211,7 @@ impl PingLimiter {
         if last.len() >= MAX_REMEMBERED {
             last.retain(|_, then| now.duration_since(*then) < MIN_GAP);
         }
-        last.insert(id, now);
+        last.insert(key, now);
         true
     }
 
@@ -271,7 +275,7 @@ async fn ping(State(state): State<AppState>, Path(token): Path<String>, ping: Pi
         }
         return answer(StatusCode::TOO_MANY_REQUESTS, "Too many tries.\n");
     };
-    if !state.pings.allow(check.id, now) {
+    if !state.pings.allow(check.id, ping, now) {
         return answer(
             StatusCode::TOO_MANY_REQUESTS,
             "Pinged too often: at most once a second.\n",
@@ -403,10 +407,17 @@ mod tests {
     fn pings_that_come_too_fast_are_turned_away() {
         let limiter = PingLimiter::default();
         let start = Instant::now();
-        assert!(limiter.allow(1, start));
-        assert!(!limiter.allow(1, start + Duration::from_millis(500)));
-        assert!(limiter.allow(2, start + Duration::from_millis(500)));
-        assert!(limiter.allow(1, start + Duration::from_secs(1)));
+        let soon = start + Duration::from_millis(500);
+        assert!(limiter.allow(1, Ping::Finished, start));
+        assert!(!limiter.allow(1, Ping::Finished, soon));
+        assert!(!limiter.allow(1, Ping::Failed, soon));
+        assert!(limiter.allow(2, Ping::Finished, soon));
+        assert!(limiter.allow(1, Ping::Finished, start + Duration::from_secs(1)));
+
+        // A run that takes less than a second says it started and how it went.
+        assert!(limiter.allow(3, Ping::Started, start));
+        assert!(limiter.allow(3, Ping::Finished, soon));
+        assert!(!limiter.allow(3, Ping::Started, soon));
 
         let source: IpAddr = "192.0.2.1".parse().unwrap();
         for _ in 0..MAX_MISSES {
