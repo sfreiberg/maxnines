@@ -543,6 +543,45 @@ impl Notifier {
         self.database.acknowledge_incidents(&incidents, now).await
     }
 
+    /// Whether a due delivery goes now. One that waits for a silence, or for its
+    /// alert to have been told, is held, and one with nothing left to say is dropped.
+    async fn ready_to_send(&self, delivery: &Delivery, silences: &ActiveSilences) -> Result<bool> {
+        // What an action printed is about the problem too.
+        let tells_of_a_problem = matches!(
+            delivery.event,
+            Event::Firing | Event::Escalated | Event::Eased | Event::Action
+        );
+        if tells_of_a_problem && silences.covering(&delivery.alert).is_some() {
+            self.database.hold_delivery(delivery).await?;
+            return Ok(false);
+        }
+        if delivery.event == Event::Reminder && Self::reminder_is_stale(delivery, silences) {
+            self.database.drop_delivery(delivery.id).await?;
+            return Ok(false);
+        }
+        // An incident can only be acknowledged once it's open. One whose opening a
+        // silence is holding back waits with it, and one that never opened has
+        // nothing to acknowledge.
+        if delivery.event == Event::Acknowledged {
+            let told = self
+                .database
+                .told_started(delivery.alert.id, delivery.channel.id)
+                .await?;
+            match told {
+                Told::Yes => {}
+                Told::NotYet => {
+                    self.database.hold_delivery(delivery).await?;
+                    return Ok(false);
+                }
+                Told::Never => {
+                    self.database.drop_delivery(delivery.id).await?;
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Sends what's due, and saves how each one went. Someone who was told an alert
     /// started always hears that it ended, or an on-call incident would stay open.
     pub async fn deliver_due(&self, now: Timestamp) -> Result<()> {
@@ -556,38 +595,16 @@ impl Notifier {
         // Each chart is drawn once a pass, however many channels it goes to, by the
         // first send that needs it, so sends start at once and draw side by side.
         let mut charts: HashMap<(i64, Event), Arc<SharedChart>> = HashMap::new();
+        // A database error stops more sends starting, but never those already
+        // started from being recorded, or one that arrived would be sent again.
+        let mut failed = None;
         for delivery in due {
-            // What an action printed is about the problem too.
-            let tells_of_a_problem = matches!(
-                delivery.event,
-                Event::Firing | Event::Escalated | Event::Eased | Event::Action
-            );
-            if tells_of_a_problem && silences.covering(&delivery.alert).is_some() {
-                self.database.hold_delivery(&delivery).await?;
-                continue;
-            }
-            if delivery.event == Event::Reminder && Self::reminder_is_stale(&delivery, &silences) {
-                self.database.drop_delivery(delivery.id).await?;
-                continue;
-            }
-            // An incident can only be acknowledged once it's open. One whose
-            // opening a silence is holding back waits with it, and one that never
-            // opened has nothing to acknowledge.
-            if delivery.event == Event::Acknowledged {
-                let told = self
-                    .database
-                    .told_started(delivery.alert.id, delivery.channel.id)
-                    .await?;
-                match told {
-                    Told::Yes => {}
-                    Told::NotYet => {
-                        self.database.hold_delivery(&delivery).await?;
-                        continue;
-                    }
-                    Told::Never => {
-                        self.database.drop_delivery(delivery.id).await?;
-                        continue;
-                    }
+            match self.ready_to_send(&delivery, &silences).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    failed = Some(error);
+                    break;
                 }
             }
             let chart = shows_chart(&delivery).then(|| {
@@ -628,6 +645,9 @@ impl Notifier {
                 }
                 Err(error) => error!(%error, "a delivery stopped unexpectedly"),
             }
+        }
+        if let Some(error) = failed {
+            return Err(error);
         }
         anyhow::ensure!(
             unrecorded == 0,
