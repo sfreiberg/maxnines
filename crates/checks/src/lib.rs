@@ -1181,8 +1181,11 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
                 .unwrap_or_default()
                 .split('/')
                 .count();
+            // Linux adds ", pipe 2" after the unit when replies take over a second.
+            let values = values
+                .split_once(" ms")
+                .map_or(values, |(values, _)| values);
             let numbers: Option<Vec<f64>> = values
-                .trim_end_matches(" ms")
                 .split('/')
                 .map(|value| value.trim().parse().ok().filter(|ms: &f64| ms.is_finite()))
                 .collect();
@@ -2098,6 +2101,14 @@ mod tests {
         assert!(close(findings.rtt_min_secs, 0.0011), "{findings:?}");
         assert!(close(findings.rtt_max_secs, 0.0033), "{findings:?}");
         assert!(close(findings.rtt_stddev_secs, 0.0004), "{findings:?}");
+
+        // Replies slower than the interval between pings.
+        let slow = "3 packets transmitted, 3 received, 0% packet loss, time 2003ms\n\
+                    rtt min/avg/max/mdev = 1001.5/1502.0/2003.5/409.8 ms, pipe 2\n";
+        let mut findings = Findings::default();
+        read_ping_summary(slow, &mut findings);
+        assert!(close(findings.rtt_min_secs, 1.0015), "{findings:?}");
+        assert!(close(findings.rtt_stddev_secs, 0.4098), "{findings:?}");
 
         let bsd = "5 packets transmitted, 5 packets received, 0.0% packet loss\n\
                    round-trip min/avg/max/stddev = 0.1/0.2/0.3/0.05 ms\n";
