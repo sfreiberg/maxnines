@@ -37,7 +37,7 @@ curl -X POST -H "Authorization: Bearer $MAXNINES_API_KEY" \
 ```
 
 - **The filter is matched when the annotation is added,** against the approved hosts
-  there are then, and the annotation stays on those. A web host added next week
+  that were already there at the time it's for, and the annotation stays on those. A web host added next week
   doesn't show last week's deploy, and one that stops being `role=web` keeps showing
   it, as it was there for it. A filter that matches no host is refused.
 - **`occurred_at`** records something that happened earlier, up to a year back.

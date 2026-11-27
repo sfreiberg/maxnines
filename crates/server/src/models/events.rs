@@ -3,7 +3,7 @@
 //! updates from what's kept about them. An event keeps the hosts it was for when it was
 //! recorded, so it stays on those and isn't put on hosts added later.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use sea_orm::sea_query::OnConflict;
@@ -15,7 +15,7 @@ use serde_json::json;
 
 use super::alerting::to_alerts;
 use super::audit::record_change;
-use super::{Database, alert, event, event_host, host_boot, host_fact, to_fact_version};
+use super::{Database, alert, event, event_host, host, host_boot, host_fact, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
 use crate::events::{Event, EventKind, SERVER, TimelineEvent, UPDATE_FACTS};
 use crate::host_filter;
@@ -76,7 +76,24 @@ async fn insert_event<C: ConnectionTrait>(
     new: &NewEvent<'_>,
     by: &str,
     now: Timestamp,
-) -> Result<event::Model> {
+) -> Result<Option<event::Model>> {
+    // Only hosts that are still there, as one may have been deleted since they
+    // were picked, and an event is never kept for no host.
+    let mut hosts = Vec::new();
+    for asked in new.hosts.chunks(HOSTS_AT_ONCE) {
+        let kept: Vec<String> = host::Entity::find()
+            .select_only()
+            .column(host::Column::Id)
+            .filter(host::Column::Id.is_in(asked.iter().cloned()))
+            .into_tuple()
+            .all(connection)
+            .await
+            .context("loading an event's hosts")?;
+        hosts.extend(kept);
+    }
+    if hosts.is_empty() {
+        return Ok(None);
+    }
     let row = event::ActiveModel {
         occurred_at: Set(new.occurred_at),
         kind: Set(new.kind.as_str().to_string()),
@@ -88,7 +105,7 @@ async fn insert_event<C: ConnectionTrait>(
         ..Default::default()
     };
     let row = row.insert(connection).await.context("saving event")?;
-    for hosts in new.hosts.chunks(HOSTS_AT_ONCE) {
+    for hosts in hosts.chunks(HOSTS_AT_ONCE) {
         let rows = hosts.iter().map(|host_id| event_host::ActiveModel {
             event_id: Set(row.id),
             host_id: Set(host_id.clone()),
@@ -99,14 +116,22 @@ async fn insert_event<C: ConnectionTrait>(
             .await
             .context("saving an event's hosts")?;
     }
-    Ok(row)
+    Ok(Some(row))
 }
 
 impl Database {
-    /// Saves an annotation, with the change in the audit log.
-    pub async fn record_event(&self, new: &NewEvent<'_>, by: &str, now: Timestamp) -> Result<i64> {
+    /// Saves an annotation, with the change in the audit log. None if none of its
+    /// hosts are left, as they may have been deleted since they were picked.
+    pub async fn record_event(
+        &self,
+        new: &NewEvent<'_>,
+        by: &str,
+        now: Timestamp,
+    ) -> Result<Option<i64>> {
         let transaction = self.connection.begin().await.context("saving event")?;
-        let row = insert_event(&transaction, new, by, now).await?;
+        let Some(row) = insert_event(&transaction, new, by, now).await? else {
+            return Ok(None);
+        };
         let after = snapshot(&row);
         record_change(
             &transaction,
@@ -118,11 +143,12 @@ impl Database {
         )
         .await?;
         transaction.commit().await.context("saving event")?;
-        Ok(row.id)
+        Ok(Some(row.id))
     }
 
-    /// Saves something the server noticed about one host, for that host alone.
-    /// These aren't changes anyone made, so they stay out of the audit log.
+    /// Saves something the server noticed about one host, for that host alone, and
+    /// nothing if the host has just been deleted. These aren't changes anyone made,
+    /// so they stay out of the audit log.
     pub async fn record_server_event(
         &self,
         kind: EventKind,
@@ -141,7 +167,9 @@ impl Database {
             filter: Some(&filter),
             hosts: &[host_id.to_string()],
         };
-        insert_event(&self.connection, &new, SERVER, now).await?;
+        let transaction = self.connection.begin().await.context("saving event")?;
+        insert_event(&transaction, &new, SERVER, now).await?;
+        transaction.commit().await.context("saving event")?;
         Ok(())
     }
 
@@ -376,16 +404,39 @@ impl Database {
     }
 }
 
-/// Forgets what was recorded about one host alone, as part of deleting it. Events for
-/// many hosts stay.
+/// Forgets what was recorded about one host alone, as part of deleting it: the
+/// events it was the only host of. Events for other hosts too stay, on those.
 pub(super) async fn delete_host_events<C: ConnectionTrait>(
     connection: &C,
     host_id: &str,
 ) -> Result<()> {
-    event::Entity::delete_many()
-        .filter(event::Column::Filter.eq(host_filter::only(host_id)))
-        .exec(connection)
+    let ids: Vec<i64> = event_host::Entity::find()
+        .select_only()
+        .column(event_host::Column::EventId)
+        .filter(event_host::Column::HostId.eq(host_id))
+        .into_tuple()
+        .all(connection)
         .await
-        .context("deleting a host's events")?;
+        .context("loading a host's events")?;
+    for ids in ids.chunks(HOSTS_AT_ONCE) {
+        let shared: HashSet<i64> = event_host::Entity::find()
+            .select_only()
+            .column(event_host::Column::EventId)
+            .distinct()
+            .filter(event_host::Column::EventId.is_in(ids.iter().copied()))
+            .filter(event_host::Column::HostId.ne(host_id))
+            .into_tuple::<i64>()
+            .all(connection)
+            .await
+            .context("loading a host's events")?
+            .into_iter()
+            .collect();
+        let alone = ids.iter().copied().filter(|id| !shared.contains(id));
+        event::Entity::delete_many()
+            .filter(event::Column::Id.is_in(alone))
+            .exec(connection)
+            .await
+            .context("deleting a host's events")?;
+    }
     Ok(())
 }

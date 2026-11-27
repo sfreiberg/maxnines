@@ -122,9 +122,10 @@ pub enum EventRefusal {
 }
 
 impl AppState {
-    /// Records an annotation, as `by`, for the approved hosts its filter picks now. It
-    /// stays on those, and isn't put on hosts added or changed later, as it's about
-    /// what happened to the hosts there were. One that picks none is refused.
+    /// Records an annotation, as `by`, for the approved hosts its filter picks now that
+    /// were already there when it happened. It stays on those, and isn't put on
+    /// hosts added or changed later, as it's about what happened to the hosts there
+    /// were. One that picks none is refused.
     pub async fn record_event(
         &self,
         mut input: EventInput,
@@ -133,6 +134,7 @@ impl AppState {
     ) -> Result<i64, EventRefusal> {
         input.tidy();
         let kind = input.check(now).map_err(EventRefusal::Invalid)?;
+        let occurred_at = input.occurred_at.unwrap_or(now);
         let search = HostSearch::from_database(&self.database, input.filter.as_deref())
             .await
             .map_err(EventRefusal::Failed)?;
@@ -147,29 +149,35 @@ impl AppState {
             .filter(|host| {
                 host.state == HostState::Approved
                     && !host.is_local()
+                    && host.first_seen_at <= occurred_at
                     && search.includes(&host.id, &host.hostname)
             })
             .map(|host| host.id)
             .collect();
-        if hosts.is_empty() {
+        let nothing = || {
             let why = match input.filter {
-                Some(_) => "This filter matches no hosts.",
-                None => "There are no hosts to mark yet.",
+                Some(_) => "This filter matches no hosts that were there then.",
+                None => "There were no hosts then to mark.",
             };
-            return Err(EventRefusal::Invalid(why.to_string()));
+            EventRefusal::Invalid(why.to_string())
+        };
+        if hosts.is_empty() {
+            return Err(nothing());
         }
         let new = NewEvent {
             kind,
-            occurred_at: input.occurred_at.unwrap_or(now),
+            occurred_at,
             title: &input.title,
             detail: input.detail.as_deref(),
             filter: input.filter.as_deref(),
             hosts: &hosts,
         };
-        self.database
-            .record_event(&new, by, now)
-            .await
-            .map_err(EventRefusal::Failed)
+        match self.database.record_event(&new, by, now).await {
+            Ok(Some(id)) => Ok(id),
+            // Its hosts were deleted since they were picked.
+            Ok(None) => Err(nothing()),
+            Err(error) => Err(EventRefusal::Failed(error)),
+        }
     }
 
     /// Deletes a revoked agent and everything kept about it. Metrics go first: if
