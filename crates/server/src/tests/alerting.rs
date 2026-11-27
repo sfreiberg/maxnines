@@ -1157,6 +1157,38 @@ async fn a_calculations_long_wait_carries_on_through_a_restart() {
     );
 }
 
+/// A group a calculation no longer reports, such as a host that's gone, ends its
+/// alert, while the others carry on.
+#[tokio::test]
+async fn a_calculations_line_that_is_no_longer_reported_ends_its_alert() {
+    let mut test = Harness::start().await;
+    let points = last_hour(&test, &[95.0, 95.0, 95.0, 95.0]);
+    let line = |name: &str| crate::metrics::Series {
+        name: name.to_string(),
+        points: points.clone(),
+    };
+    *test.script.calculated.lock().unwrap() = Some(vec![line("web-1"), line("web-2")]);
+    let body = json!({
+        "name": "Busy hosts", "calculation": "avg", "metric": "cpu.usage",
+        "group_by": "host", "critical": "value > 90", "for_secs": 0,
+    });
+    let (status, made) = api(&test.server, "POST", "/api/v1/alert-rules", &body).await;
+    assert_eq!(status, 201, "{made}");
+    test.evaluate(TimeDelta::zero()).await;
+    assert_eq!(test.open().await.len(), 2);
+
+    *test.script.calculated.lock().unwrap() = Some(vec![line("web-1")]);
+    test.evaluate(MINUTE).await;
+    let open = test.open().await;
+    assert_eq!(open.len(), 1, "{open:?}");
+    let resolved = test.resolved().await;
+    assert_eq!(
+        resolved[0].resolve_reason.as_deref(),
+        Some("This line is no longer reported")
+    );
+    assert!(test.database().alert_holds().await.unwrap().len() <= 1);
+}
+
 #[tokio::test]
 async fn a_wait_whose_problem_cleared_meanwhile_starts_over_after_a_restart() {
     let mut test = Harness::start().await;
@@ -2831,6 +2863,46 @@ async fn a_restart_leaves_an_alert_about_a_reporting_host_alone() {
     // A restart before its next sample.
     test.evaluator = evaluator(&test.server, sampled - MINUTE * 10);
     test.evaluate_at(sampled + TimeDelta::seconds(10), Some(sampled))
+        .await;
+
+    assert_eq!(test.open().await.len(), 1);
+    assert!(
+        test.resolved().await.is_empty(),
+        "{:?}",
+        test.resolved().await
+    );
+}
+
+/// However long the server was down, a host that sent anything after its alert
+/// began isn't taken for a quiet one when it starts again.
+#[tokio::test]
+async fn a_long_restart_leaves_an_alert_about_a_reporting_host_alone() {
+    let mut test = Harness::start().await;
+    let busy = AlertRuleInput {
+        name: "Busy while reporting".to_string(),
+        critical: Some("reporting && cpu.usage > 90".to_string()),
+        hold: TimeDelta::zero(),
+        ..cpu_rule()
+    };
+    test.database().create_alert_rule(&busy).await.unwrap();
+    // An alert that began twenty minutes ago, and a sample since.
+    let began = test.connected_at() - MINUTE * 20;
+    test.script.set(vec![test.reading("CPU", began, 95.0)]);
+    test.evaluate_at(began, Some(began)).await;
+    let later = began + MINUTE;
+    test.script.set(vec![test.reading("CPU", later, 95.0)]);
+    test.evaluate_at(later, Some(later)).await;
+    assert_eq!(test.open().await.len(), 1);
+
+    // The server was down since, and the agent reconnects as it comes back, with
+    // the samples it kept meanwhile still to send.
+    test.go_offline().await;
+    let mut client = test.server.connect().await;
+    handshake(&mut client, &test.host, "web-1", None).await;
+    test.server.wait_for_online(&test.id(), true).await;
+    let back = test.connected_at();
+    test.evaluator = evaluator(&test.server, back - MINUTE * 10);
+    test.evaluate_at(back + TimeDelta::seconds(30), Some(later))
         .await;
 
     assert_eq!(test.open().await.len(), 1);

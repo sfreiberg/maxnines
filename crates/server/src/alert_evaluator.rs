@@ -128,6 +128,24 @@ pub(crate) enum Change {
     Resolve,
 }
 
+/// Trackers kept through a pass though nothing checked them, as what would have
+/// couldn't be worked out: all of a rule's, or a rule's on some hosts.
+#[derive(Default)]
+struct Kept {
+    rules: HashSet<i64>,
+    hosts: HashMap<i64, HashSet<String>>,
+}
+
+impl Kept {
+    fn covers(&self, key: &Key) -> bool {
+        self.rules.contains(&key.rule_id)
+            || self
+                .hosts
+                .get(&key.rule_id)
+                .is_some_and(|hosts| hosts.contains(&key.host_id))
+    }
+}
+
 /// How long one level of a problem has lasted.
 #[derive(Debug, Default)]
 struct Hold {
@@ -623,6 +641,8 @@ pub struct Evaluator {
     /// Whether `trackers` has been given the levels kept as crossed before the
     /// server started.
     holds_restored: bool,
+    /// What's kept through this pass though it wasn't checked, emptied as it ends.
+    kept: Kept,
     /// The levels as last saved, so only what changed is written.
     saved_holds: HashSet<HeldLevel>,
 }
@@ -645,6 +665,7 @@ impl Evaluator {
             silences: HashMap::new(),
             silences_restored: false,
             holds_restored: false,
+            kept: Kept::default(),
             saved_holds: HashSet::new(),
         }
     }
@@ -900,10 +921,12 @@ impl Evaluator {
         // Silences are only held in memory, so after a start, those of alerts still
         // open carry on from when each began, for hosts whose samples say they're
         // quiet: a rule using `reporting` can be about something else, as
-        // `reporting && cpu.usage > 90` is, about a host that's sending.
+        // `reporting && cpu.usage > 90` is, about a host that's sending. One that
+        // sent anything after its alert began has its silence ended below anyway,
+        // however long the server was down.
         if !self.silences_restored {
             for (host_id, began) in quiet_before {
-                if self.looks_quiet(host_id, &last_samples, now).await {
+                if self.quiet_lately(host_id, &last_samples, now).await {
                     self.silences.entry(host_id.clone()).or_insert(*began);
                 }
             }
@@ -956,12 +979,7 @@ impl Evaluator {
             // The silence began with the newest sample, or with connecting if none
             // has come since, as an agent that was away can't have sent anything.
             let since = newest.map_or(connected.since, |taken| taken.max(connected.since));
-            let quiet_for = now - since;
-            let silent = quiet_for >= MIN_SILENCE
-                && match self.interval(&host.id).await {
-                    Some(every) => quiet_for >= every * MISSED_SAMPLES,
-                    None => true,
-                };
+            let silent = self.silent_for(&host.id, now - since).await;
             if silent {
                 self.silences.insert(host.id.clone(), since);
             }
@@ -995,18 +1013,23 @@ impl Evaluator {
 
     /// How often an agent is set to send a sample, by the config rules that apply to
     /// it now, or nothing if its config can't be worked out.
-    /// Whether a host's newest stored sample is as old as a silence has to be, as
-    /// [`Self::reporting`] tells a quiet host, or there's none from lately.
-    async fn looks_quiet(
+    /// Whether a host has sent nothing for as long as a silence has to be, as
+    /// [`Self::reporting`] tells a quiet host.
+    async fn quiet_lately(
         &self,
         host_id: &str,
         last_samples: &BTreeMap<String, Timestamp>,
         now: Timestamp,
     ) -> bool {
-        let Some(&taken) = last_samples.get(host_id) else {
-            return true;
-        };
-        let quiet_for = now - taken;
+        match last_samples.get(host_id) {
+            Some(&taken) => self.silent_for(host_id, now - taken).await,
+            None => true,
+        }
+    }
+
+    /// Whether this long without a sample makes a host quiet: at least
+    /// [`MIN_SILENCE`], and a few of its intervals.
+    async fn silent_for(&self, host_id: &str, quiet_for: TimeDelta) -> bool {
         quiet_for >= MIN_SILENCE
             && match self.interval(host_id).await {
                 Some(every) => quiet_for >= every * MISSED_SAMPLES,
@@ -1014,6 +1037,7 @@ impl Evaluator {
             }
     }
 
+    /// How often a host sends, as its config says.
     async fn interval(&self, host_id: &str) -> Option<TimeDelta> {
         match self.configs.config_for(host_id).await {
             Ok(resolved) => TimeDelta::from_std(resolved.config.interval).ok(),
@@ -1138,12 +1162,15 @@ impl Evaluator {
                 continue;
             };
             if rule.rule.is_calculation() {
-                // Waiting where it is, whatever stops it being worked out now, as
-                // what's held from before a restart is only kept while it's tracked.
-                self.keep_tracking(&mut checked, |key| key.rule_id == rule.id);
-                if !snapshot.in_grace {
-                    self.check_calculation(rule, conditions, &snapshot, &mut open, &mut checked)
+                let worked_out = !snapshot.in_grace
+                    && self
+                        .check_calculation(rule, conditions, &snapshot, &mut open, &mut checked)
                         .await?;
+                // What it was waiting for waits on, whatever stopped it being worked
+                // out now, as what's held from before a restart is only kept while
+                // it's tracked.
+                if !worked_out {
+                    self.kept.rules.insert(rule.id);
                 }
                 continue;
             }
@@ -1164,7 +1191,9 @@ impl Evaluator {
         }
 
         self.actions.give_up_on_unanswered(now).await?;
-        self.trackers.retain(|key, _| checked.contains(key));
+        let kept = std::mem::take(&mut self.kept);
+        self.trackers
+            .retain(|key, _| checked.contains(key) || kept.covers(key));
         self.save_holds().await?;
         let firing = self.database.open_alert_count().await?;
         self.status
@@ -1178,12 +1207,6 @@ impl Evaluator {
     /// that waits days isn't started over by a restart. Each one is only kept if
     /// its level is still crossed when it's next checked, and one for a rule, host
     /// or series that's gone is dropped after the first pass, as it isn't checked.
-    /// Keeps the trackers `which` picks through this pass, as one that isn't checked
-    /// is let go, with what it held.
-    fn keep_tracking(&self, checked: &mut HashSet<Key>, which: impl Fn(&Key) -> bool) {
-        checked.extend(self.trackers.keys().filter(|key| which(key)).cloned());
-    }
-
     async fn restore_holds(&mut self) -> Result<()> {
         let held = self.database.alert_holds().await?;
         for level in &held {
@@ -1268,9 +1291,11 @@ impl Evaluator {
             {
                 checked.insert(key.clone());
             }
-            self.keep_tracking(checked, |key| {
-                key.rule_id == rule.id && key.host_id == host.id
-            });
+            self.kept
+                .hosts
+                .entry(rule.id)
+                .or_default()
+                .insert(host.id.clone());
             return Ok(());
         }
         let is_online = online.is_none_or(|seen| seen.yes);
@@ -1692,7 +1717,7 @@ impl Evaluator {
         snapshot: &Snapshot,
         open: &mut HashMap<Key, Alert>,
         checked: &mut HashSet<Key>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let question = match rule.rule.question(&snapshot.catalog) {
             Ok(question) => question,
             Err(error) => {
@@ -1700,11 +1725,11 @@ impl Evaluator {
                     rule = rule.rule.name,
                     error, "a saved rule doesn't make sense"
                 );
-                return Ok(());
+                return Ok(false);
             }
         };
         let Some(lines) = self.calculated_lines(rule, &question, snapshot.now).await else {
-            return Ok(());
+            return Ok(false);
         };
 
         let unit = question.unit();
@@ -1787,7 +1812,7 @@ impl Evaluator {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]
