@@ -353,8 +353,18 @@ pub(crate) async fn mysql_connection(
         options = options.ssl_opts(tls);
     }
     mysql_async::Conn::new(options).await.map_err(|error| {
-        // Access denied, by password or, over the socket, by who's asking.
-        let refused = matches!(&error, mysql_async::Error::Server(server) if matches!(server.code, 1045 | 1698));
+        let refused = match &error {
+            // Access denied, by password or, over the socket, by who's asking.
+            mysql_async::Error::Server(server) => matches!(server.code, 1045 | 1698),
+            // MySQL answers a user it hasn't got as if it had one, signing in a
+            // way picked for it, sometimes sha256_password, which the driver can't
+            // use. An account that really signs in that way can't be signed in to
+            // either, so it's refused all the same.
+            mysql_async::Error::Driver(mysql_async::DriverError::UnknownAuthPlugin { name }) => {
+                name == "sha256_password"
+            }
+            _ => false,
+        };
         login_refused_if(refused, short(error))
     })
 }
@@ -1032,8 +1042,6 @@ mod tests {
         assert!(!result.to_string().contains("PRIVATE KEY"), "{result}");
     }
 
-    /// Real servers, where the environment says where to find them, as
-    /// `host:port username`, with no password needed.
     /// A real server named by an environment variable, as `host:port username`,
     /// with the password after the username for servers that ask for one.
     fn real(variable: &str) -> Option<(String, Credentials)> {
@@ -1067,16 +1075,26 @@ mod tests {
             let result = run(&check, Some(&credentials)).await;
             assert_eq!(result["signed_in"], true, "{variable}: {result}");
             assert!(result["server_version"].is_string(), "{result}");
-            // MySQL answers a user it hasn't got with a way of signing in the driver
-            // doesn't know, so it's told a wrong password for one it has.
-            let mut wrong = credentials.clone();
-            if kind != CheckKind::Mysql {
-                wrong.username = Some("nobody_at_all".to_string());
+            // A user it hasn't got, and a wrong password for one it has, except on
+            // PostgreSQL, which may trust whoever connects from the machine itself.
+            let known = credentials.username.as_deref().unwrap();
+            let usernames = match kind {
+                CheckKind::Postgres => vec!["nobody_at_all"],
+                _ => vec!["nobody_at_all", known],
+            };
+            for username in usernames {
+                let wrong = Credentials {
+                    username: Some(username.to_string()),
+                    password: Some("wrong".to_string()),
+                    ..credentials.clone()
+                };
+                let result = run(&check, Some(&wrong)).await;
+                assert_eq!(result["up"], 0, "{variable} as {username}: {result}");
+                assert_eq!(
+                    result["signed_in"], false,
+                    "{variable} as {username}: {result}"
+                );
             }
-            wrong.password = Some("wrong".to_string());
-            let result = run(&check, Some(&wrong)).await;
-            assert_eq!(result["up"], 0, "{variable} as nobody: {result}");
-            assert_eq!(result["signed_in"], false, "{variable} as nobody: {result}");
         }
     }
 
