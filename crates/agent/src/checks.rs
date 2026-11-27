@@ -123,6 +123,13 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path)
     );
     for (name, definition) in definitions.iter_mut() {
         let problem = |what: &str| anyhow!("check {name:?} in the agent's config {what}");
+        // An empty one, as from an environment variable that isn't set, is none, so
+        // it's never sent, and never stands in the way of a key.
+        for given in [&mut definition.username, &mut definition.password] {
+            if given.as_deref() == Some("") {
+                *given = None;
+            }
+        }
         ensure!(
             is_check_name(name),
             problem(&format!(
@@ -144,16 +151,8 @@ pub fn load_check_definitions(definitions: &mut CheckDefinitions, folder: &Path)
             problem("is a database, so give it as a database block, which reads its stats too")
         );
         check.validate()?;
-        // An empty one, as from an environment variable that isn't set, is none.
-        let username = definition
-            .username
-            .as_deref()
-            .is_some_and(|username| !username.is_empty());
-        let secret = definition
-            .password
-            .as_deref()
-            .is_some_and(|password| !password.is_empty())
-            || definition.private_key_file.is_some();
+        let username = definition.username.is_some();
+        let secret = definition.password.is_some() || definition.private_key_file.is_some();
         ensure!(
             username || secret,
             problem("needs a username or a password")
@@ -582,6 +581,41 @@ mod tests {
             );
             assert!(error.contains(why), "{error}");
         }
+    }
+
+    /// As from `env("…", "")` with the variable unset, which is no password at all.
+    #[test]
+    fn an_empty_password_is_none() {
+        let folder = tempfile::tempdir().unwrap();
+        std::fs::write(
+            folder.path().join("key"),
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let mut definitions = CheckDefinitions::from([
+            (
+                "bastion".to_string(),
+                CheckDefinition {
+                    password: Some(String::new()),
+                    private_key_file: Some(PathBuf::from("key")),
+                    ..defined("ssh", "bastion.example.com:22")
+                },
+            ),
+            (
+                "broker".to_string(),
+                CheckDefinition {
+                    password: Some(String::new()),
+                    ..defined("mqtt", "127.0.0.1:1883")
+                },
+            ),
+        ]);
+
+        load_check_definitions(&mut definitions, folder.path()).unwrap();
+
+        let broker = definitions["broker"].credentials().unwrap();
+        assert_eq!(broker.username.as_deref(), Some("monitor"));
+        assert_eq!(broker.password, None);
+        assert_eq!(definitions["bastion"].password, None);
     }
 
     #[test]
