@@ -37,6 +37,11 @@ pub struct Options {
     #[arg(long, help_heading = "Server")]
     pub yes: bool,
 
+    /// Trust only the CA in this PEM file for the server's certificate, as an agent's
+    /// ca_file does, for a server with certificates of its own
+    #[arg(long, value_name = "FILE", help_heading = "Server")]
+    pub ca_file: Option<PathBuf>,
+
     /// How many agents to simulate
     #[arg(long, default_value_t = 1000, help_heading = "Load")]
     pub agents: usize,

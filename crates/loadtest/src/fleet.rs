@@ -18,7 +18,9 @@ use tokio::time::{
     Instant, Interval, MissedTickBehavior, interval_at, sleep, sleep_until, timeout,
 };
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{
+    Connector, MaybeTlsStream, WebSocketStream, connect_async_tls_with_config,
+};
 
 use crate::sample::{Readings, Shape, facts};
 
@@ -67,6 +69,8 @@ pub struct Plan {
     pub hot_percent: f64,
     /// How often the run's rule change has facts reported.
     pub changed_facts_interval: Duration,
+    /// How to check the server's certificate, when it's not against the public roots.
+    pub connector: Option<Connector>,
     pub counters: Counters,
 }
 
@@ -134,10 +138,11 @@ async fn introduce(
 /// Connects once, so the server knows about an agent and it can be approved.
 pub async fn register(
     url: &str,
+    connector: Option<Connector>,
     identity: &Identity,
     hostname: &str,
 ) -> Result<RegistrationStatus> {
-    let (mut socket, _) = connect_async(url)
+    let (mut socket, _) = connect_async_tls_with_config(url, None, false, connector)
         .await
         .with_context(|| format!("connecting to {url}"))?;
     timeout(
@@ -353,7 +358,9 @@ impl SimulatedAgent {
         counters.attempts.fetch_add(1, Relaxed);
 
         let connected = timeout(HANDSHAKE_LIMIT, async {
-            let (mut socket, _) = connect_async(&plan.url).await?;
+            let connector = plan.connector.clone();
+            let (mut socket, _) =
+                connect_async_tls_with_config(&plan.url, None, false, connector).await?;
             let status = introduce(&mut socket, &self.identity, &self.hostname, &plan.url).await?;
             anyhow::Ok((socket, status))
         })
@@ -464,6 +471,7 @@ mod tests {
             fact_change_percent: 0.0,
             hot_percent: 0.0,
             changed_facts_interval: changed_facts_interval(),
+            connector: None,
             counters: Counters::default(),
         };
         let identity = Identity::from_pkcs8(&Identity::generate().unwrap()).unwrap();

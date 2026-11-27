@@ -9,6 +9,7 @@ mod report;
 mod report_html;
 mod sample;
 mod server;
+mod trust;
 
 use std::collections::BTreeMap;
 use std::process::ExitCode;
@@ -37,6 +38,8 @@ use report::{
 };
 use sample::Shape;
 use server::Server;
+use tokio_tungstenite::Connector;
+use trust::PrivateCa;
 
 /// How often to ask the server how it's doing.
 const STATS_EVERY: Duration = Duration::from_secs(5);
@@ -81,14 +84,20 @@ fn host_name(prefix: &str, index: usize) -> String {
 }
 
 /// Makes sure the server knows every agent and has approved it.
-async fn register_all(options: &Options, server: &Server, identities: &[Identity]) -> Result<()> {
+async fn register_all(
+    options: &Options,
+    server: &Server,
+    connector: Option<&Connector>,
+    identities: &[Identity],
+) -> Result<()> {
     let results: Vec<Result<()>> = stream::iter(identities.iter().enumerate())
         .map(|(index, identity)| {
             let (url, server) = (options.url.clone(), server.clone());
+            let connector = connector.cloned();
             let hostname = host_name(&options.host_prefix, index);
             let id = identity.id();
             async move {
-                match register(&url, identity, &hostname).await? {
+                match register(&url, connector, identity, &hostname).await? {
                     RegistrationStatus::Approved => Ok(()),
                     RegistrationStatus::Pending => {
                         tokio::task::spawn_blocking(move || server.approve(&id))
@@ -466,7 +475,17 @@ async fn run(options: Options) -> Result<Outcome> {
     options.check()?;
     raise_open_file_limit(options.agents);
 
-    let server = Server::new(options.admin_address(), options.api_key.clone());
+    let ca = options
+        .ca_file
+        .as_deref()
+        .map(PrivateCa::read)
+        .transpose()?;
+    let connector = ca.as_ref().map(PrivateCa::connector).transpose()?;
+    let server = Server::new(
+        options.admin_address(),
+        options.api_key.clone(),
+        ca.as_ref(),
+    );
     let client = server.clone();
     let stats = tokio::task::spawn_blocking(move || client.stats())
         .await
@@ -484,7 +503,7 @@ async fn run(options: Options) -> Result<Outcome> {
     let identities = keys::load(&options.keys_file, options.agents)?;
     print!("Registering agents... ");
     let registering = Instant::now();
-    register_all(&options, &server, &identities).await?;
+    register_all(&options, &server, connector.as_ref(), &identities).await?;
     println!("done in {:.1}s", registering.elapsed().as_secs_f64());
 
     let first_id = identities[0].id();
@@ -504,6 +523,7 @@ async fn run(options: Options) -> Result<Outcome> {
         fact_change_percent: options.fact_changes,
         hot_percent: options.hot_agents,
         changed_facts_interval: fleet::changed_facts_interval(),
+        connector,
         counters: Counters::default(),
     });
     let measurements = Arc::new(Measurements {

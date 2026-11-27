@@ -6,7 +6,9 @@ closely: the same handshake, timers, retries and sample shapes as real ones.
 
 Run it against a test server, because simulated agents are approved and saved like
 real ones. If `--url`, or `--admin-url` where rules are changed and agents approved,
-isn't on the host running the test, it stops unless given `--yes`.
+isn't on the host running the test, it stops unless given `--yes`. For a server whose
+certificate comes from a CA of your own, give that CA's PEM file as `--ca-file`, as
+agents are given it as `ca_file`, and only that CA is trusted.
 
 ```sh
 export MAXNINES_API_KEY=$(maxnines-server api-keys create "Load test" --user you@example.com --expires-in 1d)

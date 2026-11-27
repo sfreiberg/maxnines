@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use ureq::Agent;
 
+use crate::trust::PrivateCa;
+
 const REQUEST_LIMIT: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
@@ -23,12 +25,18 @@ pub struct PageLoad {
 }
 
 impl Server {
-    pub fn new(base: String, token: String) -> Self {
-        let client = Agent::config_builder()
+    /// The server at `base`, its certificate checked against `ca` where given.
+    pub fn new(base: String, token: String, ca: Option<&PrivateCa>) -> Self {
+        let mut config = Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(Some(REQUEST_LIMIT))
-            .build()
-            .into();
+            .timeout_global(Some(REQUEST_LIMIT));
+        if let Some(ca) = ca {
+            let tls = ureq::tls::TlsConfig::builder()
+                .root_certs(ca.roots())
+                .build();
+            config = config.tls_config(tls);
+        }
+        let client = config.build().into();
         Self {
             client,
             base,
