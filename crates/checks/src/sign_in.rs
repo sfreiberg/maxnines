@@ -345,22 +345,33 @@ pub(crate) async fn mysql_connection(
             .with_danger_accept_invalid_certs(check.insecure == Some(true));
         options = options.ssl_opts(tls);
     }
-    mysql_async::Conn::new(options).await.map_err(|error| {
-        let refused = match &error {
-            // Access denied, by password or, over the socket, by who's asking.
-            mysql_async::Error::Server(server) => matches!(server.code, 1045 | 1698),
-            // MySQL answers a user it hasn't got as if it had one, signing in a
-            // way picked for it, sometimes sha256_password, which the driver can't
-            // use. An account that really signs in that way can't be signed in to
-            // either, so it's refused all the same.
-            mysql_async::Error::Driver(mysql_async::DriverError::UnknownAuthPlugin { name }) => {
-                name == "sha256_password"
-            }
-            _ => false,
-        };
-        login_refused_if(refused, short(error))
-    })
+    mysql_async::Conn::new(options).await.map_err(mysql_failure)
 }
+
+/// What went wrong signing in to MySQL, as a check says it.
+fn mysql_failure(error: mysql_async::Error) -> anyhow::Error {
+    match &error {
+        // Access denied, by password or, over the socket, by who's asking.
+        mysql_async::Error::Server(server) if matches!(server.code, 1045 | 1698) => {
+            login_refused_if(true, short(error))
+        }
+        // MySQL answers a user it hasn't got as if it had one, signing in a way
+        // picked for it, sometimes sha256_password, which the driver can't use. An
+        // account that really signs in that way can't be signed in to either, so
+        // it's refused all the same, saying which it could be.
+        mysql_async::Error::Driver(mysql_async::DriverError::UnknownAuthPlugin { name })
+            if name == "sha256_password" =>
+        {
+            login_refused_if(true, anyhow!("{UNSUPPORTED_SHA256}"))
+        }
+        _ => short(error),
+    }
+}
+
+/// What a MySQL check says when it's asked to sign in with sha256_password.
+const UNSUPPORTED_SHA256: &str = "MySQL asked to sign in with sha256_password, which isn't \
+    supported: there's no such account, or it signs in that way, which \
+    caching_sha2_password replaced";
 
 /// Whether a host is this machine itself, which a password can be sent to without
 /// TLS, as it never crosses a network.
@@ -734,6 +745,20 @@ mod tests {
         );
         let here = Check::new("ch", CheckKind::Clickhouse, "127.0.0.1:8123");
         assert_eq!(sign_in_problem(&here, true, true), None);
+    }
+
+    #[test]
+    fn mysql_asking_for_sha256_password_is_a_refused_login_it_cant_use() {
+        let asked = mysql_async::Error::Driver(mysql_async::DriverError::UnknownAuthPlugin {
+            name: "sha256_password".to_string(),
+        });
+        let error = mysql_failure(asked);
+        assert!(error.is::<LoginRefused>());
+        assert!(error.to_string().contains("isn't supported"), "{error}");
+        let other = mysql_async::Error::Driver(mysql_async::DriverError::UnknownAuthPlugin {
+            name: "authentication_ldap_sasl".to_string(),
+        });
+        assert!(!mysql_failure(other).is::<LoginRefused>());
     }
 
     /// Made for these tests with ssh-keygen, and used for nothing else.
