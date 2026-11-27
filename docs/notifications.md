@@ -100,7 +100,9 @@ a mail server or that you'd rather not run one for. The channel form walks throu
 3. Put an address on that domain in **From**.
 
 The key is never shown again. Each notification goes with a key Resend uses to spot a
-repeat, so one retried after a timeout isn't sent twice.
+repeat, so one retried after a timeout isn't sent twice. The key is made from what's
+sent too, as Resend turns down a key used again for anything else, so a retry whose
+chart or details changed meanwhile is sent, which can mean that email arriving twice.
 
 ## Custom webhooks
 

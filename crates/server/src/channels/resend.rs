@@ -53,13 +53,19 @@ fn body(channel: &ChannelInput, notice: &Notice, web_url: Option<&str>) -> Resul
 /// Resend keeps a key for a day, so a retry after a timeout isn't sent twice. The
 /// alert's start time tells apart deliveries with the same number on two servers
 /// sharing an account. A test isn't queued, so it has none.
-fn idempotency_key(channel: &Channel, notice: &Notice) -> Option<String> {
+///
+/// Resend turns down a key used again with another body, and its chart is drawn
+/// again for each try, so the key holds what's sent too: a retry of the same email
+/// is still sent once, and one that changed is sent rather than given up on.
+fn idempotency_key(channel: &Channel, notice: &Notice, body: &Value) -> Option<String> {
     let alert = notice.alert.as_ref().filter(|_| notice.id > 0)?;
+    let sent = ring::digest::digest(&ring::digest::SHA256, body.to_string().as_bytes());
     Some(format!(
-        "maxnines-{}-{}-{}",
+        "maxnines-{}-{}-{}-{}",
         alert.started_at.timestamp_millis(),
         channel.id,
-        notice.id
+        notice.id,
+        hex::encode(&sent.as_ref()[..8])
     ))
 }
 
@@ -159,7 +165,7 @@ impl ChannelType for Resend {
             .credential
             .clone()
             .context("this channel needs a Resend API key")?;
-        let idempotency = idempotency_key(channel, notice);
+        let idempotency = idempotency_key(channel, notice, &body);
         let url = senders.resend_url().to_string();
         // The email's ID only matters to Resend.
         blocking(move || post(&url, &key, idempotency.as_deref(), &body).map(|_| None)).await
@@ -223,11 +229,14 @@ mod tests {
             channel: channel(),
         };
         let queued = notice(Event::Firing, alert());
-        assert_eq!(
-            idempotency_key(&saved, &queued).as_deref(),
-            Some("maxnines-1000-4-3")
-        );
-        assert_eq!(idempotency_key(&saved, &Notice::test()), None);
+        let body = json!({ "subject": "Disk full" });
+        let key = idempotency_key(&saved, &queued, &body).unwrap();
+        assert!(key.starts_with("maxnines-1000-4-3-"), "{key}");
+        // The same email has the same key, and a changed one another.
+        assert_eq!(idempotency_key(&saved, &queued, &body).unwrap(), key);
+        let changed = json!({ "subject": "Disk full, resolved" });
+        assert_ne!(idempotency_key(&saved, &queued, &changed).unwrap(), key);
+        assert_eq!(idempotency_key(&saved, &Notice::test(), &body), None);
     }
 
     #[test]
