@@ -143,7 +143,7 @@
 
     <label>Checks
       <textarea name="checks" rows="4" spellcheck="false" placeholder="tcp db db1:5432">{{ rule.checks }}</textarea>
-      <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>. Options can follow: <code>timeout=5</code>, <code>interval=300</code> to run less often than every sample, <code>insecure</code>, for http <code>method=POST</code>, <code>body=...</code> and <code>regex="Welcome back"</code>, for dns <code>server=8.8.8.8</code> and <code>record=MX</code>, and for ping <code>count=5</code>.</small>
+      <small>One per line, as a kind, a name and a target: <code>tcp db db1:5432</code>, <code>http site https://example.com/</code>, <code>tls site example.com:443</code>, <code>dns resolver example.com</code> or <code>ping gateway 10.0.0.1</code>. Options can follow: <code>timeout=5</code>, <code>interval=300</code> to run less often than every sample, <code>insecure</code>, for http <code>method=POST</code>, <code>body=...</code> and <code>regex="Welcome back"</code>, for dns <code>server=8.8.8.8</code> and <code>record=MX</code>, for ping <code>count=5</code>, <code>tls</code> to use TLS from the start, <code>domain_expiry=false</code>, and <code>database=</code>, <code>host_key=</code>, <code>site=</code> and <code>topic=</code> for the kinds that take them, as on the <a href="/docs/checks">Checks</a> page.</small>
     </label>
 
     <label>Checks from the agent's config

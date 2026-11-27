@@ -8,7 +8,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum_csrf::CsrfToken;
-use maxnines_protocol::{COLLECTORS, Check, CheckKind, LocalCheck, default_status_page};
+use maxnines_protocol::{
+    COLLECTORS, Check, CheckKind, CheckOption, LocalCheck, default_status_page,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -379,30 +381,58 @@ fn quote(text: &str) -> String {
     }
 }
 
+/// Every option a check line can have: the name it's typed as, and its field in
+/// the check as it's written. Each of a check's options is one, as the protocol
+/// lists them, so the form never drops one it doesn't know.
+fn line_options() -> impl Iterator<Item = (&'static str, &'static str)> {
+    [("timeout", "timeout_secs"), ("interval", "interval_secs")]
+        .into_iter()
+        .chain(CheckOption::ALL.map(|option| (option.as_str(), option.as_str())))
+}
+
+/// Whether an option is on or off, which a line gives by its name alone when on.
+fn is_flag(name: &str) -> bool {
+    [
+        CheckOption::Insecure,
+        CheckOption::Tls,
+        CheckOption::DomainExpiry,
+    ]
+    .iter()
+    .any(|flag| flag.as_str() == name)
+}
+
+/// Whether an option is a whole number, such as seconds.
+fn is_number(name: &str) -> bool {
+    ["timeout", "interval", CheckOption::Count.as_str()].contains(&name)
+}
+
 fn set_option(check: &mut Check, option: &str, line: &str) -> Result<()> {
-    if option == "insecure" {
-        check.insecure = Some(true);
-        return Ok(());
-    }
-    let Some((name, value)) = option.split_once('=') else {
-        bail!("{option:?} isn't an option, in {line:?}");
+    let (name, value) = match option.split_once('=') {
+        Some((name, value)) => (name, Some(value)),
+        None => (option, None),
     };
-    let number = || {
-        value
-            .parse()
-            .with_context(|| format!("{name} has to be a number, in {line:?}"))
+    let Some((_, field)) = line_options().find(|(typed, _)| *typed == name) else {
+        bail!("{name:?} isn't an option, in {line:?}");
     };
-    match name {
-        "timeout" => check.timeout = Some(Duration::from_secs(number()?)),
-        "interval" => check.interval = Some(Duration::from_secs(number()?)),
-        "count" => check.count = Some(u32::try_from(number()?)?),
-        "method" => check.method = Some(value.to_string()),
-        "body" => check.body = Some(value.to_string()),
-        "regex" => check.regex = Some(value.to_string()),
-        "server" => check.server = Some(value.to_string()),
-        "record" => check.record = Some(value.to_string()),
-        other => bail!("{other:?} isn't an option, in {line:?}"),
-    }
+    let value = match value {
+        None if is_flag(name) => Value::Bool(true),
+        None => bail!("{option:?} isn't an option, in {line:?}"),
+        Some(value) if is_flag(name) => Value::Bool(
+            value
+                .parse()
+                .with_context(|| format!("{name} has to be true or false, in {line:?}"))?,
+        ),
+        Some(value) if is_number(name) => Value::from(
+            value
+                .parse::<u64>()
+                .with_context(|| format!("{name} has to be a number, in {line:?}"))?,
+        ),
+        Some(value) => Value::String(value.to_string()),
+    };
+    let mut written = serde_json::to_value(&*check)?;
+    written[field] = value;
+    *check = serde_json::from_value(written)
+        .with_context(|| format!("{name} can't be {option:?}, in {line:?}"))?;
     Ok(())
 }
 
@@ -434,29 +464,14 @@ fn check_line(check: &Check) -> String {
         quote(&check.name),
         quote(&check.target),
     ];
-    let options = [
-        (
-            "timeout",
-            check.timeout.map(|value| value.as_secs().to_string()),
-        ),
-        (
-            "interval",
-            check.interval.map(|value| value.as_secs().to_string()),
-        ),
-        ("method", check.method.clone()),
-        ("body", check.body.clone()),
-        ("regex", check.regex.clone()),
-        ("server", check.server.clone()),
-        ("record", check.record.clone()),
-        ("count", check.count.map(|value| value.to_string())),
-    ];
-    for (name, value) in options {
-        if let Some(value) = value {
-            words.push(format!("{name}={}", quote(&value)));
+    let written = serde_json::to_value(check).unwrap_or_default();
+    for (name, field) in line_options() {
+        match &written[field] {
+            Value::Null => {}
+            Value::Bool(true) if is_flag(name) => words.push(name.to_string()),
+            Value::String(text) => words.push(format!("{name}={}", quote(text))),
+            other => words.push(format!("{name}={other}")),
         }
-    }
-    if check.insecure == Some(true) {
-        words.push("insecure".to_string());
     }
     words.join(" ")
 }
@@ -953,11 +968,31 @@ mod tests {
     }
 
     #[test]
+    fn every_option_a_check_has_survives_its_line() {
+        let line = "mysql orders db1:3306 timeout=5 interval=300 domain_expiry=false \
+                    insecure database=orders tls host_key=\"ssh-ed25519 AAAA\" \
+                    site=default topic=a/b count=3";
+        let checks = parse_checks(line).unwrap();
+        let check = &checks[0];
+        assert_eq!(check.database.as_deref(), Some("orders"));
+        assert_eq!((check.tls, check.domain_expiry), (Some(true), Some(false)));
+        assert_eq!(check.host_key.as_deref(), Some("ssh-ed25519 AAAA"));
+        assert_eq!(
+            (check.site.as_deref(), check.topic.as_deref()),
+            (Some("default"), Some("a/b"))
+        );
+        assert_eq!(check.count, Some(3));
+        assert_eq!(parse_checks(&check_line(check)).unwrap(), checks);
+    }
+
+    #[test]
     fn a_badly_typed_option_is_explained() {
         for (line, expected) in [
             ("tcp a b:1 nonsense", "isn't an option"),
             ("tcp a b:1 color=red", "isn't an option"),
             ("tcp a b:1 timeout=soon", "has to be a number"),
+            ("tcp a b:1 tls=maybe", "has to be true or false"),
+            ("tcp a b:1 database", "isn't an option"),
             (r#"http a http://b regex="open"#, "no closing quote"),
         ] {
             let error = format!("{:#}", parse_checks(line).unwrap_err());
