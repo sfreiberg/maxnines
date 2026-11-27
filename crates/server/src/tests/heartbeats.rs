@@ -55,6 +55,29 @@ fn latest(server: &TestServer, id: i64) -> Value {
     server.state.check_results.latest(id).unwrap().0
 }
 
+/// However long checks wait for a slot to run in, a missed ping is seen.
+#[tokio::test]
+async fn a_late_heartbeat_is_seen_while_every_check_is_busy() {
+    let server = start_with_metrics().await;
+    // Named so it comes before the heartbeat, as checks are listed by name.
+    let body = json!({
+        "check": { "name": "Accounts db", "kind": "tcp", "target": "127.0.0.1:1" },
+        "interval_secs": 60,
+    });
+    let (status, added) = api(&server, "POST", "/api/v1/remote-checks", &body).await;
+    assert_eq!(status, 201, "{added}");
+    let (id, _, _) = add_heartbeat(&server).await;
+
+    let mut scheduler = scheduler(&server);
+    let _busy = scheduler.take_every_slot();
+    let late = crate::times::now() + TimeDelta::minutes(66);
+    let waiting = tokio::time::timeout(Duration::from_secs(1), scheduler.start_due(late));
+    assert!(waiting.await.is_err(), "the check waits for a slot");
+
+    let result = latest(&server, id);
+    assert_eq!(result["up"], 0, "{result}");
+}
+
 #[tokio::test]
 async fn a_heartbeat_is_up_while_pinged_in_time_and_down_once_it_is_late_or_fails() {
     let server = start_with_metrics().await;

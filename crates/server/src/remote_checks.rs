@@ -566,17 +566,20 @@ impl Scheduler {
             );
         }
 
+        // Heartbeats first, as they wait on nothing, so checks waiting below for a
+        // free slot never hold up seeing one that's missed its ping.
+        let (heartbeats, checks): (Vec<RemoteCheck>, Vec<RemoteCheck>) =
+            checks.into_iter().partition(is_heartbeat);
+        for check in heartbeats {
+            if let Some(hostname) = agentless.get(&check.input.host_id)
+                && check.input.enabled
+            {
+                let pings = pings.get(&check.id).cloned().unwrap_or_default();
+                self.watch(&check, hostname.clone(), &pings, now).await;
+            }
+        }
         let mut started = Vec::new();
         for check in checks {
-            if is_heartbeat(&check) {
-                if let Some(hostname) = agentless.get(&check.input.host_id)
-                    && check.input.enabled
-                {
-                    let pings = pings.get(&check.id).cloned().unwrap_or_default();
-                    self.watch(&check, hostname.clone(), &pings, now).await;
-                }
-                continue;
-            }
             let due = self
                 .next_run
                 .get(&check.id)
@@ -601,6 +604,13 @@ impl Scheduler {
         }
         self.first_pass = false;
         Ok(started)
+    }
+
+    /// Takes every slot checks run in, as checks slow to answer would.
+    #[cfg(test)]
+    pub fn take_every_slot(&self) -> tokio::sync::OwnedSemaphorePermit {
+        let every = u32::try_from(MAX_RUNNING).unwrap();
+        self.slots.clone().try_acquire_many_owned(every).unwrap()
     }
 
     /// Works out how a heartbeat is now, and saves that when it's changed, when it's
