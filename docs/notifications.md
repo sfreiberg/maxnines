@@ -101,8 +101,9 @@ a mail server or that you'd rather not run one for. The channel form walks throu
 
 The key is never shown again. Each notification goes with a key Resend uses to spot a
 repeat, so one retried after a timeout isn't sent twice. The key is made from what's
-sent too, as Resend turns down a key used again for anything else, so a retry whose
-chart or details changed meanwhile is sent, which can mean that email arriving twice.
+sent too, as Resend turns down a key used again for anything else. Every try sends the
+same email, with the chart as it was when the notification was queued, so a retry is
+only sent again when something it says has changed, such as the alert being acknowledged.
 
 ## Custom webhooks
 

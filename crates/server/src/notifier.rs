@@ -440,9 +440,12 @@ impl Notifier {
         self
     }
 
-    /// The chart for a delivery, if it gets one. Drawing one is never a reason not
-    /// to send the notification.
-    async fn chart_for(&self, delivery: &Delivery, now: Timestamp) -> Option<Arc<Vec<u8>>> {
+    /// The chart for a delivery, if it gets one, as it was when the delivery was
+    /// queued, so every try at sending it sends the same, which a service that
+    /// spots a repeat by what's sent, as Resend does, needs. Drawing one is never a
+    /// reason not to send the notification.
+    async fn chart_for(&self, delivery: &Delivery) -> Option<Arc<Vec<u8>>> {
+        let now = delivery.created_at;
         let charts = self.charts.as_ref()?;
         if !shows_chart(delivery) {
             return None;
@@ -616,7 +619,7 @@ impl Notifier {
             sends.spawn(async move {
                 let chart = match chart {
                     Some(chart) => {
-                        let drawing = notifier.chart_for(&delivery, now);
+                        let drawing = notifier.chart_for(&delivery);
                         chart.get_or_init(|| drawing).await.clone()
                     }
                     None => None,
