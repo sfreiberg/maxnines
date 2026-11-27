@@ -87,7 +87,7 @@ pub(crate) async fn check_ldap(
     }
     let mut ldap = Ldap::new(socket, 1);
     let offered = match ldap.start_tls().await {
-        Err(_) if ldap.answered_in_tls => bail!(TLS_ANSWER),
+        Err(_) if ldap.answered_in_tls() => bail!(TLS_ANSWER),
         offered => offered?,
     };
     findings.tls_offered = Some(offered == StartTls::Offered);
@@ -109,6 +109,10 @@ pub(crate) async fn check_ldap(
                 Ok(socket) => {
                     let mut plain = Ldap::new(socket, 1);
                     let looked = plain.look(None, looking).await;
+                    if looked.is_err() && plain.answered_in_tls() {
+                        findings.tls_offered = None;
+                        bail!(TLS_ANSWER);
+                    }
                     if !plain.answered && looked.as_ref().is_err_and(hung_up) {
                         findings.tls_offered = None;
                         bail!(TLS_ONLY);
@@ -145,8 +149,9 @@ struct Ldap<S> {
     next_id: i64,
     /// Whether anything's been read on the connection.
     answered: bool,
-    /// Whether the first that was read started as TLS does.
-    answered_in_tls: bool,
+    /// The first two bytes read on the connection, however many reads they took,
+    /// which say whether it answered in TLS.
+    first: Vec<u8>,
 }
 
 /// How a server answered being asked to upgrade to TLS.
@@ -177,8 +182,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             buffer: BytesMut::new(),
             next_id,
             answered: false,
-            answered_in_tls: false,
+            first: Vec::new(),
         }
+    }
+
+    /// Whether what was first read started as TLS does, as a server that only
+    /// speaks it answers anything else.
+    fn answered_in_tls(&self) -> bool {
+        starts_as_tls(&self.first)
     }
 
     /// Signs in where given a login, and reads the root entry and, signed in, the
@@ -436,7 +447,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
     /// Reads one whole message, which is one BER sequence.
     async fn read_message(&mut self) -> Result<StructureTag> {
         loop {
-            if let Some(length) = message_length(&self.buffer)? {
+            // A first byte that may start a TLS alert needs the next to tell.
+            let deciding = self.first == [0x15];
+            if !deciding && let Some(length) = message_length(&self.buffer)? {
                 let bytes = self.buffer.split_to(length);
                 ensure!(nesting_within(&bytes, MAX_NESTING), NOT_LDAP);
                 let (rest, message) =
@@ -452,9 +465,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Ldap<S> {
             if read == 0 {
                 return Err(Closed.into());
             }
-            if !self.answered {
-                self.answered_in_tls = starts_as_tls(&self.buffer);
-            }
+            let wanted = 2usize.saturating_sub(self.first.len()).min(read);
+            let new = self.buffer.len() - read;
+            self.first
+                .extend_from_slice(&self.buffer[new..new + wanted]);
             self.answered = true;
         }
     }
@@ -998,6 +1012,51 @@ mod tests {
             }
         }
         assert!(!seen.leaked.load(Ordering::Relaxed));
+    }
+
+    /// A TLS alert, as a server that only speaks TLS sends to anything else.
+    const ALERT: [u8; 7] = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x46];
+
+    /// One that comes a byte at a time is still known as TLS.
+    #[tokio::test]
+    async fn a_tls_answer_read_a_byte_at_a_time_is_still_known() {
+        // A pipe that holds one byte, so each read gets one. The server reads
+        // whatever it's sent, as the pipe can't take the request otherwise.
+        let (client, server) = tokio::io::duplex(1);
+        let (mut reading, mut writing) = tokio::io::split(server);
+        tokio::spawn(async move {
+            let mut sent = Vec::new();
+            let _ = reading.read_to_end(&mut sent).await;
+        });
+        tokio::spawn(async move {
+            let _ = writing.write_all(&ALERT).await;
+        });
+        let mut ldap = Ldap::new(client, 1);
+        assert!(ldap.start_tls().await.is_err());
+        assert!(ldap.answered_in_tls(), "{:?}", ldap.first);
+    }
+
+    /// A server that hangs up on StartTLS, then answers in TLS when looked at
+    /// again, is an LDAPS port too.
+    #[tokio::test]
+    async fn an_ldaps_port_that_hangs_up_on_starttls_first_says_so() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut looks = 0;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                looks += 1;
+                let mut request = [0; 64];
+                let _ = socket.read(&mut request).await;
+                if looks > 1 {
+                    let _ = socket.write_all(&ALERT).await;
+                }
+            }
+        });
+        let result = run_signed_in(&check(address, Tls::Never), None).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(result["error"], crate::TLS_ANSWER, "{result}");
+        assert!(result.get("tls_offered").is_none(), "{result}");
     }
 
     #[tokio::test]
