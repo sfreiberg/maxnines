@@ -46,11 +46,13 @@ the config as well.
 ## Docker
 
 The server is also an image for x86_64 and Arm. Set `MAXNINES_PUBLIC_URL` to the
-address agents will use, and keep its data in a volume:
+address agents will use, and keep its data in a volume. Each release is tagged with
+its version, such as `0.1.0-alpha.11`, and `latest` is the newest release that isn't
+a pre-release, once there is one:
 
 ```sh
 docker run -d --name maxnines -p 9000:9000 -v maxnines:/var/lib/maxnines-server \
-  -e MAXNINES_PUBLIC_URL=ws://your-server:9000/ws ghcr.io/sfreiberg/maxnines-server
+  -e MAXNINES_PUBLIC_URL=ws://your-server:9000/ws ghcr.io/sfreiberg/maxnines-server:<version>
 docker exec maxnines maxnines-server --config /etc/maxnines/server.hcl \
   users create you@example.com "Your Name"
 ```

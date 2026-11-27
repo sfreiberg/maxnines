@@ -62,7 +62,7 @@ tls {
   acme {
     domains   = ["maxnines.example.com"]
     email     = "you@example.com"
-    cache_dir = "/var/lib/maxnines/acme"
+    cache_dir = "/var/lib/maxnines-server/acme"
   }
 }
 ```
@@ -70,7 +70,7 @@ tls {
 | Setting | Required | Meaning |
 | --- | --- | --- |
 | `domains` | Yes | The names to get a certificate for. Each has to point at this server |
-| `cache_dir` | Yes | Keeps the certificate and account key. Created if needed |
+| `cache_dir` | Yes | Keeps the certificate and account key. Created if needed. The packages and the Docker image let the server write only under `/var/lib/maxnines-server`, so keep it there |
 | `email` | No | Who the certificate service can contact |
 | `directory` | No | The ACME service. Defaults to Let's Encrypt |
 | `ca_file` | No | Who to trust for a private ACME service |
