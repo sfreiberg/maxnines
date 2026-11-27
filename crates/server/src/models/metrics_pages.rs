@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
     TransactionTrait,
@@ -72,17 +72,30 @@ async fn of_host<C: ConnectionTrait>(connection: &C, host_id: &str) -> Result<Ve
 
 /// A host's pages, with the host held until the transaction ends, so two pages
 /// saved at once are checked against each other rather than both against what
-/// was there before.
+/// was there before. The pages are read as they are now, past anything this
+/// transaction read before, as MySQL would otherwise keep showing what was there
+/// when it first read.
 async fn of_host_held<C: ConnectionTrait>(
     connection: &C,
     host_id: &str,
 ) -> Result<Vec<MetricsPage>> {
-    host::Entity::find_by_id(host_id)
+    let held: Option<String> = host::Entity::find_by_id(host_id)
+        .select_only()
+        .column(host::Column::Id)
         .lock_exclusive()
+        .into_tuple()
         .one(connection)
         .await
         .context("loading host")?;
-    of_host(connection, host_id).await
+    ensure!(held.is_some(), "there's no host {host_id}");
+    let rows = metrics_page::Entity::find()
+        .filter(metrics_page::Column::HostId.eq(host_id))
+        .order_by_asc(metrics_page::Column::Url)
+        .lock_exclusive()
+        .all(connection)
+        .await
+        .context("loading metrics pages")?;
+    rows.into_iter().map(to_page).collect()
 }
 
 /// Records how a page changed from `before`, reading it as it is now. A password
