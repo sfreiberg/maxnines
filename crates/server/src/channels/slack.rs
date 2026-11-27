@@ -565,6 +565,10 @@ impl ChannelType for Slack {
         true
     }
 
+    fn credential_is_token(&self) -> bool {
+        true
+    }
+
     fn takes_app_token(&self) -> bool {
         true
     }

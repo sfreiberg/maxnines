@@ -284,6 +284,10 @@ impl ChannelType for Telegram {
         true
     }
 
+    fn credential_is_token(&self) -> bool {
+        true
+    }
+
     fn shows_charts(&self) -> bool {
         true
     }

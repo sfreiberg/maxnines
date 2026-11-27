@@ -62,6 +62,13 @@ pub trait ChannelType: Send + Sync {
         false
     }
 
+    /// Whether its credential is a token, which never starts or ends with a space,
+    /// so one pasted with a space or line break around it is kept without. A
+    /// password or a header is kept exactly as it's given.
+    fn credential_is_token(&self) -> bool {
+        false
+    }
+
     /// Whether the service keeps after people itself until someone responds, so it's
     /// never sent reminders.
     fn is_on_call(&self) -> bool {

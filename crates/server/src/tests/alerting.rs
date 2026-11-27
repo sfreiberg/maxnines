@@ -4711,6 +4711,80 @@ async fn a_slack_token_is_kept_without_spaces_around_it_and_refused_with_one_ins
         assert_eq!(status, 422, "{answer}");
         assert!(answer.to_string().contains("no spaces"), "{answer}");
     }
+
+    // One that's only spaces is refused, rather than read as removing the saved one.
+    let id = made["id"].as_i64().unwrap();
+    for (credential, app_token) in [(" ", None), (" \n", None), ("xoxb-1", Some(" "))] {
+        let body = json!({
+            "name": "Chat", "kind": "slack", "target": "#alerts",
+            "credential": credential, "app_token": app_token,
+        });
+        let path = format!("/api/v1/notification-channels/{id}");
+        let (status, answer) = api(&server, "PUT", &path, &body).await;
+        assert_eq!(status, 422, "{credential:?} {app_token:?}: {answer}");
+    }
+    let kept = server
+        .state
+        .database
+        .get_channel(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.channel.credential.as_deref(), Some("xoxb-1"));
+    assert_eq!(kept.channel.app_token.as_deref(), Some("xapp-1"));
+}
+
+/// A mail server's password is kept exactly as it's given, spaces and all, from the
+/// API and from the form.
+#[tokio::test]
+async fn an_email_password_is_kept_with_the_spaces_around_it() {
+    let server = start().await;
+    let body = json!({
+        "name": "Mail", "kind": "email", "target": "a@example.com",
+        "credential": " pass word ",
+        "mail": {
+            "from": "alerts@example.com",
+            "server": { "hostname": "mail.example.com", "username": "alerts" },
+        },
+    });
+    let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 201, "{made}");
+    let id = made["id"].as_i64().unwrap();
+    let saved = server
+        .state
+        .database
+        .get_channel(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.channel.credential.as_deref(), Some(" pass word "));
+
+    let mut browser = Browser::default();
+    let edit = format!("/alerts/channels/{id}/edit");
+    let fields = [
+        ("name", "Mail"),
+        ("kind", "email"),
+        ("target", "a@example.com"),
+        ("credential", "\tsecret "),
+        ("mail_from", "alerts@example.com"),
+        ("mail_hostname", "mail.example.com"),
+        ("mail_security", "starttls"),
+        ("mail_username", "alerts"),
+        ("sends_warnings", "on"),
+        ("sends_critical", "on"),
+    ];
+    let page = browser
+        .submit(&server, &edit, &format!("/alerts/channels/{id}"), &fields)
+        .await;
+    assert_eq!(page.status, 303, "{}", page.body);
+    let saved = server
+        .state
+        .database
+        .get_channel(id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.channel.credential.as_deref(), Some("\tsecret "));
 }
 
 #[tokio::test]

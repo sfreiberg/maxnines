@@ -144,6 +144,10 @@ impl ChannelType for Resend {
         true
     }
 
+    fn credential_is_token(&self) -> bool {
+        true
+    }
+
     fn sends_mail(&self) -> bool {
         true
     }

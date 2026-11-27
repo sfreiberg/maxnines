@@ -777,6 +777,11 @@ impl ChannelKind {
         channels::of(self).has_credential()
     }
 
+    /// Whether its credential is a token, kept without spaces around it.
+    pub fn credential_is_token(self) -> bool {
+        channels::of(self).credential_is_token()
+    }
+
     /// Whether it sends email, with a from address and maybe a mail server.
     pub fn sends_mail(self) -> bool {
         channels::of(self).sends_mail()
@@ -938,8 +943,21 @@ struct ChannelFields {
     region: Option<PagerDutyRegion>,
 }
 
+/// A token pasted with a space or line break around it, kept without, as the pages
+/// keep what's typed. One that's only spaces is kept as it is, so it's refused rather
+/// than read as removing the saved one.
+fn tidy_token(given: String) -> String {
+    let trimmed = given.trim();
+    if trimmed.is_empty() {
+        given
+    } else {
+        trimmed.to_string()
+    }
+}
+
 impl From<ChannelFields> for ChannelInput {
     fn from(fields: ChannelFields) -> Self {
+        let token = fields.kind.credential_is_token();
         Self {
             severities: fields
                 .severities
@@ -947,10 +965,10 @@ impl From<ChannelFields> for ChannelInput {
             name: fields.name,
             kind: fields.kind,
             target: fields.target,
-            // A secret pasted with a space or line break around it is kept without,
-            // as the pages keep what's typed.
-            credential: fields.credential.map(|given| given.trim().to_string()),
-            app_token: fields.app_token.map(|given| given.trim().to_string()),
+            credential: fields
+                .credential
+                .map(|given| if token { tidy_token(given) } else { given }),
+            app_token: fields.app_token.map(tidy_token),
             mail: fields.mail,
             request: fields.request,
             region: fields.region,
