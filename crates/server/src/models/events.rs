@@ -17,7 +17,7 @@ use super::alerting::to_alerts;
 use super::audit::record_change;
 use super::{Database, alert, event, host_boot, host_fact, to_fact_version};
 use crate::audit::{self, Kind, Snapshot};
-use crate::events::{Event, EventKind, SERVER, TimelineEvent, UPDATE_FACTS};
+use crate::events::{Event, EventKind, SERVER, Timeline, TimelineEvent, UPDATE_FACTS};
 use crate::host_filter;
 use crate::times::Timestamp;
 
@@ -30,6 +30,15 @@ const CANDIDATES_AT_ONCE: u64 = 1_000;
 /// Few, so tests go through several pages.
 #[cfg(test)]
 const CANDIDATES_AT_ONCE: u64 = 3;
+
+/// How many annotations in a range are looked through at most for a host's own, so a
+/// long range on a server with millions of them is still quick to show. Older ones
+/// past them are left out, and the timeline says so.
+#[cfg(not(test))]
+const MAX_CANDIDATES: u64 = 100_000;
+/// Five pages, so tests reach it with few annotations.
+#[cfg(test)]
+const MAX_CANDIDATES: u64 = 15;
 
 fn snapshot(row: &event::Model) -> Snapshot {
     let fields = json!({
@@ -205,15 +214,18 @@ impl Database {
         from: Timestamp,
         to: Timestamp,
         picks: impl Fn(Option<&str>) -> bool,
-    ) -> Result<Vec<TimelineEvent>> {
+    ) -> Result<Timeline> {
         let mut timeline = Vec::new();
+        let mut looked_through = 0;
+        let mut cut_short = false;
 
         // Two recorded in the same moment are newest first by when they were added,
         // as the list of annotations has them, and the sort below keeps that. They're
         // read a page at a time, each after the last one read, as however many
         // other hosts' there are, this host's own mustn't be missed.
         let mut after: Option<(Timestamp, i64)> = None;
-        while timeline.len() < MAX_TIMELINE as usize {
+        // Those in the range after the last one read, newest first.
+        let older = |after: Option<(Timestamp, i64)>| {
             let mut page = event::Entity::find()
                 .filter(event::Column::OccurredAt.gte(from))
                 .filter(event::Column::OccurredAt.lte(to));
@@ -228,14 +240,17 @@ impl Database {
                         ),
                 );
             }
-            let rows = page
-                .order_by_desc(event::Column::OccurredAt)
+            page.order_by_desc(event::Column::OccurredAt)
                 .order_by_desc(event::Column::Id)
+        };
+        while timeline.len() < MAX_TIMELINE as usize {
+            let rows = older(after)
                 .limit(CANDIDATES_AT_ONCE)
                 .all(&self.connection)
                 .await
                 .context("loading events")?;
             let full = rows.len() as u64 == CANDIDATES_AT_ONCE;
+            looked_through += rows.len() as u64;
             after = rows.last().map(|row| (row.occurred_at, row.id));
             let room = MAX_TIMELINE as usize - timeline.len();
             timeline.extend(
@@ -252,6 +267,16 @@ impl Database {
                     }),
             );
             if !full {
+                break;
+            }
+            if looked_through >= MAX_CANDIDATES {
+                let room = timeline.len() < MAX_TIMELINE as usize;
+                cut_short = room
+                    && older(after)
+                        .one(&self.connection)
+                        .await
+                        .context("loading events")?
+                        .is_some();
                 break;
             }
         }
@@ -332,7 +357,10 @@ impl Database {
 
         timeline.sort_by_key(|event| std::cmp::Reverse(event.occurred_at));
         timeline.truncate(MAX_TIMELINE as usize);
-        Ok(timeline)
+        Ok(Timeline {
+            events: timeline,
+            cut_short,
+        })
     }
 
     /// When a host last started, as far as the server knows.

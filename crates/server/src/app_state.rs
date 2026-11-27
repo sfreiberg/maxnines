@@ -12,7 +12,7 @@ use crate::alert_conditions::{Conditions, Names};
 use crate::alerting::{self, AlertRuleInput};
 use crate::calculations::Sources;
 use crate::catalog::Catalog;
-use crate::events::{EventInput, TimelineEvent};
+use crate::events::{EventInput, Timeline};
 use crate::facts::unflatten;
 use crate::host_filter::HostFilter;
 use crate::maintenance::{self, MaintenanceWindowInput};
@@ -152,7 +152,7 @@ impl AppState {
         host_id: &str,
         from: Timestamp,
         to: Timestamp,
-    ) -> Result<Vec<TimelineEvent>> {
+    ) -> Result<Timeline> {
         let hostname = self
             .registry
             .get(host_id)

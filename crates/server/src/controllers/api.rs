@@ -1734,7 +1734,8 @@ async fn host_events(
         Err(error) => return failed(StatusCode::BAD_REQUEST, &error),
     };
     match state.timeline(&id, span.from, span.to).await {
-        Ok(mut events) => {
+        Ok(timeline) => {
+            let mut events = timeline.events;
             events.truncate(usize::try_from(span.limit).unwrap_or(usize::MAX));
             Json(events).into_response()
         }

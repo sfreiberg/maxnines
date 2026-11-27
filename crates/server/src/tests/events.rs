@@ -302,6 +302,37 @@ async fn a_hosts_annotations_are_found_past_many_of_other_hosts() {
     );
 }
 
+/// Past as many annotations as are looked through, a host's older ones are left out,
+/// and its page says so.
+#[tokio::test]
+async fn a_host_page_says_when_there_were_too_many_annotations_to_look_through() {
+    let server = start().await;
+    let (web, _client) = connect_host(&server, "web-1", json!({ "role": "web" })).await;
+    let ago = |minutes: i64| (chrono::Utc::now() - TimeDelta::minutes(minutes)).to_rfc3339();
+    let annotate = async |title: &str, filter: &str, occurred_at: String| {
+        let annotation = json!({ "title": title, "filter": filter, "occurred_at": occurred_at });
+        let (status, answer) = api(&server, "POST", "/api/v1/annotations", &annotation).await;
+        assert_eq!(status, 201, "{answer}");
+    };
+    annotate("web oldest", "role=web", ago(120)).await;
+    // One fewer of other hosts' than tests look through, all newer.
+    for n in 0..14 {
+        annotate(&format!("db {n}"), "role=db", ago(60 - n)).await;
+    }
+    let notice = "more annotations than are looked through";
+    let page = format!("/hosts/{}/metrics?range=6h", web.id());
+    let mut browser = Browser::default();
+    let shown = browser.get(&server, &page).await;
+    assert_eq!(shown.status, 200, "{}", shown.body);
+    assert!(shown.body.contains("web oldest"), "{}", shown.body);
+    assert!(!shown.body.contains(notice), "{}", shown.body);
+
+    annotate("db 14", "role=db", ago(30)).await;
+    let shown = browser.get(&server, &page).await;
+    assert!(!shown.body.contains("web oldest"), "{}", shown.body);
+    assert!(shown.body.contains(notice), "{}", shown.body);
+}
+
 /// Asked for without a `to`, a timeline runs up to now, now included, so what was
 /// added in the same millisecond as the question is there.
 #[tokio::test]

@@ -89,6 +89,7 @@
     <button type="submit" class="secondary">Add annotation</button>
   </form>
   {% endif %}
+  {% if events_cut_short %}<p class="hint">This range has more annotations than are looked through for a host's own, so its older ones may be missing. Choose a shorter range to see them.</p>{% endif %}
   {% if events %}
   <div class="table-scroll"><table class="event-list">
     <thead><tr><th>When</th><th>Kind</th><th>What</th><th>Added by</th>{% if can_respond %}<th aria-label="Delete"></th>{% endif %}</tr></thead>

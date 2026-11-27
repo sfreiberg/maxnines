@@ -181,6 +181,15 @@ pub struct TimelineEvent {
     pub id: Option<i64>,
 }
 
+/// What happened to a host over a time, newest first.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Timeline {
+    pub events: Vec<TimelineEvent>,
+    /// Whether there were more annotations in the time than are looked through
+    /// for a host's own, so some of its older ones may be missing.
+    pub cut_short: bool,
+}
+
 /// Facts whose changes are worth marking, and what to call them.
 pub const UPDATE_FACTS: [(&str, &str); 3] = [
     ("agent.version", "Agent"),

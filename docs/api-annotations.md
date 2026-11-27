@@ -71,6 +71,9 @@ the period, both included, which is the last 24 hours up to now unless given, an
 which is 500 unless given. `from` has to be before `to` and at most 366 days before it,
 and `limit` from 1 to 500, or the answer is `400`. Only what was recorded has an `id`,
 and `created_by` is who added an annotation, or `null` for what the server worked out.
+To find the host's own annotations, the newest 100,000 in the period are looked
+through, so a period with more than that may leave out its older ones. The host's
+page says when it has.
 
 ```json
 [
