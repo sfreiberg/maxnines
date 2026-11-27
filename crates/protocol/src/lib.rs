@@ -1387,8 +1387,9 @@ impl CollectorSettings {
             // sign in.
             ensure!(
                 !check.kind.sign_in().is_some_and(|needs| needs.required),
-                "check {:?} is a {} check, which has to sign in, so it goes in the agent's \
-                 own config, where its account can be, and is picked here by name",
+                "check {:?} is a {} check, which has to sign in, so on an agent it's a \
+                 database block in the agent's own config, where its account can be, which \
+                 reads its stats too",
                 check.name,
                 check.kind.label()
             );
@@ -1956,6 +1957,7 @@ mod tests {
         .unwrap();
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("has to sign in"), "{error}");
+        assert!(error.contains("database block"), "{error}");
         assert!(config.validate_sent().is_err());
         assert!(
             CheckKind::Mysql

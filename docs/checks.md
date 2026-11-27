@@ -420,8 +420,9 @@ host rather than `'%'`, and for a check on the same host use `127.0.0.1`, as
 reconnect at a limit of 1 can be refused.
 
 A MySQL check always signs in, with a username at least, so it can't be in a config
-rule, which never has an agent's passwords: define it in the agent's config and pick
-it by name. An account with no password works where MySQL lets one in, such as over
+rule, which never has an agent's passwords. On an agent, give it as a [database
+block](database-stats.md#the-database-block) in the agent's config, which signs in
+and reads its stats too. An account with no password works where MySQL lets one in, such as over
 the socket with `auth_socket` or MariaDB's `unix_socket`. A check that only read
 MySQL's greeting and hung up would count, as a load balancer's health check does,
 toward MySQL blocking the host it's checked from once `max_connect_errors` of them
