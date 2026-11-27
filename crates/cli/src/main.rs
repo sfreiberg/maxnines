@@ -338,16 +338,24 @@ fn connect(folder: &Path, name: Option<&str>) -> Result<Api> {
 /// What to tell someone when the server couldn't be told a sign-in has ended.
 const REVOKE_BY_HAND: &str = "Revoke it in MaxNines under Settings, then Signed-in apps.";
 
-/// What a context for `server` is called when the sign-in doesn't say: its short
-/// name, or with `-2`, `-3` and so on after it if a context of another server has
-/// that, so signing in to one server never takes the place of another's.
-fn unused_name(config: &Config, server: &Server) -> String {
-    let short = server.short_name();
-    let free = |name: &str| {
-        config.contexts.get(name).is_none_or(|context| {
+/// What a context for `server` is called when the sign-in doesn't say: the one it
+/// already has, whatever it's called, the current one first if there are two, so
+/// signing in again replaces its sign-in rather than leaving it beside a new one.
+/// A new one is its short name, or with `-2`, `-3` and so on after it if a context
+/// of another server has that, so signing in to one server never takes the place
+/// of another's.
+fn context_name(config: &Config, server: &Server) -> String {
+    let is_this_server = |name: &str| {
+        config.contexts.get(name).is_some_and(|context| {
             Server::parse(&context.server).is_ok_and(|theirs| theirs.root == server.root)
         })
     };
+    let mut names = config.current.iter().chain(config.contexts.keys());
+    if let Some(name) = names.find(|name| is_this_server(name)) {
+        return name.clone();
+    }
+    let short = server.short_name();
+    let free = |name: &str| !config.contexts.contains_key(name);
     (1..)
         .map(|n| match n {
             1 => short.clone(),
@@ -377,7 +385,7 @@ fn login(folder: &Path, args: LoginArgs, context: Option<&str>) -> Result<u8> {
     let server = Server::parse(&address)?;
     let name = match name {
         Some(name) => name,
-        None => unused_name(&config, &server),
+        None => context_name(&config, &server),
     };
     let device = gethostname::gethostname().to_string_lossy().into_owned();
     let role = args.role.map(Role::as_str);
@@ -879,21 +887,46 @@ mod tests {
             key_env: None,
         };
         let prod = Server::parse("https://monitor.prod.example.com").unwrap();
-        assert_eq!(unused_name(&config, &prod), "monitor");
+        assert_eq!(context_name(&config, &prod), "monitor");
         config.contexts.insert(
             "monitor".to_string(),
             context("https://monitor.prod.example.com"),
         );
         // The same server signs in to its own context again.
-        assert_eq!(unused_name(&config, &prod), "monitor");
+        assert_eq!(context_name(&config, &prod), "monitor");
         let staging = Server::parse("https://monitor.staging.example.com").unwrap();
-        assert_eq!(unused_name(&config, &staging), "monitor-2");
+        assert_eq!(context_name(&config, &staging), "monitor-2");
         config.contexts.insert(
             "monitor-2".to_string(),
             context("https://monitor.staging.example.com"),
         );
         let test = Server::parse("https://monitor.test.example.com").unwrap();
-        assert_eq!(unused_name(&config, &test), "monitor-3");
+        assert_eq!(context_name(&config, &test), "monitor-3");
+    }
+
+    #[test]
+    fn a_server_signs_in_to_its_own_context_whatever_its_called() {
+        let mut config = Config::default();
+        let context = |server: &str| config::Context {
+            server: server.to_string(),
+            key_env: None,
+        };
+        config.contexts.insert(
+            "monitor".to_string(),
+            context("https://monitor.prod.example.com"),
+        );
+        config
+            .contexts
+            .insert("work".to_string(), context("https://monitor.example.com/"));
+        let server = Server::parse("https://monitor.example.com").unwrap();
+        assert_eq!(context_name(&config, &server), "work");
+        // Of two for the same server, the current one.
+        config
+            .contexts
+            .insert("old".to_string(), context("https://monitor.example.com"));
+        assert_eq!(context_name(&config, &server), "old");
+        config.current = Some("work".to_string());
+        assert_eq!(context_name(&config, &server), "work");
     }
 
     #[test]
