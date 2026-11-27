@@ -41,8 +41,27 @@ pub fn add_sums(context: &mut cel::Context<'_, '_>) {
 /// A sum as it reads: a whole number and a fraction mix, and a division is never
 /// cut to a whole number, so `cpu.usage / 2` and `commits / 60` are what they say,
 /// while two whole numbers added, taken away or multiplied stay whole, so one can
-/// pick from a list, as `tags[size(tags) - 1]` does. Anything else is as CEL has it.
+/// pick from a list, as `tags[size(tags) - 1]` does, unless that's too big for a
+/// whole number or below zero for one that can't be, when it's worked out as
+/// fractions. Anything else is as CEL has it.
 fn sum(operator: &str, args: &[CelValue]) -> Result<CelValue, ExecutionError> {
+    match sum_as_given(operator, args) {
+        Err(ExecutionError::Overflow(..)) => {
+            let fractions: Vec<CelValue> = args
+                .iter()
+                .map(|value| match value {
+                    CelValue::Int(whole) => CelValue::Float(*whole as f64),
+                    CelValue::UInt(whole) => CelValue::Float(*whole as f64),
+                    other => other.clone(),
+                })
+                .collect();
+            sum_as_given(operator, &fractions)
+        }
+        worked_out => worked_out,
+    }
+}
+
+fn sum_as_given(operator: &str, args: &[CelValue]) -> Result<CelValue, ExecutionError> {
     let [left, right] = args else {
         return Err(ExecutionError::invalid_argument_count(2, args.len()));
     };
@@ -164,6 +183,12 @@ mod tests {
             CelValue::String("2".to_string().into())
         );
         assert_eq!(worked_out("3 * 4"), CelValue::Int(12));
+        // Too big for a whole number, or below zero for one that can't be.
+        assert_eq!(
+            worked_out("64000000000 * 1000000000"),
+            CelValue::Float(6.4e19)
+        );
+        assert_eq!(worked_out("1u - 2u"), CelValue::Float(-1.0));
         assert_eq!(worked_out("120 / 60"), CelValue::Float(2.0));
         assert_eq!(
             worked_out("'a' + 'b'"),
