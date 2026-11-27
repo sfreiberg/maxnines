@@ -434,17 +434,26 @@ impl Picks {
         Ok(crate::text::non_blank(&filled.join(" ")))
     }
 
-    /// A title with each variable's name replaced by what's picked. Longer names go
-    /// first, so `$host` is never mistaken for `$host_two`.
+    /// A title with each variable's name replaced by what's picked. A name is the
+    /// whole run of letters, digits and _ after a `$`, so `$host` is never found in
+    /// `$hostname` or `$host_two`, and one that isn't a variable, or that's in what
+    /// was picked, is left as it is.
     pub fn fill_title(&self, title: &str) -> String {
-        let mut names: Vec<&String> = self.0.keys().collect();
-        names.sort_by_key(|name| std::cmp::Reverse(name.len()));
-        let mut title = title.to_string();
-        for name in names {
-            let pick = &self.0[name].1;
-            title = title.replace(&format!("${name}"), pick.label());
+        let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let mut filled = String::with_capacity(title.len());
+        let mut rest = title;
+        while let Some(at) = rest.find('$') {
+            filled.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            let length = after.find(|c: char| !is_name(c)).unwrap_or(after.len());
+            match self.0.get(&after[..length]) {
+                Some((_, pick)) => filled.push_str(pick.label()),
+                None => filled.push_str(&rest[at..=at + length]),
+            }
+            rest = &after[length..];
         }
-        title
+        filled.push_str(rest);
+        filled
     }
 }
 
@@ -587,6 +596,19 @@ mod tests {
         assert_eq!(picks.fill_title("CPU in $env"), "CPU in All");
         assert!(picks.fill_filter(Some("$host")).is_err());
         assert!(picks.fill_filter(Some("$other")).is_err());
+    }
+
+    #[test]
+    fn only_whole_names_are_filled_and_only_once() {
+        let picks = Picks::new([
+            (host(), Pick::One(choice("a", "costs $env"))),
+            (environment(), Pick::One(choice("live", "live"))),
+        ]);
+        assert_eq!(
+            picks.fill_title("$hostname on $host, $host_two in $env: 5$"),
+            "$hostname on costs $env, $host_two in live: 5$"
+        );
+        assert_eq!(picks.fill_title("$host$env é$"), "costs $envlive é$");
     }
 
     #[test]
