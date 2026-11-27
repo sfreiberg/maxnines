@@ -253,14 +253,23 @@ where
         .read_response()
         .await?
         .context("it closed the connection without a greeting")?;
-    ensure!(
-        matches!(
-            greeting.parsed(),
-            async_imap::imap_proto::Response::Data { .. }
-        ),
-        "it didn't greet as an IMAP server does"
-    );
-    Ok(client)
+    use async_imap::imap_proto::{Response, Status};
+    match greeting.parsed() {
+        Response::Data {
+            status: Status::Ok | Status::PreAuth,
+            ..
+        } => Ok(client),
+        // Turned away, as by a server with too many connections, or shutting down.
+        Response::Data {
+            status: Status::Bye,
+            outcome,
+        } => {
+            let said = outcome.information.as_deref().unwrap_or_default();
+            let said: String = said.chars().take(200).collect();
+            bail!("it turned the connection away: {said}")
+        }
+        _ => bail!("it didn't greet as an IMAP server does"),
+    }
 }
 
 async fn imap_sign_in<T>(
@@ -741,6 +750,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One that greets with BYE, as for too many connections, isn't up.
+    #[tokio::test]
+    async fn an_imap_server_turning_the_connection_away_is_down() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = socket.write_all(b"* BYE Too many connections\r\n").await;
+            }
+        });
+        let result = run(&check(CheckKind::Imap, address, false), None).await;
+        assert_eq!(result["up"], 0, "{result}");
+        assert_eq!(
+            result["error"],
+            "it turned the connection away: Too many connections"
+        );
     }
 
     #[tokio::test]
