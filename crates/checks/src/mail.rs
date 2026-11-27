@@ -193,14 +193,18 @@ pub(crate) async fn check_imap(
     let offered = imap_offers_starttls(&mut client).await?;
     findings.tls_offered = Some(offered);
     let Some(login) = login else {
-        imap_log_out(&mut client).await;
+        imap_log_out(client.get_mut()).await;
         return Ok(());
     };
-    ensure!(offered, TLS_NOT_OFFERED);
-    client
-        .run_command_and_check_ok("STARTTLS", None)
-        .await
-        .map_err(|_| anyhow!(TLS_NOT_OFFERED))?;
+    let upgraded = offered
+        && client
+            .run_command_and_check_ok("STARTTLS", None)
+            .await
+            .is_ok();
+    if !upgraded {
+        imap_log_out(client.get_mut()).await;
+        bail!(TLS_NOT_OFFERED);
+    }
     let secured = secure(&host, client.into_inner(), &[], findings).await?;
     certificate_verdict(check, secured.problem)?;
     imap_sign_in(
@@ -274,12 +278,11 @@ where
 }
 
 /// Says goodbye before hanging up, as a connection that just drops can count
-/// against the address it came from, as fail2ban counts them.
-async fn imap_log_out<T>(client: &mut async_imap::Client<T>)
-where
-    T: AsyncRead + AsyncWrite + Unpin + std::fmt::Debug + Send,
-{
-    let _ = client.run_command_and_check_ok("LOGOUT", None).await;
+/// against the address it came from, as fail2ban counts them. Its answer isn't
+/// waited for, so a server that never gives one can't hold the check up.
+async fn imap_log_out<T: AsyncWrite + Unpin>(stream: &mut T) {
+    let _ = stream.write_all(b"z LOGOUT\r\n").await;
+    let _ = stream.flush().await;
 }
 
 async fn imap_sign_in<T>(
@@ -292,25 +295,33 @@ where
 {
     let Some((username, password)) = login else {
         let mut client = client;
-        imap_log_out(&mut client).await;
+        imap_log_out(client.get_mut()).await;
         return Ok(());
     };
     match client.login(username, password).await {
         Ok(mut session) => {
             findings.signed_in = Some(true);
-            let _ = session.logout().await;
+            imap_log_out(session.get_mut()).await;
             Ok(())
         }
-        Err((error, _)) => match error {
-            // A refusal for now, with the response code that says so, says nothing
-            // about the login.
-            async_imap::error::Error::No(said) if is_busy_imap(&said) => bail!(crate::BUSY),
-            async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_) => {
-                findings.signed_in = Some(false);
-                bail!("it didn't accept the username and password")
-            }
-            other => Err(short(other)),
-        },
+        Err((error, mut client)) => {
+            imap_log_out(client.get_mut()).await;
+            imap_refusal(error, findings)
+        }
+    }
+}
+
+/// What a login turned down means.
+fn imap_refusal(error: async_imap::error::Error, findings: &mut Findings) -> Result<()> {
+    match error {
+        // A refusal for now, with the response code that says so, says nothing
+        // about the login.
+        async_imap::error::Error::No(said) if is_busy_imap(&said) => bail!(crate::BUSY),
+        async_imap::error::Error::No(_) | async_imap::error::Error::Bad(_) => {
+            findings.signed_in = Some(false);
+            bail!("it didn't accept the username and password")
+        }
+        other => Err(short(other)),
     }
 }
 
@@ -764,40 +775,52 @@ mod tests {
         }
     }
 
-    /// Without a login, it still says goodbye before hanging up.
+    /// It says goodbye before hanging up, without a login and when it can't sign
+    /// in, and doesn't wait to hear back, as a server may never answer.
     #[tokio::test]
-    async fn an_imap_check_without_a_login_logs_out() {
+    async fn an_imap_check_logs_out_without_waiting_for_an_answer() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let (said, heard) = tokio::sync::oneshot::channel();
+        // Whether each connection logged out before it ended.
+        let (said, mut heard) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut conn = BufReader::new(socket);
-            conn.get_mut().write_all(b"* OK ready\r\n").await.unwrap();
-            let mut line = String::new();
-            while conn.read_line(&mut line).await.unwrap_or_default() > 0 {
-                let (tag, command) = line.trim_end().split_once(' ').unwrap();
-                let reply = match command {
-                    "CAPABILITY" => format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n"),
-                    "LOGOUT" => {
-                        let bye = format!("* BYE\r\n{tag} OK bye\r\n");
-                        let _ = conn.get_mut().write_all(bye.as_bytes()).await;
-                        let _ = said.send(());
-                        return;
+            while let Ok((socket, _)) = listener.accept().await {
+                let said = said.clone();
+                tokio::spawn(async move {
+                    let mut conn = BufReader::new(socket);
+                    conn.get_mut().write_all(b"* OK ready\r\n").await.unwrap();
+                    let mut line = String::new();
+                    let mut logged_out = false;
+                    while conn.read_line(&mut line).await.unwrap_or_default() > 0 {
+                        let (tag, command) = line.trim_end().split_once(' ').unwrap();
+                        let reply = match command {
+                            "CAPABILITY" => {
+                                format!("* CAPABILITY IMAP4rev1\r\n{tag} OK done\r\n")
+                            }
+                            // Never answered.
+                            "LOGOUT" => {
+                                logged_out = true;
+                                String::new()
+                            }
+                            _ => format!("{tag} BAD unknown\r\n"),
+                        };
+                        let _ = conn.get_mut().write_all(reply.as_bytes()).await;
+                        line.clear();
                     }
-                    _ => format!("{tag} BAD unknown\r\n"),
-                };
-                conn.get_mut().write_all(reply.as_bytes()).await.unwrap();
-                line.clear();
+                    let _ = said.send(logged_out);
+                });
             }
         });
+        let imap = check(CheckKind::Imap, address, false);
 
-        let result = run(&check(CheckKind::Imap, address, false), None).await;
-
+        let result = run(&imap, None).await;
         assert_eq!(result["up"], 1, "{result}");
-        heard.await.expect("it hung up without logging out");
+        assert_eq!(heard.recv().await, Some(true), "without a login");
+        let result = run(&imap, Some(&login("s3cret"))).await;
+        assert_eq!(result["error"], TLS_NOT_OFFERED, "{result}");
+        assert_eq!(heard.recv().await, Some(true), "when it can't sign in");
     }
 
     /// One that greets with BYE, as for too many connections, isn't up.
