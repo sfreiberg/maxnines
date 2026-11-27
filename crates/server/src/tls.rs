@@ -76,16 +76,18 @@ fn keep_certificate_current(
     mut seen: FileTimes,
 ) {
     tokio::spawn(async move {
-        let times = || file_times(&certificate, &key);
         loop {
             tokio::time::sleep(every).await;
-            if times() == seen {
+            // Taken before reading, as the first load does, so a file replaced while
+            // it's read is read again next time.
+            let now = file_times(&certificate, &key);
+            if now == seen {
                 continue;
             }
             match load_certificate(&certificate, &key) {
                 Ok(config) => {
                     serving.reload_from_config(Arc::new(config));
-                    seen = times();
+                    seen = now;
                     info!("loaded a new certificate");
                 }
                 Err(error) => {
