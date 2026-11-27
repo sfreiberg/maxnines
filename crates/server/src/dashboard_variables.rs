@@ -88,7 +88,7 @@ impl Variable {
     pub fn check(&self) -> Result<(), String> {
         let name = &self.name;
         let starts_with_letter = name.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
-        let well_formed = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        let well_formed = name.chars().all(is_name_char);
         if !starts_with_letter || !well_formed {
             return Err(
                 "A variable's name starts with a letter, and has only letters, digits and _."
@@ -173,14 +173,53 @@ pub fn uses(filter: &str) -> Vec<&str> {
         .collect()
 }
 
-/// A filter can only use variables the dashboard has.
-pub fn check_uses(filter: &str, variables: &[Variable]) -> Result<(), String> {
-    for name in uses(filter) {
+/// Whether a character can be in a variable's name: letters, digits and _.
+fn is_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Each `$` in a title, with the whole run of name characters after it, which may
+/// be empty, and where the `$` is.
+fn dollars(title: &str) -> impl Iterator<Item = (usize, &str)> {
+    title.match_indices('$').map(move |(at, _)| {
+        let after = &title[at + 1..];
+        let length = after
+            .find(|c: char| !is_name_char(c))
+            .unwrap_or(after.len());
+        (at, &after[..length])
+    })
+}
+
+/// The variables a title mentions, as `$host`: a `$` and a name, which starts with
+/// a letter, so a price such as `$5` isn't one.
+pub fn title_uses(title: &str) -> Vec<&str> {
+    dollars(title)
+        .map(|(_, name)| name)
+        .filter(|name| name.starts_with(|c: char| c.is_ascii_alphabetic()))
+        .collect()
+}
+
+/// A filter or title can only use variables the dashboard has.
+fn check_names<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    variables: &[Variable],
+) -> Result<(), String> {
+    for name in names {
         if !variables.iter().any(|variable| variable.name == name) {
             return Err(format!("This dashboard has no variable called ${name}."));
         }
     }
     Ok(())
+}
+
+/// A filter can only use variables the dashboard has.
+pub fn check_uses(filter: &str, variables: &[Variable]) -> Result<(), String> {
+    check_names(uses(filter), variables)
+}
+
+/// A title can only mention variables the dashboard has.
+pub fn check_title_uses(title: &str, variables: &[Variable]) -> Result<(), String> {
+    check_names(title_uses(title), variables)
 }
 
 /// Something a picker offers.
@@ -439,20 +478,17 @@ impl Picks {
     /// `$hostname` or `$host_two`, and one that isn't a variable, or that's in what
     /// was picked, is left as it is.
     pub fn fill_title(&self, title: &str) -> String {
-        let is_name = |c: char| c.is_ascii_alphanumeric() || c == '_';
         let mut filled = String::with_capacity(title.len());
-        let mut rest = title;
-        while let Some(at) = rest.find('$') {
-            filled.push_str(&rest[..at]);
-            let after = &rest[at + 1..];
-            let length = after.find(|c: char| !is_name(c)).unwrap_or(after.len());
-            match self.0.get(&after[..length]) {
-                Some((_, pick)) => filled.push_str(pick.label()),
-                None => filled.push_str(&rest[at..=at + length]),
+        let mut done = 0;
+        for (at, name) in dollars(title) {
+            let end = at + 1 + name.len();
+            if let Some((_, pick)) = self.0.get(name) {
+                filled.push_str(&title[done..at]);
+                filled.push_str(pick.label());
+                done = end;
             }
-            rest = &after[length..];
         }
-        filled.push_str(rest);
+        filled.push_str(&title[done..]);
         filled
     }
 }
@@ -609,6 +645,19 @@ mod tests {
             "$hostname on costs $env, $host_two in live: 5$"
         );
         assert_eq!(picks.fill_title("$host$env é$"), "costs $envlive é$");
+    }
+
+    #[test]
+    fn a_title_can_only_mention_the_dashboards_variables() {
+        assert_eq!(
+            title_uses("$host costs $5, $ or $env_2$x"),
+            ["host", "env_2", "x"]
+        );
+        assert!(check_title_uses("CPU on $host at $5", &[host()]).is_ok());
+        assert_eq!(
+            check_title_uses("CPU on $host_load", &[host()]),
+            Err("This dashboard has no variable called $host_load.".to_string())
+        );
     }
 
     #[test]

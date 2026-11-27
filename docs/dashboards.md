@@ -31,10 +31,12 @@ with a `$` in front:
 | `os=linux` | Every Linux host, whatever's picked. |
 
 A widget's title can mention a variable the same way, as in `CPU on $host`, and
-shows what's picked.
+shows what's picked. A name is all the letters, digits and `_` after the `$`, so
+`$host_load` is a variable of its own, not `$host` with `_load` after it. A `$` with
+a digit after it, as in `$5 a month`, is only a `$`.
 
 What's picked is kept in the page's address, so a link to a dashboard opens on the
 same host. Changing the time range keeps it too.
 
 A variable that a widget uses can't be removed or renamed until the widget's filter
-stops using it, and a widget can only use the variables its dashboard has.
+and title stop using it, and a widget can only use the variables its dashboard has.

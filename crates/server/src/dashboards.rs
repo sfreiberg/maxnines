@@ -9,7 +9,9 @@ use tracing::warn;
 use crate::app_state::AppState;
 use crate::calculations::{self, Grouping, Question};
 use crate::catalog::Catalog;
-use crate::dashboard_variables::{Picks, Variable, check_uses, check_variables, uses};
+use crate::dashboard_variables::{
+    Picks, Variable, check_title_uses, check_uses, check_variables, title_uses, uses,
+};
 use crate::metric_charts::{self, Chart, Frame, MAX_SERIES};
 use crate::metrics::TimeRange;
 
@@ -151,15 +153,14 @@ impl WidgetInput {
         }
     }
 
-    /// The error says what's wrong, to show whoever chose it. Its filter can only use
-    /// the dashboard's `variables`.
+    /// The error says what's wrong, to show whoever chose it. Its filter and title
+    /// can only use the dashboard's `variables`.
     pub fn check(&self, catalog: &Catalog, variables: &[Variable]) -> Result<(), String> {
-        if self
-            .title
-            .as_ref()
-            .is_some_and(|title| title.chars().count() > MAX_NAME_LEN)
-        {
-            return Err(format!("A title can be up to {MAX_NAME_LEN} characters."));
+        if let Some(title) = &self.title {
+            if title.chars().count() > MAX_NAME_LEN {
+                return Err(format!("A title can be up to {MAX_NAME_LEN} characters."));
+            }
+            check_title_uses(title, variables)?;
         }
         if !KINDS.contains(&self.kind.as_str()) {
             return Err("Choose a kind of widget.".to_string());
@@ -225,22 +226,25 @@ impl Dashboard {
     /// The error names a widget that uses one that would be gone.
     pub fn check_variables(&self, variables: &[Variable]) -> Result<(), String> {
         check_variables(variables)?;
-        for widget in &self.widgets {
-            let used = widget.input.filter.as_deref().map(uses);
-            if let Some(name) = used
+        let missing = |names: Vec<&str>| {
+            names
                 .into_iter()
-                .flatten()
                 .find(|name| !variables.iter().any(|variable| variable.name == *name))
-            {
-                let title = widget
-                    .input
-                    .title
-                    .as_deref()
-                    .unwrap_or(&widget.input.metric);
-                return Err(format!(
-                    "The widget \u{201c}{title}\u{201d} uses ${name}. Change its filter first."
-                ));
-            }
+                .map(str::to_string)
+        };
+        for widget in &self.widgets {
+            let input = &widget.input;
+            let in_filter = input.filter.as_deref().map(uses).and_then(missing);
+            let in_title = input.title.as_deref().map(title_uses).and_then(missing);
+            let (name, what) = match (in_filter, in_title) {
+                (Some(name), _) => (name, "filter"),
+                (None, Some(name)) => (name, "title"),
+                (None, None) => continue,
+            };
+            let title = input.title.as_deref().unwrap_or(&input.metric);
+            return Err(format!(
+                "The widget \u{201c}{title}\u{201d} uses ${name}. Change its {what} first."
+            ));
         }
         Ok(())
     }
@@ -483,6 +487,15 @@ mod tests {
             widget.check(&Catalog::built_in(), &[]),
             Err("This dashboard has no variable called $host.".to_string())
         );
+        // A title the same way, by whole names.
+        let mut widget = input();
+        widget.title = Some("Load on $host, $5 a month".to_string());
+        assert!(widget.check(&Catalog::built_in(), &[host()]).is_ok());
+        widget.title = Some("Load on $host_load".to_string());
+        assert_eq!(
+            widget.check(&Catalog::built_in(), &[host()]),
+            Err("This dashboard has no variable called $host_load.".to_string())
+        );
     }
 
     #[test]
@@ -503,6 +516,17 @@ mod tests {
         assert_eq!(
             dashboard.check_variables(&[]),
             Err("The widget \u{201c}Busy\u{201d} uses $host. Change its filter first.".to_string())
+        );
+        let mut dashboard = dashboard;
+        let widget = &mut dashboard.widgets[0].input;
+        widget.title = Some("Busy on $host".to_string());
+        widget.filter = None;
+        assert_eq!(
+            dashboard.check_variables(&[]),
+            Err(
+                "The widget \u{201c}Busy on $host\u{201d} uses $host. Change its title first."
+                    .to_string()
+            )
         );
     }
 
