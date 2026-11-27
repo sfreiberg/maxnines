@@ -657,29 +657,23 @@ fn interval(raw: &[u8]) -> Option<f64> {
     Some(micros as f64 / 1e6 + f64::from(days) * 86_400.0 + f64::from(months) * 30.0 * 86_400.0)
 }
 
+/// One statement, read-only as the whole session is, with no transaction of its own
+/// to commit or roll back, as MySQL counts both, and a template reads those counts.
 async fn run_mysql(connection: &mut mysql_async::Conn, sql: &str) -> Result<Vec<Row>> {
     use mysql_async::prelude::Queryable;
     // MySQL takes only some SHOW statements prepared, such as not SHOW WARNINGS,
     // and MariaDB before 10.6 fewer, so a SHOW goes as plain text, which runs every
-    // statement it's given: one with a `;` before its end could end the read-only
-    // transaction and run another.
+    // statement it's given: one with a `;` before its end could run another.
     let show = is_show(sql);
     let sql = sql.trim_end().trim_end_matches(';');
     if show && sql.contains(';') {
         bail!("a SHOW statement can't have a ; before its end");
     }
-    connection
-        .query_drop("START TRANSACTION READ ONLY")
-        .await
-        .map_err(short)?;
-    let outcome: Result<Vec<mysql_async::Row>> = match show {
+    let read: Vec<mysql_async::Row> = match show {
         true => connection.query(sql).await,
         false => connection.exec(sql, ()).await,
     }
-    .map_err(mysql_statement);
-    let ended = connection.query_drop("ROLLBACK").await.map_err(short);
-    let read = outcome?;
-    ended?;
+    .map_err(mysql_statement)?;
     Ok(read.into_iter().map(mysql_row).collect())
 }
 
@@ -1202,6 +1196,47 @@ mod tests {
         });
         let error = nowhere.run("SELECT 1", LIMIT).await.unwrap_err();
         assert!(!error.is::<Answered>(), "{error:#}");
+    }
+
+    /// This session's commits and rollbacks, as MySQL counts them.
+    async fn mysql_counts(session: &mut Session) -> Vec<Vec<Row>> {
+        let mut both = Vec::new();
+        for name in ["Com_rollback", "Com_commit"] {
+            let sql = format!("SHOW SESSION STATUS LIKE '{name}'");
+            both.push(session.run(&sql, LIMIT).await.unwrap());
+        }
+        both
+    }
+
+    /// Reading adds nothing to MySQL's own counts of commits and rollbacks, which a
+    /// template reads. A real one, from `MAXNINES_TEST_CHECK_MYSQL`, as `host:port
+    /// username [password]`.
+    #[tokio::test]
+    async fn reading_mysql_neither_commits_nor_rolls_back() {
+        let Ok(value) = std::env::var("MAXNINES_TEST_CHECK_MYSQL") else {
+            return;
+        };
+        let mut words = value.split_whitespace();
+        let target = words.next().unwrap();
+        let mut session = Session::new(Database {
+            check: maxnines_protocol::Check::new("real", CheckKind::Mysql, target),
+            credentials: Credentials {
+                username: words.next().map(String::from),
+                password: words.next().map(String::from),
+                private_key: None,
+            },
+        });
+        let before = mysql_counts(&mut session).await;
+        for _ in 0..3 {
+            session.run("SELECT 1", LIMIT).await.unwrap();
+        }
+        assert_eq!(mysql_counts(&mut session).await, before);
+        // Still read-only.
+        let error = session
+            .run("SELECT * FROM mysql.user FOR UPDATE", LIMIT)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("READ ONLY"), "{error:#}");
     }
 
     /// A real MongoDB, from `MAXNINES_TEST_CHECK_MONGODB`, as `host:port [username

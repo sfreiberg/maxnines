@@ -254,12 +254,12 @@ ships it turned off.
 
 **How SQL runs.** Each discover block has to be one `SELECT`, and each query one
 `SELECT` or [`SHOW`](#show-statements), which saving checks. It
-runs on its own, as a prepared statement, in a read-only transaction, and the database
-stops it after 5 seconds. On PostgreSQL a statement that worked commits its
-transaction, as nothing in it could write, so PostgreSQL's own count of rollbacks
-isn't one for each statement a template runs; MySQL's is rolled back. On MySQL and
-MariaDB the whole session is read-only too, as MySQL ends a transaction before
-anything that changes a table. ClickHouse is asked over HTTP, where every statement is
+runs on its own, as a prepared statement, read-only, and the database stops it after
+5 seconds. On PostgreSQL it's in a read-only transaction, and one that worked commits
+it, as nothing in it could write, so PostgreSQL's own count of rollbacks isn't one for
+each statement a template runs. On MySQL and MariaDB the whole session is read-only,
+so a statement runs with no transaction of its own, and adds nothing to their counts
+of commits and rollbacks. ClickHouse is asked over HTTP, where every statement is
 a GET, which it only lets read, and it's sent a 5 second limit too, unless its account
 is set to `readonly = 1`, which can't be sent settings, so its [profile's
 limit](collectors-clickhouse.md#the-account-to-sign-in-as) stands instead. A template
