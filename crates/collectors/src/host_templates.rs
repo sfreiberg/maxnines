@@ -76,7 +76,9 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
         Instances::Labelled(_) | Instances::Pattern(_)
     );
 
-    // Every instance any metric's counter has, in order.
+    // Every instance any metric's counter has, by name, so which are kept past the
+    // most there can be is the same from one read to the next, whatever order
+    // Windows gives them in.
     let mut names: Vec<&String> = Vec::new();
     let mut listed = HashSet::new();
     for metric in &work.metrics {
@@ -86,6 +88,7 @@ pub fn rows(work: &CountersWork, readings: &Readings, totals: &mut Totals) -> Ve
             }
         }
     }
+    names.sort();
     // Each counter's value by instance, looked up once for every instance and metric.
     let mut values: HashMap<&str, HashMap<&str, f64>> = HashMap::new();
     for (counter, read) in &readings.counters {

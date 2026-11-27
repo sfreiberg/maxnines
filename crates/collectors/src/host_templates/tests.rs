@@ -63,6 +63,33 @@ fn each_instance_is_labelled_by_its_name_leaving_out_the_total_and_those_exclude
     );
 }
 
+/// Past the most series there can be, the same instances are kept each read,
+/// whatever order Windows gives them in.
+#[test]
+fn past_the_most_instances_the_same_are_kept_each_read() {
+    let work = block(
+        Instances::Labelled("site".to_string()),
+        vec![metric("connections", "Current Connections")],
+    );
+    let names: Vec<String> = (0..MAX_INSTANCES + 3)
+        .map(|n| format!("site{n:03}"))
+        .collect();
+    let read = |names: &[String]| {
+        let values: Vec<(&str, f64)> = names.iter().map(|name| (name.as_str(), 1.0)).collect();
+        rows(
+            &work,
+            &readings(&[("Current Connections", &values)]),
+            &mut Totals::default(),
+        )
+    };
+    let mut reversed = names.clone();
+    reversed.reverse();
+    let forwards = read(&names);
+    assert_eq!(forwards.len(), MAX_INSTANCES);
+    assert_eq!(forwards, read(&reversed));
+    assert_eq!(forwards[0]["labels"]["site"], "site000");
+}
+
 #[test]
 fn a_pattern_labels_by_its_groups_and_same_labels_add_up_or_take_the_highest() {
     let work = block(
