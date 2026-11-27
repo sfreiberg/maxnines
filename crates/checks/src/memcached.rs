@@ -4,8 +4,10 @@
 //! started, the share of reads it had the key for and how many keys it evicted to
 //! make room.
 //!
-//! Memcached only signs in with SASL over its binary protocol, which the check
-//! doesn't speak, so it never signs in. It can connect over TLS, which Memcached
+//! The check never signs in. A Memcached with a password file answers `stats` by
+//! saying it's unauthenticated, which still shows it's Memcached and answering, so
+//! it's up with nothing more to report. One with SASL only signs in over its binary
+//! protocol, which the check doesn't speak. It can connect over TLS, which Memcached
 //! offers when started with it.
 
 use std::collections::HashMap;
@@ -34,12 +36,19 @@ pub(crate) async fn check_memcached(check: &Check, findings: &mut Findings) -> R
     } else {
         stats(socket).await?
     };
-    read(&stats, findings);
+    if let Some(stats) = stats {
+        read(&stats, findings);
+    }
     Ok(())
 }
 
-/// Asks for the stats, then leaves.
-async fn stats<S: AsyncRead + AsyncWrite + Unpin>(stream: S) -> Result<HashMap<String, String>> {
+/// Memcached's answer to a command before signing in, when it wants a login.
+const UNAUTHENTICATED: &str = "CLIENT_ERROR unauthenticated";
+
+/// Asks for the stats, then leaves. None from a Memcached that wants a login.
+async fn stats<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: S,
+) -> Result<Option<HashMap<String, String>>> {
     let mut reader = BufReader::new(stream);
     reader.get_mut().write_all(b"stats\r\n").await?;
     let mut stats = HashMap::new();
@@ -50,6 +59,10 @@ async fn stats<S: AsyncRead + AsyncWrite + Unpin>(stream: S) -> Result<HashMap<S
         let line = line.trim_end();
         if line == "END" {
             break;
+        }
+        if stats.is_empty() && line == UNAUTHENTICATED {
+            let _ = reader.get_mut().write_all(b"quit\r\n").await;
+            return Ok(None);
         }
         if line.starts_with("SERVER_ERROR") || line.starts_with("CLIENT_ERROR") || line == "ERROR" {
             bail!(NOT_MEMCACHED);
@@ -66,7 +79,7 @@ async fn stats<S: AsyncRead + AsyncWrite + Unpin>(stream: S) -> Result<HashMap<S
     // Its version is in every Memcached's stats, so without it this is something else.
     ensure!(stats.contains_key("version"), NOT_MEMCACHED);
     let _ = reader.get_mut().write_all(b"quit\r\n").await;
-    Ok(stats)
+    Ok(Some(stats))
 }
 
 fn read(stats: &HashMap<String, String>, findings: &mut Findings) {
@@ -187,6 +200,14 @@ mod tests {
         let result = run(&check(fake(fresh, false).await, false)).await;
         assert_eq!(result["up"], 1, "{result}");
         assert!(result.get("hit_rate_percent").is_none(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn a_memcached_that_wants_a_login_is_up_with_nothing_more_to_say() {
+        let answer = "CLIENT_ERROR unauthenticated\r\n";
+        let result = run(&check(fake(answer, false).await, false)).await;
+        assert_eq!(result["up"], 1, "{result}");
+        assert!(result.get("server_version").is_none(), "{result}");
     }
 
     #[tokio::test]

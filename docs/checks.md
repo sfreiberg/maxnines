@@ -106,9 +106,10 @@ A check keeps nothing between runs, so the hit rate and evictions are since Memc
 last started, not since the last run. A sudden drop in the hit rate shows best on a
 Memcached that's been up a while.
 
-It never signs in: Memcached only does that with SASL over its binary protocol, which
-the check doesn't speak, so a Memcached that needs it doesn't answer `stats` and
-counts as down. Tick **Use TLS from the start** for a Memcached started with TLS
+It never signs in. A Memcached started with a password file (`-Y`) answers that it
+wants a login, which shows it's up, with nothing more to report. One that only signs
+in with SASL (`-S`) does so over its binary protocol, which the check doesn't speak,
+so it doesn't answer `stats` and counts as down. Tick **Use TLS from the start** for a Memcached started with TLS
 (`-Z`), and its certificate is read as a website's is.
 
 ## FTP and FTPS
