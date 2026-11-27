@@ -223,9 +223,11 @@ fn parse_output(text: &str) -> (String, BTreeMap<String, f64>) {
     }
     let mut values = BTreeMap::new();
     for chunk in data {
+        // A label given twice, as from unquoted spaces the guidelines don't allow,
+        // keeps its first value rather than the two being mixed up as one series.
         for (label, value) in performance_data(chunk) {
             if values.len() < MAX_VALUES {
-                values.insert(label, value);
+                values.entry(label).or_insert(value);
             }
         }
     }
@@ -270,8 +272,10 @@ fn performance_data(text: &str) -> Vec<(String, f64)> {
                 }
             }
         };
+        // A quoted label with no value is left out on its own, as a word is.
         let Some(after) = after.strip_prefix('=') else {
-            break;
+            rest = after.trim_start();
+            continue;
         };
         let end = after.find(char::is_whitespace).unwrap_or(after.len());
         let field = &after[..end];
@@ -361,7 +365,15 @@ mod tests {
             values,
             [("pl".to_string(), 5.0), ("rta".to_string(), 0.0001)]
         );
+        let values = performance_data("'some note' pl=5%");
+        assert_eq!(values, [("pl".to_string(), 5.0)]);
         assert!(performance_data("no values here").is_empty());
+        // Unquoted spaces give one label twice, which keeps its first value.
+        let (_, values) = parse_output("OK | Total Memory=5MB Free Memory=3MB");
+        assert_eq!(
+            values,
+            BTreeMap::from([("Memory".to_string(), 5.0 * 1024.0 * 1024.0)])
+        );
     }
 
     #[test]
