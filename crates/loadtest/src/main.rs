@@ -657,7 +657,7 @@ async fn run(options: Options) -> Result<Outcome> {
             for id in &ids {
                 if let Err(error) = client.revoke(id) {
                     failed.0 += 1;
-                    failed.1.get_or_insert(format!("{error:#}"));
+                    failed.1.get_or_insert_with(|| format!("{error:#}"));
                 }
             }
             failed
