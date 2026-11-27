@@ -753,13 +753,14 @@ impl CheckKind {
         };
         match self {
             Self::Ssh => Some(SignInNeeds { key: true, ..both }),
-            Self::Mongodb
-            | Self::Clickhouse
-            | Self::Smtp
-            | Self::Imap
-            | Self::Pop3
-            | Self::Ftp
-            | Self::Ldap => Some(both),
+            // Its password goes as basic authentication, in plain HTTP without TLS.
+            Self::Clickhouse => Some(SignInNeeds {
+                password_in_clear: true,
+                ..both
+            }),
+            Self::Mongodb | Self::Smtp | Self::Imap | Self::Pop3 | Self::Ftp | Self::Ldap => {
+                Some(both)
+            }
             // Either can let an account in without a password, as over the socket.
             Self::Postgres => Some(SignInNeeds {
                 password: false,

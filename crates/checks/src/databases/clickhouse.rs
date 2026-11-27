@@ -106,8 +106,7 @@ impl Clickhouse {
         let password = credentials.password.as_deref().filter(|p| !p.is_empty());
         ensure!(
             password.is_none() || tls || is_loopback(&host),
-            "a password is only sent over plain HTTP to the host itself, so set tls for \
-             one elsewhere"
+            crate::sign_in::TLS_NEEDED_ELSEWHERE
         );
         let login = match (credentials.username.as_deref(), password) {
             (Some(username), password) => Some(Login::new(username, password.unwrap_or(""))?),

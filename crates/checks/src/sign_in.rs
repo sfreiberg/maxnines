@@ -716,6 +716,15 @@ mod tests {
             login(CheckKind::Ldap, &alone),
             Err("signing in needs a password".to_string())
         );
+        // ClickHouse's password goes in plain HTTP without TLS, so it's turned down
+        // when a check is saved, rather than every time it runs.
+        let elsewhere = Check::new("ch", CheckKind::Clickhouse, "db.example.com:8123");
+        assert_eq!(
+            sign_in_problem(&elsewhere, true, true),
+            Some(TLS_NEEDED_ELSEWHERE)
+        );
+        let here = Check::new("ch", CheckKind::Clickhouse, "127.0.0.1:8123");
+        assert_eq!(sign_in_problem(&here, true, true), None);
     }
 
     /// Made for these tests with ssh-keygen, and used for nothing else.
