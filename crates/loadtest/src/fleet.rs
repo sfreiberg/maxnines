@@ -65,6 +65,8 @@ pub struct Plan {
     pub facts_every: Duration,
     pub fact_change_percent: f64,
     pub hot_percent: f64,
+    /// How often the run's rule change has facts reported.
+    pub changed_facts_interval: Duration,
     pub counters: Counters,
 }
 
@@ -184,9 +186,13 @@ pub struct SimulatedAgent {
     changed: bool,
 }
 
-/// How often the load test's rule change has facts reported, which no rule is
-/// likely to have already, so every agent's config changes and it can be told.
-pub const CHANGED_FACTS_INTERVAL: Duration = Duration::from_secs(3593);
+/// How often a run's rule change has facts reported: an odd number of seconds no
+/// rule is likely to have already, picked afresh for each run, so every agent's
+/// config changes and it can be told, even with a rule left by a run that was
+/// stopped part way.
+pub fn changed_facts_interval() -> Duration {
+    Duration::from_secs(3001 + 2 * rand::random_range(0..500))
+}
 
 impl SimulatedAgent {
     pub fn new(index: usize, identity: Identity, hostname: String, plan: &Plan) -> Self {
@@ -313,7 +319,7 @@ impl SimulatedAgent {
                                     .push(began.elapsed());
                             }
                             // Once for each agent, however often it reconnects.
-                            if !self.changed && config.facts_interval == CHANGED_FACTS_INTERVAL {
+                            if !self.changed && config.facts_interval == plan.changed_facts_interval {
                                 self.changed = true;
                                 counters.changed_configs.fetch_add(1, Relaxed);
                             }
@@ -457,6 +463,7 @@ mod tests {
             facts_every: Duration::from_secs(3600),
             fact_change_percent: 0.0,
             hot_percent: 0.0,
+            changed_facts_interval: changed_facts_interval(),
             counters: Counters::default(),
         };
         let identity = Identity::from_pkcs8(&Identity::generate().unwrap()).unwrap();

@@ -299,8 +299,9 @@ async fn run_rule_change(
 
     let saved = {
         let added = added.clone();
+        let facts = plan.changed_facts_interval;
         tokio::task::spawn_blocking(move || {
-            let facts = fleet::CHANGED_FACTS_INTERVAL.as_secs();
+            let facts = facts.as_secs();
             let settings = json!({ "facts_interval_secs": facts });
             let id = server.add_rule_over_all("Load test rule change", settings)?;
             *lock(&added) = Some(id);
@@ -502,6 +503,7 @@ async fn run(options: Options) -> Result<Outcome> {
         facts_every: options.facts_every,
         fact_change_percent: options.fact_changes,
         hot_percent: options.hot_agents,
+        changed_facts_interval: fleet::changed_facts_interval(),
         counters: Counters::default(),
     });
     let measurements = Arc::new(Measurements {
