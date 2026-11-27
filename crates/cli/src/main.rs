@@ -339,15 +339,17 @@ fn connect(folder: &Path, name: Option<&str>) -> Result<Api> {
 const REVOKE_BY_HAND: &str = "Revoke it in MaxNines under Settings, then Signed-in apps.";
 
 /// What a context for `server` is called when the sign-in doesn't say: the one it
-/// already has, whatever it's called, the current one first if there are two, so
-/// signing in again replaces its sign-in rather than leaving it beside a new one.
+/// already signs in to, whatever it's called, the current one first if there are
+/// two, so signing in again replaces its sign-in rather than leaving it beside a new
+/// one. One that uses an API key is never taken, as signing in would drop its key.
 /// A new one is its short name, or with `-2`, `-3` and so on after it if a context
 /// of another server has that, so signing in to one server never takes the place
 /// of another's.
 fn context_name(config: &Config, server: &Server) -> String {
     let is_this_server = |name: &str| {
         config.contexts.get(name).is_some_and(|context| {
-            Server::parse(&context.server).is_ok_and(|theirs| theirs.root == server.root)
+            context.key_env.is_none()
+                && Server::parse(&context.server).is_ok_and(|theirs| theirs.root == server.root)
         })
     };
     let mut names = config.current.iter().chain(config.contexts.keys());
@@ -927,6 +929,29 @@ mod tests {
         assert_eq!(context_name(&config, &server), "old");
         config.current = Some("work".to_string());
         assert_eq!(context_name(&config, &server), "work");
+    }
+
+    #[test]
+    fn signing_in_never_takes_a_context_that_uses_an_api_key() {
+        let mut config = Config::default();
+        config.contexts.insert(
+            "ci".to_string(),
+            config::Context {
+                server: "https://monitor.example.com".to_string(),
+                key_env: Some("MAXNINES_KEY".to_string()),
+            },
+        );
+        config.current = Some("ci".to_string());
+        let server = Server::parse("https://monitor.example.com").unwrap();
+        assert_eq!(context_name(&config, &server), "monitor");
+        config.contexts.insert(
+            "monitor".to_string(),
+            config::Context {
+                server: "https://monitor.example.com".to_string(),
+                key_env: None,
+            },
+        );
+        assert_eq!(context_name(&config, &server), "monitor");
     }
 
     #[test]

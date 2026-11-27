@@ -71,7 +71,8 @@ for a machine without a browser. The code works for as long as the server says, 
 a network that drops while you type it only means maxnines asks again.
 
 Each server is a context, by name. Signing in to a server without naming a context
-uses the one it already has, whatever it's called. A new one is named after the first
+uses the one it already has, whatever it's called, other than one that uses an API
+key, which signing in would take its key from. A new one is named after the first
 part of the server's name, such as `monitor` for `monitor.example.com`, with `-2`, `-3`
 and so on after it when another server's context has that. The last one signed in to
 is the one used, until
