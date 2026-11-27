@@ -8,7 +8,7 @@ and Telegram tokens, mail server passwords and Resend API keys can be set but ne
 | --- | --- |
 | `name` | Required. No two channels can have the same name, ignoring case, or saving gives `422` |
 | `kind` | Required. `webhook`, `custom_webhook`, `email`, `resend`, `discord`, `slack`, `teams`, `pagerduty`, `alertops`, `signl4` or `telegram` |
-| `target` | Required. A webhook's address, a Teams workflow's URL, email addresses separated by commas for email and Resend, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
+| `target` | Required, except when changing a channel. A webhook's address, a Teams workflow's URL, email addresses separated by commas for email and Resend, a Slack channel, a PagerDuty integration key, the URL from AlertOps or SIGNL4, or a Telegram chat ID such as `-1001234567890` or `@channel` |
 | `credential` | Slack's or Telegram's bot token, the mail server's password for email, the API key for Resend, or a custom webhook's headers, one to a line as `Name: value` |
 | `mail` | Email and Resend only. See below |
 | `request` | Custom webhooks only, and required for them. See below |
@@ -117,7 +117,13 @@ curl -H "Authorization: Bearer $MAXNINES_API_KEY" \
 
 `PUT /api/v1/notification-channels/{id}`
 
-Replaces the whole channel, including its target and credential.
+Replaces the channel with the one sent, except what's never read back. Leaving out
+`target`, `credential` or `app_token` keeps the one saved, as leaving its box empty on
+the page does, so a channel read from the API can be sent back changed. A credential
+is only kept while the channel is the same kind and it would go to the same place:
+the same mail server, port and security for email, and a custom webhook's URL on the
+same server, or it has to be given again. An empty `credential` or `app_token` removes
+it.
 
 ```sh
 curl -X PUT -H "Authorization: Bearer $MAXNINES_API_KEY" \

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::{CsrfForm, Page, server_error};
 use crate::alerting::{
     self, Channel, ChannelInput, ChannelKind, Mail, MailSecurity, MailServer, NameTaken,
-    PagerDutyRegion, Severity, WebhookMethod, WebhookRequest,
+    PagerDutyRegion, Severity, WebhookMethod, WebhookRequest, same_destination,
 };
 use crate::app_state::AppState;
 use crate::channels;
@@ -266,19 +266,8 @@ impl ChannelForm {
             .is_some_and(|server| server.username.is_some());
         let typed = self.typed_credential(kind);
         // A saved password or header only ever goes back where it went.
-        let same_place = |saved: &ChannelInput| match kind {
-            ChannelKind::Email => {
-                let server = |mail: Option<&Mail>| {
-                    mail.and_then(|mail| mail.server.as_ref()).map(|server| {
-                        let hostname = server.hostname.to_ascii_lowercase();
-                        (hostname, server.port, server.security)
-                    })
-                };
-                server(saved.mail.as_ref()) == server(mail.as_ref())
-            }
-            ChannelKind::CustomWebhook => crate::destinations::same_place(&saved.target, &target),
-            _ => true,
-        };
+        let same_place =
+            |saved: &ChannelInput| same_destination(saved, kind, &target, mail.as_ref());
         let credential = match saved {
             _ if !kind.has_credential() => None,
             _ if kind == ChannelKind::Email && !signs_in => None,

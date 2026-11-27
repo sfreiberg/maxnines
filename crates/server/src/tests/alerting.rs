@@ -3892,6 +3892,57 @@ async fn a_pagerduty_key_is_set_but_never_shown_again() {
 }
 
 #[tokio::test]
+async fn a_change_through_the_api_keeps_a_channels_secrets_as_the_page_does() {
+    let server = start().await;
+    let body = json!({
+        "name": "Hooks", "kind": "custom_webhook", "target": "https://hooks.example.com/T0K3N",
+        "credential": "Authorization: Bearer s3cret",
+        "request": { "content_type": "application/json", "body": "{}" },
+    });
+    let (status, made) = api(&server, "POST", "/api/v1/notification-channels", &body).await;
+    assert_eq!(status, 201, "{made}");
+    let id = made["id"].as_i64().unwrap();
+    let path = format!("/api/v1/notification-channels/{id}");
+    let saved = || async {
+        server
+            .state
+            .database
+            .get_channel(id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+
+    // Renamed with what a read gives back, which has neither.
+    let renamed = json!({
+        "name": "Hooks for ops", "kind": "custom_webhook",
+        "request": { "content_type": "application/json", "body": "{}" },
+    });
+    assert_eq!(api(&server, "PUT", &path, &renamed).await.0, 204);
+    let channel = saved().await.channel;
+    assert_eq!(channel.name, "Hooks for ops");
+    assert_eq!(channel.target, "https://hooks.example.com/T0K3N");
+    assert_eq!(
+        channel.credential.as_deref(),
+        Some("Authorization: Bearer s3cret")
+    );
+
+    // Never for another server.
+    let mut moved = renamed.clone();
+    moved["target"] = json!("https://hooks.evil.example/x");
+    assert_eq!(api(&server, "PUT", &path, &moved).await.0, 204);
+    assert_eq!(saved().await.channel.credential, None);
+
+    // An empty one removes it.
+    let mut with = renamed.clone();
+    with["credential"] = json!("X-Key: 1");
+    assert_eq!(api(&server, "PUT", &path, &with).await.0, 204);
+    with["credential"] = json!("");
+    assert_eq!(api(&server, "PUT", &path, &with).await.0, 204);
+    assert_eq!(saved().await.channel.credential, None);
+}
+
+#[tokio::test]
 async fn a_pagerduty_key_has_to_look_like_one() {
     let server = start().await;
     for target in ["too-short", "has spaces in it and is 32 long..", ""] {

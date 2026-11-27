@@ -866,12 +866,69 @@ pub struct ChannelInput {
     pub region: Option<PagerDutyRegion>,
 }
 
+/// Whether a secret saved for `saved` would go to the same place if kept for a
+/// channel of `kind` sent to `target` through `mail`: the same mail server, or a
+/// custom webhook on the same server. Every other kind's secret only ever goes to
+/// its own service.
+pub fn same_destination(
+    saved: &ChannelInput,
+    kind: ChannelKind,
+    target: &str,
+    mail: Option<&Mail>,
+) -> bool {
+    match kind {
+        ChannelKind::Email => {
+            let server = |mail: Option<&Mail>| {
+                mail.and_then(|mail| mail.server.as_ref()).map(|server| {
+                    let hostname = server.hostname.to_ascii_lowercase();
+                    (hostname, server.port, server.security)
+                })
+            };
+            server(saved.mail.as_ref()) == server(mail)
+        }
+        ChannelKind::CustomWebhook => crate::destinations::same_place(&saved.target, target),
+        _ => true,
+    }
+}
+
+impl ChannelInput {
+    /// A change through the API: what it leaves out keeps what's saved, as the page
+    /// does, while it's the same kind and a secret goes to the same place. An empty
+    /// `credential` or `app_token` removes it.
+    pub fn keeping_secrets_of(mut self, saved: &ChannelInput) -> Self {
+        let same_kind = saved.kind == self.kind;
+        if same_kind && self.target.trim().is_empty() {
+            self.target.clone_from(&saved.target);
+        }
+        // A mail server's password only goes with a username.
+        let signs_in = self.kind != ChannelKind::Email
+            || self
+                .mail
+                .as_ref()
+                .and_then(|mail| mail.server.as_ref())
+                .is_some_and(|server| server.username.is_some());
+        let keep = same_kind
+            && signs_in
+            && same_destination(saved, self.kind, &self.target, self.mail.as_ref());
+        let kept = |given: Option<String>, saved: &Option<String>| match given {
+            None if keep => saved.clone(),
+            Some(given) if given.is_empty() => None,
+            given => given,
+        };
+        self.credential = kept(self.credential, &saved.credential);
+        self.app_token = kept(self.app_token, &saved.app_token);
+        self
+    }
+}
+
 /// A channel as it's sent in, where which alerts it takes can be left out, as what
 /// that means depends on its kind.
 #[derive(Deserialize)]
 struct ChannelFields {
     name: String,
     kind: ChannelKind,
+    /// Left out of a change, the saved one is kept.
+    #[serde(default)]
     target: String,
     credential: Option<String>,
     app_token: Option<String>,

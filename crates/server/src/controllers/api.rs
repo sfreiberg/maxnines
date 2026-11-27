@@ -2403,6 +2403,11 @@ async fn update_channel(
     UrlPath(id): UrlPath<i64>,
     Json(input): Json<ChannelInput>,
 ) -> Response {
+    let input = match state.database.get_channel(id).await {
+        Ok(Some(saved)) => input.keeping_secrets_of(&saved.channel),
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return server_error(&error),
+    };
     if let Err(error) = alerting::check_channel(&input) {
         return refused(&error);
     }
