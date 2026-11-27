@@ -193,12 +193,12 @@ impl std::fmt::Display for Closed {
 
 impl std::error::Error for Closed {}
 
-/// What a check without TLS says of a server that hung up on its first request
-/// without answering it, which is what a port that only takes TLS does.
 /// Why a server that said it can't take a login just now says nothing about the
 /// login, which a temporary refusal never does.
 pub(crate) const BUSY: &str = "it's too busy, or unavailable";
 
+/// What a check without TLS says of a server that hung up on its first request
+/// without answering it, which is what a port that only takes TLS does.
 pub(crate) const TLS_ONLY: &str = "it closed the connection without answering, which a port that only takes TLS does \
      when tls isn't set";
 
@@ -1113,10 +1113,11 @@ async fn dns_over_tcp(address: SocketAddr, query: &[u8], id: u16) -> Result<DnsA
     let length = u16::try_from(query.len()).context("the DNS question is too long")?;
     let mut sent = length.to_be_bytes().to_vec();
     sent.extend_from_slice(query);
-    stream.write_all(&sent).await?;
-    let length = usize::from(stream.read_u16().await?);
+    let hung_up = |_| anyhow!("the DNS server hung up over TCP");
+    stream.write_all(&sent).await.map_err(hung_up)?;
+    let length = usize::from(stream.read_u16().await.map_err(hung_up)?);
     let mut answer = vec![0; length];
-    stream.read_exact(&mut answer).await?;
+    stream.read_exact(&mut answer).await.map_err(hung_up)?;
     dns_answers(&answer, id)
 }
 
