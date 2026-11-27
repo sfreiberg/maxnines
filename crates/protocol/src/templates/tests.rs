@@ -775,6 +775,11 @@ fn any_multi_line_text_goes_to_hcl_and_back_unchanged() {
         "SELECT 1\nFROM t\n\n",
         "\nSELECT 1\n",
         "SELECT 1 -- EOT\nEOT\n",
+        // Other whitespace than spaces before every line, which isn't indenting.
+        "\u{a0}SELECT 1\n\u{a0}FROM t\n",
+        "\u{3000}SELECT 1\n\u{3000}FROM t\n",
+        "\u{a0}SELECT 1\n  FROM t\n",
+        "SELECT 1\n \u{a0}FROM t\n",
     ] {
         let mut template = base.clone();
         template.queries[0].sql = sql.to_string();

@@ -19,8 +19,9 @@ pub fn to_hcl(template: &Template) -> String {
 
 /// Text as a heredoc where it reads back exactly as it is, and otherwise quoted,
 /// with escapes. A heredoc always ends in a newline, and `<<-` takes away the
-/// indent its lines share, so it's only for text ending in one, with a line that
-/// starts at the edge, and nothing but plain spaces before any line's words.
+/// indent its lines share, counting any whitespace, as a no-break space, so it's
+/// only for text ending in one, with a line that starts at the edge, and nothing but
+/// plain spaces before any line's words.
 fn text(value: &str) -> Expression {
     let lines = || value.lines();
     let heredoc = value.contains('\n')
@@ -28,7 +29,7 @@ fn text(value: &str) -> Expression {
         && !value.contains(['\r', '\t'])
         && !value.contains("${")
         && !value.contains("%{")
-        && lines().any(|line| !line.starts_with(' ') && !line.is_empty())
+        && lines().any(|line| !line.starts_with(char::is_whitespace) && !line.is_empty())
         && !lines().any(|line| line.trim() == "EOT")
         && !lines().any(|line| !line.is_empty() && line.trim().is_empty());
     if heredoc {
