@@ -33,6 +33,10 @@ const MAX_CONTAINERS: usize = 64;
 /// How long one call to Docker can take, in seconds.
 const TIMEOUT_SECS: u64 = 10;
 
+/// How long a whole round can take: listing, then reading each container at once.
+/// A Docker that stalls past it gives no containers, rather than the last ones.
+const ROUND_LIMIT: Duration = Duration::from_secs(2 * TIMEOUT_SECS);
+
 /// Where Docker and Podman listen, in the order they're tried. `DOCKER_HOST` comes
 /// first when it names a socket.
 const SOCKETS: [&str; 2] = ["/var/run/docker.sock", "/run/podman/podman.sock"];
@@ -89,7 +93,7 @@ impl ContainerCollector {
             cpu = seen;
             containers
         };
-        background.repeat(interval, None, round, settle)?;
+        background.repeat(interval, Some(ROUND_LIMIT), round, settle)?;
         Ok(Self { background })
     }
 }
