@@ -65,12 +65,27 @@ pub fn numbered(instances: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-/// The instances of a wildcard path to report: `_Total` first, then the rest by
-/// name, up to the most kept, each with its path, and how many weren't kept.
-/// Programs that share a name are numbered in the order Windows gives them.
-pub fn kept_instances(path: &str, instances: Vec<(String, f64)>) -> (Vec<(String, f64)>, usize) {
-    let (names, values): (Vec<String>, Vec<f64>) = instances.into_iter().unzip();
-    let mut instances: Vec<(String, f64)> = numbered(names).into_iter().zip(values).collect();
+/// Each instance with a value, numbered as Windows numbers programs that share a
+/// name, counting the ones without a value, as Windows does, so `svchost#2` is the
+/// same program in every counter read at once, whichever have a value for it.
+pub fn numbered_with_values(
+    instances: impl IntoIterator<Item = (String, Option<f64>)>,
+) -> Vec<(String, f64)> {
+    let (names, values): (Vec<String>, Vec<Option<f64>>) = instances.into_iter().unzip();
+    numbered(names)
+        .into_iter()
+        .zip(values)
+        .filter_map(|(name, value)| Some((name, value?)))
+        .collect()
+}
+
+/// The instances of a wildcard path to report, already numbered: `_Total` first,
+/// then the rest by name, up to the most kept, each with its path, and how many
+/// weren't kept.
+pub fn kept_instances(
+    path: &str,
+    mut instances: Vec<(String, f64)>,
+) -> (Vec<(String, f64)>, usize) {
     instances.sort_by(|(a, _), (b, _)| (a != "_Total", a).cmp(&(b != "_Total", b)));
     let dropped = instances.len().saturating_sub(MAX_INSTANCES);
     instances.truncate(MAX_INSTANCES);
@@ -159,7 +174,7 @@ pub(crate) mod pdh {
 
     use std::time::{Duration, Instant};
 
-    use super::{NOT_FOUND, NOT_READ, Reading, kept_instances};
+    use super::{NOT_FOUND, NOT_READ, Reading, kept_instances, numbered_with_values};
     use crate::windows_text::{from_wide, wide};
 
     /// How often a path a host doesn't have is looked for again. Looking up a name
@@ -227,8 +242,8 @@ pub(crate) mod pdh {
         Reading::Values { values, dropped }
     }
 
-    /// A counter's values, by instance, as Windows gives them: instances of programs
-    /// that share a name come with the same name.
+    /// A counter's values, by instance, in the order Windows gives them, programs
+    /// that share a name numbered as Windows numbers them.
     pub(crate) fn formatted(counter: PDH_HCOUNTER) -> Formatted {
         let (mut size, mut count) = (0u32, 0u32);
         // SAFETY: asking how much room the values need, with nowhere to put them yet.
@@ -254,21 +269,17 @@ pub(crate) mod pdh {
         }
         // SAFETY: Windows filled in `count` items at the start of the buffer.
         let items = unsafe { std::slice::from_raw_parts(items, count as usize) };
-        let usable: Vec<(String, f64)> = items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.FmtValue.CStatus,
-                    PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
-                )
-            })
-            .map(|item| {
-                // SAFETY: each name ends with a zero, and with PDH_FMT_DOUBLE asked for,
-                // the value is a double.
-                unsafe { (from_wide(item.szName), item.FmtValue.Anonymous.doubleValue) }
-            })
-            .collect();
-        Formatted::Values(usable)
+        let all = items.iter().map(|item| {
+            let valid = matches!(
+                item.FmtValue.CStatus,
+                PDH_CSTATUS_VALID_DATA | PDH_CSTATUS_NEW_DATA
+            );
+            // SAFETY: with PDH_FMT_DOUBLE asked for, the value is a double.
+            let value = valid.then_some(unsafe { item.FmtValue.Anonymous.doubleValue });
+            // SAFETY: each name ends with a zero.
+            (unsafe { from_wide(item.szName) }, value)
+        });
+        Formatted::Values(numbered_with_values(all))
     }
 
     impl Counters {
@@ -387,6 +398,27 @@ mod tests {
         );
     }
 
+    /// One without a value still takes its number, so the programs after it keep
+    /// theirs, and each counter's `svchost#2` is the same program.
+    #[test]
+    fn an_instance_without_a_value_keeps_the_others_numbers() {
+        let read = [
+            ("svchost", Some(1.0)),
+            ("svchost", None),
+            ("lsass", Some(3.0)),
+            ("svchost", Some(4.0)),
+        ]
+        .map(|(name, value)| (name.to_string(), value));
+        assert_eq!(
+            numbered_with_values(read),
+            [
+                ("svchost".to_string(), 1.0),
+                ("lsass".to_string(), 3.0),
+                ("svchost#2".to_string(), 4.0),
+            ]
+        );
+    }
+
     #[test]
     fn a_path_without_a_wildcard_is_one_item_with_its_value() {
         let path = r"\Processor(_Total)\% Processor Time".to_string();
@@ -430,6 +462,7 @@ mod tests {
         instances.reverse();
         instances.push(("_Total".to_string(), 50.0));
         instances.push(("app000".to_string(), 2.0));
+        let instances = numbered_with_values(instances.into_iter().map(|(n, v)| (n, Some(v))));
         let (kept, dropped) = kept_instances(path, instances);
         assert_eq!(kept.len(), MAX_INSTANCES);
         assert_eq!(dropped, 7);

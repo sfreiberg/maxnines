@@ -633,10 +633,7 @@ mod platform {
                     continue;
                 };
                 let values = match path.contains("(*)") {
-                    true => {
-                        let (names, values): (Vec<String>, Vec<f64>) = values.into_iter().unzip();
-                        numbered(names).into_iter().zip(values).collect()
-                    }
+                    true => values,
                     false => values
                         .into_iter()
                         .take(1)
