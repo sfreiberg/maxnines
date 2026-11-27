@@ -18,7 +18,10 @@ listen = "127.0.0.1:9000"
 public_url = "ws://127.0.0.1:9000/ws"
 
 # Proxies whose X-Forwarded-For header can be believed, as addresses or CIDRs.
-trusted_proxies = []
+# Left out, one on this host is, so a reverse proxy here shows each person's own
+# address in the audit log and keeps their sign-in tries apart. An empty list
+# believes none.
+# trusted_proxies = ["10.0.0.5"]
 
 # The server pings each agent this often, and counts an agent as offline after
 # this long without hearing from it.

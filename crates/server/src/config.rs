@@ -653,6 +653,8 @@ mod tests {
         assert_eq!(config.audience(), "ws://127.0.0.1:9000/ws");
         assert_eq!(config.registration.max_pending, 1000);
         assert!(config.registration.rule.is_empty());
+        // So a proxy on the same host is believed, as it is with no config at all.
+        assert_eq!(config.trusted_proxies, None);
     }
 
     /// What the Linux packages install, which keeps everything in the service's
