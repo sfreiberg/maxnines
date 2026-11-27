@@ -224,8 +224,28 @@ impl Tracker {
         hold: TimeDelta,
         open: Option<Severity>,
     ) -> Option<Change> {
-        self.holds.resize_with(levels.len(), Hold::default);
-        self.severities = levels.iter().map(|(severity, _)| *severity).collect();
+        // Each level keeps its own hold, by severity, so a rule changed to have
+        // fewer levels or others never hands one level's wait to another.
+        let severities: Vec<Severity> = levels.iter().map(|(severity, _)| *severity).collect();
+        if severities != self.severities {
+            let mut before: Vec<(Severity, Hold)> = self
+                .severities
+                .iter()
+                .copied()
+                .zip(std::mem::take(&mut self.holds))
+                .collect();
+            self.holds = severities
+                .iter()
+                .map(|severity| {
+                    before
+                        .iter()
+                        .position(|(had, _)| had == severity)
+                        .map(|at| before.swap_remove(at).1)
+                        .unwrap_or_default()
+                })
+                .collect();
+            self.severities = severities;
+        }
         // Carried on from before a restart, and kept only if it still holds now.
         if !self.restored.is_empty() {
             for (hold, (severity, _)) in self.holds.iter_mut().zip(levels) {
@@ -1095,6 +1115,9 @@ impl Evaluator {
                 continue;
             };
             if rule.rule.is_calculation() {
+                // Waiting where it is, whatever stops it being worked out now, as
+                // what's held from before a restart is only kept while it's tracked.
+                self.keep_tracking(&mut checked, |key| key.rule_id == rule.id);
                 if !snapshot.in_grace {
                     self.check_calculation(rule, conditions, &snapshot, &mut open, &mut checked)
                         .await?;
@@ -1132,6 +1155,12 @@ impl Evaluator {
     /// that waits days isn't started over by a restart. Each one is only kept if
     /// its level is still crossed when it's next checked, and one for a rule, host
     /// or series that's gone is dropped after the first pass, as it isn't checked.
+    /// Keeps the trackers `which` picks through this pass, as one that isn't checked
+    /// is let go, with what it held.
+    fn keep_tracking(&self, checked: &mut HashSet<Key>, which: impl Fn(&Key) -> bool) {
+        checked.extend(self.trackers.keys().filter(|key| which(key)).cloned());
+    }
+
     async fn restore_holds(&mut self) -> Result<()> {
         let held = self.database.alert_holds().await?;
         for level in &held {
@@ -1207,7 +1236,8 @@ impl Evaluator {
             .as_ref()
             .and_then(|reporting| reporting.get(&host.id))
             .copied();
-        // What can't be told isn't guessed at: whatever is open stays open.
+        // What can't be told isn't guessed at: whatever is open stays open, and
+        // whatever is waiting to count waits on.
         if (uses_online && online.is_none()) || (uses_reporting && reporting.is_none()) {
             for key in open
                 .keys()
@@ -1215,6 +1245,9 @@ impl Evaluator {
             {
                 checked.insert(key.clone());
             }
+            self.keep_tracking(checked, |key| {
+                key.rule_id == rule.id && key.host_id == host.id
+            });
             return Ok(());
         }
         let is_online = online.is_none_or(|seen| seen.yes);
@@ -1331,6 +1364,8 @@ impl Evaluator {
                 && (uses_online || uses_reporting)
                 && matches!(change, Some(Change::Fire(_)))
             {
+                // Looked at again once the wait is over, though nothing new comes.
+                tracker.last_stamp = None;
                 continue;
             }
 
@@ -1926,6 +1961,21 @@ mod tests {
     /// A rule with a warning and a critical level, and a value crossing as many.
     fn two(crossed: usize) -> [(Severity, bool); 2] {
         [(W, crossed >= 1), (C, crossed >= 2)]
+    }
+
+    #[test]
+    fn a_level_taken_out_of_a_rule_hands_its_wait_to_no_other() {
+        let mut tracker = Tracker::default();
+        tracker.observe(&two(1), at(0), secs(1800), None);
+        // The warning's gone from the rule, and the critical level is new.
+        assert_eq!(
+            tracker.observe(&one(true), at(7200), secs(1800), None),
+            None
+        );
+        assert_eq!(
+            tracker.observe(&one(true), at(9000), secs(1800), None),
+            Some(Change::Fire(C))
+        );
     }
 
     #[test]

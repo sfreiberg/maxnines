@@ -1128,6 +1128,36 @@ async fn a_long_wait_carries_on_through_a_restart() {
 }
 
 #[tokio::test]
+async fn a_calculations_long_wait_carries_on_through_a_restart() {
+    let mut test = Harness::start().await;
+    // Nobody reporting counts nothing, which is the problem.
+    *test.script.calculated.lock().unwrap() = Some(Vec::new());
+    let body = json!({
+        "name": "Nobody", "calculation": "count", "metric": "cpu.usage",
+        "critical": "value < 1", "for_secs": 3600,
+    });
+    let path = "/api/v1/alert-rules";
+    let (status, made) = api(&test.server, "POST", path, &body).await;
+    assert_eq!(status, 201, "{made}");
+    test.evaluate(TimeDelta::zero()).await;
+    assert_eq!(test.database().alert_holds().await.unwrap().len(), 1);
+
+    // A restart, and a pass while agents are still coming back, which doesn't
+    // work the rule out but keeps what it held.
+    test.evaluator = evaluator(&test.server, test.now + MINUTE * 35);
+    test.evaluate(MINUTE * 36).await;
+    assert_eq!(test.database().alert_holds().await.unwrap().len(), 1);
+    test.evaluate(MINUTE * 40).await;
+    assert!(test.open().await.is_empty(), "not an hour yet");
+    test.evaluate(MINUTE * 61).await;
+    assert_eq!(
+        test.open().await.len(),
+        1,
+        "an hour, counting before the restart"
+    );
+}
+
+#[tokio::test]
 async fn a_wait_whose_problem_cleared_meanwhile_starts_over_after_a_restart() {
     let mut test = Harness::start().await;
     let rule = AlertRuleInput {
@@ -2163,6 +2193,37 @@ async fn an_open_offline_alert_survives_the_grace_period_after_a_restart() {
 
     assert_eq!(test.open().await.len(), 1);
     assert!(test.resolved().await.is_empty());
+}
+
+#[tokio::test]
+async fn a_problem_held_back_just_after_a_restart_alerts_once_the_wait_is_over() {
+    let mut test = Harness::start().await;
+    let rule = AlertRuleInput {
+        hold: TimeDelta::zero(),
+        ..AlertRuleInput::with_conditions("Gone or busy", None, Some("!online || cpu.usage > 90"))
+    };
+    test.database().create_alert_rule(&rule).await.unwrap();
+    test.go_offline().await;
+    let gone = test.server.state.presence.get(&test.id()).unwrap().since;
+    // Its last reading, from before it went, which doesn't change while it's gone.
+    test.script.set(vec![test.reading("CPU", gone, 10.0)]);
+
+    let restart = gone + TimeDelta::minutes(1);
+    let mut restarted = evaluator(&test.server, restart);
+    restarted
+        .evaluate(restart + TimeDelta::seconds(1))
+        .await
+        .unwrap();
+    assert!(
+        test.open().await.is_empty(),
+        "agents may still be coming back"
+    );
+
+    restarted
+        .evaluate(restart + TimeDelta::minutes(3))
+        .await
+        .unwrap();
+    assert_eq!(test.open().await.len(), 1);
 }
 
 #[tokio::test]
