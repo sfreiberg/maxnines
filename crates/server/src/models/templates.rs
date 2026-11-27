@@ -1833,51 +1833,22 @@ impl Database {
         // A server's first start adds the built-in templates without a notice.
         let upgrading = !rows.is_empty();
         let mut changed = Vec::new();
-        let mut kept = BTreeSet::new();
-
-        for built_in in shipped {
-            let template = &built_in.template;
-            let existing = rows.iter().find(|row| row.key == template.key).or_else(|| {
+        // The template each shipped one is, as it was before, under its key or one
+        // it was renamed from.
+        let existing_of = |template: &Template| {
+            rows.iter().find(|row| row.key == template.key).or_else(|| {
                 rows.iter()
                     .find(|row| template.renamed_from.contains(&row.key))
-            });
-            if let Some(row) = existing {
-                kept.insert(row.id);
-            }
-            let same = existing.is_some_and(|row| {
-                row.key == template.key
-                    && row.fingerprint.as_deref() == Some(built_in.fingerprint.as_str())
-            });
-            if same {
-                continue;
-            }
-            move_aside(&transaction, template, now).await?;
-            let id = match existing {
-                Some(row) => {
-                    rewrite_original(&transaction, row, template, &built_in.fingerprint, now)
-                        .await?;
-                    changed.push(template.name.clone());
-                    row.id
-                }
-                None => {
-                    let id = add_original(
-                        &transaction,
-                        template,
-                        Origin::BuiltIn,
-                        &built_in.fingerprint,
-                        upgrading,
-                        now,
-                    )
-                    .await?;
-                    if upgrading {
-                        changed.push(template.name.clone());
-                    }
-                    id
-                }
-            };
-            kept.insert(id);
-        }
+            })
+        };
+        let kept: BTreeSet<i64> = shipped
+            .iter()
+            .filter_map(|built_in| existing_of(&built_in.template))
+            .map(|row| row.id)
+            .collect();
 
+        // Those no longer shipped go first, so one shipped now can take the key,
+        // name or alert names one of them had.
         for row in rows.iter().filter(|row| !kept.contains(&row.id)) {
             let stored = to_stored(&transaction, row.clone()).await?;
             // Kept unseen, so the notice says it went.
@@ -1889,6 +1860,40 @@ impl Database {
                 .context("updating a template")?;
             delete_in(&transaction, &stored, now).await?;
             changed.push(stored.template.name);
+        }
+
+        for built_in in shipped {
+            let template = &built_in.template;
+            let existing = existing_of(template);
+            let same = existing.is_some_and(|row| {
+                row.key == template.key
+                    && row.fingerprint.as_deref() == Some(built_in.fingerprint.as_str())
+            });
+            if same {
+                continue;
+            }
+            move_aside(&transaction, template, now).await?;
+            match existing {
+                Some(row) => {
+                    rewrite_original(&transaction, row, template, &built_in.fingerprint, now)
+                        .await?;
+                    changed.push(template.name.clone());
+                }
+                None => {
+                    add_original(
+                        &transaction,
+                        template,
+                        Origin::BuiltIn,
+                        &built_in.fingerprint,
+                        upgrading,
+                        now,
+                    )
+                    .await?;
+                    if upgrading {
+                        changed.push(template.name.clone());
+                    }
+                }
+            }
         }
 
         transaction

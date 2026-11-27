@@ -66,8 +66,30 @@ impl Database {
             .await
             .context("loading rules")?;
         let mut changed = Vec::new();
+        // Built-in rules no longer shipped go first, so one shipped now can take the
+        // name one of them had. Their settings go with them.
+        let gone = rows.iter().filter(|row| {
+            row.built_in
+                .as_deref()
+                .is_some_and(|key| !shipped.iter().any(|built_in| built_in.key == key))
+        });
+        let mut gone_names = BTreeSet::new();
+        for row in gone {
+            let before = load_rule(&transaction, row.id).await?;
+            config_rule::Entity::delete_by_id(row.id)
+                .exec(&transaction)
+                .await
+                .context("removing a built-in rule")?;
+            record_by_server(&transaction, row.id, before.as_ref()).await?;
+            changed.push(row.name.clone());
+            gone_names.insert(row.name_key.clone());
+        }
         // Names in use, as they're compared, kept up to date as rules are renamed.
-        let mut taken: BTreeSet<String> = rows.iter().map(|row| row.name_key.clone()).collect();
+        let mut taken: BTreeSet<String> = rows
+            .iter()
+            .map(|row| row.name_key.clone())
+            .filter(|name| !gone_names.contains(name))
+            .collect();
 
         for built_in in shipped {
             let key = name_key(&built_in.rule.name);
@@ -148,22 +170,6 @@ impl Database {
             save_settings(&transaction, row.id, &built_in.rule.settings).await?;
             record_by_server(&transaction, row.id, None).await?;
             changed.push(built_in.rule.name.clone());
-        }
-
-        let gone = rows.iter().filter(|row| {
-            row.built_in
-                .as_deref()
-                .is_some_and(|key| !shipped.iter().any(|built_in| built_in.key == key))
-        });
-        // Their settings go with them.
-        for row in gone {
-            let before = load_rule(&transaction, row.id).await?;
-            config_rule::Entity::delete_by_id(row.id)
-                .exec(&transaction)
-                .await
-                .context("removing a built-in rule")?;
-            record_by_server(&transaction, row.id, before.as_ref()).await?;
-            changed.push(row.name.clone());
         }
 
         transaction

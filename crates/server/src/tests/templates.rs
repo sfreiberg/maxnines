@@ -2613,3 +2613,25 @@ async fn a_change_to_one_template_runs_as_reading_them_all_again_would() {
     assert!(database.delete_template(app, now).await.unwrap());
     assert!(running(&database).iter().all(|(id, ..)| *id != app));
 }
+
+#[tokio::test]
+async fn an_upgrade_can_give_a_new_built_in_template_the_name_of_one_it_drops() {
+    let database = Database::for_test().await;
+    let now = crate::times::now();
+    database
+        .sync_templates(&shipped(&[APP]), now)
+        .await
+        .unwrap();
+
+    // Another key, with the same name and the same alerts' names.
+    let replaced = APP.replace("template \"app\"", "template \"application\"");
+    let changed = database
+        .sync_templates(&shipped(&[&replaced]), now)
+        .await
+        .unwrap();
+
+    assert_eq!(changed, ["App", "App"]);
+    let templates = database.list_templates().await.unwrap();
+    let keys: Vec<&str> = templates.iter().map(|t| t.template.key.as_str()).collect();
+    assert_eq!(keys, ["application"]);
+}

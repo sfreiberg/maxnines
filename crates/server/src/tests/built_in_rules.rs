@@ -168,6 +168,26 @@ async fn an_upgrade_brings_its_changes_to_built_in_rules_but_never_to_peoples_ow
 }
 
 #[tokio::test]
+async fn an_upgrade_can_give_a_new_built_in_rule_the_name_of_one_it_drops() {
+    let server = with_every_built_in_rule().await;
+    let database = &server.state.database;
+    let mut later = all().unwrap();
+    let mac = later.iter_mut().find(|rule| rule.key == "macos").unwrap();
+    mac.key = "apple".to_string();
+
+    let changed = database
+        .sync_built_in_rules(&later, crate::times::now())
+        .await
+        .unwrap();
+
+    assert_eq!(changed, ["macOS", "macOS"]);
+    assert_eq!(
+        rule_named(&server, "macOS").await.built_in.as_deref(),
+        Some("apple")
+    );
+}
+
+#[tokio::test]
 async fn a_built_in_rule_can_only_be_turned_on_or_off_through_the_api() {
     let server = with_every_built_in_rule().await;
     let mac = rule_named(&server, "macOS").await;
