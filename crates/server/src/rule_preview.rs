@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::models::{ConfigRule, RuleInput};
-use crate::rule_engine::{Condition, ConfigRules, Host, ResolvedConfig};
+use crate::rule_engine::{CompiledRule, Condition, ConfigRules, Host, ResolvedConfig};
 
 /// Enough to see the pattern without a page that never ends. Counts still cover
 /// every agent, and the agents that change come first.
@@ -55,9 +55,12 @@ pub fn preview(
     rule: &RuleInput,
     hosts: &[PreviewHost],
 ) -> Result<Preview> {
+    let mut tried = proposed(rules, id, rule);
+    tried.rule.enabled = true;
     let compiled = Compiled {
         before: ConfigRules::new(rules.iter().cloned())?,
         after: ConfigRules::new(with_rule(rules, id, rule))?,
+        rule: CompiledRule::new(tried)?,
         condition: rule
             .applies_to
             .as_deref()
@@ -91,23 +94,28 @@ pub fn preview(
     })
 }
 
-/// The rules as they'd be after saving, in the order the database would give.
-fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<ConfigRule> {
+/// The rule as it would be saved, in place of the one with `id` if there is one.
+fn proposed(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> ConfigRule {
     let replaced = id.and_then(|id| rules.iter().find(|saved| saved.id == id));
-    let mut proposed: Vec<ConfigRule> = rules
-        .iter()
-        .filter(|saved| Some(saved.id) != id)
-        .cloned()
-        .collect();
-    proposed.push(ConfigRule {
+    ConfigRule {
         id: id.unwrap_or(NEW_RULE_ID),
         built_in: replaced.and_then(|saved| saved.built_in.clone()),
         built_in_changed_at: None,
         template: replaced.and_then(|saved| saved.template.clone()),
         rule: rule.clone(),
-    });
-    proposed.sort_by_key(|saved| (saved.rule.priority, saved.built_in.is_none(), saved.id));
-    proposed
+    }
+}
+
+/// The rules as they'd be after saving, in the order the database would give.
+fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<ConfigRule> {
+    let mut all: Vec<ConfigRule> = rules
+        .iter()
+        .filter(|saved| Some(saved.id) != id)
+        .cloned()
+        .collect();
+    all.push(proposed(rules, id, rule));
+    all.sort_by_key(|saved| (saved.rule.priority, saved.built_in.is_none(), saved.id));
+    all
 }
 
 /// The rules before and after, and the rule's own condition, compiled once for every
@@ -115,6 +123,9 @@ fn with_rule(rules: &[ConfigRule], id: Option<i64>, rule: &RuleInput) -> Vec<Con
 struct Compiled {
     before: ConfigRules,
     after: ConfigRules,
+    /// The rule being tried, on whether or not it's turned on, to say which hosts
+    /// it's for as saving it would: by operating system and template too.
+    rule: CompiledRule,
     condition: Option<Condition>,
 }
 
@@ -124,7 +135,7 @@ fn preview_host(compiled: &Compiled, host: &PreviewHost) -> HostPreview {
         Some(condition) => condition.check(&shown),
         None => Ok(true),
     };
-    let matches = *check.as_ref().unwrap_or(&false);
+    let matches = compiled.rule.matches(&shown);
 
     let reported = host.facts.as_object().is_some_and(|f| !f.is_empty());
     let mut note = match check {
@@ -404,6 +415,24 @@ mod tests {
         assert_eq!(preview.hosts[0].changes, ["Sample interval: 15s → 5s"]);
         assert!(!preview.hosts[1].matches);
         assert!(preview.hosts[1].changes.is_empty());
+    }
+
+    #[test]
+    fn a_rule_for_some_operating_systems_matches_only_their_hosts() {
+        let mut rule = input("linux", 100, None, json!({ "interval_secs": 5 }));
+        rule.operating_systems = vec!["linux".to_string()];
+        let on = |hostname: &str, family: &str| PreviewHost {
+            facts: json!({ "os": { "family": family } }),
+            ..host(hostname, "web")
+        };
+        let hosts = [on("web-1", "linux"), on("win-1", "windows")];
+
+        let preview = preview(&[default_rule()], None, &rule, &hosts).unwrap();
+
+        assert_eq!((preview.matching, preview.changing), (1, 1), "{preview:?}");
+        assert_eq!(preview.hosts[0].hostname, "web-1");
+        assert!(preview.hosts[0].matches);
+        assert!(!preview.hosts[1].matches);
     }
 
     #[test]
