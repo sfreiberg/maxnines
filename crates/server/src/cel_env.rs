@@ -11,40 +11,73 @@ use cel::{Env, ExecutionError, Value as CelValue};
 /// working anything out.
 pub static FUNCTIONS: LazyLock<Arc<Env>> = LazyLock::new(|| Arc::new(Env::stdlib()));
 
-/// What every number a sum works on goes through, so whole numbers and fractions mix:
-/// CEL only adds two numbers of the same kind. Nobody can type it, as it isn't a name.
-pub const NUMBER: &str = "number:";
+/// What a sum is worked out with in place of CEL's own `+`, `-`, `*` and `/`, which
+/// only work on two numbers of the same kind. Nobody can type them, as they aren't
+/// names.
+const SUMS: [(&str, &str); 4] = [
+    (operators::ADD, "sum:+"),
+    (operators::SUBSTRACT, "sum:-"),
+    (operators::MULTIPLY, "sum:*"),
+    (operators::DIVIDE, "sum:/"),
+];
 
-/// A whole number as one with a fraction, and anything else as it is.
-pub fn number(Arguments(args): Arguments) -> Result<CelValue, ExecutionError> {
-    match args.as_slice() {
-        [CelValue::Int(whole)] => Ok(CelValue::Float(*whole as f64)),
-        [CelValue::UInt(whole)] => Ok(CelValue::Float(*whole as f64)),
-        [other] => Ok(other.clone()),
-        _ => Err(ExecutionError::invalid_argument_count(1, args.len())),
+/// Adds the functions sums are worked out with to `context`.
+pub fn add_sums(context: &mut cel::Context<'_, '_>) {
+    // The names aren't CEL's own, so adding them can't fail.
+    let _ = context.add_function("sum:+", |Arguments(args): Arguments| {
+        sum(operators::ADD, &args)
+    });
+    let _ = context.add_function("sum:-", |Arguments(args): Arguments| {
+        sum(operators::SUBSTRACT, &args)
+    });
+    let _ = context.add_function("sum:*", |Arguments(args): Arguments| {
+        sum(operators::MULTIPLY, &args)
+    });
+    let _ = context.add_function("sum:/", |Arguments(args): Arguments| {
+        sum(operators::DIVIDE, &args)
+    });
+}
+
+/// A sum as it reads: a whole number and a fraction mix, and a division is never
+/// cut to a whole number, so `cpu.usage / 2` and `commits / 60` are what they say,
+/// while two whole numbers added, taken away or multiplied stay whole, so one can
+/// pick from a list, as `tags[size(tags) - 1]` does. Anything else is as CEL has it.
+fn sum(operator: &str, args: &[CelValue]) -> Result<CelValue, ExecutionError> {
+    let [left, right] = args else {
+        return Err(ExecutionError::invalid_argument_count(2, args.len()));
+    };
+    let as_fraction = |value: &CelValue| match value {
+        CelValue::Int(whole) => Some(*whole as f64),
+        CelValue::UInt(whole) => Some(*whole as f64),
+        CelValue::Float(fraction) => Some(*fraction),
+        _ => None,
+    };
+    let whole = matches!(
+        (left, right),
+        (CelValue::Int(_), CelValue::Int(_)) | (CelValue::UInt(_), CelValue::UInt(_))
+    );
+    let (left, right) = match (as_fraction(left), as_fraction(right)) {
+        (Some(l), Some(r)) if operator == operators::DIVIDE || !whole => {
+            (CelValue::Float(l), CelValue::Float(r))
+        }
+        _ => (left.clone(), right.clone()),
+    };
+    match operator {
+        operators::ADD => left + right,
+        operators::SUBSTRACT => left - right,
+        operators::MULTIPLY => left * right,
+        _ => left / right,
     }
 }
 
-/// Makes a sum's whole numbers ones with fractions as it's worked out, so
-/// `cpu.usage / 2` works as it reads. Comparisons mix them already.
+/// Makes a sum worked out as [`sum`] has it, so `cpu.usage / 2` works as it reads.
+/// Comparisons mix numbers already.
 pub fn fraction_sum(call: &mut CallExpr) {
-    let sums = matches!(
-        call.func_name.as_str(),
-        operators::ADD | operators::SUBSTRACT | operators::MULTIPLY | operators::DIVIDE
-    );
-    if !sums || call.target.is_some() {
+    if call.target.is_some() {
         return;
     }
-    for arg in &mut call.args {
-        let inner = std::mem::take(arg);
-        *arg = IdedExpr {
-            id: inner.id,
-            expr: Expr::Call(CallExpr {
-                func_name: NUMBER.to_string(),
-                target: None,
-                args: vec![inner],
-            }),
-        };
+    if let Some((_, ours)) = SUMS.iter().find(|(theirs, _)| *theirs == call.func_name) {
+        call.func_name = (*ours).to_string();
     }
 }
 
@@ -103,8 +136,12 @@ mod tests {
         let mut expr = Program::compile(text).unwrap().expression().clone();
         fractions(&mut expr);
         let mut context = Context::with_env(FUNCTIONS.clone());
-        context.add_function(NUMBER, number).unwrap();
+        add_sums(&mut context);
         context.add_variable_from_value("x", CelValue::Float(1.5));
+        context.add_variable_from_value(
+            "tags",
+            CelValue::List(std::sync::Arc::new(vec!["a".into(), "b".into()])),
+        );
         context.resolve(&expr).unwrap()
     }
 
@@ -114,5 +151,27 @@ mod tests {
         assert_eq!(worked_out("7 / 2"), CelValue::Float(3.5));
         assert_eq!(worked_out("[x + 1][0]"), CelValue::Float(2.5));
         assert_eq!(worked_out("[1, 2].map(n, n * x)[1]"), CelValue::Float(3.0));
+    }
+
+    #[test]
+    fn whole_numbers_stay_whole_except_when_divided() {
+        assert_eq!(
+            worked_out("tags[size(tags) - 1]"),
+            CelValue::String("b".to_string().into())
+        );
+        assert_eq!(
+            worked_out("string(1 + 1)"),
+            CelValue::String("2".to_string().into())
+        );
+        assert_eq!(worked_out("3 * 4"), CelValue::Int(12));
+        assert_eq!(worked_out("120 / 60"), CelValue::Float(2.0));
+        assert_eq!(
+            worked_out("'a' + 'b'"),
+            CelValue::String("ab".to_string().into())
+        );
+        assert_eq!(
+            worked_out("duration('1m') + duration('1s') == duration('61s')"),
+            CelValue::Bool(true)
+        );
     }
 }

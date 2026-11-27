@@ -19,7 +19,7 @@ use cel::{Context as CelContext, ExecutionError, Program, Value as CelValue};
 use chrono::TimeDelta;
 
 use crate::catalog::Catalog;
-use crate::cel_env::{FUNCTIONS, NUMBER, fraction_sum, number};
+use crate::cel_env::{FUNCTIONS, add_sums, fraction_sum};
 use crate::metrics::{self, Kind, Metric, Source, Unit};
 
 /// What the database column holds, with room to spare for anyone's condition.
@@ -565,7 +565,7 @@ static BASE: LazyLock<CelContext<'static, 'static>> = LazyLock::new(|| {
         });
     }
     let _ = context.add_function(FORECAST, forecast);
-    let _ = context.add_function(NUMBER, number);
+    add_sums(&mut context);
     context
 });
 

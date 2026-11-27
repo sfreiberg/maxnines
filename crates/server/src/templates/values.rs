@@ -24,7 +24,7 @@ use maxnines_protocol::Sample;
 use maxnines_protocol::templates::work::{QUERY_FIELD, TemplateWork, collector_of};
 use maxnines_protocol::templates::{Metric, Template};
 
-use crate::cel_env::{FUNCTIONS, NUMBER, fractions, number};
+use crate::cel_env::{FUNCTIONS, add_sums, fractions};
 use crate::metrics::INSTANCE_LABEL;
 use crate::times::Timestamp;
 
@@ -271,7 +271,7 @@ fn evaluate(
         }
     };
     context.add_function(RATE, rate).ok()?;
-    context.add_function(NUMBER, number).ok()?;
+    add_sums(&mut context);
     let value = match context.resolve(expr).ok()? {
         CelValue::Float(number) => number,
         CelValue::Int(number) => number as f64,
