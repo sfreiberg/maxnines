@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 
 use super::audit::record_change;
-use super::{Database, metrics_page};
+use super::{Database, host, metrics_page};
 use crate::audit::{Kind, Snapshot};
 use crate::metrics_pages::{MetricsPage, MetricsPageInput, check_names};
 
@@ -69,6 +70,21 @@ async fn of_host<C: ConnectionTrait>(connection: &C, host_id: &str) -> Result<Ve
     rows.into_iter().map(to_page).collect()
 }
 
+/// A host's pages, with the host held until the transaction ends, so two pages
+/// saved at once are checked against each other rather than both against what
+/// was there before.
+async fn of_host_held<C: ConnectionTrait>(
+    connection: &C,
+    host_id: &str,
+) -> Result<Vec<MetricsPage>> {
+    host::Entity::find_by_id(host_id)
+        .lock_exclusive()
+        .one(connection)
+        .await
+        .context("loading host")?;
+    of_host(connection, host_id).await
+}
+
 /// Records how a page changed from `before`, reading it as it is now. A password
 /// or token only ever shows as having changed.
 async fn record<C: ConnectionTrait>(
@@ -122,7 +138,7 @@ impl Database {
             .begin()
             .await
             .context("saving metrics page")?;
-        let others = of_host(&transaction, host_id).await?;
+        let others = of_host_held(&transaction, host_id).await?;
         check_names(others.iter().map(|page| &page.input).chain([input]))?;
         let id = metrics_page::Entity::insert(to_row(host_id, input)?)
             .exec(&transaction)
@@ -146,7 +162,7 @@ impl Database {
             return Ok(false);
         };
         let input = input.keeping_secrets_of(&before.input, None);
-        let others = of_host(&transaction, &before.host_id).await?;
+        let others = of_host_held(&transaction, &before.host_id).await?;
         let others = others.iter().filter(|page| page.id != id);
         check_names(others.map(|page| &page.input).chain([&input]))?;
         let mut row = to_row(&before.host_id, &input)?;
