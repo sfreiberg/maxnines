@@ -22,7 +22,7 @@ use maxnines_protocol::actions::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -343,21 +343,6 @@ fn check_given(needed: &[&str], variables: &BTreeMap<String, String>) -> Result<
     Ok(())
 }
 
-/// Reads until the end, keeping a little more than is shown, and lets up to
-/// [`LET_GO_BYTES`](crate::custom::LET_GO_BYTES) more go unkept rather than unread,
-/// as a command whose output is closed on it is stopped by the signal that says
-/// so, while one printing without end is stopped that way.
-async fn read_some(reader: Option<impl AsyncRead + Unpin>, kept: &mut Vec<u8>) {
-    if let Some(mut reader) = reader {
-        let limit = MAX_ACTION_OUTPUT_BYTES as u64 + 1;
-        // What was read before an error is still worth having.
-        if (&mut reader).take(limit).read_to_end(kept).await.is_ok() {
-            let mut rest = reader.take(crate::custom::LET_GO_BYTES);
-            let _ = tokio::io::copy(&mut rest, &mut tokio::io::sink()).await;
-        }
-    }
-}
-
 /// Runs a command as whoever this process is.
 async fn run_command(command: &[String], limit: Duration) -> Ended {
     let Some((program, arguments)) = command.split_first() else {
@@ -382,32 +367,27 @@ async fn run_command(command: &[String], limit: Duration) -> Ended {
         }
     };
     let id = child.id();
-    let (stdout, stderr) = (child.stdout.take(), child.stderr.take());
-
-    // Kept out here, so what was printed before running out of time survives.
-    let (mut printed, mut complained) = (Vec::new(), Vec::new());
-    // It's done when it ends, even if something it started, such as the program
-    // it restarted, still holds its output: that's read a moment more, then let go.
-    let finishing = async {
-        let reading = async {
-            tokio::join!(
-                read_some(stdout, &mut printed),
-                read_some(stderr, &mut complained)
-            )
-        };
-        tokio::pin!(reading);
-        tokio::select! {
-            _ = &mut reading => child.wait().await,
-            status = child.wait() => {
-                let _ = timeout(crate::custom::READ_AFTER_EXIT, &mut reading).await;
-                status
-            }
-        }
-    };
-    let finished = timeout(limit, finishing).await;
+    let mut outputs: Vec<Box<dyn AsyncRead + Unpin + Send>> = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        outputs.push(Box::new(stdout));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        outputs.push(Box::new(stderr));
+    }
+    // A little more than is shown is kept of each, to tell it was cut. It's done
+    // when it ends, even if something it started, such as the program it
+    // restarted, carries on with its output, which is read for as long as it does.
+    let outputs = crate::custom::Outputs::read(outputs, MAX_ACTION_OUTPUT_BYTES as u64 + 1);
+    let finished = timeout(limit, child.wait()).await;
     if finished.is_err() {
         stop_group(id);
     }
+    // What was printed before running out of time is kept too.
+    let mut printed = outputs.settle().await.into_iter();
+    let (mut printed, complained) = (
+        printed.next().unwrap_or_default(),
+        printed.next().unwrap_or_default(),
+    );
 
     if !complained.is_empty() {
         if printed.last().is_some_and(|last| *last != b'\n') {
@@ -634,6 +614,27 @@ mod tests {
             assert_eq!(result.outcome, ActionOutcome::Succeeded);
             assert_eq!(result.output, "restarted\n");
             assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        /// What it started can carry on printing where the action's output went,
+        /// as a restarted program logs, and isn't stopped for it.
+        #[tokio::test]
+        async fn what_an_action_started_carries_on_printing() {
+            let folder = tempfile::tempdir().unwrap();
+            let alive = folder.path().join("alive");
+            let script = format!(
+                "(sleep 1; echo later; echo yes > '{}') & echo started",
+                alive.display()
+            );
+            let result = run(&["/bin/sh", "-c", &script], &[], 10).await;
+            assert_eq!(result.outcome, ActionOutcome::Succeeded);
+            assert_eq!(result.output, "started\n");
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !alive.exists() {
+                assert!(std::time::Instant::now() < deadline, "it was stopped");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         #[tokio::test]

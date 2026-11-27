@@ -11,15 +11,16 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use maxnines_protocol::is_custom_metric_name;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 
 use crate::background::Background;
@@ -215,8 +216,14 @@ pub(crate) async fn run_command(
 
     let mut child = command.spawn().map_err(|_| Failure::NotStarted)?;
     let id = child.id();
-    match timeout(limit, finish(&mut child, max_output)).await {
-        Ok(finished) => finished.map_err(|()| Failure::NotRead),
+    let stdout = child.stdout.take().ok_or(Failure::NotRead)?;
+    let outputs = Outputs::read(vec![Box::new(stdout)], max_output);
+    match timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => {
+            let printed = outputs.settle().await;
+            Ok((status, printed.into_iter().next().unwrap_or_default()))
+        }
+        Ok(Err(_)) => Err(Failure::NotRead),
         Err(_) => {
             stop_group(id);
             Err(Failure::TimedOut)
@@ -224,52 +231,110 @@ pub(crate) async fn run_command(
     }
 }
 
-/// Reads what a command prints until it ends, keeping up to `max_output` bytes.
-/// Up to [`LET_GO_BYTES`] more is read and let go rather than its output closed
-/// on it at once, as a command whose output is closed is stopped by the signal
-/// that says so, as if it had failed; one printing more than that, as without
-/// end, is stopped that way. A command that ends while something it started still
-/// holds its output, such as a program left running, ends there: what's printed is
-/// only read a moment more.
-async fn finish(child: &mut Child, max_output: u64) -> Result<(ExitStatus, Vec<u8>), ()> {
-    let stdout = child.stdout.take().ok_or(())?;
-    let mut output = Vec::new();
-    let status = {
-        // Its output is closed as soon as reading stops, which is what stops a
-        // command printing without end.
-        let reading = async {
-            let mut stdout = stdout;
-            (&mut stdout)
-                .take(max_output)
-                .read_to_end(&mut output)
-                .await?;
-            let mut rest = (&mut stdout).take(LET_GO_BYTES);
-            tokio::io::copy(&mut rest, &mut tokio::io::sink()).await?;
-            std::io::Result::Ok(())
-        };
-        tokio::pin!(reading);
-        tokio::select! {
-            read = &mut reading => {
-                read.map_err(|_| ())?;
-                child.wait().await.map_err(|_| ())?
-            }
-            status = child.wait() => {
-                let status = status.map_err(|_| ())?;
-                let _ = timeout(READ_AFTER_EXIT, &mut reading).await;
-                status
-            }
-        }
-    };
-    Ok((status, output))
-}
-
 /// How long what a command printed is still read once it has ended, for what was
 /// left in the pipe.
-pub(crate) const READ_AFTER_EXIT: Duration = Duration::from_millis(500);
+const READ_AFTER_EXIT: Duration = Duration::from_millis(500);
 
-/// How much more than is kept is read and let go, so a command that prints a lot
-/// can finish, while one that prints without end is stopped.
-pub(crate) const LET_GO_BYTES: u64 = 1024 * 1024;
+/// How much more than is kept is read and let go while a command runs, so one that
+/// prints a lot can finish, while one that prints without end is stopped.
+const LET_GO_BYTES: u64 = 1024 * 1024;
+
+/// A command's outputs, each read on a task of its own as it runs. Up to a number
+/// of bytes of each is kept, and the rest read and let go rather than left unread,
+/// as a command whose output is closed on it is stopped by the signal that says so,
+/// as if it had failed. While it runs, more than [`LET_GO_BYTES`] past what's kept
+/// closes it, which stops a command printing without end. Once it's ended, what
+/// still holds an output, such as a program it started, has it read until it lets
+/// it go, so that program carries on.
+pub(crate) struct Outputs {
+    kept: Vec<Arc<Mutex<Vec<u8>>>>,
+    settled: Vec<oneshot::Receiver<()>>,
+    ended: watch::Sender<bool>,
+}
+
+type Output = Box<dyn AsyncRead + Unpin + Send>;
+
+impl Outputs {
+    pub(crate) fn read(outputs: Vec<Output>, keep: u64) -> Self {
+        let (ended, ended_seen) = watch::channel(false);
+        let mut kept = Vec::new();
+        let mut settled = Vec::new();
+        for output in outputs {
+            let held = Arc::new(Mutex::new(Vec::new()));
+            let (settle, settling) = oneshot::channel();
+            tokio::spawn(read_output(
+                output,
+                keep,
+                held.clone(),
+                settle,
+                ended_seen.clone(),
+            ));
+            kept.push(held);
+            settled.push(settling);
+        }
+        Self {
+            kept,
+            settled,
+            ended,
+        }
+    }
+
+    /// What each output printed, once its command has ended or been stopped: what
+    /// was left in the pipes is read for a moment more.
+    pub(crate) async fn settle(self) -> Vec<Vec<u8>> {
+        self.ended.send_replace(true);
+        let settling = async {
+            for settled in self.settled {
+                let _ = settled.await;
+            }
+        };
+        let _ = timeout(READ_AFTER_EXIT, settling).await;
+        self.kept
+            .iter()
+            .map(|kept| std::mem::take(&mut *kept.lock().unwrap_or_else(PoisonError::into_inner)))
+            .collect()
+    }
+}
+
+/// Reads one output for [`Outputs`], saying it's settled once `keep` bytes are
+/// kept or it's closed.
+async fn read_output(
+    mut output: Output,
+    keep: u64,
+    kept: Arc<Mutex<Vec<u8>>>,
+    settle: oneshot::Sender<()>,
+    ended: watch::Receiver<bool>,
+) {
+    let mut settle = Some(settle);
+    let mut let_go = 0;
+    let mut buffer = vec![0; 8192];
+    loop {
+        let read = match output.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let mut rest = &buffer[..read];
+        if settle.is_some() {
+            let mut held = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            let room = usize::try_from(keep).unwrap_or(usize::MAX) - held.len();
+            let taken = rest.len().min(room);
+            held.extend_from_slice(&rest[..taken]);
+            rest = &rest[taken..];
+            if held.len() as u64 >= keep {
+                settle.take().map(|settle| settle.send(()));
+            }
+        }
+        if !*ended.borrow() {
+            let_go += rest.len() as u64;
+            if let_go > LET_GO_BYTES {
+                break;
+            }
+        }
+    }
+    if let Some(settle) = settle {
+        let _ = settle.send(());
+    }
+}
 
 fn interpret(name: &str, status: ExitStatus, output: &[u8]) -> Result<Reading, String> {
     if output.len() > MAX_OUTPUT_BYTES {

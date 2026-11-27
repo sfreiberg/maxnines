@@ -423,7 +423,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     /// More than is kept, which is read to the end rather than the pipe closed on
     /// it, so it ends as it means to and not by the signal that closing sends.
     #[cfg(unix)]
@@ -438,6 +437,7 @@ mod tests {
         assert_eq!(outcome.status, CRITICAL, "{}", outcome.message);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_plugin_that_cannot_run_or_takes_too_long_is_unknown() {
         let missing = command(&["/no/such/plugin"]);
