@@ -1173,11 +1173,22 @@ fn read_ping_summary(output: &str, findings: &mut Findings) {
         if let Some((names, values)) = line.split_once(" = ")
             && names.contains("min/avg/max")
         {
-            let numbers: Vec<f64> = values
+            // Each name has its value, or the line isn't read, so one that couldn't
+            // be read never shifts the others along.
+            let named = names
+                .rsplit(' ')
+                .next()
+                .unwrap_or_default()
+                .split('/')
+                .count();
+            let numbers: Option<Vec<f64>> = values
                 .trim_end_matches(" ms")
                 .split('/')
-                .filter_map(|value| value.trim().parse().ok())
+                .map(|value| value.trim().parse().ok().filter(|ms: &f64| ms.is_finite()))
                 .collect();
+            let Some(numbers) = numbers.filter(|numbers| numbers.len() == named) else {
+                continue;
+            };
             // Pings give milliseconds.
             let seconds: Vec<f64> = numbers.iter().map(|ms| ms / 1000.0).collect();
             // BusyBox, as on Alpine, gives no standard deviation.
@@ -2102,6 +2113,13 @@ mod tests {
         assert!(close(findings.rtt_min_secs, 0.000064), "{findings:?}");
         assert!(close(findings.rtt_max_secs, 0.000105), "{findings:?}");
         assert_eq!(findings.rtt_stddev_secs, None);
+
+        // A value that can't be read leaves the line out, rather than shifting the
+        // rest into the wrong places.
+        let broken = "rtt min/avg/max/mdev = 0.1/-nan/0.3/0.05 ms\n";
+        let mut findings = Findings::default();
+        read_ping_summary(broken, &mut findings);
+        assert_eq!(findings.rtt_max_secs, None, "{findings:?}");
     }
 
     #[cfg(unix)]
