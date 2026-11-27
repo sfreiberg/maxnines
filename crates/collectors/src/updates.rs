@@ -42,7 +42,11 @@ fn from_security(line: &str) -> bool {
         return false;
     };
     let sources = sources.split(')').next().unwrap_or_default();
-    // The new version, then each archive it's in, separated by commas.
+    // The new version, then each archive it's in, separated by commas. A version can
+    // have a colon too, after an epoch, as `1:9.2p1-2+deb12u3`.
+    let Some((_version, sources)) = sources.trim_start().split_once(' ') else {
+        return false;
+    };
     sources.split(',').any(|source| {
         let archive = source.split_whitespace().find(|word| word.contains(':'));
         archive.is_some_and(|archive| {
@@ -225,13 +229,16 @@ Inst openssl [3.0.2-0ubuntu1.10] (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates, 
 Inst tzdata [2024a-0ubuntu0.22.04] (2024a-0ubuntu0.22.04.1 Ubuntu:22.04/jammy-updates [all])
 Inst libc6 [2.36-9] (2.36-9+deb12u4 Debian-Security:12/stable-security [amd64])
 Inst libsecurity-perl [1.0-1] (1.0-2 Debian:12/stable [all])
+Inst openssh-server [1:9.2p1-2+deb12u2] (1:9.2p1-2+deb12u3 Debian-Security:12/stable-security [arm64])
+Inst bind9-host [1:9.18.24-1] (1:9.18.28-1~deb12u2 Debian:12.7/stable, Debian-Security:12/stable-security [arm64])
+Inst vim [2:9.0.1378-2] (2:9.0.1378-2+deb12u1 Debian:12.7/stable [arm64])
 Conf openssl (3.0.2-0ubuntu1.12 Ubuntu:22.04/jammy-updates [amd64])
 ";
         assert_eq!(
             parse_apt(output),
             Updates {
-                pending: 4,
-                security: Some(2),
+                pending: 7,
+                security: Some(4),
             }
         );
         assert_eq!(parse_apt("Reading package lists...\n").pending, 0);
