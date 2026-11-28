@@ -239,8 +239,9 @@ pub enum WriterCommand {
         host_id: String,
         done: oneshot::Sender<Result<(), String>>,
     },
-    /// Takes nothing more, finishes everything already queued, and closes the
-    /// database cleanly.
+    /// Once the writer reaches it, takes nothing more, finishes what's still
+    /// queued, and closes the database cleanly. What's sent before it gets there is
+    /// done as ever.
     Stop,
 }
 
@@ -327,16 +328,20 @@ fn run_writer(
     // be deleted with it, and would make it again, so it's dropped. Samples from an
     // agent mean it was approved again, so they're stored as ever.
     let mut deleted: HashSet<String> = HashSet::new();
-    let mut stopping = false;
     let mut next_tidy = Instant::now();
     let every = store.batch_every();
     let mut next_write = Instant::now();
     // What's left from last time goes first, without waiting for more. Once it's
     // stopping, the queue is closed, so this ends when everything in it is done.
     while !queued.is_empty() || commands.blocking_recv_many(&mut queued, WRITE_QUEUE_SIZE) > 0 {
-        if !stopping {
+        if !stopping(&commands, &queued) {
             gather_until(next_write, &mut commands, &mut queued);
         }
+        // A failed write isn't tried again once it's stopping, so a database that's
+        // gone can't keep the server from stopping. Agents send what they never
+        // heard was stored again.
+        let stopping = stopping(&commands, &queued);
+        let retries = if stopping { 0 } else { RETRIES };
         let mut samples = Vec::with_capacity(queued.len());
         // Every acknowledgement each sample owes: a sample sent twice in one batch is
         // stored once, and both copies hear about it only if the batch is saved.
@@ -377,15 +382,12 @@ fn run_writer(
                 WriterCommand::DeleteHost { host_id, done } => deletion = Some((host_id, done)),
                 // Sending anything more fails at once, so nothing is dropped
                 // unheard, and what was sent before this is still done.
-                WriterCommand::Stop => {
-                    stopping = true;
-                    commands.close();
-                }
+                WriterCommand::Stop => commands.close(),
             }
         }
         next_write = Instant::now() + every;
         if !samples.is_empty() {
-            let saved = save(store.as_mut(), &samples, counts);
+            let saved = save(store.as_mut(), &samples, counts, retries);
             for (new, acks) in samples.iter().zip(acks) {
                 let time = new.sample.time;
                 if saved {
@@ -419,6 +421,14 @@ fn run_writer(
         Ok(Err(error)) => error!(error = format!("{error:#}"), "closing the store failed"),
         Err(_) => error!("store panicked while closing"),
     }
+}
+
+/// Whether it's been told to stop, or will be once it reaches what's queued.
+fn stopping(commands: &mpsc::Receiver<WriterCommand>, queued: &[WriterCommand]) -> bool {
+    commands.is_closed()
+        || queued
+            .iter()
+            .any(|command| matches!(command, WriterCommand::Stop))
 }
 
 /// Collects what arrives until a batch is due. A full batch doesn't wait, so a busy
@@ -507,12 +517,19 @@ fn write_batch(
 /// checked before they get here, so a failure means the database itself has a problem.
 /// What isn't saved stays with the agents that sent it, as they only let go of a sample
 /// once they hear it's stored.
-fn save(store: &mut dyn Store, samples: &[NewSample], counts: &WriteCounts) -> bool {
+fn save(
+    store: &mut dyn Store,
+    samples: &[NewSample],
+    counts: &WriteCounts,
+    retries: usize,
+) -> bool {
     let Err(mut error) = write_batch(store, samples, counts) else {
         return true;
     };
-    warn!(error, samples = samples.len(), "write failed, trying again");
-    for _ in 0..RETRIES {
+    if retries > 0 {
+        warn!(error, samples = samples.len(), "write failed, trying again");
+    }
+    for _ in 0..retries {
         thread::sleep(RETRY_WAIT);
         match write_batch(store, samples, counts) {
             Ok(()) => return true,
@@ -558,6 +575,8 @@ pub mod testing {
         pub samples: Arc<Mutex<Vec<(String, String, Timestamp)>>>,
         /// How many samples each successful write held.
         pub writes: Arc<Mutex<Vec<usize>>>,
+        /// How many writes were tried, failed ones included.
+        pub tried: Arc<std::sync::atomic::AtomicUsize>,
         pub closed: Arc<Mutex<bool>>,
         /// Holds up writes while it's set, as a slow disk does.
         pub paused: Arc<AtomicBool>,
@@ -626,6 +645,7 @@ pub mod testing {
             while self.0.paused.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(1));
             }
+            self.0.tried.fetch_add(1, Ordering::Relaxed);
             for new in samples {
                 match new.hostname.as_str() {
                     "fail" => bail!("deliberate test failure"),
@@ -978,7 +998,7 @@ mod tests {
         };
         let counts = WriteCounts::default();
 
-        assert!(super::save(&mut store, &batch(100), &counts));
+        assert!(super::save(&mut store, &batch(100), &counts, RETRIES));
 
         assert_eq!(store.writes, [100, 100, 100]);
         assert_eq!(counts.written.load(Ordering::Relaxed), 100);
@@ -993,7 +1013,7 @@ mod tests {
         };
         let counts = WriteCounts::default();
 
-        assert!(!super::save(&mut store, &batch(100), &counts));
+        assert!(!super::save(&mut store, &batch(100), &counts, RETRIES));
 
         assert_eq!(store.writes.len(), 1 + RETRIES);
         assert!(store.writes.iter().all(|size| *size == 100));
@@ -1176,8 +1196,31 @@ mod tests {
         assert_eq!(finished.try_recv().unwrap(), Ok(()));
         assert_eq!(*saved.deleted.lock().unwrap(), ["host-1"]);
         assert_eq!(timestamps(&saved), [2]);
+        // The test holds a sender, so this only ends because stopping closed the
+        // queue.
         assert!(*saved.closed.lock().unwrap());
-        assert!(sender.try_send(save("a", 3)).is_err());
+    }
+
+    /// A write that fails while it's stopping isn't tried again, however near the
+    /// stop is in the queue, as one before it always is.
+    #[test]
+    fn a_failed_write_is_not_tried_again_once_it_is_stopping() {
+        let saved = Saved::default();
+        let counts = Arc::new(WriteCounts::default());
+        let (sender, handle) = spawn_writer(Box::new(MemoryStore(saved.clone())), counts.clone());
+        sender.blocking_send(save("fail", 1)).unwrap();
+        wait_for_failures(&counts, 1);
+        assert_eq!(saved.tried.load(Ordering::Relaxed), RETRIES + 1);
+        sender.blocking_send(WriterCommand::Stop).unwrap();
+        handle.join().unwrap();
+
+        for commands in [
+            vec![save("fail", 1), WriterCommand::Stop],
+            vec![save("fail", 1), delete("host-2").0, WriterCommand::Stop],
+        ] {
+            let (saved, _) = run_with(commands);
+            assert_eq!(saved.tried.load(Ordering::Relaxed), 1);
+        }
     }
 
     #[test]
