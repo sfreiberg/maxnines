@@ -189,15 +189,41 @@ fn the_catalog_has_the_metrics_of_templates_that_are_on() {
     assert!(checked.find("pg.size").is_some(), "every part counts");
 }
 
-/// A template's metrics can't be named among a collector's.
+/// A template kept from before its key was one built-in metrics start with has none
+/// of its metrics read, on or off, and the built-in ones are as they were.
 #[test]
-fn a_template_with_a_collectors_prefix_as_its_key_is_refused() {
+fn the_catalog_leaves_out_a_template_whose_key_built_in_metrics_start_with() {
+    let stored = parse(
+        r#"template "cpu" {
+             name     = "Processor"
+             database = "postgres"
+             query "q" { sql = "SELECT 1 AS heat, 2 AS usage" }
+             query "off" {
+               enabled = false
+               sql     = "SELECT 1 AS spare"
+             }
+           }"#,
+    )
+    .unwrap();
+    let built_in = Catalog::built_in();
+    let catalog = Catalog::with_templates([&stored]);
+    assert_eq!(catalog.all().len(), built_in.all().len());
+    assert!(catalog.find("cpu.heat").is_none());
+    assert!(catalog.find("cpu.up").is_none());
+    assert!(catalog.find_known("cpu.spare").is_none());
+    assert_eq!(catalog.find("cpu.usage"), built_in.find("cpu.usage"));
+    assert_eq!(catalog.of_template("cpu").count(), 0);
+}
+
+/// A template's metrics can't be named among the ones MaxNines has built in.
+#[test]
+fn a_template_with_metrics_cannot_have_a_key_built_in_metrics_start_with() {
     // The built-in PostgreSQL template's are its own, and under another key it
     // has nothing wrong with it either.
     assert_eq!(problems(&postgres_as_pg()), Vec::<String>::new());
 
     // Whatever its metrics are called, and it's said once: its alerts, which would
-    // be read as being about the collector's metrics, aren't checked until then.
+    // be read as being about the built-in metrics, aren't checked until then.
     let found = problems(
         r#"template "cpu" {
              name     = "Processor"
@@ -212,9 +238,80 @@ fn a_template_with_a_collectors_prefix_as_its_key_is_refused() {
     assert_eq!(
         found,
         [
-            r#"template "cpu", key: "cpu" is what a collector's metrics start with, so a template that reads metrics of its own can't be called it"#
+            r#"template "cpu", key: "cpu" is what metrics MaxNines has built in start with, and this template's own, such as cpu.up, would be named among them: give it another key"#
         ]
     );
+
+    // A database template has one of its own without a query: whether it answers.
+    let found = problems(
+        r#"template "server" {
+             name     = "Server"
+             database = "postgres"
+           }"#,
+    );
+    assert_eq!(
+        found,
+        [
+            r#"template "server", key: "server" is what metrics MaxNines has built in start with, and this template's own, such as server.up, would be named among them: give it another key"#
+        ]
+    );
+
+    // Counters blocks' are metrics too.
+    let found = problems(
+        r#"template "disk" {
+             name = "Disks"
+             os   = ["windows"]
+             counters "c" {
+               object  = "PhysicalDisk"
+               metrics = { speed = { counter = "Disk Bytes/sec" } }
+             }
+           }"#,
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("such as disk.speed"), "{found:?}");
+
+    // One with only alerts about other metrics has none to name, as the built-in
+    // `raid` and `updates` are, and a key that only starts like a taken one is free.
+    let alerts_only = r#"template "disk" {
+             name = "Disks"
+             alert "full" {
+               name    = "Disk full"
+               warning = "disk.usage > 90"
+             }
+           }"#;
+    assert_eq!(problems(alerts_only), Vec::<String>::new());
+    let free = r#"template "disks" {
+             name     = "Disks"
+             database = "postgres"
+             query "q" { sql = "SELECT 1 AS heat" }
+           }"#;
+    assert_eq!(problems(free), Vec::<String>::new());
+}
+
+/// Every built-in metric's name is one, and the keys the docs say are taken are
+/// what they start with, worked out from them.
+#[test]
+fn the_keys_built_in_metrics_take_are_the_ones_the_docs_list() {
+    for metric in crate::metrics::built_in() {
+        assert!(
+            maxnines_protocol::entries::is_metric_name(&metric.name),
+            "{}",
+            metric.name
+        );
+    }
+    let docs = include_str!("../../../../docs/templates.md");
+    let listed = docs
+        .lines()
+        .skip_while(|line| !line.ends_with("The keys taken are:"))
+        .find(|line| line.starts_with('`'))
+        .expect("the docs list the keys taken");
+    let listed: Vec<&str> = listed
+        .trim_end_matches('.')
+        .split(", ")
+        .map(|key| key.trim_matches('`'))
+        .collect();
+    let taken: Vec<&str> = crate::metrics::prefixes().iter().copied().collect();
+    assert_eq!(listed, taken);
 }
 
 #[test]

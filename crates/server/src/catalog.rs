@@ -79,12 +79,16 @@ impl Catalog {
     }
 
     fn insert(&mut self, metric: Metric, on: bool) {
-        // Saving a template refuses a name the code has, so this is one an upgrade
-        // brought since.
-        if metrics::find(&metric.name).is_some() {
+        // Saving a template refuses a key the code's metrics start with, so this is
+        // one an upgrade brought a metric under since.
+        if metric
+            .template
+            .as_deref()
+            .is_some_and(|key| metrics::prefixes().contains(key))
+        {
             warn!(
                 metric = metric.name,
-                "a template's metric has the name of a built-in one, which is the one read"
+                "a template's key is what built-in metrics start with, so its metrics aren't read"
             );
             return;
         }

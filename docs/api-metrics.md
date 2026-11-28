@@ -10,6 +10,11 @@ every [template](templates.md) that's on, by their full names, such as `myapp.la
 One of a template's has the template's `key` as `template`, and the `description` the
 template gives it; for a built-in one both are `null`.
 
+A metric's name is two or more parts joined by dots, each of lowercase letters,
+digits and underscores, starting with a letter, and up to 255 characters in all.
+The first part is a template's key, or one of the
+[keys MaxNines' own metrics start with](templates.md#the-format).
+
 ```sh
 curl -H "Authorization: Bearer $MAXNINES_API_KEY" "$MAXNINES_URL/api/v1/metrics"
 ```

@@ -1,56 +1,32 @@
 //! What an agent reads, as a flat list: each entry is one metric's reading for one
 //! series, with when it was taken, and either its value or why there isn't one.
 //! Collectors and templates send the same thing, under names from one namespace,
-//! `<prefix>.<name>`, where each prefix belongs to one of them.
+//! `<prefix>.<name>`, where each prefix belongs to one of them: a template's key,
+//! or what the server's built-in metrics start with, which it keeps templates'
+//! keys clear of.
 //!
 //! Every run sends an entry for every metric it covers. One that failed puts its
-//! error on each, one with nothing to say for a metric sends that metric with
-//! neither a value nor an error, and the newest entry for a metric and series is how
-//! it stands: an error lasts until an entry without one.
+//! error on each, and one with nothing to say for a metric sends that metric with
+//! neither a value nor an error. An entry speaks for every series of its metric
+//! that its own series starts: a failed query knows the database it ran for and not
+//! the rows it didn't get, so its error on `["main"]` is every `["main", ...]`
+//! series', and lasts until a newer entry for any of them has none.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-/// The prefixes of the metrics collectors send, and of what the server and agent
-/// say of themselves. A template with metrics of its own can't have one as its key,
-/// as its metrics are `<key>.<name>`.
-pub const COLLECTOR_PREFIXES: &[&str] = &[
-    "agent",
-    "apache",
-    "check",
-    "clock",
-    "command",
-    "container",
-    "counter",
-    "cpu",
-    "custom",
-    "database_account",
-    "disk",
-    "file",
-    "gpu",
-    "host",
-    "memory",
-    "network",
-    "nginx",
-    "openmetrics",
-    "php_fpm",
-    "process",
-    "raid",
-    "sensor",
-    "server",
-    "service",
-    "smart",
-    "system",
-    "time_sync",
-    "top",
-    "unifi",
-    "updates",
-    "zfs",
-];
+use crate::templates::is_key;
 
-/// Whether collectors send metrics under this prefix.
-pub fn is_collector_prefix(prefix: &str) -> bool {
-    COLLECTOR_PREFIXES.contains(&prefix)
+/// The longest a metric's whole name can be.
+pub const MAX_METRIC_LEN: usize = 255;
+
+/// Whether this can be a metric's name: two or more parts joined by dots, each
+/// lowercase letters, digits and underscores, starting with a letter, as a key
+/// is, and up to [`MAX_METRIC_LEN`] characters in all. The first part is its
+/// prefix, which is a template's key or what a collector's metrics start with.
+pub fn is_metric_name(name: &str) -> bool {
+    name.len() <= MAX_METRIC_LEN && name.contains('.') && name.split('.').all(is_key)
 }
 
 /// A metric's prefix and its name under it, `postgres` and `lag` for `postgres.lag`,
@@ -64,18 +40,64 @@ pub fn split_metric(metric: &str) -> Option<(&str, &str)> {
 /// Everything an agent has read since it last sent. It doesn't say which agent it
 /// came from, because the server takes that from the authenticated connection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SentSample")]
 pub struct Sample {
     /// When it was sent, which is only what tells it apart from the agent's other
     /// samples, for the server to say it has it.
     pub time: DateTime<Utc>,
     pub entries: Vec<Entry>,
+    /// What it was sent that isn't an entry, which is left out so the rest is kept:
+    /// one that can't be read doesn't cost an agent everything sent with it. Never
+    /// sent, as an agent has none.
+    #[serde(skip_serializing)]
+    pub refused: Vec<Refused>,
+}
+
+/// Something sent as an entry that isn't one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refused {
+    /// The metric it says it's for, if it says.
+    pub metric: Option<String>,
+    pub why: String,
+}
+
+/// A sample as it's sent, each entry still to be read.
+#[derive(Deserialize)]
+struct SentSample {
+    time: DateTime<Utc>,
+    entries: Vec<Value>,
+}
+
+impl From<SentSample> for Sample {
+    fn from(sent: SentSample) -> Self {
+        let mut entries = Vec::with_capacity(sent.entries.len());
+        let mut refused = Vec::new();
+        for entry in sent.entries {
+            let metric = entry
+                .get("metric")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            match serde_json::from_value(entry) {
+                Ok(entry) => entries.push(entry),
+                Err(error) => refused.push(Refused {
+                    metric,
+                    why: error.to_string(),
+                }),
+            }
+        }
+        Self {
+            time: sent.time,
+            entries,
+            refused,
+        }
+    }
 }
 
 /// One metric's reading for one series.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Sent", into = "Sent")]
 pub struct Entry {
-    /// The metric's full name, `<prefix>.<name>`.
+    /// The metric's full name, `<prefix>.<name>`, which [`is_metric_name`].
     pub metric: String,
     /// The values of the labels that tell this series from the metric's others, in
     /// the order the metric's description names them. Empty for a metric with one
@@ -124,6 +146,20 @@ impl TryFrom<Sent> for Entry {
     type Error = String;
 
     fn try_from(sent: Sent) -> Result<Self, String> {
+        if !is_metric_name(&sent.metric) {
+            return Err(format!(
+                "{:?} isn't a metric's name: two or more parts joined by dots, each of \
+                 lowercase letters, digits and underscores, starting with a letter",
+                sent.metric
+            ));
+        }
+        if sent
+            .error
+            .as_deref()
+            .is_some_and(|error| error.trim().is_empty())
+        {
+            return Err(format!("{} has an error that says nothing", sent.metric));
+        }
         let reading = match (sent.value, sent.error) {
             (Some(_), Some(_)) => {
                 return Err(format!(
@@ -163,7 +199,7 @@ impl From<Entry> for Sent {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::*;
 
@@ -270,6 +306,18 @@ mod tests {
                     "series": "user", "value": 1 }),
             json!({ "metric": "cpu.usage", "time": "2026-11-27T18:41:10.311Z",
                     "series": [1], "value": 1 }),
+            // A name that isn't a prefix and a name under it.
+            json!({ "metric": "", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": "usage", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": ".usage", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": "cpu.", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": "cpu..usage", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": "CPU.usage", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": "cpu.usage!", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            json!({ "metric": "cpu.9lives", "time": "2026-11-27T18:41:10.311Z", "value": 1 }),
+            // An error that says nothing.
+            json!({ "metric": "cpu.usage", "time": "2026-11-27T18:41:10.311Z", "error": "" }),
+            json!({ "metric": "cpu.usage", "time": "2026-11-27T18:41:10.311Z", "error": "  " }),
             // Something it doesn't know, as a misspelt `error` would otherwise read
             // as nothing to say.
             json!({ "metric": "cpu.usage", "time": "2026-11-27T18:41:10.311Z",
@@ -287,7 +335,7 @@ mod tests {
     fn a_null_value_or_error_is_the_same_as_none() {
         let read: Entry = serde_json::from_value(json!({
             "metric": "cpu.usage", "time": "2026-11-27T18:41:10.311Z",
-            "value": Value::Null, "error": Value::Null,
+            "value": null, "error": null,
         }))
         .unwrap();
         assert_eq!(read.reading, Reading::Nothing);
@@ -298,6 +346,7 @@ mod tests {
         let sample = Sample {
             time: "2026-11-27T18:41:15.120Z".parse().unwrap(),
             entries: vec![entry("cpu.usage", &["user"], number(12))],
+            refused: Vec::new(),
         };
         let sent = json!({
             "time": "2026-11-27T18:41:15.120Z",
@@ -306,6 +355,104 @@ mod tests {
         });
         assert_eq!(serde_json::to_value(&sample).unwrap(), sent);
         assert_eq!(serde_json::from_value::<Sample>(sent).unwrap(), sample);
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_read_is_left_out_and_the_rest_are_kept() {
+        let sample: Sample = serde_json::from_value(json!({
+            "time": "2026-11-27T18:41:15.120Z",
+            "entries": [
+                { "metric": "cpu.usage", "series": ["user"],
+                  "time": "2026-11-27T18:41:10.311Z", "value": 12 },
+                { "metric": "cpu.load", "time": "2026-11-27T18:41:10.311Z",
+                  "value": 1, "error": "no" },
+                { "metric": "Not One", "time": "2026-11-27T18:41:10.311Z", "value": 1 },
+                { "time": "2026-11-27T18:41:10.311Z", "value": 1 },
+                "nothing like one",
+                { "metric": "memory.usage", "time": "2026-11-27T18:41:10.311Z", "value": 61.5 },
+            ],
+        }))
+        .unwrap();
+        let kept: Vec<&str> = sample.entries.iter().map(|e| e.metric.as_str()).collect();
+        assert_eq!(kept, ["cpu.usage", "memory.usage"]);
+        let refused: Vec<(Option<&str>, &str)> = sample
+            .refused
+            .iter()
+            .map(|refused| (refused.metric.as_deref(), refused.why.as_str()))
+            .collect();
+        assert_eq!(refused.len(), 4, "{refused:?}");
+        assert_eq!(refused[0].0, Some("cpu.load"));
+        assert!(refused[0].1.contains("a value and an error"), "{refused:?}");
+        assert_eq!(refused[1].0, Some("Not One"));
+        assert!(
+            refused[1].1.contains("isn't a metric's name"),
+            "{refused:?}"
+        );
+        assert_eq!(refused[2].0, None);
+        assert!(refused[2].1.contains("metric"), "{refused:?}");
+        assert_eq!(refused[3].0, None);
+        // What it refused is never sent on.
+        assert!(
+            serde_json::to_value(&sample)
+                .unwrap()
+                .get("refused")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_sample_that_is_not_one_is_refused_whole() {
+        let refused = [
+            json!({ "entries": [] }),
+            json!({ "time": "2026-11-27T18:41:15.120Z" }),
+            json!({ "time": "2026-11-27T18:41:15.120Z", "entries": {} }),
+            json!({ "time": "yesterday", "entries": [] }),
+        ];
+        for sent in refused {
+            assert!(
+                serde_json::from_value::<Sample>(sent.clone()).is_err(),
+                "{sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_metrics_name_is_two_or_more_keys_joined_by_dots() {
+        let long = format!("a.{}", "b".repeat(64));
+        let parts = ["part"; 51].join(".");
+        assert_eq!(parts.len(), MAX_METRIC_LEN - 1);
+        for name in [
+            "cpu.usage",
+            "network.packets.received",
+            "a.b.c.d.e.f",
+            "php_fpm.listen_queue",
+            "disk_2.io9",
+            long.as_str(),
+            parts.as_str(),
+        ] {
+            assert!(is_metric_name(name), "{name:?}");
+        }
+        let too_long_a_part = format!("a.{}", "b".repeat(65));
+        let too_long = ["part"; 52].join(".");
+        for name in [
+            "",
+            "cpu",
+            ".",
+            ".usage",
+            "cpu.",
+            "cpu..usage",
+            "CPU.usage",
+            "cpu.Usage",
+            "cpu.usage!",
+            "cpu usage.x",
+            "cpu.9lives",
+            "_cpu.usage",
+            "cpu.usage ",
+            too_long_a_part.as_str(),
+            too_long.as_str(),
+        ] {
+            assert!(!is_metric_name(name), "{name:?}");
+        }
     }
 
     #[test]
@@ -318,15 +465,5 @@ mod tests {
         for not_one in ["", "lag", ".lag", "postgres.", "."] {
             assert_eq!(split_metric(not_one), None, "{not_one:?}");
         }
-    }
-
-    #[test]
-    fn the_collector_prefixes_are_sorted_keys_without_repeats() {
-        assert!(COLLECTOR_PREFIXES.is_sorted_by(|a, b| a < b));
-        for prefix in COLLECTOR_PREFIXES {
-            assert!(crate::templates::is_key(prefix), "{prefix}");
-        }
-        assert!(is_collector_prefix("cpu"));
-        assert!(!is_collector_prefix("postgres"));
     }
 }

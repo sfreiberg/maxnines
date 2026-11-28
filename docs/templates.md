@@ -92,10 +92,17 @@ template "myapp" {
 The **key**, `myapp`, starts the names of the template's metrics, so the column
 `connections` is the metric `myapp.connections`. It's lowercase letters, digits and
 underscores, starting with a letter, and no two templates share one. So are the keys of
-the blocks inside it, such as `sessions` and `busy`. A template with metrics
-of its own can't have a key that MaxNines' own metrics start with, such as `cpu` or
-`disk`, as `cpu.usage` is already one: give it another key. One with only alerts
-about other metrics can.
+the blocks inside it, such as `sessions` and `busy`.
+
+A metric's whole name is two or more parts joined by dots, each made the way a key
+is, and up to 255 characters in all: `myapp.connections`, `network.packets.received`.
+
+A template with metrics of its own can't have a key that the metrics MaxNines has
+built in start with, as `cpu.usage` is already one. A database template always has one
+of its own, `myapp.up`, which says whether the database answers. One with only alerts about
+other metrics has none, and can. The keys taken are:
+
+`agent`, `apache`, `check`, `clock`, `command`, `container`, `counter`, `cpu`, `custom`, `database_account`, `disk`, `file`, `gpu`, `host`, `memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `process`, `raid`, `sensor`, `server`, `service`, `smart`, `system`, `time_sync`, `top`, `unifi`, `updates`, `zfs`.
 
 An agent is sent what it reads all at once, so a template can have up to 64 discover
 blocks and queries together, each SQL statement up to 64 KB with what fills it, each

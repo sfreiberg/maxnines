@@ -223,10 +223,22 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
             ));
         }
     }
-    // An alert about a name that's taken would be read as being about the collector's
-    // metric, so there's nothing to learn from checking the alerts until the key,
-    // which the template's own check refuses, is another.
-    let names_taken = template.key_is_taken();
+    // Each prefix is one source's, so a template's metrics can't be named among the
+    // ones MaxNines reads itself. One with only alerts about other metrics has none.
+    // An alert of one that has would be read as being about the built-in metrics, so
+    // there's nothing to learn from checking the alerts until its key is another.
+    let names_taken = key_is_taken(template);
+    if let (true, Some((metric, _))) = (names_taken, own.first()) {
+        problems.push(Problem::new(
+            Place::Template,
+            "key",
+            format!(
+                "{:?} is what metrics MaxNines has built in start with, and this template's \
+                 own, such as {}, would be named among them: give it another key",
+                template.key, metric.name
+            ),
+        ));
+    }
     let catalog = catalog.with_template(template);
     let names = Names {
         catalog: &catalog,
@@ -253,6 +265,12 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
         }
     }
     problems
+}
+
+/// Whether a template has metrics of its own under a key that the metrics MaxNines
+/// has built in start with.
+pub fn key_is_taken(template: &Template) -> bool {
+    crate::metrics::prefixes().contains(template.key.as_str()) && !metrics_of(template).is_empty()
 }
 
 /// Why no label can be called `instance`, in any template.

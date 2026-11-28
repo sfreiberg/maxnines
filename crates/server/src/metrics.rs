@@ -6,11 +6,12 @@
 //! saved. [`crate::catalog::Catalog`] has both. Only agent IDs and times come from
 //! requests, and those are bound as parameters.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta};
+use maxnines_protocol::entries::split_metric;
 use maxnines_protocol::templates::work::ACCOUNTS;
 use serde::Serialize;
 use serde_json::Value;
@@ -2339,6 +2340,20 @@ pub fn built_in() -> &'static [Arc<Metric>] {
             .collect()
     });
     &BUILT_IN
+}
+
+/// What the metrics named here in code start with, `cpu` for `cpu.usage`. No
+/// template with metrics of its own can have one as its key, as its metrics would be
+/// named among them.
+pub fn prefixes() -> &'static BTreeSet<&'static str> {
+    static PREFIXES: LazyLock<BTreeSet<&'static str>> = LazyLock::new(|| {
+        METRICS
+            .iter()
+            .filter_map(|metric| split_metric(metric.name))
+            .map(|(prefix, _)| prefix)
+            .collect()
+    });
+    &PREFIXES
 }
 
 /// One of the metrics named here in code, which is all this finds: what a

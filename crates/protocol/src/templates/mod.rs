@@ -853,21 +853,6 @@ pub fn is_key(name: &str) -> bool {
 const KEY_RULE: &str = "has to be lowercase letters, digits and underscores, starting with a letter, up to 64 characters";
 
 impl Template {
-    /// Whether it has metrics of its own, which are named `<key>.<name>`: what its
-    /// queries and counters blocks read, and for a database, whether it's answering.
-    /// One with only alerts about other metrics has none.
-    pub fn has_metrics(&self) -> bool {
-        !self.queries.is_empty()
-            || !self.counters.is_empty()
-            || matches!(self.target, Some(Target::Database(_)))
-    }
-
-    /// Whether its metrics would be named among a collector's, as its key is what
-    /// the collector's start with.
-    pub fn key_is_taken(&self) -> bool {
-        self.has_metrics() && crate::entries::is_collector_prefix(&self.key)
-    }
-
     /// Everything wrong with it that it can say itself, in the order it's written.
     pub fn check(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
@@ -878,16 +863,6 @@ impl Template {
 
         if !is_key(&self.key) {
             say(top, "key", format!("{:?} {KEY_RULE}", self.key));
-        } else if self.key_is_taken() {
-            say(
-                top,
-                "key",
-                format!(
-                    "{:?} is what a collector's metrics start with, so a template that reads \
-                     metrics of its own can't be called it",
-                    self.key
-                ),
-            );
         }
         check_name(&self.name, &mut |message| say(top, "name", message));
         if let Some(description) = &self.description
