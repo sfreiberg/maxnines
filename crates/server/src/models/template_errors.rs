@@ -7,7 +7,9 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+};
 use serde::Serialize;
 
 use maxnines_protocol::templates::work::{MAX_ERROR_LEN, MAX_ERRORS, TemplateErrors};
@@ -62,7 +64,8 @@ impl Database {
     /// at `at` said it: for each template and database it says anything of, what's
     /// wrong now in place of what was before. Something still saying the same keeps
     /// when it began. Anything said of a template there isn't, or more than could
-    /// be kept, is let go.
+    /// be kept, is let go. It's all kept or none of it is, so a failure never leaves
+    /// some of what was said in place of the rest.
     pub async fn save_template_errors(
         &self,
         host_id: &str,
@@ -79,6 +82,11 @@ impl Database {
             .into_iter()
             .map(|row| (row.key, row.id))
             .collect();
+        let transaction = self
+            .connection
+            .begin()
+            .await
+            .context("saving what's going wrong")?;
         for one in said.iter().filter(|one| can_keep(one)) {
             let Some(&template_id) = templates.get(&one.template) else {
                 continue;
@@ -88,7 +96,7 @@ impl Database {
                 .filter(template_error::Column::HostId.eq(host_id))
                 .filter(template_error::Column::TemplateId.eq(template_id))
                 .filter(template_error::Column::DatabaseName.eq(database.clone()))
-                .all(&self.connection)
+                .all(&transaction)
                 .await
                 .context("loading what's going wrong")?
                 .into_iter()
@@ -102,7 +110,7 @@ impl Database {
                         active.message = Set(message.clone());
                         active.since = Set(at);
                         active
-                            .update(&self.connection)
+                            .update(&transaction)
                             .await
                             .context("saving what's going wrong")?;
                     }
@@ -116,7 +124,7 @@ impl Database {
                             since: Set(at),
                             ..Default::default()
                         }
-                        .insert(&self.connection)
+                        .insert(&transaction)
                         .await
                         .context("saving what's going wrong")?;
                     }
@@ -126,11 +134,15 @@ impl Database {
             if !gone.is_empty() {
                 template_error::Entity::delete_many()
                     .filter(template_error::Column::Id.is_in(gone))
-                    .exec(&self.connection)
+                    .exec(&transaction)
                     .await
                     .context("forgetting what's going wrong")?;
             }
         }
+        transaction
+            .commit()
+            .await
+            .context("saving what's going wrong")?;
         Ok(())
     }
 

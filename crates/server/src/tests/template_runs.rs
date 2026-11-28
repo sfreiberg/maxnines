@@ -185,3 +185,80 @@ async fn what_goes_wrong_is_kept_shown_where_each_template_runs_and_forgotten() 
     TestServer::next_config(&mut client).await;
     wait_for_errors(database, &host.id(), <[_]>::is_empty).await;
 }
+
+/// A save that fails partway leaves what was kept before as it was, rather than
+/// some of what was said in place of the rest.
+#[tokio::test]
+async fn what_goes_wrong_is_kept_whole_or_not_at_all() {
+    use maxnines_protocol::templates::work::TemplateErrors;
+    use sea_orm::ConnectionTrait;
+
+    let server = start_with_metrics().await;
+    let host = identity();
+    let mut client = server.connect_approved(&host, "db-1").await;
+    TestServer::next_config(&mut client).await;
+    // It reads both databases, so nothing kept of them is forgotten meanwhile.
+    let facts = AgentMessage::Facts {
+        facts: json!({ "agent": { "databases": { "a": "postgres", "b": "postgres" } } }),
+    };
+    send(&mut client, &facts).await;
+    server.wait_for_facts(&host.id(), 1).await;
+    let database = &server.state.database;
+    let template = crate::templates::load(STOCK, &json!({}), &database.catalog()).unwrap();
+    database
+        .create_template(&template, crate::times::now())
+        .await
+        .unwrap();
+    TestServer::next_config(&mut client).await;
+    let said = |database: &str, part: &str, message: &str| TemplateErrors {
+        template: "stock".to_string(),
+        database: Some(database.to_string()),
+        errors: BTreeMap::from([(part.to_string(), message.to_string())]),
+    };
+    let first = crate::times::now() - TimeDelta::seconds(10);
+    database
+        .save_template_errors(&host.id(), &[said("a", "query orders", "first")], first)
+        .await
+        .unwrap();
+
+    // The database refuses one part, after the one before it has changed.
+    let connection = database.connection();
+    let refuse = match connection.get_database_backend() {
+        sea_orm::DatabaseBackend::Sqlite => vec![
+            "CREATE TRIGGER refuse BEFORE INSERT ON template_errors \
+             WHEN NEW.part = 'refused' BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        ],
+        sea_orm::DatabaseBackend::Postgres => vec![
+            "CREATE FUNCTION refuse() RETURNS trigger AS $$ \
+             BEGIN RAISE EXCEPTION 'refused'; END $$ LANGUAGE plpgsql",
+            "CREATE TRIGGER refuse BEFORE INSERT ON template_errors FOR EACH ROW \
+             WHEN (NEW.part = 'refused') EXECUTE FUNCTION refuse()",
+        ],
+        _ => vec![
+            "CREATE TRIGGER refuse BEFORE INSERT ON template_errors FOR EACH ROW \
+             BEGIN IF NEW.part = 'refused' THEN \
+             SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'refused'; END IF; END",
+        ],
+    };
+    for sql in refuse {
+        connection.execute_unprepared(sql).await.unwrap();
+    }
+    let said_since = [
+        said("a", "query orders", "second"),
+        said("b", "refused", "never kept"),
+    ];
+    let saved = database
+        .save_template_errors(&host.id(), &said_since, crate::times::now())
+        .await;
+    assert!(saved.is_err());
+
+    let kept = database
+        .template_errors(Some(&host.id()), None)
+        .await
+        .unwrap();
+    let kept: Vec<_> = kept
+        .iter()
+        .map(|error| (error.part.as_str(), error.message.as_str(), error.since))
+        .collect();
+    assert_eq!(kept, [("query orders", "first", first)]);
+}
