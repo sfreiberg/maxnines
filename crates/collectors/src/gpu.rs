@@ -2,9 +2,12 @@
 //! where IOKit publishes each GPU's own statistics to anyone, without extra rights.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 
 use crate::Collector;
+use crate::entries::{Entries, at};
 
 /// Where macOS keeps how busy a GPU is: Apple's own GPUs and AMD's say the first,
 /// and some older drivers the second.
@@ -81,7 +84,39 @@ impl Collector for GpuCollector {
             .collect();
         Ok(Value::Array(gpus))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &["gpu.usage", "gpu.memory"]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let gpus = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = gpus
+            .iter()
+            .filter_map(|gpu| Some((gpu.get("name")?.as_str()?, gpu)));
+        let mut any = false;
+        for (name, gpu) in named {
+            any = true;
+            for (metric, field) in GPU_FIELDS {
+                entries.read(metric, &[name], at(gpu, field));
+            }
+        }
+        // A host whose GPUs say nothing has nothing for either.
+        if !any {
+            for (metric, _) in GPU_FIELDS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        entries.done()
+    }
 }
+
+/// A GPU's metrics, and what each is read from.
+const GPU_FIELDS: [(&str, &str); 2] = [
+    ("gpu.usage", "usage_percent"),
+    ("gpu.memory", "memory_used_bytes"),
+];
 
 mod platform {
     use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
@@ -177,6 +212,45 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+
+    #[test]
+    fn gpu_entries_have_a_series_for_each_gpu() {
+        let output = json!([
+            { "name": "Apple M4 Pro", "usage_percent": 31.0, "memory_used_bytes": 390_922_240 },
+            // An older card that only says how busy it is.
+            { "name": "Radeon 2", "usage_percent": 7.0, "memory_used_bytes": null },
+        ]);
+        let entries = GpuCollector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("gpu.usage[Apple M4 Pro]".to_string(), json!(31.0)),
+                ("gpu.memory[Apple M4 Pro]".to_string(), json!(390_922_240)),
+                ("gpu.usage[Radeon 2]".to_string(), json!(7.0)),
+                ("gpu.memory[Radeon 2]".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&GpuCollector, &entries);
+
+        // With no GPUs, each metric says it has nothing.
+        let none = GpuCollector.entries(&json!([]), time());
+        assert_eq!(
+            said(&none),
+            [
+                ("gpu.usage".to_string(), Value::Null),
+                ("gpu.memory".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&GpuCollector, &none);
+    }
+
+    /// What a real collection says is entries for exactly the collector's metrics.
+    #[test]
+    fn what_this_hosts_gpus_really_say_becomes_entries_for_their_metrics() {
+        let output = GpuCollector.collect().unwrap();
+        every_metric_has_an_entry(&GpuCollector, &GpuCollector.entries(&output, time()));
+    }
 
     fn statistics(pairs: &[(&str, i64)]) -> impl Fn(&str) -> Option<i64> {
         let pairs: HashMap<String, i64> = pairs

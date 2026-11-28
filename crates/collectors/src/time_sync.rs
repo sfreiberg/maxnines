@@ -21,9 +21,12 @@
 //! using, and how far the clock is from them.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 
 use crate::Collector;
+use crate::entries::{Entries, at};
 
 /// One reading of the clock's sync. A number left out isn't known on this system.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -206,7 +209,42 @@ impl Collector for TimeSyncCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.read().to_value())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &[
+            "time_sync.synced",
+            "time_sync.max_error",
+            "time_sync.offset",
+            "time_sync.sources",
+        ]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        // Why nothing could be read is the error of whatever wasn't. A stopped time
+        // service still says the clock isn't synced, which is kept.
+        let problem = at(output, "problem")
+            .as_str()
+            .filter(|problem| !problem.trim().is_empty());
+        for (metric, series, field) in TIME_SYNC_FIELDS {
+            let read = at(output, field);
+            match problem {
+                Some(problem) if read.is_null() => entries.error(metric, &[series], problem),
+                // Each system has its own numbers, so the others have nothing.
+                _ => entries.read(metric, &[series], read),
+            }
+        }
+        entries.done()
+    }
 }
+
+/// The clock's metrics, what each one's series is called, and what it's read from.
+const TIME_SYNC_FIELDS: [(&str, &str, &str); 4] = [
+    ("time_sync.synced", "Synced", "synced"),
+    ("time_sync.max_error", "Largest error", "max_error_secs"),
+    ("time_sync.offset", "Offset", "offset_secs"),
+    ("time_sync.sources", "Time sources", "sources"),
+];
 
 #[cfg(unix)]
 mod kernel {
@@ -294,6 +332,96 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
+    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+
+    #[test]
+    fn time_sync_entries_are_what_this_systems_time_service_says() {
+        let collector = TimeSyncCollector::new();
+        // A kernel's reading, and the Windows Time service's.
+        let kernel = from_kernel(0, 2_500).to_value();
+        let entries = collector.entries(&kernel, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("time_sync.synced[Synced]".to_string(), json!(1)),
+                (
+                    "time_sync.max_error[Largest error]".to_string(),
+                    json!(0.0025)
+                ),
+                ("time_sync.offset[Offset]".to_string(), Value::Null),
+                ("time_sync.sources[Time sources]".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        let windows = from_windows(Service::Running, Some(2.0), Some(1_500.0)).to_value();
+        let entries = collector.entries(&windows, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("time_sync.synced[Synced]".to_string(), json!(1)),
+                (
+                    "time_sync.max_error[Largest error]".to_string(),
+                    Value::Null
+                ),
+                ("time_sync.offset[Offset]".to_string(), json!(0.0015)),
+                ("time_sync.sources[Time sources]".to_string(), json!(2.0)),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn why_the_clock_could_not_be_read_is_the_error_of_what_was_not() {
+        let collector = TimeSyncCollector::new();
+        let error = json!({ "error": UNREADABLE });
+        let unreadable = from_windows(Service::Running, None, None).to_value();
+        let entries = collector.entries(&unreadable, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("time_sync.synced[Synced]".to_string(), error.clone()),
+                (
+                    "time_sync.max_error[Largest error]".to_string(),
+                    error.clone()
+                ),
+                ("time_sync.offset[Offset]".to_string(), error.clone()),
+                ("time_sync.sources[Time sources]".to_string(), error),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // A time service that's missing still says the clock isn't synced.
+        let error = json!({ "error": MISSING });
+        let missing = from_windows(Service::Missing, None, None).to_value();
+        let entries = collector.entries(&missing, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("time_sync.synced[Synced]".to_string(), json!(0)),
+                (
+                    "time_sync.max_error[Largest error]".to_string(),
+                    error.clone()
+                ),
+                ("time_sync.offset[Offset]".to_string(), error.clone()),
+                ("time_sync.sources[Time sources]".to_string(), error),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // Nothing read and no reason given is nothing.
+        let entries = collector.entries(&json!({ "known": 0, "problem": "" }), time());
+        assert!(said(&entries).iter().all(|(_, value)| value.is_null()));
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    /// What a real collection says is entries for exactly the collector's metrics.
+    #[test]
+    fn what_this_hosts_clock_really_says_becomes_entries_for_its_metrics() {
+        let mut collector = TimeSyncCollector::new();
+        let output = collector.collect().unwrap();
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/time_sync")

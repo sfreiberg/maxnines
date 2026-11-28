@@ -5,6 +5,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at};
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::{AgentConfig, COLLECTORS, CollectorSettings};
 use serde_json::{Value, json};
 use sysinfo::{
@@ -314,6 +317,35 @@ fn status_pages(
     )?))
 }
 
+/// The entries of a collector whose output is a list of items, each a series under
+/// what its `name` field says: every metric, read from its field of each item. With
+/// no named items, each metric says it has nothing.
+fn item_entries(
+    output: &Value,
+    name: &str,
+    fields: &[(&str, &str)],
+    time: DateTime<Utc>,
+) -> Vec<Entry> {
+    let mut entries = Entries::at(time);
+    let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
+    let named = items
+        .iter()
+        .filter_map(|item| Some((item.get(name)?.as_str()?, item)));
+    let mut any = false;
+    for (series, item) in named {
+        any = true;
+        for (metric, field) in fields {
+            entries.read(metric, &[series], at(item, field));
+        }
+    }
+    if !any {
+        for (metric, _) in fields {
+            entries.nothing(metric, &[]);
+        }
+    }
+    entries.done()
+}
+
 /// Some sensors report raw values that aren't temperatures, such as -9200 on
 /// Apple hardware. Nothing a host can survive falls outside this.
 fn is_plausible(celsius: f32) -> bool {
@@ -351,7 +383,18 @@ impl Collector for SensorCollector {
             .collect();
         Ok(Value::Array(sensors))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &["sensor.temperature"]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        item_entries(output, "label", &SENSOR_FIELDS, time)
+    }
 }
+
+/// A sensor's metric, and what it's read from.
+const SENSOR_FIELDS: [(&str, &str); 1] = [("sensor.temperature", "celsius")];
 
 /// The process list, read once a sample however many collectors use it. CPU usage
 /// is measured between two reads, like the CPU collector's, so it's read once now.
@@ -515,7 +558,22 @@ impl Collector for ProcessCollector {
         let running = ProcessTable::running_for(&self.table, self.samples);
         Ok(Value::Array(tally(&self.names, &running)))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &["process.count", "process.cpu", "process.memory"]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        item_entries(output, "name", &PROCESS_FIELDS, time)
+    }
 }
+
+/// A watched name's metrics, and what each is read from.
+const PROCESS_FIELDS: [(&str, &str); 3] = [
+    ("process.count", "count"),
+    ("process.cpu", "cpu_percent"),
+    ("process.memory", "memory_bytes"),
+];
 
 /// How many programs each of the top lists keeps.
 const TOP: usize = 5;
@@ -546,7 +604,22 @@ impl Collector for TopProcessCollector {
         let running = ProcessTable::running_for(&self.table, self.samples);
         Ok(Value::Array(top(running)))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &["top.cpu", "top.memory", "top.count"]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        item_entries(output, "name", &TOP_FIELDS, time)
+    }
 }
+
+/// A top program's metrics, and what each is read from.
+const TOP_FIELDS: [(&str, &str); 3] = [
+    ("top.cpu", "cpu_percent"),
+    ("top.memory", "memory_bytes"),
+    ("top.count", "count"),
+];
 
 /// The top programs by CPU and by memory, together, each once, busiest first.
 fn top(processes: Vec<RunningProcess>) -> Vec<Value> {
@@ -584,10 +657,55 @@ fn top(processes: Vec<RunningProcess>) -> Vec<Value> {
         .collect()
 }
 
+/// What the tests of collectors' entries share.
+#[cfg(test)]
+pub mod test_entries {
+    use maxnines_protocol::entries::Reading;
+    use serde_json::json;
+
+    use super::*;
+
+    pub fn time() -> DateTime<Utc> {
+        "2026-11-28T09:00:00Z".parse().unwrap()
+    }
+
+    /// Entries as `metric[series, ...]` and what they say, to compare whole.
+    pub fn said(entries: &[Entry]) -> Vec<(String, Value)> {
+        entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.time, time());
+                let name = match entry.series.as_slice() {
+                    [] => entry.metric.clone(),
+                    series => format!("{}[{}]", entry.metric, series.join(", ")),
+                };
+                let reading = match &entry.reading {
+                    Reading::Value(value) => serde_json::to_value(value).unwrap(),
+                    Reading::Error(error) => json!({ "error": error }),
+                    Reading::Nothing => Value::Null,
+                };
+                (name, reading)
+            })
+            .collect()
+    }
+
+    /// Every metric a collector says it reads has an entry, and it has entries for
+    /// no others, so a failed collection's errors are on the same metrics.
+    pub fn every_metric_has_an_entry(collector: &dyn Collector, entries: &[Entry]) {
+        let mut read: Vec<&str> = entries.iter().map(|entry| entry.metric.as_str()).collect();
+        read.sort_unstable();
+        read.dedup();
+        let mut metrics = collector.metrics().to_vec();
+        metrics.sort_unstable();
+        assert_eq!(read, metrics, "{}", collector.name());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
+    use super::test_entries::{every_metric_has_an_entry, said, time};
     use super::*;
 
     fn config(collectors: Value) -> AgentConfig {
@@ -915,6 +1033,129 @@ mod tests {
     fn sensors_give_a_list_even_when_there_are_none() {
         let mut collector = SensorCollector::new().unwrap();
         assert!(collector.collect().unwrap().is_array());
+    }
+
+    #[test]
+    fn sensor_entries_have_a_series_for_each_sensor() {
+        let collector = SensorCollector::new().unwrap();
+        let output = json!([
+            { "label": "CPU", "celsius": 45.5 },
+            { "label": "Battery" },
+            // One without a label can't be told from the others.
+            { "celsius": 30.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("sensor.temperature[CPU]".to_string(), json!(45.5)),
+                ("sensor.temperature[Battery]".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // A host with no sensors says it has nothing.
+        let none = collector.entries(&json!([]), time());
+        assert_eq!(
+            said(&none),
+            [("sensor.temperature".to_string(), Value::Null)]
+        );
+        every_metric_has_an_entry(&collector, &none);
+    }
+
+    #[test]
+    fn process_entries_have_a_series_for_each_watched_name() {
+        let collector = processes_watching(&[]);
+        let output = json!([
+            { "name": "nginx", "count": 2, "cpu_percent": 5.0, "memory_bytes": 200 },
+            { "name": "sshd", "count": 0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("process.count[nginx]".to_string(), json!(2)),
+                ("process.cpu[nginx]".to_string(), json!(5.0)),
+                ("process.memory[nginx]".to_string(), json!(200)),
+                ("process.count[sshd]".to_string(), json!(0)),
+                ("process.cpu[sshd]".to_string(), Value::Null),
+                ("process.memory[sshd]".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no names to watch, each metric says it has nothing.
+        let none = collector.entries(&json!([]), time());
+        assert_eq!(
+            said(&none),
+            [
+                ("process.count".to_string(), Value::Null),
+                ("process.cpu".to_string(), Value::Null),
+                ("process.memory".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &none);
+    }
+
+    #[test]
+    fn top_process_entries_have_a_series_for_each_program() {
+        let collector = TopProcessCollector::new(ProcessTable::shared(false).unwrap());
+        let output = json!([
+            { "name": "php-fpm", "count": 2, "cpu_percent": 25.0, "memory_bytes": 200 },
+            { "name": "postgres", "cpu_percent": 20.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("top.cpu[php-fpm]".to_string(), json!(25.0)),
+                ("top.memory[php-fpm]".to_string(), json!(200)),
+                ("top.count[php-fpm]".to_string(), json!(2)),
+                ("top.cpu[postgres]".to_string(), json!(20.0)),
+                ("top.memory[postgres]".to_string(), Value::Null),
+                ("top.count[postgres]".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        let none = collector.entries(&json!([]), time());
+        assert_eq!(
+            said(&none),
+            [
+                ("top.cpu".to_string(), Value::Null),
+                ("top.memory".to_string(), Value::Null),
+                ("top.count".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &none);
+    }
+
+    /// What a real collection says is entries for exactly the collector's metrics.
+    #[test]
+    fn what_sensors_and_processes_really_say_becomes_entries_for_their_metrics() {
+        let mut sensors = SensorCollector::new().unwrap();
+        let output = sensors.collect().unwrap();
+        every_metric_has_an_entry(&sensors, &sensors.entries(&output, time()));
+
+        let exe = std::env::current_exe().unwrap();
+        let name = exe.file_name().unwrap().to_string_lossy().to_string();
+        let mut watched = processes_watching(&[&name]);
+        let output = watched.collect().unwrap();
+        let entries = watched.entries(&output, time());
+        every_metric_has_an_entry(&watched, &entries);
+        let count = &said(&entries)[0];
+        assert_eq!(count.0, format!("process.count[{name}]"));
+        assert!(count.1.as_u64() >= Some(1), "{count:?}");
+
+        let mut top = TopProcessCollector::new(ProcessTable::shared(false).unwrap());
+        let output = top.collect().unwrap();
+        let entries = top.entries(&output, time());
+        every_metric_has_an_entry(&top, &entries);
+        assert!(
+            said(&entries)
+                .iter()
+                .any(|(name, value)| name.starts_with("top.memory[") && value.is_u64())
+        );
     }
 
     #[test]

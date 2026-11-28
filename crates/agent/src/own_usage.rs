@@ -1,5 +1,7 @@
 use anyhow::{Result, anyhow};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
@@ -132,11 +134,62 @@ impl Collector for OwnUsageCollector {
             "uptime_secs": uptime_secs,
         }))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &["agent.memory", "agent.cpu", "agent.uptime"]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        entries.read("agent.memory", &["Memory"], at(output, "memory_bytes"));
+        entries.read("agent.cpu", &["CPU"], at(output, "cpu_percent"));
+        entries.read("agent.uptime", &["Uptime"], at(output, "uptime_secs"));
+        entries.done()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    #[test]
+    fn the_agents_entries_are_what_it_uses_and_how_long_it_has_run() {
+        let collector = OwnUsageCollector::new().unwrap();
+        let output = json!({ "memory_bytes": 9_000_000, "cpu_percent": 0.5, "uptime_secs": 120 });
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("agent.memory[Memory]".to_string(), json!(9_000_000)),
+                ("agent.cpu[CPU]".to_string(), json!(0.5)),
+                ("agent.uptime[Uptime]".to_string(), json!(120)),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // Anything it couldn't say has nothing.
+        let bare = collector.entries(&json!({ "uptime_secs": 5 }), time());
+        assert_eq!(
+            said(&bare),
+            [
+                ("agent.memory[Memory]".to_string(), Value::Null),
+                ("agent.cpu[CPU]".to_string(), Value::Null),
+                ("agent.uptime[Uptime]".to_string(), json!(5)),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &bare);
+    }
+
+    /// What a real collection says is entries for exactly the collector's metrics.
+    #[test]
+    fn what_the_agent_really_uses_becomes_entries_for_its_metrics() {
+        let mut collector = OwnUsageCollector::new().unwrap();
+        let output = collector.collect().unwrap();
+        let entries = collector.entries(&output, time());
+        every_metric_has_an_entry(&collector, &entries);
+        assert!(said(&entries).iter().all(|(_, value)| value.is_number()));
+    }
 
     #[test]
     fn the_agent_reports_what_it_uses() {

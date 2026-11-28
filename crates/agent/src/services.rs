@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 
 use crate::background::{Background, FAILED_UNEXPECTEDLY};
@@ -59,7 +62,51 @@ impl Collector for ServiceCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &SERVICE_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let services = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = services
+            .iter()
+            .filter_map(|service| Some((service.get("name")?.as_str()?, service)));
+        let mut any = false;
+        for (name, service) in named {
+            any = true;
+            let (running, state) = (at(service, "running"), at(service, "state"));
+            // One that couldn't be asked about has why as its state, which is the
+            // error of both.
+            let why = state
+                .as_str()
+                .filter(|why| running.is_null() && !why.trim().is_empty());
+            match why {
+                Some(why) => {
+                    for metric in SERVICE_METRICS {
+                        entries.error(metric, &[name], why);
+                    }
+                }
+                None => {
+                    entries.read("service.running", &[name], running);
+                    entries.read("service.state", &[name], state);
+                }
+            }
+        }
+        // With no services to watch, or none asked about yet, each has nothing.
+        if !any {
+            for metric in SERVICE_METRICS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        entries.done()
+    }
 }
+
+/// A service's metrics: whether it's running, and the service manager's own word
+/// for its state.
+const SERVICE_METRICS: [&str; 2] = ["service.running", "service.state"];
 
 /// A service being watched.
 struct Watched {
@@ -289,6 +336,91 @@ async fn query(_watched: &Watched) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// Watching nothing, so nothing is asked of the service manager.
+    fn watching_nothing() -> ServiceCollector {
+        ServiceCollector::new(Vec::new(), Duration::from_secs(3600)).unwrap()
+    }
+
+    #[test]
+    fn service_entries_have_a_series_for_each_service() {
+        let collector = watching_nothing();
+        let output = json!([
+            { "name": "nginx", "running": 1, "state": "active" },
+            { "name": "cron", "running": 0, "state": "failed" },
+            { "name": "sshd", "state": "timed out" },
+            // Nothing said of it at all.
+            { "name": "ntpd" },
+        ]);
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("service.running[nginx]".to_string(), json!(1)),
+                ("service.state[nginx]".to_string(), json!("active")),
+                ("service.running[cron]".to_string(), json!(0)),
+                ("service.state[cron]".to_string(), json!("failed")),
+                // One that couldn't be asked about has why as its error.
+                (
+                    "service.running[sshd]".to_string(),
+                    json!({ "error": "timed out" })
+                ),
+                (
+                    "service.state[sshd]".to_string(),
+                    json!({ "error": "timed out" })
+                ),
+                ("service.running[ntpd]".to_string(), Value::Null),
+                ("service.state[ntpd]".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no services, or none asked about yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(
+                said(&none),
+                [
+                    ("service.running".to_string(), Value::Null),
+                    ("service.state".to_string(), Value::Null),
+                ]
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn what_a_report_says_becomes_entries() {
+        let collector = watching_nothing();
+        let output = json!([
+            report("nginx", Status::running("active")),
+            report("sshd", Status::unknown(NOT_ASKED)),
+        ]);
+        assert_eq!(
+            said(&collector.entries(&output, time())),
+            [
+                ("service.running[nginx]".to_string(), json!(1)),
+                ("service.state[nginx]".to_string(), json!("active")),
+                (
+                    "service.running[sshd]".to_string(),
+                    json!({ "error": NOT_ASKED })
+                ),
+                (
+                    "service.state[sshd]".to_string(),
+                    json!({ "error": NOT_ASKED })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn watching_no_services_really_collects_nothing_for_each_metric() {
+        let mut collector = watching_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     async fn query_named(name: &str) -> Status {
         query(&Watched::new(name.to_string())).await
