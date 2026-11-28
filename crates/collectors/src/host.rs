@@ -15,7 +15,7 @@ use systemstat::Platform;
 
 use crate::Collector;
 use crate::disk_activity::DiskActivity;
-use crate::entries::{Entries, at, percent};
+use crate::entries::{Entries, at, metrics_of, names, percent};
 use crate::file_systems;
 use crate::interface_drops::{self, Drops};
 use crate::system::{self, CpuTime};
@@ -37,8 +37,8 @@ impl Collector for HostCollector {
         }))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &["host.uptime", "host.booted_at"]
+    fn metrics(&self) -> Vec<String> {
+        names(&["host.uptime", "host.booted_at"])
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -70,13 +70,17 @@ impl CpuCollector {
         Ok(collector)
     }
 
-    /// Gives the changes since the last call, in the same order as the fields.
-    fn count(&mut self) -> (Option<u64>, Option<u64>) {
+    /// Reads the context switches and interrupts counted since the host started,
+    /// giving for each the change since the last call and then the count itself.
+    fn count(&mut self) -> [(Option<u64>, Option<u64>); 2] {
         let (context_switches, interrupts) = system::cpu_counters();
-        (
-            self.context_switches.update(context_switches),
-            self.interrupts.update(interrupts),
-        )
+        [
+            (
+                self.context_switches.update(context_switches),
+                context_switches,
+            ),
+            (self.interrupts.update(interrupts), interrupts),
+        ]
     }
 }
 
@@ -89,8 +93,10 @@ impl Collector for CpuCollector {
         self.system.refresh_cpu_usage();
         let per_core: Vec<f32> = self.system.cpus().iter().map(|c| c.usage()).collect();
         let load = System::load_average().ok();
-        let (context_switches, interrupts) = self.count();
-        let (context_switches_total, interrupts_total) = system::cpu_counters();
+        let [
+            (context_switches, context_switches_total),
+            (interrupts, interrupts_total),
+        ] = self.count();
 
         Ok(json!({
             "context_switches_total": context_switches_total,
@@ -108,15 +114,15 @@ impl Collector for CpuCollector {
         }))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &[
+    fn metrics(&self) -> Vec<String> {
+        names(&[
             "cpu.usage",
             "cpu.cores",
             "cpu.load",
             "cpu.time",
             "cpu.context_switches",
             "cpu.interrupts",
-        ]
+        ])
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -139,11 +145,7 @@ impl Collector for CpuCollector {
             entries.read("cpu.load", &[series], at(output, field));
         }
         for (series, field) in CPU_TIMES {
-            entries.read(
-                "cpu.time",
-                &[series],
-                at(output, &format!("time_percent.{field}")),
-            );
+            entries.read("cpu.time", &[series], at(output, field));
         }
         // Running totals since the host started.
         entries.read(
@@ -162,13 +164,13 @@ impl Collector for CpuCollector {
 
 /// The kinds of processor time, as a series is called and as it's read.
 const CPU_TIMES: [(&str, &str); 7] = [
-    ("User", "user"),
-    ("System", "system"),
-    ("Nice", "nice"),
-    ("Interrupt", "interrupt"),
-    ("I/O wait", "iowait"),
-    ("Steal", "steal"),
-    ("Idle", "idle"),
+    ("User", "time_percent.user"),
+    ("System", "time_percent.system"),
+    ("Nice", "time_percent.nice"),
+    ("Interrupt", "time_percent.interrupt"),
+    ("I/O wait", "time_percent.iowait"),
+    ("Steal", "time_percent.steal"),
+    ("Idle", "time_percent.idle"),
 ];
 
 pub struct MemoryCollector {
@@ -190,10 +192,14 @@ impl MemoryCollector {
         Ok(collector)
     }
 
-    /// Gives the changes since the last call, as pages swapped in and out.
-    fn count(&mut self) -> (Option<u64>, Option<u64>) {
+    /// Reads the pages swapped in and out since the host started, giving for each
+    /// the change since the last call and then the count itself.
+    fn count(&mut self) -> [(Option<u64>, Option<u64>); 2] {
         let (swap_in, swap_out) = system::swap_counters();
-        (self.swap_in.update(swap_in), self.swap_out.update(swap_out))
+        [
+            (self.swap_in.update(swap_in), swap_in),
+            (self.swap_out.update(swap_out), swap_out),
+        ]
     }
 }
 
@@ -204,8 +210,7 @@ impl Collector for MemoryCollector {
 
     fn collect(&mut self) -> Result<Value> {
         self.system.refresh_memory();
-        let (swap_in, swap_out) = self.count();
-        let (swap_in_total, swap_out_total) = system::swap_counters();
+        let [(swap_in, swap_in_total), (swap_out, swap_out_total)] = self.count();
         Ok(json!({
             "swap_in_pages_total": swap_in_total,
             "swap_out_pages_total": swap_out_total,
@@ -220,8 +225,8 @@ impl Collector for MemoryCollector {
         }))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &[
+    fn metrics(&self) -> Vec<String> {
+        names(&[
             "memory.usage",
             "memory.total",
             "memory.used",
@@ -230,7 +235,7 @@ impl Collector for MemoryCollector {
             "memory.swap_used",
             "memory.detail",
             "memory.swap_activity",
-        ]
+        ])
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -254,11 +259,7 @@ impl Collector for MemoryCollector {
         }
         // Each system has its own kinds, so the others have nothing.
         for (series, field) in MEMORY_KINDS {
-            entries.read(
-                "memory.detail",
-                &[series],
-                at(output, &format!("detail.{field}")),
-            );
+            entries.read("memory.detail", &[series], at(output, field));
         }
         // Running totals since the host started.
         entries.read(
@@ -277,19 +278,19 @@ impl Collector for MemoryCollector {
 
 /// The kinds of memory use, as a series is called and as it's read.
 const MEMORY_KINDS: [(&str, &str); 13] = [
-    ("Active", "active_bytes"),
-    ("Inactive", "inactive_bytes"),
-    ("Wired", "wired_bytes"),
-    ("Cached", "cached_bytes"),
-    ("Buffers", "buffers_bytes"),
-    ("Slab", "slab_bytes"),
-    ("Shared", "shared_bytes"),
-    ("Compressed", "compressed_bytes"),
-    ("Speculative", "speculative_bytes"),
-    ("Purgeable", "purgeable_bytes"),
-    ("ZFS cache", "zfs_arc_bytes"),
-    ("Page file", "page_file_bytes"),
-    ("Free", "free_bytes"),
+    ("Active", "detail.active_bytes"),
+    ("Inactive", "detail.inactive_bytes"),
+    ("Wired", "detail.wired_bytes"),
+    ("Cached", "detail.cached_bytes"),
+    ("Buffers", "detail.buffers_bytes"),
+    ("Slab", "detail.slab_bytes"),
+    ("Shared", "detail.shared_bytes"),
+    ("Compressed", "detail.compressed_bytes"),
+    ("Speculative", "detail.speculative_bytes"),
+    ("Purgeable", "detail.purgeable_bytes"),
+    ("ZFS cache", "detail.zfs_arc_bytes"),
+    ("Page file", "detail.page_file_bytes"),
+    ("Free", "detail.free_bytes"),
 ];
 
 pub struct DiskCollector {
@@ -373,8 +374,8 @@ impl Collector for DiskCollector {
         Ok(Value::Array(disks))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &DISK_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&DISK_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -383,9 +384,7 @@ impl Collector for DiskCollector {
         let named = disks
             .iter()
             .filter_map(|disk| Some((disk.get("mount_point")?.as_str()?, disk)));
-        let mut any = false;
         for (mount_point, disk) in named {
-            any = true;
             let series = [mount_point];
             let used = percent(at(disk, "used_bytes"), at(disk, "total_bytes"));
             entries.number("disk.usage", &series, used);
@@ -395,11 +394,7 @@ impl Collector for DiskCollector {
                 entries.read(metric, &series, at(disk, field));
             }
         }
-        if !any {
-            for metric in DISK_METRICS {
-                entries.nothing(metric, &[]);
-            }
-        }
+        entries.fill(&DISK_METRICS);
         entries.done()
     }
 }
@@ -426,16 +421,7 @@ const DISK_FIELDS: [(&str, &str); 16] = [
 ];
 
 /// Every metric a disk has: those worked out, then those read as they are.
-const DISK_METRICS: [&str; 18] = {
-    let mut metrics = ["disk.usage"; 18];
-    metrics[1] = "disk.inodes";
-    let mut at = 0;
-    while at < DISK_FIELDS.len() {
-        metrics[at + 2] = DISK_FIELDS[at].0;
-        at += 1;
-    }
-    metrics
-};
+const DISK_METRICS: [&str; 18] = metrics_of(&["disk.usage", "disk.inodes"], &DISK_FIELDS);
 
 /// Total and free inodes. A disk can run out of these with plenty of space left.
 /// Windows file systems don't have them, and some Unix ones report none.
@@ -555,26 +541,18 @@ impl Collector for NetworkCollector {
         Ok(Value::Object(interfaces))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &NETWORK_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&NETWORK_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let interfaces = output
-            .as_object()
-            .filter(|interfaces| !interfaces.is_empty());
-        let Some(interfaces) = interfaces else {
-            for (metric, _) in NETWORK_FIELDS {
-                entries.nothing(metric, &[]);
-            }
-            return entries.done();
-        };
-        for (name, interface) in interfaces {
+        for (name, interface) in output.as_object().into_iter().flatten() {
             for (metric, field) in NETWORK_FIELDS {
                 entries.read(metric, &[name], at(interface, field));
             }
         }
+        entries.fill(&NETWORK_METRICS);
         entries.done()
     }
 }
@@ -593,15 +571,7 @@ const NETWORK_FIELDS: [(&str, &str); 9] = [
     ("network.link", "link_up"),
 ];
 
-const NETWORK_METRICS: [&str; 9] = {
-    let mut metrics = [""; 9];
-    let mut at = 0;
-    while at < NETWORK_FIELDS.len() {
-        metrics[at] = NETWORK_FIELDS[at].0;
-        at += 1;
-    }
-    metrics
-};
+const NETWORK_METRICS: [&str; 9] = metrics_of(&[], &NETWORK_FIELDS);
 
 /// 1 or 0 where the system says, and nothing where it doesn't, so that an
 /// interface with no known state can't set off an alert.
@@ -629,7 +599,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+    use crate::entries::testing::{every_metric_has_an_entry, said, time};
 
     #[test]
     fn cpu_time_adds_up_to_the_whole_of_the_time_measured() {

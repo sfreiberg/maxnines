@@ -17,13 +17,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, ensure};
 use chrono::{DateTime, Utc};
 use maxnines_checks::{Credentials, failed_report, limit, run_signed_in, timed_out_report};
-use maxnines_collectors::entries::{Entries, at, filled, percent};
+use maxnines_collectors::entries::{Entries, at, filled, names, percent};
 use maxnines_protocol::entries::Entry;
 use maxnines_protocol::{Check, CheckKind, LocalCheck, MAX_CHECK_NAME_LEN, is_check_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::background::{Background, FAILED_UNEXPECTEDLY};
+use crate::background::{Background, FAILED_UNEXPECTEDLY, rows_of};
 use crate::collector::Collector;
 
 /// How long a check gets to report once its own time limit is up.
@@ -283,14 +283,21 @@ impl Collector for CheckCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &CHECK_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&CHECK_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// What one check found, or each of a list, under its own name only and with
+    /// the metrics of its kind only, as each runs apart from the others.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let checks = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = checks
+        let named = rows_of(output)
             .iter()
             .filter_map(|check| Some((check.get("name")?.as_str()?, check)));
         for (name, check) in named {
@@ -303,14 +310,10 @@ impl Collector for CheckCollector {
             let no_domain = filled(at(check, "domain_error")).as_str();
             for (metric, field, kinds) in &CHECK_FIELDS {
                 let read = filled(at(check, field));
-                let why = no_domain.filter(|_| read.is_null() && DOMAIN_METRICS.contains(metric));
-                match why {
-                    Some(why) => entries.error(metric, &series, why),
-                    // What it found is said whatever its kind.
-                    None if kinds.has(kind) || !read.is_null() => {
-                        entries.read(metric, &series, read);
-                    }
-                    None => {}
+                let why = no_domain.filter(|_| DOMAIN_METRICS.contains(metric));
+                // What it found is said whatever its kind.
+                if kinds.has(kind) || !read.is_null() || why.is_some() {
+                    entries.read_or(metric, &series, read, why);
                 }
             }
             let usage = percent(
@@ -321,9 +324,6 @@ impl Collector for CheckCollector {
                 entries.number("check.memory_usage", &series, usage);
             }
         }
-        // With no checks, none run yet, or none of the kind a metric is read from,
-        // the metric has nothing.
-        entries.fill(&CHECK_METRICS);
         entries.done()
     }
 }
@@ -447,8 +447,10 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
+    use maxnines_collectors::entries::testing::{every_entry_is_for_its_metrics, said, time};
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::{each_is_for_a_series, read_once};
 
     /// Running nothing, so nothing is reached.
     fn checking_nothing() -> CheckCollector {
@@ -566,39 +568,39 @@ mod tests {
                 (of("check.memory_usage"), json!(25.0)),
             ]
         );
-        // The metrics no check here is of the kind for have nothing.
-        let unread: Vec<(String, Value)> = said(&entries)
-            .into_iter()
-            .filter(|(name, _)| !name.contains('['))
-            .collect();
-        assert_eq!(
-            unread,
-            [
-                (of("check.tls_offered"), Value::Null),
-                (of("check.records"), Value::Null),
-                (of("check.packet_loss"), Value::Null),
-                (of("check.rtt_min"), Value::Null),
-                (of("check.rtt_max"), Value::Null),
-                (of("check.rtt_stddev"), Value::Null),
-                (of("check.host_key"), Value::Null),
-                (of("check.sign_in_methods"), Value::Null),
-                (of("check.password_sign_in"), Value::Null),
-                (of("check.search"), Value::Null),
-                (of("check.round_trip"), Value::Null),
-            ]
-        );
-        every_metric_has_an_entry(&collector, &entries);
+        // The metrics no check here is of the kind for aren't said at all, as
+        // nothing one check says is about the others.
+        each_is_for_a_series(&entries);
+        every_entry_is_for_its_metrics(&collector, &entries);
 
-        // With no checks, or none run yet, each metric has nothing.
+        // Nor is anything with no checks, or none run yet.
         for output in [json!([]), Value::Null] {
-            let none = collector.entries(&output, time());
-            let nothing: Vec<(String, Value)> = CHECK_METRICS
-                .iter()
-                .map(|metric| (metric.to_string(), Value::Null))
-                .collect();
-            assert_eq!(said(&none), nothing);
-            every_metric_has_an_entry(&collector, &none);
+            assert_eq!(collector.entries(&output, time()), []);
         }
+    }
+
+    #[test]
+    fn each_checks_result_is_its_own_and_handed_over_once() {
+        let ping = Check::new("gateway", CheckKind::Ping, "192.0.2.1");
+        let mut collector = CheckCollector {
+            background: Background::holding([
+                timed_out_report(&ping),
+                json!({ "name": "port", "kind": "tcp", "up": 1 }),
+            ]),
+        };
+        let read = read_once(&mut collector);
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
+        let of = |check: &str| -> Vec<&str> {
+            let own = read.iter().filter(|entry| entry.series == [check]);
+            own.map(|entry| entry.metric.as_str()).collect()
+        };
+        // Each has the metrics of its own kind and no others.
+        assert_eq!(of("gateway").len() + of("port").len(), read.len());
+        assert!(of("gateway").contains(&"check.packet_loss"));
+        assert!(!of("gateway").contains(&"check.connect"));
+        assert!(of("port").contains(&"check.connect"));
+        assert!(!of("port").contains(&"check.packet_loss"));
     }
 
     #[test]
@@ -639,7 +641,8 @@ mod tests {
             };
             assert_eq!(value, &expected, "{metric}");
         }
-        every_metric_has_an_entry(&collector, &entries);
+        each_is_for_a_series(&entries);
+        every_entry_is_for_its_metrics(&collector, &entries);
     }
 
     #[test]
@@ -670,15 +673,15 @@ mod tests {
         let site = said_of(&entries, "site");
         assert_eq!(site[0], (of("check.up"), json!(0)));
         assert_eq!(site[2], (of("check.error"), json!(FAILED_UNEXPECTEDLY)));
-        every_metric_has_an_entry(&collector, &entries);
+        each_is_for_a_series(&entries);
+        every_entry_is_for_its_metrics(&collector, &entries);
     }
 
     #[test]
-    fn running_no_checks_really_collects_nothing_for_each_metric() {
+    fn running_no_checks_collects_and_says_nothing() {
         let mut collector = checking_nothing();
-        let output = collector.collect().unwrap();
-        assert_eq!(output, json!([]));
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+        assert_eq!(collector.collect().unwrap(), json!([]));
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     #[test]

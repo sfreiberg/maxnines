@@ -22,12 +22,12 @@ use bollard::{API_DEFAULT_VERSION, Docker};
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use futures_util::future::join_all;
-use maxnines_collectors::entries::{Entries, at, percent};
+use maxnines_collectors::entries::{Entries, at, failed, metrics_of, names, percent};
 use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
-use crate::background::{Background, Missed};
+use crate::background::{Background, FAILED_UNEXPECTEDLY, Missed};
 use crate::collector::Collector;
 
 /// No host needs more than this many charted, and each one is its own series.
@@ -72,33 +72,40 @@ impl ContainerCollector {
                 match read {
                     Ok(containers) => {
                         *complained.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                        Value::Array(containers)
+                        Ok(containers)
                     }
                     Err(error) => {
-                        complain(&complained, format!("{error:#}"));
-                        Value::Null
+                        let error = format!("{error:#}");
+                        complain(&complained, error.clone());
+                        Err(error)
                     }
                 }
             }
         };
-        let settle = move |containers: Result<Value, Missed>| {
-            // A panic is in the log already.
-            if containers == Err(Missed::OutOfTime) {
-                let limit = ROUND_LIMIT.as_secs();
-                complain(
-                    &told,
-                    format!("reading them didn't finish within {limit} seconds"),
-                );
-            }
-            let mut containers = containers.unwrap_or_default();
-            let mut seen = HashMap::new();
-            if let Value::Array(rows) = &mut containers {
-                for row in rows {
-                    settle_cpu(row, &cpu, &mut seen);
+        let settle = move |read: Result<Result<Vec<Value>, String>, Missed>| {
+            let read = match read {
+                Ok(read) => read,
+                Err(Missed::OutOfTime) => {
+                    let limit = ROUND_LIMIT.as_secs();
+                    let error = format!("reading them didn't finish within {limit} seconds");
+                    complain(&told, error.clone());
+                    Err(error)
                 }
-            }
+                // A panic is in the log already.
+                Err(Missed::Panicked) => Err(FAILED_UNEXPECTEDLY.to_string()),
+            };
+            let mut seen = HashMap::new();
+            let settled = match read {
+                Ok(mut rows) => {
+                    for row in &mut rows {
+                        settle_cpu(row, &cpu, &mut seen);
+                    }
+                    Value::Array(rows)
+                }
+                Err(error) => unreadable(&error),
+            };
             cpu = seen;
-            containers
+            settled
         };
         background.repeat(interval, Some(ROUND_LIMIT), round, settle)?;
         Ok(Self { background })
@@ -110,12 +117,23 @@ impl Collector for ContainerCollector {
         "containers"
     }
 
+    /// Nothing until containers have been read, and when they couldn't be.
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.latest().pop().unwrap_or_default())
+        let read = self.background.latest().pop().unwrap_or_default();
+        Ok(match read.is_array() {
+            true => read,
+            false => Value::Null,
+        })
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &CONTAINER_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&CONTAINER_METRICS)
+    }
+
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -123,17 +141,26 @@ impl Collector for ContainerCollector {
     }
 }
 
-/// What was read of each container, as entries. It's apart from the collector so
-/// it can be tried without one, which would look for Docker.
+/// What a round that couldn't read containers leaves, which says why.
+fn unreadable(error: &str) -> Value {
+    json!({ "error": format!("Containers couldn't be read: {error}") })
+}
+
+/// What one round read, as entries: each container, or why none could be read,
+/// which is the error of every metric. It's apart from the collector so it can be
+/// tried without one, which would look for Docker.
 fn container_entries(output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+    if let Some(why) = at(output, "error").as_str() {
+        return failed(&CONTAINER_METRICS, time, why);
+    }
+    let Some(containers) = output.as_array() else {
+        return Vec::new();
+    };
     let mut entries = Entries::at(time);
-    let containers = output.as_array().map(Vec::as_slice).unwrap_or_default();
     let named = containers
         .iter()
         .filter_map(|container| Some((container.get("name")?.as_str()?, container)));
-    let mut any = false;
     for (name, container) in named {
-        any = true;
         let series = [name];
         let of_limit = percent(
             at(container, "memory_bytes"),
@@ -144,12 +171,8 @@ fn container_entries(output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
             entries.read(metric, &series, at(container, field));
         }
     }
-    // With no containers, or when they couldn't be read, each metric has nothing.
-    if !any {
-        for metric in CONTAINER_METRICS {
-            entries.nothing(metric, &[]);
-        }
-    }
+    // A host with no containers has nothing for each metric.
+    entries.fill(&CONTAINER_METRICS);
     entries.done()
 }
 
@@ -175,15 +198,7 @@ const CONTAINER_FIELDS: [(&str, &str); 14] = [
 ];
 
 /// Every metric a container has: the one worked out, then those read as they are.
-const CONTAINER_METRICS: [&str; 15] = {
-    let mut metrics = ["container.memory_limit"; 15];
-    let mut at = 0;
-    while at < CONTAINER_FIELDS.len() {
-        metrics[at + 1] = CONTAINER_FIELDS[at].0;
-        at += 1;
-    }
-    metrics
-};
+const CONTAINER_METRICS: [&str; 15] = metrics_of(&["container.memory_limit"], &CONTAINER_FIELDS);
 
 /// Logs why containers can't be read, once for each new reason, as they're read
 /// every interval.
@@ -410,8 +425,10 @@ mod tests {
         ContainerMemoryStats, ContainerNetworkStats, ContainerState, Health,
     };
 
+    use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::read_once;
 
     fn summary(name: &str) -> ContainerSummary {
         ContainerSummary {
@@ -597,8 +614,8 @@ mod tests {
             Ok(Value::Null)
         }
 
-        fn metrics(&self) -> &'static [&'static str] {
-            &CONTAINER_METRICS
+        fn metrics(&self) -> Vec<String> {
+            names(&CONTAINER_METRICS)
         }
     }
 
@@ -656,17 +673,47 @@ mod tests {
         );
         every_metric_has_an_entry(&Metrics, &entries);
 
-        // With no containers, or when they couldn't be read, each has nothing.
-        for output in [json!([]), Value::Null] {
-            let none = container_entries(&output, time());
-            assert_eq!(none.len(), CONTAINER_METRICS.len());
-            assert!(
-                said(&none)
-                    .iter()
-                    .all(|(name, value)| !name.contains('[') && value.is_null())
-            );
-            every_metric_has_an_entry(&Metrics, &none);
+        // A host with no containers has nothing for each.
+        let none = container_entries(&json!([]), time());
+        assert_eq!(none.len(), CONTAINER_METRICS.len());
+        assert!(
+            said(&none)
+                .iter()
+                .all(|(name, value)| !name.contains('[') && value.is_null())
+        );
+        every_metric_has_an_entry(&Metrics, &none);
+        // Before they've been read, nothing is said at all.
+        assert_eq!(container_entries(&Value::Null, time()), []);
+    }
+
+    #[test]
+    fn why_containers_could_not_be_read_is_the_error_of_every_metric() {
+        let round = unreadable("found no Docker or Podman socket");
+        let entries = container_entries(&round, time());
+        every_metric_has_an_entry(&Metrics, &entries);
+        let why = "Containers couldn't be read: found no Docker or Podman socket";
+        for (name, value) in said(&entries) {
+            assert!(!name.contains('['), "{name}");
+            assert_eq!(value, json!({ "error": why }), "{name}");
         }
+
+        // Which is still nothing to the server that reads what's collected, and is
+        // handed over once as entries.
+        let mut collector = ContainerCollector {
+            background: Background::holding([round]),
+        };
+        assert_eq!(collector.collect().unwrap(), Value::Null);
+        assert_eq!(read_once(&mut collector).len(), CONTAINER_METRICS.len());
+    }
+
+    #[test]
+    fn a_round_of_containers_is_handed_over_once() {
+        let round = json!([{ "name": "web", "up": 1 }]);
+        let mut collector = ContainerCollector {
+            background: Background::holding([round.clone()]),
+        };
+        assert_eq!(collector.collect().unwrap(), round);
+        assert_eq!(read_once(&mut collector).len(), CONTAINER_METRICS.len());
     }
 
     #[test]
@@ -720,6 +767,7 @@ mod tests {
         let mut collector = ContainerCollector::new(Duration::from_secs(3600)).unwrap();
         assert_eq!(collector.name(), "containers");
         assert_eq!(collector.collect().unwrap(), Value::Null);
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     #[test]

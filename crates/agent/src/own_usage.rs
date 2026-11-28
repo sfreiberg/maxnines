@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at};
+use maxnines_collectors::entries::{Entries, at, names};
 use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 use sysinfo::{CpuRefreshKind, Pid, ProcessRefreshKind, ProcessesToUpdate, System};
@@ -135,8 +135,8 @@ impl Collector for OwnUsageCollector {
         }))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &["agent.memory", "agent.cpu", "agent.uptime"]
+    fn metrics(&self) -> Vec<String> {
+        names(&OWN_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -148,10 +148,13 @@ impl Collector for OwnUsageCollector {
     }
 }
 
+const OWN_METRICS: [&str; 3] = ["agent.memory", "agent.cpu", "agent.uptime"];
+
 #[cfg(test)]
 mod tests {
+    use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
 
     #[test]
     fn the_agents_entries_are_what_it_uses_and_how_long_it_has_run() {

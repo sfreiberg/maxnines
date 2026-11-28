@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at};
+use maxnines_collectors::entries::{Entries, metrics_of, names};
 use maxnines_protocol::entries::Entry;
 use maxnines_protocol::{AgentConfig, COLLECTORS, CollectorSettings};
 use serde_json::{Value, json};
@@ -317,32 +317,18 @@ fn status_pages(
     )?))
 }
 
-/// The entries of a collector whose output is a list of items, each a series under
-/// what its `name` field says: every metric, read from its field of each item. With
-/// no named items, each metric says it has nothing.
-fn item_entries(
+/// The entries of a collector that reads when asked and whose output is a list of
+/// items, each a series under what its `name` field says. With no named items, each
+/// metric says it has nothing.
+fn item_entries<const METRICS: usize>(
     output: &Value,
     name: &str,
-    fields: &[(&str, &str)],
+    fields: &[(&'static str, &'static str); METRICS],
     time: DateTime<Utc>,
 ) -> Vec<Entry> {
     let mut entries = Entries::at(time);
-    let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
-    let named = items
-        .iter()
-        .filter_map(|item| Some((item.get(name)?.as_str()?, item)));
-    let mut any = false;
-    for (series, item) in named {
-        any = true;
-        for (metric, field) in fields {
-            entries.read(metric, &[series], at(item, field));
-        }
-    }
-    if !any {
-        for (metric, _) in fields {
-            entries.nothing(metric, &[]);
-        }
-    }
+    entries.items(output, name, fields);
+    entries.fill(&metrics_of::<METRICS>(&[], fields));
     entries.done()
 }
 
@@ -384,8 +370,8 @@ impl Collector for SensorCollector {
         Ok(Value::Array(sensors))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &["sensor.temperature"]
+    fn metrics(&self) -> Vec<String> {
+        names(&SENSOR_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -395,6 +381,7 @@ impl Collector for SensorCollector {
 
 /// A sensor's metric, and what it's read from.
 const SENSOR_FIELDS: [(&str, &str); 1] = [("sensor.temperature", "celsius")];
+const SENSOR_METRICS: [&str; 1] = metrics_of(&[], &SENSOR_FIELDS);
 
 /// The process list, read once a sample however many collectors use it. CPU usage
 /// is measured between two reads, like the CPU collector's, so it's read once now.
@@ -559,8 +546,8 @@ impl Collector for ProcessCollector {
         Ok(Value::Array(tally(&self.names, &running)))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &["process.count", "process.cpu", "process.memory"]
+    fn metrics(&self) -> Vec<String> {
+        names(&PROCESS_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -574,6 +561,7 @@ const PROCESS_FIELDS: [(&str, &str); 3] = [
     ("process.cpu", "cpu_percent"),
     ("process.memory", "memory_bytes"),
 ];
+const PROCESS_METRICS: [&str; 3] = metrics_of(&[], &PROCESS_FIELDS);
 
 /// How many programs each of the top lists keeps.
 const TOP: usize = 5;
@@ -605,8 +593,8 @@ impl Collector for TopProcessCollector {
         Ok(Value::Array(top(running)))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &["top.cpu", "top.memory", "top.count"]
+    fn metrics(&self) -> Vec<String> {
+        names(&TOP_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -620,6 +608,7 @@ const TOP_FIELDS: [(&str, &str); 3] = [
     ("top.memory", "memory_bytes"),
     ("top.count", "count"),
 ];
+const TOP_METRICS: [&str; 3] = metrics_of(&[], &TOP_FIELDS);
 
 /// The top programs by CPU and by memory, together, each once, busiest first.
 fn top(processes: Vec<RunningProcess>) -> Vec<Value> {
@@ -657,55 +646,12 @@ fn top(processes: Vec<RunningProcess>) -> Vec<Value> {
         .collect()
 }
 
-/// What the tests of collectors' entries share.
-#[cfg(test)]
-pub mod test_entries {
-    use maxnines_protocol::entries::Reading;
-    use serde_json::json;
-
-    use super::*;
-
-    pub fn time() -> DateTime<Utc> {
-        "2026-11-28T09:00:00Z".parse().unwrap()
-    }
-
-    /// Entries as `metric[series, ...]` and what they say, to compare whole.
-    pub fn said(entries: &[Entry]) -> Vec<(String, Value)> {
-        entries
-            .iter()
-            .map(|entry| {
-                assert_eq!(entry.time, time());
-                let name = match entry.series.as_slice() {
-                    [] => entry.metric.clone(),
-                    series => format!("{}[{}]", entry.metric, series.join(", ")),
-                };
-                let reading = match &entry.reading {
-                    Reading::Value(value) => serde_json::to_value(value).unwrap(),
-                    Reading::Error(error) => json!({ "error": error }),
-                    Reading::Nothing => Value::Null,
-                };
-                (name, reading)
-            })
-            .collect()
-    }
-
-    /// Every metric a collector says it reads has an entry, and it has entries for
-    /// no others, so a failed collection's errors are on the same metrics.
-    pub fn every_metric_has_an_entry(collector: &dyn Collector, entries: &[Entry]) {
-        let mut read: Vec<&str> = entries.iter().map(|entry| entry.metric.as_str()).collect();
-        read.sort_unstable();
-        read.dedup();
-        let mut metrics = collector.metrics().to_vec();
-        metrics.sort_unstable();
-        assert_eq!(read, metrics, "{}", collector.name());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::test_entries::{every_metric_has_an_entry, said, time};
+    use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+
     use super::*;
 
     fn config(collectors: Value) -> AgentConfig {
@@ -1061,6 +1007,27 @@ mod tests {
             [("sensor.temperature".to_string(), Value::Null)]
         );
         every_metric_has_an_entry(&collector, &none);
+    }
+
+    #[test]
+    fn sensors_sharing_a_label_are_one_series_and_one_without_a_name_is_none() {
+        let collector = SensorCollector::new().unwrap();
+        let output = json!([
+            { "label": "Core", "celsius": 40.0 },
+            { "label": "Core", "celsius": 50.0 },
+            { "label": "", "celsius": 30.0 },
+        ]);
+        assert_eq!(
+            said(&collector.entries(&output, time())),
+            [("sensor.temperature[Core]".to_string(), json!(40.0))]
+        );
+
+        // Only one with no name, so there's no series, which is said.
+        let unnamed = collector.entries(&json!([{ "label": "", "celsius": 30.0 }]), time());
+        assert_eq!(
+            said(&unnamed),
+            [("sensor.temperature".to_string(), Value::Null)]
+        );
     }
 
     #[test]

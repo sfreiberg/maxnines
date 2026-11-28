@@ -19,7 +19,7 @@ use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 
 use crate::Collector;
-use crate::entries::{Entries, at, filled};
+use crate::entries::{Entries, at, filled, names};
 
 /// The most instances one wildcard path reports, as `\Process(*)` has one for every
 /// program running and each is a series on the server.
@@ -162,8 +162,8 @@ impl Collector for CounterCollector {
         Ok(output(&self.counters.read()))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &COUNTER_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&COUNTER_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -186,19 +186,10 @@ impl Collector for CounterCollector {
             // its values are its instances'.
             entries.read("counter.ok", &[name], at(item, "ok"));
             let why = filled(at(item, "error")).as_str();
-            match why {
-                Some(why) if value.is_null() => entries.error("counter.value", &[name], why),
-                _ => entries.read("counter.value", &[name], value),
-            }
+            entries.read_or("counter.value", &[name], value, why);
             // Only a wildcard path has instances to leave out.
             if name.contains("(*)") {
-                let dropped = at(item, "dropped");
-                match why {
-                    Some(why) if dropped.is_null() => {
-                        entries.error("counter.dropped", &[name], why);
-                    }
-                    _ => entries.read("counter.dropped", &[name], dropped),
-                }
+                entries.read_or("counter.dropped", &[name], at(item, "dropped"), why);
             }
         }
         // With no paths, or none with a wildcard, the metric has nothing.
@@ -427,7 +418,7 @@ pub(crate) mod pdh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+    use crate::entries::testing::{every_metric_has_an_entry, said, time};
 
     #[test]
     fn counter_entries_have_a_series_for_each_path_and_each_instance() {

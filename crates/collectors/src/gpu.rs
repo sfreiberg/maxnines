@@ -7,7 +7,7 @@ use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 
 use crate::Collector;
-use crate::entries::{Entries, at};
+use crate::entries::{Entries, metrics_of, names};
 
 /// Where macOS keeps how busy a GPU is: Apple's own GPUs and AMD's say the first,
 /// and some older drivers the second.
@@ -85,29 +85,15 @@ impl Collector for GpuCollector {
         Ok(Value::Array(gpus))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &["gpu.usage", "gpu.memory"]
+    fn metrics(&self) -> Vec<String> {
+        names(&GPU_METRICS)
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let gpus = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = gpus
-            .iter()
-            .filter_map(|gpu| Some((gpu.get("name")?.as_str()?, gpu)));
-        let mut any = false;
-        for (name, gpu) in named {
-            any = true;
-            for (metric, field) in GPU_FIELDS {
-                entries.read(metric, &[name], at(gpu, field));
-            }
-        }
+        entries.items(output, "name", &GPU_FIELDS);
         // A host whose GPUs say nothing has nothing for either.
-        if !any {
-            for (metric, _) in GPU_FIELDS {
-                entries.nothing(metric, &[]);
-            }
-        }
+        entries.fill(&GPU_METRICS);
         entries.done()
     }
 }
@@ -117,6 +103,8 @@ const GPU_FIELDS: [(&str, &str); 2] = [
     ("gpu.usage", "usage_percent"),
     ("gpu.memory", "memory_used_bytes"),
 ];
+
+const GPU_METRICS: [&str; 2] = metrics_of(&[], &GPU_FIELDS);
 
 mod platform {
     use objc2_core_foundation::{CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType};
@@ -212,7 +200,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+    use crate::entries::testing::{every_metric_has_an_entry, said, time};
 
     #[test]
     fn gpu_entries_have_a_series_for_each_gpu() {

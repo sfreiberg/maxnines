@@ -1,14 +1,24 @@
 //! Putting what a collector read into entries: one for each metric and series,
 //! under the metric's own name.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, Utc};
 use maxnines_protocol::entries::{Entry, EntryValue, Reading};
 use serde_json::{Number, Value};
 
-/// The entries of one collection, all read at one time.
+/// What's said of something that failed and gave no reason, as an error has to say
+/// something.
+pub const NO_REASON: &str = "it failed without saying why";
+
+/// The entries of one reading, all read at one time. A metric and series has one
+/// entry: the first said of it is kept, so two items that share a name are one
+/// series rather than two entries nothing could tell apart.
 pub struct Entries {
     time: DateTime<Utc>,
     entries: Vec<Entry>,
+    metrics: HashSet<String>,
+    said: HashSet<(String, Vec<String>)>,
 }
 
 impl Entries {
@@ -16,17 +26,22 @@ impl Entries {
         Self {
             time,
             entries: Vec::new(),
+            metrics: HashSet::new(),
+            said: HashSet::new(),
         }
     }
 
     /// What was read for a metric and series: a number, a yes or no, or text. Nothing
-    /// there, or anything else, says the collection worked and had nothing for it.
+    /// there, empty text, or anything else, says the reading worked and had nothing
+    /// for it.
     pub fn read(&mut self, metric: &str, series: &[&str], value: &Value) {
         let reading = match value {
             Value::Number(number) => Reading::Value(EntryValue::Number(number.clone())),
             Value::Bool(yes) => Reading::Value(EntryValue::Bool(*yes)),
-            Value::String(text) => Reading::Value(EntryValue::Text(text.clone())),
-            Value::Null | Value::Array(_) | Value::Object(_) => Reading::Nothing,
+            Value::String(text) if !text.trim().is_empty() => {
+                Reading::Value(EntryValue::Text(text.clone()))
+            }
+            Value::String(_) | Value::Null | Value::Array(_) | Value::Object(_) => Reading::Nothing,
         };
         self.put(metric, series, reading);
     }
@@ -41,14 +56,42 @@ impl Entries {
         self.put(metric, series, reading);
     }
 
-    /// The collection worked and had nothing for this metric.
+    /// The reading worked and had nothing for this metric.
     pub fn nothing(&mut self, metric: &str, series: &[&str]) {
         self.put(metric, series, Reading::Nothing);
     }
 
-    /// Why there's nothing for this metric.
+    /// Why there's nothing for this metric. An error that says nothing still is one.
     pub fn error(&mut self, metric: &str, series: &[&str], error: &str) {
+        let error = match error.trim() {
+            "" => NO_REASON,
+            _ => error,
+        };
         self.put(metric, series, Reading::Error(error.to_string()));
+    }
+
+    /// What was read, or `why` it couldn't be where there's nothing: the error of
+    /// each metric an item that couldn't be read has no value for.
+    pub fn read_or(&mut self, metric: &str, series: &[&str], value: &Value, why: Option<&str>) {
+        match why {
+            Some(why) if filled(value).is_null() => self.error(metric, series, why),
+            _ => self.read(metric, series, value),
+        }
+    }
+
+    /// Each item of a list as a series under what its `name` field says: every
+    /// metric, read from its field of the item. An item with no name isn't a
+    /// series, so it's left out.
+    pub fn items(&mut self, items: &Value, name: &str, fields: &[(&str, &str)]) {
+        let items = items.as_array().map(Vec::as_slice).unwrap_or_default();
+        for item in items {
+            let Some(series) = item.get(name).and_then(Value::as_str) else {
+                continue;
+            };
+            for (metric, field) in fields {
+                self.read(metric, &[series], at(item, field));
+            }
+        }
     }
 
     fn put(&mut self, metric: &str, series: &[&str], reading: Reading) {
@@ -56,20 +99,33 @@ impl Entries {
             maxnines_protocol::entries::is_metric_name(metric),
             "{metric}"
         );
+        // A series with an empty name would be read as no series at all.
+        if series.iter().any(|value| value.trim().is_empty()) {
+            return;
+        }
+        let series: Vec<String> = series.iter().map(|value| value.to_string()).collect();
+        if !self.said.insert((metric.to_string(), series.clone())) {
+            return;
+        }
+        if !self.metrics.contains(metric) {
+            self.metrics.insert(metric.to_string());
+        }
         self.entries.push(Entry {
             metric: metric.to_string(),
-            series: series.iter().map(|value| value.to_string()).collect(),
+            series,
             time: self.time,
             reading,
         });
     }
 
-    /// Says each of these metrics has nothing, unless it has an entry already: one
-    /// read from only some kinds of item has none when there are none of that kind.
-    pub fn fill(&mut self, metrics: &[&str]) {
+    /// Says each of these metrics has nothing, unless it has an entry already: what
+    /// a reading that looked at everything and found no items, or none of the kind
+    /// a metric is read from, says of them. Not for a reading of one item among
+    /// others, as an entry with no series speaks for every series.
+    pub fn fill<Metric: AsRef<str>>(&mut self, metrics: &[Metric]) {
         for metric in metrics {
-            if !self.entries.iter().any(|entry| entry.metric == *metric) {
-                self.nothing(metric, &[]);
+            if !self.metrics.contains(metric.as_ref()) {
+                self.nothing(metric.as_ref(), &[]);
             }
         }
     }
@@ -77,6 +133,31 @@ impl Entries {
     pub fn done(self) -> Vec<Entry> {
         self.entries
     }
+}
+
+/// Every metric of a table of metrics and the fields they're read from, after the
+/// ones said or worked out apart from it. `METRICS` has to be how many that is.
+pub const fn metrics_of<const METRICS: usize>(
+    first: &[&'static str],
+    fields: &[(&'static str, &'static str)],
+) -> [&'static str; METRICS] {
+    assert!(first.len() + fields.len() == METRICS);
+    let mut metrics = [""; METRICS];
+    let mut at = 0;
+    while at < METRICS {
+        metrics[at] = if at < first.len() {
+            first[at]
+        } else {
+            fields[at - first.len()].0
+        };
+        at += 1;
+    }
+    metrics
+}
+
+/// Metric names as a collector says them.
+pub fn names(metrics: &[&str]) -> Vec<String> {
+    metrics.iter().map(|metric| metric.to_string()).collect()
 }
 
 /// What's at a path of names joined by dots in a collector's output, or null where
@@ -104,16 +185,21 @@ pub fn percent(part: &Value, whole: &Value) -> Option<f64> {
 }
 
 /// The error every one of a collector's metrics has when collecting failed.
-pub fn failed(metrics: &[&str], time: DateTime<Utc>, error: &str) -> Vec<Entry> {
+pub fn failed<Metric: AsRef<str>>(
+    metrics: &[Metric],
+    time: DateTime<Utc>,
+    error: &str,
+) -> Vec<Entry> {
     let mut entries = Entries::at(time);
     for metric in metrics {
-        entries.error(metric, &[], error);
+        entries.error(metric.as_ref(), &[], error);
     }
     entries.done()
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// What the tests of collectors' entries share.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
     use serde_json::json;
 
     use super::*;
@@ -142,16 +228,37 @@ pub(crate) mod tests {
             .collect()
     }
 
+    fn read(entries: &[Entry]) -> Vec<String> {
+        let mut read: Vec<String> = entries.iter().map(|entry| entry.metric.clone()).collect();
+        read.sort_unstable();
+        read.dedup();
+        read
+    }
+
     /// Every metric a collector says it reads has an entry, and it has entries for
     /// no others, so a failed collection's errors are on the same metrics.
     pub fn every_metric_has_an_entry(collector: &dyn crate::Collector, entries: &[Entry]) {
-        let mut read: Vec<&str> = entries.iter().map(|entry| entry.metric.as_str()).collect();
-        read.sort_unstable();
-        read.dedup();
-        let mut metrics = collector.metrics().to_vec();
+        let mut metrics = collector.metrics();
         metrics.sort_unstable();
-        assert_eq!(read, metrics, "{}", collector.name());
+        assert_eq!(read(entries), metrics, "{}", collector.name());
     }
+
+    /// Every entry is for a metric the collector says it reads: what holds of one
+    /// item's reading, which has only the metrics its kind of item is read for.
+    pub fn every_entry_is_for_its_metrics(collector: &dyn crate::Collector, entries: &[Entry]) {
+        let metrics = collector.metrics();
+        for metric in read(entries) {
+            assert!(metrics.contains(&metric), "{}: {metric}", collector.name());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::testing::*;
+    use super::*;
 
     #[test]
     fn what_was_read_keeps_its_kind_and_anything_else_is_nothing() {
@@ -203,6 +310,118 @@ pub(crate) mod tests {
                 ("a.missing".to_string(), Value::Null),
             ]
         );
+    }
+
+    #[test]
+    fn a_metric_and_series_has_one_entry_and_the_first_is_kept() {
+        let mut entries = Entries::at(time());
+        entries.read("a.heat", &["core"], &json!(40));
+        entries.read("a.heat", &["core"], &json!(50));
+        entries.error("a.heat", &["core"], "no");
+        entries.read("a.heat", &["other"], &json!(60));
+        entries.read("a.heat", &[], &json!(70));
+        entries.read("a.speed", &["core"], &json!(80));
+        assert_eq!(
+            said(&entries.done()),
+            [
+                ("a.heat[core]".to_string(), json!(40)),
+                ("a.heat[other]".to_string(), json!(60)),
+                ("a.heat".to_string(), json!(70)),
+                ("a.speed[core]".to_string(), json!(80)),
+            ]
+        );
+    }
+
+    /// An empty name would be read as no series at all, which speaks for every one.
+    #[test]
+    fn a_series_with_an_empty_name_has_no_entry() {
+        let mut entries = Entries::at(time());
+        entries.read("a.cpu", &[""], &json!(1));
+        entries.read("a.cpu", &["  "], &json!(2));
+        entries.error("a.cpu", &["page", ""], "no");
+        entries.read("a.cpu", &["init"], &json!(3));
+        assert_eq!(
+            said(&entries.done()),
+            [("a.cpu[init]".to_string(), json!(3))]
+        );
+    }
+
+    #[test]
+    fn an_error_that_says_nothing_still_is_one_and_empty_text_is_nothing() {
+        let mut entries = Entries::at(time());
+        entries.error("a.one", &[], "");
+        entries.error("a.two", &[], " \n");
+        entries.read("a.model", &[], &json!(""));
+        entries.read("a.serial", &[], &json!("  "));
+        assert_eq!(
+            said(&entries.done()),
+            [
+                ("a.one".to_string(), json!({ "error": NO_REASON })),
+                ("a.two".to_string(), json!({ "error": NO_REASON })),
+                ("a.model".to_string(), Value::Null),
+                ("a.serial".to_string(), Value::Null),
+            ]
+        );
+        assert_eq!(
+            said(&failed(&["a.one"], time(), "")),
+            [("a.one".to_string(), json!({ "error": NO_REASON }))]
+        );
+    }
+
+    #[test]
+    fn why_something_could_not_be_read_is_the_error_of_what_it_has_nothing_for() {
+        let mut entries = Entries::at(time());
+        entries.read_or("a.up", &["x"], &json!(0), Some("refused"));
+        entries.read_or("a.took", &["x"], &Value::Null, Some("refused"));
+        entries.read_or("a.version", &["x"], &json!(""), Some("refused"));
+        entries.read_or("a.size", &["x"], &Value::Null, None);
+        assert_eq!(
+            said(&entries.done()),
+            [
+                ("a.up[x]".to_string(), json!(0)),
+                ("a.took[x]".to_string(), json!({ "error": "refused" })),
+                ("a.version[x]".to_string(), json!({ "error": "refused" })),
+                ("a.size[x]".to_string(), Value::Null),
+            ]
+        );
+    }
+
+    #[test]
+    fn each_named_item_of_a_list_is_a_series_of_every_metric() {
+        const FIELDS: [(&str, &str); 2] = [("a.heat", "celsius"), ("a.limit", "limit.high")];
+        const METRICS: [&str; 3] = metrics_of(&["a.share"], &FIELDS);
+        assert_eq!(METRICS, ["a.share", "a.heat", "a.limit"]);
+        assert_eq!(names(&METRICS), ["a.share", "a.heat", "a.limit"]);
+
+        let items = json!([
+            { "label": "core", "celsius": 40, "limit": { "high": 90 } },
+            { "celsius": 50 },
+            { "label": "", "celsius": 55 },
+            { "label": "core", "celsius": 60 },
+            { "label": "board", "celsius": 30 },
+        ]);
+        let mut entries = Entries::at(time());
+        entries.items(&items, "label", &FIELDS);
+        entries.fill(&METRICS);
+        assert_eq!(
+            said(&entries.done()),
+            [
+                ("a.heat[core]".to_string(), json!(40)),
+                ("a.limit[core]".to_string(), json!(90)),
+                ("a.heat[board]".to_string(), json!(30)),
+                ("a.limit[board]".to_string(), Value::Null),
+                ("a.share".to_string(), Value::Null),
+            ]
+        );
+
+        for none in [json!([]), Value::Null, json!({ "label": "core" })] {
+            let mut entries = Entries::at(time());
+            entries.items(&none, "label", &FIELDS);
+            entries.fill(&METRICS);
+            let said = said(&entries.done());
+            assert_eq!(said.len(), 3, "{none}");
+            assert!(said.iter().all(|(_, value)| value.is_null()), "{none}");
+        }
     }
 
     #[test]

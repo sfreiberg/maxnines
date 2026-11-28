@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_collectors::entries::{Entries, at, filled, metrics_of, names};
 use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 
@@ -68,53 +68,85 @@ impl Collector for UpdatesCollector {
             .unwrap_or(Value::Null))
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &UPDATES_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&UPDATES_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// One look: its row.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        if !output.is_object() {
+            return Vec::new();
+        }
         let mut entries = Entries::at(time);
-        // Why nothing could be asked is the error of whatever wasn't read. What was
-        // asked is still known.
+        // Why nothing could be asked is the error of the numbers this system's
+        // package manager would have said and didn't. What was asked is still
+        // known, and each system says its own numbers, so the others have nothing.
         let problem = filled(at(output, "problem")).as_str();
-        for (metric, series, field) in UPDATES_FIELDS {
-            let read = filled(at(output, field));
-            match problem {
-                Some(problem) if read.is_null() => entries.error(metric, series, problem),
-                // Each system says its own numbers, so the others have nothing, as
-                // they all do before the first look.
-                _ => entries.read(metric, series, read),
-            }
+        let says = numbers_of(at(output, "manager").as_str().unwrap_or_default());
+        for ((metric, field), series) in UPDATES_FIELDS.into_iter().zip(UPDATES_SERIES) {
+            let why = problem.filter(|_| says.contains(&metric));
+            entries.read_or(metric, series, at(output, field), why);
         }
         entries.done()
     }
 }
 
-/// The metrics, what each one's series is called, and what it's read from: the
-/// numbers, then what was asked and what went wrong with part of asking.
-const UPDATES_FIELDS: [(&str, &[&str], &str); 7] = [
-    ("updates.pending", &["Updates"], "pending"),
-    ("updates.security", &["Security updates"], "security"),
-    ("updates.vulnerable", &["Vulnerable packages"], "vulnerable"),
-    (
-        "updates.reboot_required",
-        &["Reboot required"],
-        "reboot_required",
-    ),
-    ("updates.lists_age", &["Package lists"], "lists_age_secs"),
-    ("updates.manager", &[], "manager"),
-    ("updates.note", &[], "note"),
+/// The metrics, and what each is read from: the numbers, then what was asked and
+/// what went wrong with part of asking.
+const UPDATES_FIELDS: [(&str, &str); 7] = [
+    ("updates.pending", "pending"),
+    ("updates.security", "security"),
+    ("updates.vulnerable", "vulnerable"),
+    ("updates.reboot_required", "reboot_required"),
+    ("updates.lists_age", "lists_age_secs"),
+    ("updates.manager", "manager"),
+    ("updates.note", "note"),
 ];
 
-const UPDATES_METRICS: [&str; 7] = {
-    let mut metrics = [""; 7];
-    let mut at = 0;
-    while at < UPDATES_FIELDS.len() {
-        metrics[at] = UPDATES_FIELDS[at].0;
-        at += 1;
+/// What each metric's series is called, in the same order.
+const UPDATES_SERIES: [&[&str]; 7] = [
+    &["Updates"],
+    &["Security updates"],
+    &["Vulnerable packages"],
+    &["Reboot required"],
+    &["Package lists"],
+    &[],
+    &[],
+];
+
+const UPDATES_METRICS: [&str; 7] = metrics_of(&[], &UPDATES_FIELDS);
+
+/// The numbers a package manager is asked for, by what its row calls it. One
+/// that isn't known is only known to have updates to count.
+fn numbers_of(manager: &str) -> &'static [&'static str] {
+    match manager {
+        "apt" | "dnf" | "yum" | "zypper" | "windows_update" => &[
+            "updates.pending",
+            "updates.security",
+            "updates.reboot_required",
+            "updates.lists_age",
+        ],
+        "pacman" | "apk" => &[
+            "updates.pending",
+            "updates.reboot_required",
+            "updates.lists_age",
+        ],
+        "pkg" => &[
+            "updates.pending",
+            "updates.vulnerable",
+            "updates.reboot_required",
+            "updates.lists_age",
+        ],
+        "softwareupdate" => &["updates.pending", "updates.lists_age"],
+        _ => &["updates.pending"],
     }
-    metrics
-};
+}
 
 /// What one look found. A number left out wasn't known: the system doesn't say it,
 /// or asking failed.
@@ -902,8 +934,10 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 
 #[cfg(test)]
 mod tests {
+    use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::read_once;
 
     /// A collector that never asks a package manager anything.
     fn asking_nothing() -> UpdatesCollector {
@@ -945,64 +979,86 @@ mod tests {
         );
         every_metric_has_an_entry(&collector, &entries);
 
-        // Before the first look, each metric has nothing.
-        let none = collector.entries(&Value::Null, time());
-        assert_eq!(
-            said(&none),
-            [
-                ("updates.pending[Updates]".to_string(), Value::Null),
-                (
-                    "updates.security[Security updates]".to_string(),
-                    Value::Null
-                ),
-                (
-                    "updates.vulnerable[Vulnerable packages]".to_string(),
-                    Value::Null
-                ),
-                (
-                    "updates.reboot_required[Reboot required]".to_string(),
-                    Value::Null
-                ),
-                ("updates.lists_age[Package lists]".to_string(), Value::Null),
-                ("updates.manager".to_string(), Value::Null),
-                ("updates.note".to_string(), Value::Null),
-            ]
-        );
-        every_metric_has_an_entry(&collector, &none);
+        // Before the first look, nothing is said at all.
+        assert_eq!(collector.entries(&Value::Null, time()), []);
     }
 
     #[test]
     fn why_updates_could_not_be_asked_about_is_the_error_of_what_was_not_read() {
         let collector = asking_nothing();
-        let output = Found::problem("pacman", "checkupdates isn't installed").to_value();
-        let entries = collector.entries(&output, time());
+        // The kernel still said whether a reboot is waiting.
+        let found = Found {
+            reboot_required: Some(false),
+            ..Found::problem("pacman", "checkupdates isn't installed")
+        };
+        let entries = collector.entries(&found.to_value(), time());
         let error = json!({ "error": "checkupdates isn't installed" });
         assert_eq!(
             said(&entries),
             [
                 ("updates.pending[Updates]".to_string(), error.clone()),
+                // pacman says neither of these, so they aren't missing.
                 (
                     "updates.security[Security updates]".to_string(),
-                    error.clone()
+                    Value::Null
                 ),
                 (
                     "updates.vulnerable[Vulnerable packages]".to_string(),
-                    error.clone()
+                    Value::Null
                 ),
                 (
                     "updates.reboot_required[Reboot required]".to_string(),
-                    error.clone()
+                    json!(0)
                 ),
-                (
-                    "updates.lists_age[Package lists]".to_string(),
-                    error.clone()
-                ),
-                // What was asked is still known.
+                ("updates.lists_age[Package lists]".to_string(), error),
+                // What was asked is still known, and nothing went wrong with part
+                // of asking.
                 ("updates.manager".to_string(), json!("pacman")),
-                ("updates.note".to_string(), error),
+                ("updates.note".to_string(), Value::Null),
             ]
         );
         every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn a_problem_is_the_error_of_the_numbers_its_package_manager_says() {
+        let collector = asking_nothing();
+        let errors = |manager: &'static str| -> Vec<String> {
+            let output = Found::problem(manager, "it couldn't be run").to_value();
+            let entries = collector.entries(&output, time());
+            every_metric_has_an_entry(&collector, &entries);
+            said(&entries)
+                .into_iter()
+                .filter(|(_, value)| value.get("error").is_some())
+                .map(|(name, _)| name.split('[').next().unwrap().to_string())
+                .collect()
+        };
+        let (pending, security, vulnerable, reboot, lists) = (
+            "updates.pending",
+            "updates.security",
+            "updates.vulnerable",
+            "updates.reboot_required",
+            "updates.lists_age",
+        );
+        for manager in ["apt", "dnf", "yum", "zypper", "windows_update"] {
+            assert_eq!(errors(manager), [pending, security, reboot, lists]);
+        }
+        for manager in ["pacman", "apk"] {
+            assert_eq!(errors(manager), [pending, reboot, lists]);
+        }
+        assert_eq!(errors("pkg"), [pending, vulnerable, reboot, lists]);
+        assert_eq!(errors("softwareupdate"), [pending, lists]);
+        // A distribution whose package manager isn't known.
+        assert_eq!(errors(""), [pending]);
+    }
+
+    #[test]
+    fn a_look_at_the_updates_is_handed_over_once() {
+        let look = Found::problem("apt", "apt-get couldn't be run").to_value();
+        let mut collector = UpdatesCollector {
+            background: Background::holding([look]),
+        };
+        assert_eq!(read_once(&mut collector).len(), UPDATES_METRICS.len());
     }
 
     #[test]
@@ -1045,11 +1101,10 @@ mod tests {
     }
 
     #[test]
-    fn a_collector_that_has_asked_nothing_collects_nothing_for_each_metric() {
-        let mut collector = asking_nothing();
-        let output = collector.collect().unwrap();
-        assert_eq!(output, Value::Null);
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    fn a_collector_that_has_not_looked_yet_has_no_entries() {
+        let mut collector = UpdatesCollector::new().unwrap();
+        assert_eq!(collector.collect().unwrap(), Value::Null);
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     /// What a package manager printed, as captured on a real system by

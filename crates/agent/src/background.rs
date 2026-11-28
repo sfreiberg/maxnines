@@ -18,7 +18,9 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
+use maxnines_protocol::entries::Entry;
 use serde_json::Value;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::task::AbortHandle;
@@ -95,12 +97,34 @@ pub fn runtime() -> Result<Handle> {
     Ok(handle)
 }
 
+/// An item's newest result.
+#[derive(Default)]
+struct Kept {
+    /// Null until it has one.
+    value: Value,
+    /// When it was finished.
+    read: DateTime<Utc>,
+    /// Whether it's still to be handed over as what was read then, which happens
+    /// once.
+    fresh: bool,
+}
+
+impl Kept {
+    fn now(value: Value) -> Self {
+        Self {
+            value,
+            read: maxnines_protocol::time::now(),
+            fresh: true,
+        }
+    }
+}
+
 /// Repeats work in the background, each item on its own schedule, and keeps each
 /// one's newest result. It stops when dropped, which happens whenever the agent's
 /// config changes.
 #[derive(Default)]
 pub struct Background {
-    results: Arc<Mutex<Vec<Value>>>,
+    results: Arc<Mutex<Vec<Kept>>>,
     tasks: Vec<AbortHandle>,
 }
 
@@ -111,7 +135,7 @@ impl Background {
 
     /// Adds an item whose result never changes, such as why one can't run.
     pub fn constant(&mut self, value: Value) {
-        self.lock().push(value);
+        self.lock().push(Kept::now(value));
     }
 
     /// Adds an item that runs `round` every `every`, first at a random point in
@@ -157,7 +181,7 @@ impl Background {
         let runtime = runtime()?;
         let slot = {
             let mut results = self.lock();
-            results.push(Value::Null);
+            results.push(Kept::default());
             results.len() - 1
         };
         let results = self.results.clone();
@@ -185,7 +209,8 @@ impl Background {
                 }
                 match catch_unwind(AssertUnwindSafe(|| publish(found))) {
                     Ok(value) => {
-                        results.lock().unwrap_or_else(PoisonError::into_inner)[slot] = value;
+                        results.lock().unwrap_or_else(PoisonError::into_inner)[slot] =
+                            Kept::now(value);
                     }
                     Err(_) => error!("a background collector panicked"),
                 }
@@ -195,32 +220,65 @@ impl Background {
         Ok(())
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Value>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Kept>> {
         self.results.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Each item's newest result, in the order they were added, with null for one
     /// that has none yet.
     pub fn latest(&self) -> Vec<Value> {
-        self.lock().clone()
+        self.lock().iter().map(|kept| kept.value.clone()).collect()
+    }
+
+    /// Each result finished since this was last asked, with when it was finished,
+    /// in the order the items were added. Each is handed over once, so an item
+    /// that hasn't finished another round since has nothing here.
+    pub fn fresh(&self) -> Vec<(Value, DateTime<Utc>)> {
+        self.lock()
+            .iter_mut()
+            .filter_map(|kept| {
+                let fresh = std::mem::take(&mut kept.fresh) && !kept.value.is_null();
+                fresh.then(|| (kept.value.clone(), kept.read))
+            })
+            .collect()
+    }
+
+    /// What a collector's [`Collector::read`] is: the entries of each fresh result,
+    /// read when it was finished.
+    ///
+    /// [`Collector::read`]: maxnines_collectors::Collector::read
+    pub fn read(&self, entries: impl Fn(&Value, DateTime<Utc>) -> Vec<Entry>) -> Vec<Entry> {
+        self.fresh()
+            .iter()
+            .flat_map(|(result, time)| entries(result, *time))
+            .collect()
     }
 
     /// Every item's rows together, a list's items each a row of their own. Null
     /// until something has a result, unless there's nothing to wait for.
     pub fn rows(&self) -> Value {
         let results = self.lock();
-        if !results.is_empty() && results.iter().all(Value::is_null) {
+        if !results.is_empty() && results.iter().all(|kept| kept.value.is_null()) {
             return Value::Null;
         }
         let mut rows = Vec::new();
         for result in results.iter() {
-            match result {
+            match &result.value {
                 Value::Null => {}
                 Value::Array(items) => rows.extend(items.iter().cloned()),
                 row => rows.push(row.clone()),
             }
         }
         Value::Array(rows)
+    }
+}
+
+/// The rows of one result: a list's items, or the one row it is.
+pub fn rows_of(result: &Value) -> &[Value] {
+    match result {
+        Value::Null => &[],
+        Value::Array(rows) => rows,
+        row => std::slice::from_ref(row),
     }
 }
 
@@ -247,6 +305,42 @@ impl Busy {
 impl Drop for Busy {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+/// What the tests of collectors that read in the background share.
+#[cfg(test)]
+pub mod testing {
+    use super::*;
+
+    impl Background {
+        /// Holding these results, each finished just now, and running nothing.
+        pub fn holding(results: impl IntoIterator<Item = Value>) -> Self {
+            let mut background = Self::new();
+            for result in results {
+                background.constant(result);
+            }
+            background
+        }
+    }
+
+    /// What a collector reads of the results it holds, which it has to hand over
+    /// once, each entry with when its result was finished rather than when it was
+    /// asked.
+    pub fn read_once(collector: &mut dyn maxnines_collectors::Collector) -> Vec<Entry> {
+        let asked = DateTime::UNIX_EPOCH;
+        let read = collector.read(asked).unwrap();
+        assert!(read.iter().all(|entry| entry.time > asked));
+        assert_eq!(collector.read(asked).unwrap(), []);
+        read
+    }
+
+    /// One item's reading speaks only for its own series, where an entry with no
+    /// series would speak for every other item's too.
+    pub fn each_is_for_a_series(entries: &[Entry]) {
+        for entry in entries {
+            assert!(!entry.series.is_empty(), "{}", entry.metric);
+        }
     }
 }
 
@@ -308,6 +402,82 @@ mod tests {
             .unwrap();
         assert_eq!(background.rows(), Value::Null);
         assert_eq!(Background::new().rows(), json!([]));
+    }
+
+    /// Rounds that each wait to be let through, giving their number, and what lets
+    /// one through.
+    fn gated(background: &mut Background) -> Arc<tokio::sync::Semaphore> {
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (waited, rounds) = (gate.clone(), Arc::new(AtomicUsize::new(0)));
+        background
+            .repeat(
+                SHORT,
+                None,
+                move || {
+                    let (gate, rounds) = (waited.clone(), rounds.clone());
+                    async move {
+                        gate.acquire().await.unwrap().forget();
+                        rounds.fetch_add(1, Ordering::Relaxed) + 1
+                    }
+                },
+                |found| json!(found.unwrap()),
+            )
+            .unwrap();
+        gate
+    }
+
+    #[test]
+    fn a_result_is_handed_over_once_with_when_it_was_finished() {
+        let mut background = Background::new();
+        background.constant(json!("can't run"));
+        let gate = gated(&mut background);
+
+        // Only what never changes has a result yet, and it's handed over once too.
+        let before = maxnines_protocol::time::now();
+        let fresh = background.fresh();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].0, json!("can't run"));
+        assert!(fresh[0].1 <= before);
+        assert_eq!(background.fresh(), []);
+
+        gate.add_permits(1);
+        wait_until(|| background.latest()[1] == json!(1));
+        let fresh = background.fresh();
+        let after = maxnines_protocol::time::now();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].0, json!(1));
+        assert!(before <= fresh[0].1 && fresh[0].1 <= after);
+        // Nothing has finished since, though the newest result is still kept.
+        assert_eq!(background.fresh(), []);
+        assert_eq!(background.latest()[1], json!(1));
+
+        gate.add_permits(1);
+        wait_until(|| background.latest()[1] == json!(2));
+        let next = background.fresh();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, json!(2));
+        assert!(fresh[0].1 <= next[0].1);
+    }
+
+    #[test]
+    fn reading_gives_each_fresh_results_entries_at_its_own_time() {
+        let mut background = Background::new();
+        let gate = gated(&mut background);
+        let entries = |result: &Value, time: DateTime<Utc>| {
+            let mut entries = maxnines_collectors::entries::Entries::at(time);
+            entries.read("round.number", &[], result);
+            entries.done()
+        };
+        assert_eq!(background.read(entries), []);
+
+        gate.add_permits(1);
+        wait_until(|| background.latest()[0] == json!(1));
+        let finished = maxnines_protocol::time::now();
+        let read = background.read(entries);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].metric, "round.number");
+        assert!(read[0].time <= finished);
+        assert_eq!(background.read(entries), []);
     }
 
     #[test]

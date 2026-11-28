@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at};
+use maxnines_collectors::entries::{Entries, at, names};
 use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 
-use crate::background::{Background, FAILED_UNEXPECTEDLY};
+use crate::background::{Background, FAILED_UNEXPECTEDLY, rows_of};
 use crate::collector::Collector;
 
 /// A service manager can stall, but it answers quickly when it's healthy.
@@ -63,19 +63,24 @@ impl Collector for ServiceCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &SERVICE_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&SERVICE_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// What was said of one service, or of each in a list, under its own name
+    /// only, as each is asked about apart from the others.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let services = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = services
+        let named = rows_of(output)
             .iter()
             .filter_map(|service| Some((service.get("name")?.as_str()?, service)));
-        let mut any = false;
         for (name, service) in named {
-            any = true;
             let (running, state) = (at(service, "running"), at(service, "state"));
             // One that couldn't be asked about has why as its state, which is the
             // error of both.
@@ -92,12 +97,6 @@ impl Collector for ServiceCollector {
                     entries.read("service.running", &[name], running);
                     entries.read("service.state", &[name], state);
                 }
-            }
-        }
-        // With no services to watch, or none asked about yet, each has nothing.
-        if !any {
-            for metric in SERVICE_METRICS {
-                entries.nothing(metric, &[]);
             }
         }
         entries.done()
@@ -335,8 +334,12 @@ async fn query(_watched: &Watched) -> Status {
 
 #[cfg(test)]
 mod tests {
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::{each_is_for_a_series, read_once};
 
     /// Watching nothing, so nothing is asked of the service manager.
     fn watching_nothing() -> ServiceCollector {
@@ -376,18 +379,29 @@ mod tests {
         );
         every_metric_has_an_entry(&collector, &entries);
 
-        // With no services, or none asked about yet, each metric has nothing.
+        each_is_for_a_series(&entries);
+
+        // With no services, or none asked about yet, nothing is said, as nothing
+        // one service says is about the others.
         for output in [json!([]), Value::Null] {
-            let none = collector.entries(&output, time());
-            assert_eq!(
-                said(&none),
-                [
-                    ("service.running".to_string(), Value::Null),
-                    ("service.state".to_string(), Value::Null),
-                ]
-            );
-            every_metric_has_an_entry(&collector, &none);
+            assert_eq!(collector.entries(&output, time()), []);
         }
+    }
+
+    #[test]
+    fn each_services_answer_is_its_own_and_handed_over_once() {
+        let mut collector = ServiceCollector {
+            background: Background::holding([
+                report("nginx", Status::running("active")),
+                report("sshd", Status::unknown(NOT_ASKED)),
+            ]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 4);
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
+        let series: Vec<&str> = read.iter().map(|entry| entry.series[0].as_str()).collect();
+        assert_eq!(series, ["nginx", "nginx", "sshd", "sshd"]);
     }
 
     #[test]
@@ -415,11 +429,10 @@ mod tests {
     }
 
     #[test]
-    fn watching_no_services_really_collects_nothing_for_each_metric() {
+    fn watching_no_services_collects_and_says_nothing() {
         let mut collector = watching_nothing();
-        let output = collector.collect().unwrap();
-        assert_eq!(output, json!([]));
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+        assert_eq!(collector.collect().unwrap(), json!([]));
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     async fn query_named(name: &str) -> Status {

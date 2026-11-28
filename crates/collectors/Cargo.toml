@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# What the tests of collectors' entries share, for the crates that have such tests.
+testing = []
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true

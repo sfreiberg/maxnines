@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_collectors::entries::{Entries, at, filled, metrics_of, names};
 use maxnines_protocol::entries::Entry;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -65,51 +65,54 @@ impl Collector for RaidCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &RAID_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&RAID_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// One look at every array and pool: a row for each, and for each problem.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let Some(rows) = output.as_array() else {
+            return Vec::new();
+        };
         let mut entries = Entries::at(time);
-        let rows = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = rows
-            .iter()
-            .filter_map(|row| Some((row.get("name")?.as_str()?, row)));
-        let (mut arrays, mut pools) = (false, false);
-        for (name, row) in named {
-            // What couldn't be asked says why, under the name of what was asked,
-            // which is never an array's. Whatever it would have found could have
-            // been an array or a pool, so it's the error of every metric.
+        for row in rows {
+            // What couldn't be asked says why, as the error of the metrics it
+            // would have read, whichever arrays or pools those are of.
             if let Some(problem) = filled(at(row, "problem")).as_str() {
-                (arrays, pools) = (true, true);
-                for metric in RAID_METRICS {
-                    entries.error(metric, &[name], problem);
+                let unread = at(row, "unread").as_str();
+                if unread != Some(Unread::Pools.as_str()) {
+                    for metric in ARRAY_METRICS {
+                        entries.error(metric, &[], problem);
+                    }
+                }
+                if unread != Some(Unread::Arrays.as_str()) {
+                    for metric in ZFS_METRICS {
+                        entries.error(metric, &[], problem);
+                    }
                 }
                 continue;
             }
-            arrays = true;
+            let Some(name) = at(row, "name").as_str() else {
+                continue;
+            };
             for (metric, field) in RAID_FIELDS {
-                entries.read(metric, &[name], filled(at(row, field)));
+                entries.read(metric, &[name], at(row, field));
             }
             if at(row, "kind") == "zfs" {
-                pools = true;
                 for (metric, field) in ZFS_FIELDS {
                     entries.read(metric, &[name], at(row, field));
                 }
             }
         }
-        // With no arrays, or none looked at yet, each metric has nothing, as do
-        // ZFS's own on a host whose arrays are all something else.
-        if !arrays {
-            for (metric, _) in RAID_FIELDS {
-                entries.nothing(metric, &[]);
-            }
-        }
-        if !pools {
-            for (metric, _) in ZFS_FIELDS {
-                entries.nothing(metric, &[]);
-            }
-        }
+        // With no arrays each metric has nothing, as do ZFS's own on a host whose
+        // arrays are all something else.
+        entries.fill(&RAID_METRICS);
         entries.done()
     }
 }
@@ -147,27 +150,39 @@ const ZFS_FIELDS: [(&str, &str); 10] = [
     ("zfs.scrub_errors", "scrub_errors"),
 ];
 
+const ARRAY_METRICS: [&str; 13] = metrics_of(&[], &RAID_FIELDS);
+const ZFS_METRICS: [&str; 10] = metrics_of(&[], &ZFS_FIELDS);
 /// Every metric: each array's, then each pool's.
-const RAID_METRICS: [&str; 23] = {
-    let mut metrics = [""; 23];
-    let mut at = 0;
-    while at < RAID_FIELDS.len() {
-        metrics[at] = RAID_FIELDS[at].0;
-        at += 1;
+const RAID_METRICS: [&str; 23] = metrics_of(&ARRAY_METRICS, &ZFS_FIELDS);
+
+/// What a problem kept from being read, which says which metrics it's the error
+/// of.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Unread {
+    /// What every array has: something other than ZFS couldn't be asked.
+    Arrays,
+    /// What only ZFS says: zpool couldn't be asked.
+    Pools,
+    /// Both, as nothing says which.
+    Everything,
+}
+
+impl Unread {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Arrays => "arrays",
+            Self::Pools => "pools",
+            Self::Everything => "everything",
+        }
     }
-    while at < metrics.len() {
-        metrics[at] = ZFS_FIELDS[at - RAID_FIELDS.len()].0;
-        at += 1;
-    }
-    metrics
-};
+}
 
 /// What one look found: each array, and what couldn't be read, by what it was
 /// asked with.
 #[derive(Debug, Default, PartialEq)]
 struct Found {
     arrays: Vec<Array>,
-    problems: Vec<(&'static str, String)>,
+    problems: Vec<(&'static str, Unread, String)>,
 }
 
 impl Found {
@@ -187,7 +202,7 @@ impl Found {
         };
         Self {
             arrays: Vec::new(),
-            problems: vec![("raid", problem)],
+            problems: vec![("raid", Unread::Everything, problem)],
         }
     }
 
@@ -201,8 +216,13 @@ impl Found {
     /// with no sets.
     fn to_value(&self) -> Value {
         let mut rows: Vec<Value> = self.arrays.iter().map(Array::to_value).collect();
-        for (asked, problem) in &self.problems {
-            rows.push(json!({ "name": asked, "problem": problem, "arrays": 0 }));
+        for (asked, unread, problem) in &self.problems {
+            rows.push(json!({
+                "name": asked,
+                "problem": problem,
+                "unread": unread.as_str(),
+                "arrays": 0,
+            }));
         }
         Value::Array(rows)
     }
@@ -326,6 +346,7 @@ async fn read() -> Found {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => found.problems.push((
                 "/proc/mdstat",
+                Unread::Arrays,
                 format!("/proc/mdstat couldn't be read: {error}"),
             )),
         }
@@ -357,7 +378,7 @@ fn failure(program: &str, ran: &crate::programs::Ran) -> String {
 
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 mod zfs {
-    use super::{Found, failure, parse_zpool, run};
+    use super::{Found, Unread, failure, parse_zpool, run};
     use crate::programs::{first_of, refused_by_sudo};
 
     /// Where each system puts zpool: Linux's packages, and FreeBSD's base system.
@@ -392,9 +413,11 @@ mod zfs {
         let sudo = if can_open { None } else { first_of(SUDO) };
         // Problems are named by zpool's path, as a pool's name can't have a `/`.
         if !can_open && sudo.is_none() {
-            found
-                .problems
-                .push((zpool, needs_root(zpool, "sudo isn't installed, so")));
+            found.problems.push((
+                zpool,
+                Unread::Pools,
+                needs_root(zpool, "sudo isn't installed, so"),
+            ));
             return;
         }
         let ask = |arguments: &'static [&'static str]| async move {
@@ -421,7 +444,7 @@ mod zfs {
         let list = match ask(LIST).await {
             Ok(list) => list,
             Err(problem) => {
-                found.problems.push((zpool, problem));
+                found.problems.push((zpool, Unread::Pools, problem));
                 return;
             }
         };
@@ -435,7 +458,7 @@ mod zfs {
         let status = match ask(STATUS).await {
             Ok(status) => status,
             Err(problem) => {
-                found.problems.push((zpool, problem));
+                found.problems.push((zpool, Unread::Pools, problem));
                 String::new()
             }
         };
@@ -457,7 +480,7 @@ mod zfs {
 
 #[cfg(target_os = "macos")]
 mod appleraid {
-    use super::{Found, failure, parse_appleraid, run};
+    use super::{Found, Unread, failure, parse_appleraid, run};
 
     pub async fn read(found: &mut Found) {
         match run("/usr/sbin/diskutil", &["appleRAID", "list"]).await {
@@ -468,16 +491,19 @@ mod appleraid {
             }
             Ok(ran) => found.problems.push((
                 "diskutil appleRAID",
+                Unread::Arrays,
                 failure("diskutil appleRAID list", &ran),
             )),
-            Err(error) => found.problems.push(("diskutil appleRAID", error)),
+            Err(error) => found
+                .problems
+                .push(("diskutil appleRAID", Unread::Arrays, error)),
         }
     }
 }
 
 #[cfg(windows)]
 mod windows {
-    use super::{Found, failure, parse_storage_spaces, run};
+    use super::{Found, Unread, failure, parse_storage_spaces, run};
 
     /// Each Storage Spaces virtual disk, as JSON.
     const SCRIPT: &str = include_str!("raid.ps1");
@@ -500,7 +526,9 @@ mod windows {
                 failure("PowerShell", &ran)
             ),
         };
-        found.problems.push(("Storage Spaces", problem));
+        found
+            .problems
+            .push(("Storage Spaces", Unread::Arrays, problem));
     }
 }
 
@@ -1252,8 +1280,10 @@ fn parse_storage_spaces(json: &[u8]) -> std::result::Result<Vec<Array>, String> 
 
 #[cfg(test)]
 mod tests {
+    use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::read_once;
 
     /// A collector that never looks at anything.
     fn looking_at_nothing() -> RaidCollector {
@@ -1326,17 +1356,28 @@ mod tests {
         );
         every_metric_has_an_entry(&collector, &entries);
 
-        // With no arrays, or none looked at yet, each metric has nothing.
-        for output in [json!([]), Value::Null] {
-            let none = collector.entries(&output, time());
-            assert_eq!(none.len(), RAID_METRICS.len());
-            assert!(
-                said(&none)
-                    .iter()
-                    .all(|(name, value)| !name.contains('[') && value.is_null())
-            );
-            every_metric_has_an_entry(&collector, &none);
-        }
+        // A look that found no arrays has nothing for each metric.
+        let none = collector.entries(&json!([]), time());
+        assert_eq!(none.len(), RAID_METRICS.len());
+        assert!(
+            said(&none)
+                .iter()
+                .all(|(name, value)| !name.contains('[') && value.is_null())
+        );
+        every_metric_has_an_entry(&collector, &none);
+        // No look yet says nothing at all.
+        assert_eq!(collector.entries(&Value::Null, time()), []);
+    }
+
+    #[test]
+    fn a_look_at_the_arrays_is_handed_over_once() {
+        let mut collector = RaidCollector {
+            background: Background::holding([Found::default().to_value()]),
+        };
+        assert_eq!(read_once(&mut collector).len(), RAID_METRICS.len());
+
+        let mut waiting = RaidCollector::new().unwrap();
+        assert_eq!(waiting.read(time()).unwrap(), []);
     }
 
     #[test]
@@ -1369,40 +1410,66 @@ mod tests {
     }
 
     #[test]
-    fn what_could_not_be_asked_is_an_error_under_the_name_of_what_was_asked() {
+    fn what_could_not_be_asked_is_the_error_of_what_it_would_have_read() {
         let collector = looking_at_nothing();
+        let md0 = || Array {
+            name: "/dev/md0".into(),
+            kind: "md",
+            degraded: true,
+            ..Array::default()
+        };
         // zpool couldn't be asked, while md's arrays were read.
         let found = Found {
-            arrays: vec![Array {
-                name: "/dev/md0".into(),
-                kind: "md",
-                degraded: true,
-                ..Array::default()
-            }],
-            problems: vec![("/usr/sbin/zpool", "zpool couldn't be run".into())],
+            arrays: vec![md0()],
+            problems: vec![(
+                "/usr/sbin/zpool",
+                Unread::Pools,
+                "zpool couldn't be run".into(),
+            )],
         };
         let entries = collector.entries(&found.to_value(), time());
         every_metric_has_an_entry(&collector, &entries);
         let read = said(&entries);
-        assert_eq!(read.len(), RAID_FIELDS.len() + RAID_METRICS.len());
+        assert_eq!(read.len(), RAID_METRICS.len());
         assert!(read.contains(&("raid.degraded[/dev/md0]".to_string(), json!(1))));
-        for metric in RAID_METRICS {
+        for metric in ZFS_METRICS {
             assert!(
                 read.contains(&(
-                    format!("{metric}[/usr/sbin/zpool]"),
+                    metric.to_string(),
                     json!({ "error": "zpool couldn't be run" })
                 )),
                 "{metric}: {read:?}"
             );
         }
+        assert!(read.iter().all(|(name, _)| !name.contains("zpool")));
 
-        // A look that didn't finish has nothing else.
+        // What isn't ZFS couldn't be asked, on a host with no pools.
+        let found = Found {
+            arrays: Vec::new(),
+            problems: vec![(
+                "/proc/mdstat",
+                Unread::Arrays,
+                "/proc/mdstat couldn't be read".into(),
+            )],
+        };
+        let entries = collector.entries(&found.to_value(), time());
+        every_metric_has_an_entry(&collector, &entries);
+        for (name, value) in said(&entries) {
+            let expected = match name.starts_with("raid.") {
+                true => json!({ "error": "/proc/mdstat couldn't be read" }),
+                false => Value::Null,
+            };
+            assert_eq!(value, expected, "{name}");
+            assert!(!name.contains('['), "{name}");
+        }
+
+        // A look that didn't finish could have read anything.
         let unfinished = Found::unfinished(Missed::Panicked).to_value();
         let entries = collector.entries(&unfinished, time());
         every_metric_has_an_entry(&collector, &entries);
         assert_eq!(entries.len(), RAID_METRICS.len());
         for (name, value) in said(&entries) {
-            assert!(name.ends_with("[raid]"), "{name}");
+            assert!(!name.contains('['), "{name}");
             assert!(value["error"].is_string(), "{name}: {value}");
         }
     }
@@ -2217,7 +2284,11 @@ Device Node:          disk4
     fn rows_have_every_text_and_problems_have_a_name_no_array_can() {
         let found = Found {
             arrays: md("ubuntu-24.04", "raid1-recovering"),
-            problems: vec![("/usr/sbin/zpool", "zpool couldn't be run".into())],
+            problems: vec![(
+                "/usr/sbin/zpool",
+                Unread::Pools,
+                "zpool couldn't be run".into(),
+            )],
         };
         let rows = found.to_value();
         let rows = rows.as_array().unwrap();
@@ -2230,7 +2301,7 @@ Device Node:          disk4
         assert!(md0.get("size_bytes").is_none());
         assert_eq!(
             rows.last().unwrap(),
-            &json!({ "name": "/usr/sbin/zpool", "problem": "zpool couldn't be run", "arrays": 0 })
+            &json!({ "name": "/usr/sbin/zpool", "problem": "zpool couldn't be run", "unread": "pools", "arrays": 0 })
         );
         let pools = Found {
             arrays: zfs("ubuntu-24.04", "data-errors"),

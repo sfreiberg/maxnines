@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
-use maxnines_collectors::entries::{Entries, at};
+use maxnines_collectors::entries::{Entries, at, filled, metrics_of, names};
 use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 
-use crate::background::{Background, Busy, FAILED_UNEXPECTEDLY};
+use crate::background::{Background, Busy, FAILED_UNEXPECTEDLY, rows_of};
 use crate::collector::Collector;
 
 /// Network drives can hang, which shows as this much delay and then a failure.
@@ -83,35 +83,29 @@ impl Collector for FileCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &FILE_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&FILE_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// What one look at a path found, or each of a list, under its own path only,
+    /// as each is looked at apart from the others.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let paths = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = paths
+        let named = rows_of(output)
             .iter()
             .filter_map(|found| Some((found.get("path")?.as_str()?, found)));
-        let mut any = false;
         for (path, found) in named {
-            any = true;
             // A path that couldn't be looked at says why, which is the error of
-            // everything about it.
-            let why = at(found, "error")
-                .as_str()
-                .filter(|why| !why.trim().is_empty());
+            // everything about it, as it has nothing else.
+            let why = filled(at(found, "error")).as_str();
             for (metric, field) in FILE_FIELDS {
-                match why {
-                    Some(why) => entries.error(metric, &[path], why),
-                    None => entries.read(metric, &[path], at(found, field)),
-                }
-            }
-        }
-        // With no paths to watch, or none looked at yet, each metric has nothing.
-        if !any {
-            for metric in FILE_METRICS {
-                entries.nothing(metric, &[]);
+                entries.read_or(metric, &[path], at(found, field), why);
             }
         }
         entries.done()
@@ -128,15 +122,7 @@ const FILE_FIELDS: [(&str, &str); 5] = [
     ("file.entries", "entries"),
 ];
 
-const FILE_METRICS: [&str; 5] = {
-    let mut metrics = [""; 5];
-    let mut at = 0;
-    while at < FILE_FIELDS.len() {
-        metrics[at] = FILE_FIELDS[at].0;
-        at += 1;
-    }
-    metrics
-};
+const FILE_METRICS: [&str; 5] = metrics_of(&[], &FILE_FIELDS);
 
 /// A path that can't be reached in time says nothing about whether it exists,
 /// so it has no `exists` value, and an alert on it holds its state.
@@ -202,8 +188,12 @@ fn inspect(path: &String, now: DateTime<Utc>) -> Value {
 mod tests {
     use std::time::Instant;
 
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::{each_is_for_a_series, read_once};
 
     fn path_of(path: &Path) -> String {
         path.to_str().unwrap().to_string()
@@ -258,21 +248,27 @@ mod tests {
         );
         every_metric_has_an_entry(&collector, &entries);
 
-        // With no paths, or none looked at yet, each metric has nothing.
+        each_is_for_a_series(&entries);
+
+        // With no paths, or none looked at yet, nothing is said, as nothing one
+        // path says is about the others.
         for output in [json!([]), Value::Null] {
-            let none = collector.entries(&output, time());
-            assert_eq!(
-                said(&none),
-                [
-                    ("file.exists".to_string(), Value::Null),
-                    ("file.size".to_string(), Value::Null),
-                    ("file.age".to_string(), Value::Null),
-                    ("file.folder".to_string(), Value::Null),
-                    ("file.entries".to_string(), Value::Null),
-                ]
-            );
-            every_metric_has_an_entry(&collector, &none);
+            assert_eq!(collector.entries(&output, time()), []);
         }
+    }
+
+    #[test]
+    fn each_look_at_a_path_is_its_own_and_handed_over_once() {
+        let mut collector = FileCollector {
+            background: Background::holding([
+                json!({ "path": "/srv/nope", "exists": 0 }),
+                json!({ "path": "/mnt/nfs", "error": "timed out" }),
+            ]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 2 * FILE_METRICS.len());
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
     }
 
     #[test]
@@ -316,11 +312,10 @@ mod tests {
     }
 
     #[test]
-    fn watching_no_paths_really_collects_nothing_for_each_metric() {
+    fn watching_no_paths_collects_and_says_nothing() {
         let mut collector = watching_nothing();
-        let output = collector.collect().unwrap();
-        assert_eq!(output, json!([]));
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+        assert_eq!(collector.collect().unwrap(), json!([]));
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 
 use crate::Collector;
-use crate::entries::{Entries, at};
+use crate::entries::{Entries, at, filled};
 
 /// One reading of the clock's sync. A number left out isn't known on this system.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -40,6 +40,9 @@ pub struct Reading {
     pub sources: Option<u64>,
     /// Why nothing could be read, for the host's page.
     pub problem: Option<String>,
+    /// Whether that's a failure to read it, rather than a time service that's
+    /// stopped and says so, which is a reading like any other.
+    pub failed: bool,
 }
 
 impl Reading {
@@ -65,6 +68,9 @@ impl Reading {
             "problem".into(),
             json!(self.problem.clone().unwrap_or_default()),
         );
+        if let Some(problem) = self.problem.as_ref().filter(|_| self.failed) {
+            row.insert("error".into(), json!(problem));
+        }
         Value::Object(row)
     }
 }
@@ -143,6 +149,7 @@ fn from_windows(service: Service, sources: Option<f64>, offset_micros: Option<f6
         }
         (Service::Running, None) => Reading {
             problem: problem(UNREADABLE),
+            failed: true,
             ..Reading::default()
         },
         (Service::Off, _) => Reading {
@@ -160,11 +167,13 @@ fn from_windows(service: Service, sources: Option<f64>, offset_micros: Option<f6
             problem: problem(
                 "The Windows Time service isn't running, and how it starts couldn't be read, so whether the clock is synced isn't known",
             ),
+            failed: true,
             ..Reading::default()
         },
         (Service::Missing, _) => Reading {
             synced: Some(false),
             problem: problem(MISSING),
+            failed: true,
             ..Reading::default()
         },
     }
@@ -210,41 +219,55 @@ impl Collector for TimeSyncCollector {
         Ok(self.read().to_value())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &[
-            "time_sync.synced",
-            "time_sync.max_error",
-            "time_sync.offset",
-            "time_sync.sources",
-        ]
+    fn metrics(&self) -> Vec<String> {
+        FIELDS
+            .iter()
+            .map(|(metric, ..)| metric.to_string())
+            .collect()
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
-        let mut entries = Entries::at(time);
-        // Why nothing could be read is the error of whatever wasn't. A stopped time
-        // service still says the clock isn't synced, which is kept.
-        let problem = at(output, "problem")
-            .as_str()
-            .filter(|problem| !problem.trim().is_empty());
-        for (metric, series, field) in TIME_SYNC_FIELDS {
-            let read = at(output, field);
-            match problem {
-                Some(problem) if read.is_null() => entries.error(metric, &[series], problem),
-                // Each system has its own numbers, so the others have nothing.
-                _ => entries.read(metric, &[series], read),
-            }
-        }
-        entries.done()
+        clock_entries(output, time, &FIELDS)
     }
 }
 
-/// The clock's metrics, what each one's series is called, and what it's read from.
-const TIME_SYNC_FIELDS: [(&str, &str, &str); 4] = [
-    ("time_sync.synced", "Synced", "synced"),
+/// What a reading says of each of a system's metrics. Why it couldn't be read is
+/// the error of whatever it has no value for. A time service that's stopped is a
+/// reading, not a failure: it says what it knows, and has nothing for the rest.
+fn clock_entries(output: &Value, time: DateTime<Utc>, fields: &[Field]) -> Vec<Entry> {
+    let mut entries = Entries::at(time);
+    let error = filled(at(output, "error")).as_str();
+    for (metric, series, field) in fields {
+        entries.read_or(metric, &[series], at(output, field), error);
+    }
+    entries.done()
+}
+
+/// A metric of the clock, what its series is called, and what it's read from.
+type Field = (&'static str, &'static str, &'static str);
+
+const SYNCED: Field = ("time_sync.synced", "Synced", "synced");
+
+/// What a kernel says of its clock.
+#[cfg_attr(windows, allow(dead_code))]
+const KERNEL_FIELDS: [Field; 2] = [
+    SYNCED,
     ("time_sync.max_error", "Largest error", "max_error_secs"),
+];
+
+/// What the Windows Time service says of its.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_FIELDS: [Field; 3] = [
+    SYNCED,
     ("time_sync.offset", "Offset", "offset_secs"),
     ("time_sync.sources", "Time sources", "sources"),
 ];
+
+/// The metrics read on this system, which never has the others'.
+#[cfg(not(windows))]
+const FIELDS: [Field; 2] = KERNEL_FIELDS;
+#[cfg(windows)]
+const FIELDS: [Field; 3] = WINDOWS_FIELDS;
 
 #[cfg(unix)]
 mod kernel {
@@ -266,6 +289,7 @@ mod kernel {
                     "The kernel wouldn't say whether the clock is synced: {}",
                     std::io::Error::last_os_error()
                 )),
+                failed: true,
                 ..Reading::default()
             };
         }
@@ -332,87 +356,82 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+    use crate::entries::testing::{every_metric_has_an_entry, said, time};
+
+    fn synced(value: Value) -> (String, Value) {
+        ("time_sync.synced[Synced]".to_string(), value)
+    }
+
+    fn largest_error(value: Value) -> (String, Value) {
+        ("time_sync.max_error[Largest error]".to_string(), value)
+    }
+
+    fn offset(value: Value) -> (String, Value) {
+        ("time_sync.offset[Offset]".to_string(), value)
+    }
+
+    fn sources(value: Value) -> (String, Value) {
+        ("time_sync.sources[Time sources]".to_string(), value)
+    }
 
     #[test]
-    fn time_sync_entries_are_what_this_systems_time_service_says() {
-        let collector = TimeSyncCollector::new();
-        // A kernel's reading, and the Windows Time service's.
+    fn time_sync_entries_are_what_a_systems_time_service_says() {
         let kernel = from_kernel(0, 2_500).to_value();
-        let entries = collector.entries(&kernel, time());
         assert_eq!(
-            said(&entries),
-            [
-                ("time_sync.synced[Synced]".to_string(), json!(1)),
-                (
-                    "time_sync.max_error[Largest error]".to_string(),
-                    json!(0.0025)
-                ),
-                ("time_sync.offset[Offset]".to_string(), Value::Null),
-                ("time_sync.sources[Time sources]".to_string(), Value::Null),
-            ]
+            said(&clock_entries(&kernel, time(), &KERNEL_FIELDS)),
+            [synced(json!(1)), largest_error(json!(0.0025))]
         );
-        every_metric_has_an_entry(&collector, &entries);
-
         let windows = from_windows(Service::Running, Some(2.0), Some(1_500.0)).to_value();
-        let entries = collector.entries(&windows, time());
         assert_eq!(
-            said(&entries),
-            [
-                ("time_sync.synced[Synced]".to_string(), json!(1)),
-                (
-                    "time_sync.max_error[Largest error]".to_string(),
-                    Value::Null
-                ),
-                ("time_sync.offset[Offset]".to_string(), json!(0.0015)),
-                ("time_sync.sources[Time sources]".to_string(), json!(2.0)),
-            ]
+            said(&clock_entries(&windows, time(), &WINDOWS_FIELDS)),
+            [synced(json!(1)), offset(json!(0.0015)), sources(json!(2.0))]
         );
-        every_metric_has_an_entry(&collector, &entries);
     }
 
     #[test]
     fn why_the_clock_could_not_be_read_is_the_error_of_what_was_not() {
-        let collector = TimeSyncCollector::new();
         let error = json!({ "error": UNREADABLE });
         let unreadable = from_windows(Service::Running, None, None).to_value();
-        let entries = collector.entries(&unreadable, time());
         assert_eq!(
-            said(&entries),
-            [
-                ("time_sync.synced[Synced]".to_string(), error.clone()),
-                (
-                    "time_sync.max_error[Largest error]".to_string(),
-                    error.clone()
-                ),
-                ("time_sync.offset[Offset]".to_string(), error.clone()),
-                ("time_sync.sources[Time sources]".to_string(), error),
-            ]
+            said(&clock_entries(&unreadable, time(), &WINDOWS_FIELDS)),
+            [synced(error.clone()), offset(error.clone()), sources(error)]
         );
-        every_metric_has_an_entry(&collector, &entries);
 
         // A time service that's missing still says the clock isn't synced.
         let error = json!({ "error": MISSING });
         let missing = from_windows(Service::Missing, None, None).to_value();
-        let entries = collector.entries(&missing, time());
         assert_eq!(
-            said(&entries),
+            said(&clock_entries(&missing, time(), &WINDOWS_FIELDS)),
+            [synced(json!(0)), offset(error.clone()), sources(error)]
+        );
+
+        let stopped = from_windows(Service::Stopped, None, None).to_value();
+        let entries = clock_entries(&stopped, time(), &WINDOWS_FIELDS);
+        assert!(
+            said(&entries)
+                .iter()
+                .all(|(_, said)| said.get("error").is_some())
+        );
+    }
+
+    /// Windows starts its time service only when it's needed on many hosts, and one
+    /// that's turned off says the clock isn't synced. Neither failed to be read.
+    #[test]
+    fn a_time_service_that_is_stopped_is_a_reading_and_not_an_error() {
+        let idle = from_windows(Service::Idle, None, None).to_value();
+        assert_eq!(
+            said(&clock_entries(&idle, time(), &WINDOWS_FIELDS)),
             [
-                ("time_sync.synced[Synced]".to_string(), json!(0)),
-                (
-                    "time_sync.max_error[Largest error]".to_string(),
-                    error.clone()
-                ),
-                ("time_sync.offset[Offset]".to_string(), error.clone()),
-                ("time_sync.sources[Time sources]".to_string(), error),
+                synced(Value::Null),
+                offset(Value::Null),
+                sources(Value::Null)
             ]
         );
-        every_metric_has_an_entry(&collector, &entries);
-
-        // Nothing read and no reason given is nothing.
-        let entries = collector.entries(&json!({ "known": 0, "problem": "" }), time());
-        assert!(said(&entries).iter().all(|(_, value)| value.is_null()));
-        every_metric_has_an_entry(&collector, &entries);
+        let off = from_windows(Service::Off, None, None).to_value();
+        assert_eq!(
+            said(&clock_entries(&off, time(), &WINDOWS_FIELDS)),
+            [synced(json!(0)), offset(Value::Null), sources(Value::Null)]
+        );
     }
 
     /// What a real collection says is entries for exactly the collector's metrics.
@@ -609,6 +628,8 @@ mod tests {
         let idle = from_windows(Service::Idle, None, None).to_value();
         assert_eq!(idle["known"], 0);
         assert_eq!(idle.as_object().unwrap().len(), 2, "{idle}");
+        let missing = from_windows(Service::Missing, None, None).to_value();
+        assert_eq!(missing["error"], MISSING);
         let off = from_windows(Service::Off, None, None).to_value();
         assert_eq!((&off["known"], &off["synced"]), (&json!(1), &json!(0)));
     }

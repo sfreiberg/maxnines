@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at, percent};
+use maxnines_collectors::entries::{Entries, at, names, percent};
 use maxnines_collectors::failed_services::failed_services;
 use maxnines_collectors::system::{limits, login_sessions, report};
 use maxnines_collectors::tcp::tcp_states;
@@ -51,25 +51,21 @@ impl Collector for SystemCollector {
         Ok(self.background.latest().pop().unwrap_or_default())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &[
-            "system.open_files",
-            "system.open_files_used",
-            "system.processes",
-            "system.processes_used",
-            "system.threads",
-            "system.threads_used",
-            "system.conntrack",
-            "system.conntrack_used",
-            "system.sessions",
-            "system.tcp",
-            "system.tcp_total",
-            "system.failed_services",
-            "system.failed_service_names",
-        ]
+    fn metrics(&self) -> Vec<String> {
+        names(&SYSTEM_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// One look at the host: its report.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        if !output.is_object() {
+            return Vec::new();
+        }
         let mut entries = Entries::at(time);
         // Each system has its own limits, so the others have nothing.
         for (metric, share, series, field, limit) in LIMITS {
@@ -105,6 +101,22 @@ impl Collector for SystemCollector {
         entries.done()
     }
 }
+
+const SYSTEM_METRICS: [&str; 13] = [
+    "system.open_files",
+    "system.open_files_used",
+    "system.processes",
+    "system.processes_used",
+    "system.threads",
+    "system.threads_used",
+    "system.conntrack",
+    "system.conntrack_used",
+    "system.sessions",
+    "system.tcp",
+    "system.tcp_total",
+    "system.failed_services",
+    "system.failed_service_names",
+];
 
 /// What the host has a limit on: the metric counting it, the metric of how much of
 /// the limit is used, what the count's series is called, and what the count and
@@ -154,8 +166,10 @@ mod tests {
     use maxnines_collectors::system::Limits;
     use serde_json::json;
 
+    use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::read_once;
 
     /// On so long an interval that what it asks the host is never waited for.
     fn collector() -> SystemCollector {
@@ -212,22 +226,29 @@ mod tests {
     #[test]
     fn a_system_that_says_nothing_has_nothing_for_each_metric() {
         let collector = collector();
-        // A host that could be asked nothing, and one not asked yet.
+        // A host that could be asked nothing.
         let unknown = report(&Limits::default(), None, None, None);
-        for output in [unknown, Value::Null] {
-            let entries = collector.entries(&output, time());
-            assert_eq!(entries.len(), 20);
-            assert!(said(&entries).iter().all(|(_, value)| value.is_null()));
-            every_metric_has_an_entry(&collector, &entries);
-        }
+        let entries = collector.entries(&unknown, time());
+        assert_eq!(entries.len(), 20);
+        assert!(said(&entries).iter().all(|(_, value)| value.is_null()));
+        every_metric_has_an_entry(&collector, &entries);
+        // One not asked yet says nothing at all.
+        assert_eq!(collector.entries(&Value::Null, time()), []);
     }
 
-    /// Whether or not the host has been asked by now, what's collected is entries
-    /// for exactly the collector's metrics.
     #[test]
-    fn what_the_system_really_says_becomes_entries_for_its_metrics() {
-        let mut collector = collector();
-        let output = collector.collect().unwrap();
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    fn a_look_at_the_system_is_handed_over_once() {
+        let look = report(&Limits::default(), Some(2), None, None);
+        let mut collector = SystemCollector {
+            background: Background::holding([look]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 20);
+        every_metric_has_an_entry(&collector, &read);
+
+        // Before the first look there's nothing to hand over.
+        let mut waiting = self::collector();
+        assert_eq!(waiting.collect().unwrap(), Value::Null);
+        assert_eq!(waiting.read(time()).unwrap(), []);
     }
 }

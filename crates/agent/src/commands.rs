@@ -15,12 +15,12 @@ use std::collections::BTreeMap;
 use std::process::ExitStatus;
 use std::time::Duration;
 
-use crate::background::{Background, FAILED_UNEXPECTEDLY};
+use crate::background::{Background, FAILED_UNEXPECTEDLY, rows_of};
 use crate::collector::Collector;
 use crate::custom::{Failure, run_command};
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_collectors::entries::{Entries, at, filled, names};
 use maxnines_protocol::entries::Entry;
 use maxnines_protocol::is_custom_metric_name;
 use serde::Deserialize;
@@ -143,14 +143,21 @@ impl Collector for CommandCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &COMMAND_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&COMMAND_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// One plugin's run, or each item of a list, under the plugin's own names
+    /// only, as each runs apart from the others.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = items
+        let named = rows_of(output)
             .iter()
             .filter_map(|item| Some((item.get("name")?.as_str()?, item)));
         for (name, item) in named {
@@ -164,11 +171,13 @@ impl Collector for CommandCollector {
             // other, and its message says why.
             entries.read("command.status", &[name], at(item, "status"));
             entries.read("command.ok", &[name], at(item, "ok"));
-            entries.read("command.message", &[name], filled(at(item, "message")));
+            entries.read("command.message", &[name], at(item, "message"));
+            // Why it couldn't be run is also the error of the values it didn't
+            // give. Its own item says something of them every time, so the error
+            // ends when it runs again.
+            let why = filled(at(item, "error")).as_str();
+            entries.read_or("command.value", &[name], &Value::Null, why);
         }
-        // With no plugins, none run yet, or none that gave a value, the metric has
-        // nothing.
-        entries.fill(&COMMAND_METRICS);
         entries.done()
     }
 }
@@ -191,6 +200,9 @@ struct Outcome {
     /// Its performance data, by label, in seconds and bytes where it gave a unit
     /// of time or size.
     values: BTreeMap<String, f64>,
+    /// Whether it couldn't be run at all, where a plugin that ran and said
+    /// something is wrong, or that it doesn't know, did its job.
+    failed: bool,
 }
 
 impl Outcome {
@@ -200,18 +212,23 @@ impl Outcome {
             status: UNKNOWN,
             message: message.to_string(),
             values: BTreeMap::new(),
+            failed: true,
         }
     }
 
     /// One item for the plugin, then one per value, named by the plugin and label
-    /// joined by a dot, as a custom metric's several values are.
+    /// joined by a dot, as a custom metric's several values are. A plugin that
+    /// couldn't be run has why as its `error` too, as a custom metric does.
     fn report(self, name: &str) -> Vec<Value> {
-        let own = json!({
+        let mut own = json!({
             "name": name,
             "status": self.status,
             "ok": u8::from(self.status == OK),
             "message": self.message,
         });
+        if self.failed {
+            own["error"] = json!(self.message);
+        }
         std::iter::once(own)
             .chain(
                 self.values.into_iter().map(
@@ -242,6 +259,7 @@ fn interpret(status: ExitStatus, output: &[u8]) -> Outcome {
         status,
         message,
         values,
+        failed: false,
     }
 }
 
@@ -364,8 +382,12 @@ fn reading_value(reading: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::{each_is_for_a_series, read_once};
 
     /// Running nothing, so no program is started.
     fn running_nothing() -> CommandCollector {
@@ -381,7 +403,10 @@ mod tests {
             // It printed nothing to say why.
             { "name": "raid", "status": 0, "ok": 1, "message": "" },
             // One that couldn't be run is unknown, and says why.
-            { "name": "backup", "status": 3, "ok": 0, "message": "timed out" },
+            { "name": "backup", "status": 3, "ok": 0, "message": "timed out",
+              "error": "timed out" },
+            // One that ran and said it doesn't know did its job.
+            { "name": "ups", "status": 3, "ok": 0, "message": "UPS UNKNOWN" },
             // A status with nothing else said.
             { "name": "odd", "status": 2 },
             // A value that isn't a number.
@@ -397,35 +422,56 @@ mod tests {
                 (of("command.status[load]"), json!(1)),
                 (of("command.ok[load]"), json!(0)),
                 (of("command.message[load]"), json!("LOAD WARNING")),
+                (of("command.value[load]"), Value::Null),
                 (of("command.value[load.load1]"), json!(4.5)),
                 (of("command.status[raid]"), json!(0)),
                 (of("command.ok[raid]"), json!(1)),
                 (of("command.message[raid]"), Value::Null),
+                (of("command.value[raid]"), Value::Null),
+                // Why is the error of the values it didn't give, too.
                 (of("command.status[backup]"), json!(3)),
                 (of("command.ok[backup]"), json!(0)),
                 (of("command.message[backup]"), json!("timed out")),
+                (of("command.value[backup]"), json!({ "error": "timed out" })),
+                (of("command.status[ups]"), json!(3)),
+                (of("command.ok[ups]"), json!(0)),
+                (of("command.message[ups]"), json!("UPS UNKNOWN")),
+                (of("command.value[ups]"), Value::Null),
                 (of("command.status[odd]"), json!(2)),
                 (of("command.ok[odd]"), Value::Null),
                 (of("command.message[odd]"), Value::Null),
+                (of("command.value[odd]"), Value::Null),
                 (of("command.value[odd.size]"), Value::Null),
             ]
         );
         every_metric_has_an_entry(&collector, &entries);
+        each_is_for_a_series(&entries);
 
-        // With no plugins, or none run yet, each metric has nothing.
+        // With no plugins, or none run yet, nothing is said, as nothing one
+        // plugin says is about the others.
         for output in [json!([]), Value::Null] {
-            let none = collector.entries(&output, time());
-            assert_eq!(
-                said(&none),
-                [
-                    (of("command.status"), Value::Null),
-                    (of("command.ok"), Value::Null),
-                    (of("command.message"), Value::Null),
-                    (of("command.value"), Value::Null),
-                ]
-            );
-            every_metric_has_an_entry(&collector, &none);
+            assert_eq!(collector.entries(&output, time()), []);
         }
+    }
+
+    #[test]
+    fn each_plugins_run_is_its_own_and_handed_over_once() {
+        let worked = Outcome {
+            status: WARNING,
+            message: "LOAD WARNING".to_string(),
+            values: BTreeMap::from([("load1".to_string(), 4.5)]),
+            failed: false,
+        };
+        let mut collector = CommandCollector {
+            background: Background::holding([
+                Value::Array(worked.report("load")),
+                Value::Array(Outcome::problem(NOT_DEFINED).report("gone")),
+            ]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 5 + 4);
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
     }
 
     #[test]
@@ -435,6 +481,7 @@ mod tests {
             status: OK,
             message: "DISK OK".to_string(),
             values: BTreeMap::from([("/".to_string(), 2048.0)]),
+            failed: false,
         };
         let mut output = worked.report("disk");
         output.extend(Outcome::problem(NOT_DEFINED).report("gone"));
@@ -446,30 +493,23 @@ mod tests {
                 (of("command.status[disk]"), json!(0)),
                 (of("command.ok[disk]"), json!(1)),
                 (of("command.message[disk]"), json!("DISK OK")),
+                (of("command.value[disk]"), Value::Null),
                 (of("command.value[disk./]"), json!(2048.0)),
                 (of("command.status[gone]"), json!(3)),
                 (of("command.ok[gone]"), json!(0)),
                 (of("command.message[gone]"), json!(NOT_DEFINED)),
+                (of("command.value[gone]"), json!({ "error": NOT_DEFINED })),
             ]
         );
         every_metric_has_an_entry(&collector, &entries);
-
-        // A plugin with no values leaves that metric with nothing.
-        let output = Value::Array(Outcome::problem(NOT_DEFINED).report("gone"));
-        let entries = collector.entries(&output, time());
-        assert_eq!(
-            said(&entries).last(),
-            Some(&(of("command.value"), Value::Null))
-        );
-        every_metric_has_an_entry(&collector, &entries);
+        each_is_for_a_series(&entries);
     }
 
     #[test]
-    fn running_no_plugins_really_collects_nothing_for_each_metric() {
+    fn running_no_plugins_collects_and_says_nothing() {
         let mut collector = running_nothing();
-        let output = collector.collect().unwrap();
-        assert_eq!(output, json!([]));
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+        assert_eq!(collector.collect().unwrap(), json!([]));
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     fn command(command: &[&str]) -> CheckCommand {
@@ -548,12 +588,20 @@ mod tests {
             status: WARNING,
             message: "LOAD WARNING".to_string(),
             values: BTreeMap::from([("load1".to_string(), 4.5)]),
+            failed: false,
         };
         assert_eq!(
             outcome.report("load"),
             [
                 json!({ "name": "load", "status": 1, "ok": 0, "message": "LOAD WARNING" }),
                 json!({ "name": "load.load1", "value": 4.5 }),
+            ]
+        );
+        // One that couldn't be run says why as its error too.
+        assert_eq!(
+            Outcome::problem(NOT_DEFINED).report("gone"),
+            [
+                json!({ "name": "gone", "status": 3, "ok": 0, "message": NOT_DEFINED, "error": NOT_DEFINED })
             ]
         );
     }
@@ -617,6 +665,7 @@ mod tests {
     async fn a_plugin_that_cannot_run_or_takes_too_long_is_unknown() {
         let missing = command(&["/no/such/plugin"]);
         let missing = run(&missing.command, missing.limit()).await;
+        assert!(missing.failed);
         assert_eq!(
             (missing.status, missing.message),
             (UNKNOWN, Failure::NotStarted.to_string())

@@ -16,13 +16,13 @@ use std::time::Duration;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use maxnines_checks::fetch_page;
-use maxnines_collectors::entries::{Entries, at, filled, percent};
+use maxnines_collectors::entries::{Entries, at, filled, metrics_of, names, percent};
 use maxnines_protocol::default_status_page;
 use maxnines_protocol::entries::Entry;
 use maxnines_protocol::totals::Change;
 use serde_json::{Map, Value, json};
 
-use crate::background::{Background, FAILED_UNEXPECTEDLY, Missed};
+use crate::background::{Background, FAILED_UNEXPECTEDLY, Missed, rows_of};
 use crate::collector::Collector;
 
 /// A status page is a few lines served by the host itself, so anything slower
@@ -117,12 +117,12 @@ impl Software {
         }
     }
 
-    /// What was read of each page, as entries. It's apart from the collector so it
-    /// can be tried without one, which would ask for a page.
+    /// One read of a page, or each of a list, as entries under the page's own name
+    /// only, as each is read apart from the others. It's apart from the collector
+    /// so it can be tried without one, which would ask for a page.
     fn entries(self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let pages = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = pages
+        let named = rows_of(output)
             .iter()
             .filter_map(|page| Some((page.get("name")?.as_str()?, page)));
         for (name, page) in named {
@@ -141,15 +141,9 @@ impl Software {
                 }
             }
             for (metric, field) in self.fields() {
-                let read = at(page, field);
-                match why {
-                    Some(why) if read.is_null() => entries.error(metric, &series, why),
-                    _ => entries.read(metric, &series, read),
-                }
+                entries.read_or(metric, &series, at(page, field), why);
             }
         }
-        // With no pages, or none read yet, each metric has nothing.
-        entries.fill(self.metrics());
         entries.done()
     }
 }
@@ -188,24 +182,6 @@ const PHP_FPM_FIELDS: [(&str, &str); 8] = [
 
 /// Every metric of a page: what's said or worked out apart from its fields, then
 /// each field's.
-const fn metrics_of<const METRICS: usize>(
-    first: &[&'static str],
-    fields: &[(&'static str, &'static str)],
-) -> [&'static str; METRICS] {
-    assert!(first.len() + fields.len() == METRICS);
-    let mut metrics = [""; METRICS];
-    let mut at = 0;
-    while at < METRICS {
-        metrics[at] = if at < first.len() {
-            first[at]
-        } else {
-            fields[at - first.len()].0
-        };
-        at += 1;
-    }
-    metrics
-}
-
 const APACHE_METRICS: [&str; 10] =
     metrics_of(&["apache.up", "apache.worker_usage"], &APACHE_FIELDS);
 const NGINX_METRICS: [&str; 8] = metrics_of(&["nginx.up"], &NGINX_FIELDS);
@@ -458,8 +434,14 @@ impl Collector for StatusPageCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        self.software.metrics()
+    fn metrics(&self) -> Vec<String> {
+        names(self.software.metrics())
+    }
+
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
     }
 
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
@@ -475,8 +457,12 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::{each_is_for_a_series, read_once};
 
     /// A collector of one software's pages that reads none, so nothing is asked
     /// for. Made with no addresses, it would ask for the usual one.
@@ -694,21 +680,31 @@ mod tests {
     }
 
     #[test]
-    fn with_no_pages_or_none_read_yet_each_metric_has_nothing() {
+    fn with_no_pages_or_none_read_yet_nothing_is_said() {
         for software in [Software::Apache, Software::Nginx, Software::PhpFpm] {
             let mut collector = reading_nothing(software);
             assert_eq!(collector.collect().unwrap(), json!([]));
+            assert_eq!(collector.read(time()).unwrap(), []);
+            // Nothing one page says is about the others.
             for output in [json!([]), Value::Null] {
-                let none = collector.entries(&output, time());
-                let nothing: Vec<(String, Value)> = collector
-                    .metrics()
-                    .iter()
-                    .map(|metric| (metric.to_string(), Value::Null))
-                    .collect();
-                assert_eq!(said(&none), nothing);
-                every_metric_has_an_entry(&collector, &none);
+                assert_eq!(collector.entries(&output, time()), []);
             }
         }
+    }
+
+    #[test]
+    fn each_pages_read_is_its_own_and_handed_over_once() {
+        let mut totals = Totals::default();
+        let up = totals.row("a", read_nginx(NGINX).map_err(str::to_string));
+        let down = Totals::default().row("b", Err(TIMED_OUT.to_string()));
+        let mut collector = StatusPageCollector {
+            software: Software::Nginx,
+            background: Background::holding([up, down]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 2 * NGINX_METRICS.len());
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
     }
 
     #[test]

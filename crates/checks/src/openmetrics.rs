@@ -256,6 +256,17 @@ impl Totals {
     /// Only the totals in this sample are remembered, so a series that's gone, or
     /// a whole page that stopped answering, starts afresh if it comes back.
     pub fn settle(&mut self, kept: Vec<Value>) -> Vec<Value> {
+        self.settled(kept, false)
+    }
+
+    /// As [`settle`](Self::settle), with each running total beside its change, as
+    /// `change_total`. One seen for the first time is kept with only its total,
+    /// as that's known though its change isn't.
+    pub fn settle_with_totals(&mut self, kept: Vec<Value>) -> Vec<Value> {
+        self.settled(kept, true)
+    }
+
+    fn settled(&mut self, kept: Vec<Value>, with_totals: bool) -> Vec<Value> {
         let mut seen = HashMap::with_capacity(self.0.len());
         let rows = kept
             .into_iter()
@@ -273,12 +284,24 @@ impl Totals {
                     return Some(json!({ "name": name, "value": number }));
                 }
                 let total = number.as_f64()?;
+                // A total listed twice keeps its first, rather than one being
+                // compared with the other.
+                if seen.contains_key(&name) {
+                    return None;
+                }
                 let (key, last) = match self.0.remove_entry(&name) {
                     Some((key, last)) => (key, Some(last)),
                     None => (name.clone(), None),
                 };
                 seen.insert(key, total);
-                Some(json!({ "name": name, "change": change(last?, total) }))
+                let mut row = json!({ "name": name });
+                if let Some(last) = last {
+                    row["change"] = json!(change(last, total));
+                }
+                if with_totals {
+                    row["change_total"] = number;
+                }
+                (last.is_some() || with_totals).then_some(row)
             })
             .collect();
         self.0 = seen;
@@ -435,6 +458,52 @@ jobs_created 1700000000
                 json!({ "name": "app:9100", "up": 1, "dropped": 0 }),
                 json!({ "name": "b", "change": 0.0 }),
                 json!({ "name": "level", "value": 1.5 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_running_total_can_be_kept_beside_its_change() {
+        let page = json!({ "name": "app:9100", "up": 1, "dropped": 0 });
+        let kept = |jobs: f64| {
+            vec![
+                page.clone(),
+                json!(["jobs_total", jobs, true]),
+                // Listed twice, which keeps its first.
+                json!(["jobs_total", 999.0, true]),
+                json!(["queue", 1.5, false]),
+            ]
+        };
+        let queue = json!({ "name": "queue", "value": 1.5 });
+
+        // Left out, a total seen for the first time has nothing to say.
+        let mut totals = Totals::default();
+        assert_eq!(totals.settle(kept(100.0)), [page.clone(), queue.clone()]);
+        assert_eq!(
+            totals.settle(kept(130.0)),
+            [
+                page.clone(),
+                json!({ "name": "jobs_total", "change": 30.0 }),
+                queue.clone(),
+            ]
+        );
+
+        // Kept, its total is known before its change is.
+        let mut totals = Totals::default();
+        assert_eq!(
+            totals.settle_with_totals(kept(100.0)),
+            [
+                page.clone(),
+                json!({ "name": "jobs_total", "change_total": 100.0 }),
+                queue.clone(),
+            ]
+        );
+        assert_eq!(
+            totals.settle_with_totals(kept(130.0)),
+            [
+                page,
+                json!({ "name": "jobs_total", "change": 30.0, "change_total": 130.0 }),
+                queue,
             ]
         );
     }

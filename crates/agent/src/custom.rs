@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_collectors::entries::{Entries, at, filled, names};
 use maxnines_protocol::entries::Entry;
 use maxnines_protocol::is_custom_metric_name;
 use serde::Deserialize;
@@ -26,7 +26,7 @@ use tokio::process::Command;
 use tokio::sync::{oneshot, watch};
 use tokio::time::timeout;
 
-use crate::background::{Background, FAILED_UNEXPECTEDLY};
+use crate::background::{Background, FAILED_UNEXPECTEDLY, rows_of};
 use crate::collector::Collector;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -143,14 +143,21 @@ impl Collector for CustomCollector {
         Ok(self.background.rows())
     }
 
-    fn metrics(&self) -> &'static [&'static str] {
-        &CUSTOM_METRICS
+    fn metrics(&self) -> Vec<String> {
+        names(&CUSTOM_METRICS)
     }
 
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// One command's run, or each item of a list, under the command's own names
+    /// only, as each runs apart from the others.
     fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
         let mut entries = Entries::at(time);
-        let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
-        let named = items
+        let named = rows_of(output)
             .iter()
             .filter_map(|item| Some((item.get("name")?.as_str()?, item)));
         for (name, item) in named {
@@ -166,13 +173,9 @@ impl Collector for CustomCollector {
             // its value every time, so the error ends when it works again, even
             // when its values are items of their own.
             entries.read("custom.ok", &[name], at(item, "ok"));
-            match filled(at(item, "error")).as_str() {
-                Some(why) if value.is_null() => entries.error("custom.value", &[name], why),
-                _ => entries.read("custom.value", &[name], value),
-            }
+            let why = filled(at(item, "error")).as_str();
+            entries.read_or("custom.value", &[name], value, why);
         }
-        // With no commands, or none run yet, each metric has nothing.
-        entries.fill(&CUSTOM_METRICS);
         entries.done()
     }
 }
@@ -431,8 +434,12 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
 
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
     use super::*;
-    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+    use crate::background::testing::{each_is_for_a_series, read_once};
 
     /// Running nothing, so no program is started.
     fn running_nothing() -> CustomCollector {
@@ -470,19 +477,28 @@ mod tests {
             ]
         );
         every_metric_has_an_entry(&collector, &entries);
+        each_is_for_a_series(&entries);
 
-        // With no commands, or none run yet, each metric has nothing.
+        // With no commands, or none run yet, nothing is said, as nothing one
+        // command says is about the others.
         for output in [json!([]), Value::Null] {
-            let none = collector.entries(&output, time());
-            assert_eq!(
-                said(&none),
-                [
-                    (of("custom.ok"), Value::Null),
-                    (of("custom.value"), Value::Null),
-                ]
-            );
-            every_metric_has_an_entry(&collector, &none);
+            assert_eq!(collector.entries(&output, time()), []);
         }
+    }
+
+    #[test]
+    fn each_commands_run_is_its_own_and_handed_over_once() {
+        let several = Reading::Several(BTreeMap::from([("app.jobs".to_string(), 3.0)]));
+        let mut collector = CustomCollector {
+            background: Background::holding([
+                Value::Array(report("app", Ok(several))),
+                Value::Array(report("gone", Err(NOT_DEFINED.to_string()))),
+            ]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 3 + 2);
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
     }
 
     #[test]
@@ -510,11 +526,10 @@ mod tests {
     }
 
     #[test]
-    fn running_no_commands_really_collects_nothing_for_each_metric() {
+    fn running_no_commands_collects_and_says_nothing() {
         let mut collector = running_nothing();
-        let output = collector.collect().unwrap();
-        assert_eq!(output, json!([]));
-        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+        assert_eq!(collector.collect().unwrap(), json!([]));
+        assert_eq!(collector.read(time()).unwrap(), []);
     }
 
     fn metric(command: &[&str]) -> CustomMetric {
