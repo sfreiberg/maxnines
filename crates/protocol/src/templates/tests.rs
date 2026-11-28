@@ -788,3 +788,53 @@ fn any_multi_line_text_goes_to_hcl_and_back_unchanged() {
         assert_eq!(again.queries[0].sql, sql, "{written}");
     }
 }
+
+#[test]
+fn a_template_with_metrics_cannot_have_a_collectors_prefix_as_its_key() {
+    let with_query = |key: &str| {
+        format!(
+            r#"template "{key}" {{
+                 name     = "A"
+                 database = "postgres"
+                 query "q" {{
+                   sql     = "SELECT 1 AS m"
+                   metrics = {{ m = {{ title = "M" }} }}
+                 }}
+               }}"#
+        )
+    };
+    let with_counters = |key: &str| {
+        format!(
+            r#"template "{key}" {{
+                 name = "A"
+                 os   = ["windows"]
+                 counters "c" {{
+                   object  = "X"
+                   metrics = {{ m = {{ counter = "Y" }} }}
+                 }}
+               }}"#
+        )
+    };
+    let with_alerts = |key: &str| {
+        format!(
+            r#"template "{key}" {{
+                 name = "A"
+                 alert "full" {{
+                   name    = "Disk full"
+                   warning = "disk.usage > 90"
+                 }}
+               }}"#
+        )
+    };
+    let refused = "template \"disk\", key: \"disk\" is what a collector's metrics start with, \
+                   so a template that reads metrics of its own can't be called it";
+    assert_eq!(problems(&with_query("disk")), [refused]);
+    assert_eq!(problems(&with_counters("disk")), [refused]);
+    // Its metrics would be `disk.m`, among the collector's own. One with only
+    // alerts names none, as the built-in `raid` and `updates` are.
+    assert_eq!(problems(&with_alerts("disk")), [] as [&str; 0]);
+    for free in ["disks", "postgres", "disk_2"] {
+        assert_eq!(problems(&with_query(free)), [] as [&str; 0], "{free}");
+        assert_eq!(problems(&with_counters(free)), [] as [&str; 0], "{free}");
+    }
+}

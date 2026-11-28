@@ -189,25 +189,30 @@ fn the_catalog_has_the_metrics_of_templates_that_are_on() {
     assert!(checked.find("pg.size").is_some(), "every part counts");
 }
 
-/// A template's metric can't have the name of one MaxNines has built in.
+/// A template's metrics can't be named among a collector's.
 #[test]
-fn a_metric_with_a_built_in_metrics_name_is_refused() {
+fn a_template_with_a_collectors_prefix_as_its_key_is_refused() {
     // The built-in PostgreSQL template's are its own, and under another key it
     // has nothing wrong with it either.
     assert_eq!(problems(&postgres_as_pg()), Vec::<String>::new());
 
-    // One name is enough, and it's the column that says where.
+    // Whatever its metrics are called, and it's said once: its alerts, which would
+    // be read as being about the collector's metrics, aren't checked until then.
     let found = problems(
         r#"template "cpu" {
              name     = "Processor"
              database = "postgres"
-             query "q" { sql = "SELECT 1 AS usage, 2 AS heat" }
+             query "q" { sql = "SELECT 1 AS heat" }
+             alert "hot" {
+               name    = "Hot"
+               warning = "usage > 90 && no_such_metric > 1"
+             }
            }"#,
     );
     assert_eq!(
         found,
         [
-            r#"template "cpu", query "q": its metric cpu.usage would have the name of one MaxNines has built in: give the columns other names, or the template another key"#
+            r#"template "cpu", key: "cpu" is what a collector's metrics start with, so a template that reads metrics of its own can't be called it"#
         ]
     );
 }

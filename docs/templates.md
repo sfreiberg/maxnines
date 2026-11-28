@@ -92,9 +92,10 @@ template "myapp" {
 The **key**, `myapp`, starts the names of the template's metrics, so the column
 `connections` is the metric `myapp.connections`. It's lowercase letters, digits and
 underscores, starting with a letter, and no two templates share one. So are the keys of
-the blocks inside it, such as `sessions` and `busy`. A template whose metric would
-have the name of one MaxNines has built in, such as `cpu.usage`, is refused:
-give it another key.
+the blocks inside it, such as `sessions` and `busy`. A template with metrics
+of its own can't have a key that MaxNines' own metrics start with, such as `cpu` or
+`disk`, as `cpu.usage` is already one: give it another key. One with only alerts
+about other metrics can.
 
 An agent is sent what it reads all at once, so a template can have up to 64 discover
 blocks and queries together, each SQL statement up to 64 KB with what fills it, each

@@ -210,9 +210,6 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
 
     let own = metrics_of(template);
     let short = |metric: &Metric| metric.name[template.key.len() + 1..].to_string();
-    // Two metrics can't share a name, and the ones MaxNines reads itself are there
-    // first. Said once for each query or counters block, however many it has.
-    let mut taken: Vec<(Place, &'static str, Vec<String>)> = Vec::new();
     for (metric, _) in &own {
         let short = short(metric);
         if let Some(variable) = Variable::ALL.iter().find(|v| v.name() == short) {
@@ -225,29 +222,11 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
                 ),
             ));
         }
-        if crate::metrics::find(&metric.name).is_some() {
-            let (place, how) = taken_place(template, &short);
-            match taken.iter_mut().find(|(seen, ..)| *seen == place) {
-                Some((.., names)) => names.push(metric.name.clone()),
-                None => taken.push((place, how, vec![metric.name.clone()])),
-            }
-        }
     }
-    // An alert about a name that's taken would be read as being about the built-in
-    // metric, so there's nothing to learn from checking the alerts until it isn't.
-    let names_taken = !taken.is_empty();
-    for (place, how, names) in taken {
-        let message = match names.as_slice() {
-            [name] => {
-                format!("its metric {name} would have the name of one MaxNines has built in: {how}")
-            }
-            names => format!(
-                "its metrics {} would have the names of ones MaxNines has built in: {how}",
-                names.join(", ")
-            ),
-        };
-        problems.push(Problem::new(place, "", message));
-    }
+    // An alert about a name that's taken would be read as being about the collector's
+    // metric, so there's nothing to learn from checking the alerts until the key,
+    // which the template's own check refuses, is another.
+    let names_taken = template.key_is_taken();
     let catalog = catalog.with_template(template);
     let names = Names {
         catalog: &catalog,
@@ -722,31 +701,6 @@ pub fn metrics_of(template: &Template) -> Vec<(Metric, bool)> {
             (read, metric.on)
         })
         .collect()
-}
-
-/// Where a template gives a metric whose name is taken, and what to do about it.
-fn taken_place(template: &Template, short: &str) -> (Place, &'static str) {
-    for (index, query) in template.queries.iter().enumerate() {
-        let columns = query_columns(template, query).unwrap_or_default();
-        if columns.iter().any(|column| column == short)
-            || query.metrics.iter().any(|metric| metric.key == short)
-        {
-            return (
-                Place::Query(index),
-                "give the columns other names, or the template another key",
-            );
-        }
-    }
-    for (index, counters) in template.counters.iter().enumerate() {
-        if counters.metrics.iter().any(|metric| metric.key == short) {
-            return (
-                Place::Counters(index),
-                "give the metrics other names, or the template another key",
-            );
-        }
-    }
-    // Whether its database is answering, which every database template has.
-    (Place::Template, "give the template another key")
 }
 
 /// A length of time a template wrote, which its checks have made sure is one.

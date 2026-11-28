@@ -3,6 +3,7 @@
 pub mod actions;
 pub mod auth;
 pub mod config_file;
+pub mod entries;
 pub mod hcl_env;
 pub mod logging;
 #[cfg(windows)]
