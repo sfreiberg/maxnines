@@ -80,9 +80,15 @@ impl Collector for SmartCollector {
     }
 
     fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
-        Ok(self
-            .background
-            .read(|result, time| self.entries(result, time)))
+        // A look that didn't finish leaves what was known in place for the host's
+        // page, which isn't a reading: every metric says why there's none.
+        Ok(self.background.read_or(
+            |result, time| self.entries(result, time),
+            |_, missed, time| {
+                let why = format!("Drives couldn't be read: {}", missed.why(ROUND_LIMIT));
+                failed(&SMART_METRICS, time, &why)
+            },
+        ))
     }
 
     /// One look at every drive: a row for each.
@@ -98,9 +104,12 @@ impl Collector for SmartCollector {
             return failed(&SMART_METRICS, time, problem);
         }
         let mut entries = Entries::at(time);
-        let named = rows
-            .iter()
-            .filter_map(|drive| Some((drive.get("name")?.as_str()?, drive)));
+        // A drive that can't be read is named by its device, and keeps the series
+        // it was last read as, which is the one that has nothing now.
+        let named = rows.iter().filter_map(|drive| {
+            let name = drive.get("series").or_else(|| drive.get("name"))?;
+            Some((name.as_str()?, drive))
+        });
         for (name, drive) in named {
             // Why a drive couldn't be read is its note, which is the error of
             // whatever it has nothing for. Its device and whether it's asleep are
@@ -195,11 +204,16 @@ impl Known {
                             (device, row)
                         }
                         Drive::Unreadable { device, error } => {
-                            // Under the name it had when it was last read, so it's
-                            // the same series that says why it has nothing now.
-                            let name = self.rows.get(&device).and_then(|row| row["name"].as_str());
-                            let name = name.unwrap_or(&device);
-                            let row = json!({ "name": name, "device": device, "asleep": 0, "note": error });
+                            let mut row = json!({ "name": device, "device": device, "asleep": 0, "note": error });
+                            // The series it was when it was last read, which is
+                            // the one that says why it has nothing now.
+                            let last = self.rows.get(&device);
+                            let series = last.and_then(|last| {
+                                last.get("series").or_else(|| last.get("name"))?.as_str()
+                            });
+                            if let Some(series) = series.filter(|series| *series != device) {
+                                row["series"] = json!(series);
+                            }
                             (device, row)
                         }
                     };
@@ -635,6 +649,7 @@ fn parse_windows(json: &[u8]) -> std::result::Result<Vec<Drive>, String> {
 #[cfg(test)]
 mod tests {
     use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
+    use maxnines_protocol::entries::Reading;
 
     use super::*;
     use crate::background::testing::read_once;
@@ -740,7 +755,10 @@ mod tests {
             let output = known.publish(Ok(Round::Drives(vec![unreadable()])));
             assert_eq!(
                 output,
-                json!([{ "name": nvme, "device": "/dev/nvme0", "asleep": 0, "note": "it stopped answering" }])
+                json!([{
+                    "name": "/dev/nvme0", "series": nvme, "device": "/dev/nvme0",
+                    "asleep": 0, "note": "it stopped answering",
+                }])
             );
             let said = said(&collector.entries(&output, time()));
             assert_eq!(said.len(), SMART_METRICS.len());
@@ -749,6 +767,37 @@ mod tests {
                 json!({ "error": "it stopped answering" })
             )));
         }
+    }
+
+    /// What was known stays for the host's page, but it isn't a reading of the
+    /// drives now, and one that stopped answering may be why the look didn't end.
+    #[test]
+    fn a_look_that_did_not_finish_is_an_error_and_not_what_was_known() {
+        let mut known = Known::default();
+        known.publish(Ok(Round::Drives(vec![parse_drive(
+            "/dev/nvme0",
+            NVME.as_bytes(),
+        )])));
+        let published = known.publish(Err(Missed::OutOfTime));
+        assert_eq!(published.as_array().unwrap().len(), 1);
+        let mut collector = SmartCollector {
+            background: Background::missing(published, Missed::OutOfTime),
+        };
+        let read = read_once(&mut collector);
+        let why = format!(
+            "Drives couldn't be read: it didn't finish within {} seconds",
+            ROUND_LIMIT.as_secs()
+        );
+        for entry in &read {
+            assert!(entry.series.is_empty(), "{}", entry.metric);
+            assert_eq!(
+                entry.reading,
+                Reading::Error(why.clone()),
+                "{}",
+                entry.metric
+            );
+        }
+        every_metric_has_an_entry(&collector, &read);
     }
 
     #[test]

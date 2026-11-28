@@ -2,14 +2,14 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use maxnines_collectors::entries::{Entries, at, names, percent};
+use maxnines_collectors::entries::{Entries, at, failed, names, percent};
 use maxnines_collectors::failed_services::failed_services;
 use maxnines_collectors::system::{limits, login_sessions, report};
 use maxnines_collectors::tcp::tcp_states;
 use maxnines_protocol::entries::Entry;
 use serde_json::Value;
 
-use crate::background::Background;
+use crate::background::{Background, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 
 /// How close the host is to its limits, how many people are on it, its TCP
@@ -56,9 +56,14 @@ impl Collector for SystemCollector {
     }
 
     fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
-        Ok(self
-            .background
-            .read(|result, time| self.entries(result, time)))
+        // A look has no limit, so one that found nothing panicked.
+        Ok(self.background.read_or(
+            |result, time| self.entries(result, time),
+            |_, _, time| {
+                let why = format!("The host couldn't be looked at: {FAILED_UNEXPECTEDLY}");
+                failed(&SYSTEM_METRICS, time, &why)
+            },
+        ))
     }
 
     /// One look at the host: its report.
@@ -169,7 +174,9 @@ mod tests {
     use maxnines_collectors::entries::testing::{every_metric_has_an_entry, said, time};
 
     use super::*;
+    use crate::background::Missed;
     use crate::background::testing::read_once;
+    use maxnines_protocol::entries::Reading;
 
     /// On so long an interval that what it asks the host is never waited for.
     fn collector() -> SystemCollector {
@@ -250,5 +257,23 @@ mod tests {
         let mut waiting = self::collector();
         assert_eq!(waiting.collect().unwrap(), Value::Null);
         assert_eq!(waiting.read(time()).unwrap(), []);
+    }
+
+    #[test]
+    fn a_look_that_panicked_is_an_error_on_every_metric() {
+        let mut collector = SystemCollector {
+            background: Background::missing(Value::Null, Missed::Panicked),
+        };
+        let read = read_once(&mut collector);
+        let why = format!("The host couldn't be looked at: {FAILED_UNEXPECTEDLY}");
+        for entry in &read {
+            assert_eq!(
+                entry.reading,
+                Reading::Error(why.clone()),
+                "{}",
+                entry.metric
+            );
+        }
+        every_metric_has_an_entry(&collector, &read);
     }
 }

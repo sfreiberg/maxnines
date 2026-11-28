@@ -42,6 +42,14 @@ pub const FAILED_UNEXPECTEDLY: &str =
 
 impl Missed {
     /// `late` for a round that ran out of time, or `broke` for one that panicked.
+    /// Why there's nothing from a round with this `limit`, as an error says it.
+    pub fn why(self, limit: Duration) -> String {
+        match self {
+            Self::OutOfTime => format!("it didn't finish within {} seconds", limit.as_secs()),
+            Self::Panicked => FAILED_UNEXPECTEDLY.to_string(),
+        }
+    }
+
     pub fn pick<T: Clone>(self, late: &T, broke: &T) -> T {
         match self {
             Self::OutOfTime => late.clone(),
@@ -107,14 +115,18 @@ struct Kept {
     /// Whether it's still to be handed over as what was read then, which happens
     /// once.
     fresh: bool,
+    /// Why the round it's from found nothing, when it ran out of time or panicked,
+    /// whatever was published for it.
+    missed: Option<Missed>,
 }
 
 impl Kept {
-    fn now(value: Value) -> Self {
+    fn now(value: Value, missed: Option<Missed>) -> Self {
         Self {
             value,
             read: maxnines_protocol::time::now(),
             fresh: true,
+            missed,
         }
     }
 }
@@ -135,7 +147,7 @@ impl Background {
 
     /// Adds an item whose result never changes, such as why one can't run.
     pub fn constant(&mut self, value: Value) {
-        self.lock().push(Kept::now(value));
+        self.lock().push(Kept::now(value, None));
     }
 
     /// Adds an item that runs `round` every `every`, first at a random point in
@@ -207,10 +219,11 @@ impl Background {
                 if matches!(found, Err(Missed::Panicked)) {
                     error!("a background collector panicked");
                 }
+                let missed = found.as_ref().err().copied();
                 match catch_unwind(AssertUnwindSafe(|| publish(found))) {
                     Ok(value) => {
                         results.lock().unwrap_or_else(PoisonError::into_inner)[slot] =
-                            Kept::now(value);
+                            Kept::now(value, missed);
                     }
                     Err(_) => error!("a background collector panicked"),
                 }
@@ -230,16 +243,27 @@ impl Background {
         self.lock().iter().map(|kept| kept.value.clone()).collect()
     }
 
+    /// Each round finished since this was last asked, in the order the items were
+    /// added: what was published for it, when it finished, and why it found
+    /// nothing if it ran out of time or panicked. Each is handed over once.
+    fn finished(&self) -> Vec<(Value, DateTime<Utc>, Option<Missed>)> {
+        self.lock()
+            .iter_mut()
+            .filter_map(|kept| {
+                std::mem::take(&mut kept.fresh)
+                    .then(|| (kept.value.clone(), kept.read, kept.missed))
+            })
+            .collect()
+    }
+
     /// Each result finished since this was last asked, with when it was finished,
     /// in the order the items were added. Each is handed over once, so an item
     /// that hasn't finished another round since has nothing here.
     pub fn fresh(&self) -> Vec<(Value, DateTime<Utc>)> {
-        self.lock()
-            .iter_mut()
-            .filter_map(|kept| {
-                let fresh = std::mem::take(&mut kept.fresh) && !kept.value.is_null();
-                fresh.then(|| (kept.value.clone(), kept.read))
-            })
+        self.finished()
+            .into_iter()
+            .filter(|(result, ..)| !result.is_null())
+            .map(|(result, time, _)| (result, time))
             .collect()
     }
 
@@ -251,6 +275,23 @@ impl Background {
         self.fresh()
             .iter()
             .flat_map(|(result, time)| entries(result, *time))
+            .collect()
+    }
+
+    /// As [`Self::read`], for a collector that publishes what it knew before for a
+    /// round that ran out of time or panicked. That isn't a reading, so `missed`
+    /// says what such a round's entries are instead, given what was published.
+    pub fn read_or(
+        &self,
+        entries: impl Fn(&Value, DateTime<Utc>) -> Vec<Entry>,
+        missed: impl Fn(&Value, Missed, DateTime<Utc>) -> Vec<Entry>,
+    ) -> Vec<Entry> {
+        self.finished()
+            .iter()
+            .flat_map(|(result, time, why)| match why {
+                Some(why) => missed(result, *why, *time),
+                None => entries(result, *time),
+            })
             .collect()
     }
 
@@ -320,6 +361,14 @@ pub mod testing {
             for result in results {
                 background.constant(result);
             }
+            background
+        }
+
+        /// Holding what was published for a round that found nothing, and running
+        /// nothing.
+        pub fn missing(published: Value, missed: Missed) -> Self {
+            let background = Self::new();
+            background.lock().push(Kept::now(published, Some(missed)));
             background
         }
     }
@@ -457,6 +506,33 @@ mod tests {
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].0, json!(2));
         assert!(fresh[0].1 <= next[0].1);
+    }
+
+    #[test]
+    fn a_round_that_found_nothing_is_read_as_what_its_collector_says_of_that() {
+        let mut background = Background::new();
+        background
+            .repeat(
+                SHORT,
+                Some(SHORT),
+                std::future::pending::<Value>,
+                |found| match found {
+                    Ok(found) => found,
+                    Err(_) => json!("what was known before"),
+                },
+            )
+            .unwrap();
+        wait_until(|| !background.latest()[0].is_null());
+        let entries = |_: &Value, _: DateTime<Utc>| panic!("it wasn't a reading");
+        let missed = |published: &Value, why: Missed, time: DateTime<Utc>| {
+            assert_eq!(published, &json!("what was known before"));
+            assert_eq!(why, Missed::OutOfTime);
+            maxnines_collectors::entries::failed(&["round.number"], time, "too slow")
+        };
+        // Every round runs out of time, so there may be another by the next read.
+        let read = background.read_or(entries, missed);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].metric, "round.number");
     }
 
     #[test]

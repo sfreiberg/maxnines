@@ -345,7 +345,11 @@ impl PageReads {
         let result = kept.first().cloned().unwrap_or_default();
         let answered = result["up"] == 1;
         reads.results.insert(page.id, result);
-        let rows = reads.totals.entry(page.id).or_default().settle(kept);
+        let rows = reads
+            .totals
+            .entry(page.id)
+            .or_default()
+            .settle_with_totals(kept);
         (rows, answered)
     }
 }

@@ -73,9 +73,18 @@ impl Collector for UpdatesCollector {
     }
 
     fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
-        Ok(self
-            .background
-            .read(|result, time| self.entries(result, time)))
+        // A look that didn't finish leaves what was known in place for the host's
+        // page, which isn't a reading: the numbers say why there are none.
+        Ok(self.background.read_or(
+            |result, time| self.entries(result, time),
+            |known, missed, time| {
+                let why = format!("Updates couldn't be counted: {}", missed.why(ROUND_LIMIT));
+                look_entries(
+                    &json!({ "manager": known["manager"], "problem": why }),
+                    time,
+                )
+            },
+        ))
     }
 
     /// One look: its row.
@@ -83,18 +92,27 @@ impl Collector for UpdatesCollector {
         if !output.is_object() {
             return Vec::new();
         }
-        let mut entries = Entries::at(time);
-        // Why nothing could be asked is the error of the numbers this system's
-        // package manager would have said and didn't. What was asked is still
-        // known, and each system says its own numbers, so the others have nothing.
-        let problem = filled(at(output, "problem")).as_str();
-        let says = numbers_of(at(output, "manager").as_str().unwrap_or_default());
-        for ((metric, field), series) in UPDATES_FIELDS.into_iter().zip(UPDATES_SERIES) {
-            let why = problem.filter(|_| says.contains(&metric));
-            entries.read_or(metric, series, at(output, field), why);
-        }
-        entries.done()
+        look_entries(output, time)
     }
+}
+
+/// What a look's row says of each metric.
+fn look_entries(output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+    let mut entries = Entries::at(time);
+    // Why nothing could be asked is the error of the numbers this system's
+    // package manager would have said and didn't. What was asked is still
+    // known, and each system says its own numbers, so the others have nothing.
+    let problem = filled(at(output, "problem")).as_str();
+    let says = numbers_of(at(output, "manager").as_str().unwrap_or_default());
+    let fields = UPDATES_FIELDS.into_iter().zip(UPDATES_SERIES);
+    for (((metric, field), series), uncounted) in fields.zip(UPDATES_UNCOUNTED) {
+        // Or why this number alone couldn't be counted.
+        let why = problem
+            .filter(|_| says.contains(&metric))
+            .or_else(|| filled(at(output, uncounted)).as_str());
+        entries.read_or(metric, series, at(output, field), why);
+    }
+    entries.done()
 }
 
 /// The metrics, and what each is read from: the numbers, then what was asked and
@@ -119,6 +137,10 @@ const UPDATES_SERIES: [&[&str]; 7] = [
     &[],
     &[],
 ];
+
+/// Where a row says why a number alone couldn't be counted, in the same order, for
+/// the numbers that are asked for apart from the rest.
+const UPDATES_UNCOUNTED: [&str; 7] = ["", "security_error", "vulnerable_error", "", "", "", ""];
 
 const UPDATES_METRICS: [&str; 7] = metrics_of(&[], &UPDATES_FIELDS);
 
@@ -164,6 +186,9 @@ struct Found {
     problem: Option<String>,
     /// What went wrong with part of it.
     notes: Vec<String>,
+    /// Why security updates alone couldn't be counted, and vulnerable packages.
+    security_error: Option<String>,
+    vulnerable_error: Option<String>,
 }
 
 impl Found {
@@ -173,6 +198,23 @@ impl Found {
             problem: Some(problem.into()),
             ..Found::default()
         }
+    }
+
+    /// Security updates couldn't be counted though the rest could, which the note
+    /// says, and which is that number's error.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn uncounted_security(&mut self, what: &str, why: &str) {
+        let error = format!("{what} couldn't be counted. {why}");
+        self.notes.push(error.clone());
+        self.security_error = Some(error);
+    }
+
+    /// As [`Self::uncounted_security`], for vulnerable packages.
+    #[cfg_attr(not(target_os = "freebsd"), allow(dead_code))]
+    fn uncounted_vulnerable(&mut self, what: &str, why: &str) {
+        let error = format!("{what} couldn't be counted. {why}");
+        self.notes.push(error.clone());
+        self.vulnerable_error = Some(error);
     }
 
     /// Its row. The texts are always there, even when empty, as the server keeps a
@@ -199,6 +241,15 @@ impl Found {
             json!(self.problem.clone().unwrap_or_default()),
         );
         row.insert("note".into(), json!(self.notes.join(" ")));
+        let uncounted = [
+            ("security_error", &self.security_error),
+            ("vulnerable_error", &self.vulnerable_error),
+        ];
+        for (name, error) in uncounted {
+            if let Some(error) = error {
+                row.insert(name.into(), json!(error));
+            }
+        }
         Value::Object(row)
     }
 }
@@ -450,13 +501,8 @@ mod linux {
             Ok(ran) if ran.code == Some(0) => {
                 found.security = Some(parse_dnf_security(&ran.stdout));
             }
-            Ok(ran) => found.notes.push(format!(
-                "Security updates couldn't be counted. {}",
-                failure(manager, &ran)
-            )),
-            Err(error) => found
-                .notes
-                .push(format!("Security updates couldn't be counted. {error}")),
+            Ok(ran) => found.uncounted_security("Security updates", &failure(manager, &ran)),
+            Err(error) => found.uncounted_security("Security updates", &error),
         }
         let mut lists = files_in("/var/cache/dnf", Some("repodata/repomd.xml"), |_| true);
         lists.extend(files_in(
@@ -505,13 +551,8 @@ mod linux {
         };
         match ask(&["list-patches", "--category", "security"]).await {
             Ok(ran) if fine(&ran) => found.security = Some(parse_zypper(&ran.stdout)),
-            Ok(ran) => found.notes.push(format!(
-                "Security patches couldn't be counted. {}",
-                failure("zypper", &ran)
-            )),
-            Err(error) => found
-                .notes
-                .push(format!("Security patches couldn't be counted. {error}")),
+            Ok(ran) => found.uncounted_security("Security patches", &failure("zypper", &ran)),
+            Err(error) => found.uncounted_security("Security patches", &error),
         }
         found.lists_age_secs = age_of_newest(
             files_in("/var/cache/zypp/raw", Some("repodata/repomd.xml"), |_| true)
@@ -626,13 +667,10 @@ mod freebsd {
             Ok(ran) if ran.code == Some(0) || (ran.code == Some(1) && ran.stderr.is_empty()) => {
                 found.vulnerable = Some(lines(&ran.stdout).count() as u64);
             }
-            Ok(ran) => found.notes.push(format!(
-                "Vulnerable packages couldn't be counted. {}",
-                failure("pkg audit", &ran)
-            )),
-            Err(error) => found
-                .notes
-                .push(format!("Vulnerable packages couldn't be counted. {error}")),
+            Ok(ran) => {
+                found.uncounted_vulnerable("Vulnerable packages", &failure("pkg audit", &ran))
+            }
+            Err(error) => found.uncounted_vulnerable("Vulnerable packages", &error),
         }
         let mut lists = files_in("/var/db/pkg", None, |name| {
             name.starts_with("repo-") && name.ends_with(".sqlite")
@@ -938,6 +976,8 @@ mod tests {
 
     use super::*;
     use crate::background::testing::read_once;
+    use crate::background::{FAILED_UNEXPECTEDLY, Missed};
+    use maxnines_protocol::entries::Reading;
 
     /// A collector that never asks a package manager anything.
     fn asking_nothing() -> UpdatesCollector {
@@ -1059,6 +1099,71 @@ mod tests {
             background: Background::holding([look]),
         };
         assert_eq!(read_once(&mut collector).len(), UPDATES_METRICS.len());
+    }
+
+    /// What was known stays for the host's page, but it isn't a count of the
+    /// updates there are now.
+    #[test]
+    fn a_look_that_did_not_finish_is_an_error_on_the_numbers_and_not_what_was_known() {
+        let known = Found {
+            manager: "pacman",
+            pending: Some(4),
+            ..Found::default()
+        };
+        let mut collector = UpdatesCollector {
+            background: Background::missing(known.to_value(), Missed::Panicked),
+        };
+        let read = read_once(&mut collector);
+        let why = format!("Updates couldn't be counted: {FAILED_UNEXPECTEDLY}");
+        for entry in &read {
+            // pacman has no count of security updates or vulnerable packages.
+            let said = numbers_of("pacman").contains(&entry.metric.as_str());
+            assert_eq!(numbers_of("pacman").len(), 3);
+            let failed = entry.reading == Reading::Error(why.clone());
+            assert_eq!(failed, said, "{}", entry.metric);
+            // What was known isn't said again as if it were read now.
+            if entry.metric != "updates.manager" {
+                assert!(
+                    !matches!(entry.reading, Reading::Value(_)),
+                    "{}",
+                    entry.metric
+                );
+            }
+        }
+        every_metric_has_an_entry(&collector, &read);
+    }
+
+    #[test]
+    fn a_number_that_alone_could_not_be_counted_has_why_as_its_error() {
+        let collector = asking_nothing();
+        let mut found = Found {
+            manager: "dnf",
+            pending: Some(2),
+            ..Found::default()
+        };
+        found.uncounted_security("Security updates", "dnf took longer than 300 seconds");
+        let row = found.to_value();
+        let why = "Security updates couldn't be counted. dnf took longer than 300 seconds";
+        assert_eq!(row["note"], why);
+        let entries = said(&collector.entries(&row, time()));
+        assert!(entries.contains(&("updates.pending[Updates]".to_string(), json!(2))));
+        assert!(entries.contains(&(
+            "updates.security[Security updates]".to_string(),
+            json!({ "error": why })
+        )));
+
+        let mut found = Found {
+            manager: "pkg",
+            pending: Some(0),
+            ..Found::default()
+        };
+        found.uncounted_vulnerable("Vulnerable packages", "pkg audit failed");
+        let entries = said(&collector.entries(&found.to_value(), time()));
+        assert!(entries.contains(&(
+            "updates.vulnerable[Vulnerable packages]".to_string(),
+            json!({ "error": "Vulnerable packages couldn't be counted. pkg audit failed" })
+        )));
+        assert!(entries.contains(&("updates.pending[Updates]".to_string(), json!(0))));
     }
 
     #[test]

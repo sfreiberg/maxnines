@@ -183,7 +183,13 @@ impl Collector for OpenMetricsCollector {
     }
 
     fn collect(&mut self) -> Result<Value> {
-        Ok(self.background.rows())
+        // A counter read for the first time has a total and no change yet, which
+        // is a row only its entries are read from.
+        let mut rows = self.background.rows();
+        if let Some(rows) = rows.as_array_mut() {
+            rows.retain(|row| row.get("change_total").is_none() || row.get("change").is_some());
+        }
+        Ok(rows)
     }
 
     fn metrics(&self) -> Vec<String> {
@@ -343,11 +349,8 @@ mod tests {
             row(&output, address),
             Some(&json!({ "name": address, "up": 1, "dropped": 0 }))
         );
-        // Nothing to compare with yet, so only the total is known.
-        assert_eq!(
-            row(&output, &named("jobs_total")),
-            Some(&json!({ "name": named("jobs_total"), "change_total": 100.0 }))
-        );
+        // Nothing to compare with yet, so there's no change to say.
+        assert_eq!(row(&output, &named("jobs_total")), None);
 
         served.showing.store(1, Ordering::Relaxed);
         let output = collect_until(&mut collector, |output| {
