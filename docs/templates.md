@@ -365,7 +365,9 @@ one command, whatever they say, and Redis has 5 seconds to answer. Redis has no
 read-only sessions, so what a command may do is up to the account it signs in as:
 give MaxNines a [user that can only run INFO and
 PING](collectors-redis.md#the-account-to-sign-in-as), and more only for what your own
-template asks. Valkey is asked the same way.
+template asks. Letting it run `CONFIG GET` lets it read Redis' passwords too, so
+[read a setting from INFO](collectors-redis.md#the-account-to-sign-in-as) where it's
+there. Valkey is asked the same way.
 
 The reply is made a document, read with `columns`, `rows` and paths as a
 [MongoDB](#mongodb-commands) reply is:

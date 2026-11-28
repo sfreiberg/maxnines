@@ -54,9 +54,14 @@ ACL SAVE
 
 That runs every command the template does. `ACL SAVE` keeps the user over a restart
 when users are kept in an ACL file; with users in `redis.conf`, use `CONFIG REWRITE`
-instead. A template of your own that asks for more, such as `CONFIG GET maxclients`,
-needs that too, such as `+config|get`. Nothing stops a template's command doing more
-than reading, so what it may do is up to the account.
+instead. A template of your own that asks for more needs that too. Nothing stops a
+template's command doing more than reading, so what it may do is up to the account.
+
+**Avoid `+config|get`.** It lets the account read every setting, Redis' own passwords
+in `requirepass` and `masterauth` included, as Redis can't allow some settings and not
+others. Read a setting from `INFO` where it's there instead: recent versions give
+`maxclients` in `INFO clients`, and `maxmemory` and `maxmemory_policy` in
+`INFO memory`.
 
 **What the account may do.** MaxNines [reads](database-stats.md#what-the-account-may-do)
 what the account may do with `ACL GETUSER`. A user like the one above can't run it,
