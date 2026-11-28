@@ -1,0 +1,1047 @@
+//! Web servers' own status pages: Apache's `mod_status`, nginx's `stub_status`
+//! and PHP-FPM's pool status. Each collector reads the pages it's told to, or the
+//! usual address when it isn't told, and reports what they say as numbers. One
+//! request gives everything a page has, however many numbers that is.
+//!
+//! Running totals, such as requests served, are turned into the change since the
+//! page was last read here, as the server expects for a rate. A page that stops
+//! answering starts afresh when it's back, rather than counting the gap as one burst.
+//! Each total is also there as the page gave it, under its name with `_total`
+//! added, which is what its entry says.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_checks::fetch_page;
+use maxnines_collectors::entries::{Entries, at, filled, metrics_of, names, percent};
+use maxnines_protocol::default_status_page;
+use maxnines_protocol::entries::Entry;
+use maxnines_protocol::totals::Change;
+use serde_json::{Map, Value, json};
+
+use crate::background::{Background, FAILED_UNEXPECTEDLY, Missed, rows_of};
+use crate::collector::Collector;
+
+/// A status page is a few lines served by the host itself, so anything slower
+/// than this is a server in trouble.
+const TIMEOUT: Duration = Duration::from_secs(10);
+
+const TIMED_OUT: &str = "timed out";
+const NOT_APACHE: &str = "the page isn't Apache's machine-readable status page";
+const NOT_NGINX: &str = "the page isn't nginx's stub_status page";
+const NOT_PHP_FPM: &str = "the page isn't PHP-FPM's status page";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Software {
+    Apache,
+    Nginx,
+    PhpFpm,
+}
+
+/// What a page said. Levels are reported as they are, and running totals as the
+/// change since the last sample.
+#[derive(Debug, Default, PartialEq)]
+struct Reading {
+    levels: BTreeMap<&'static str, f64>,
+    totals: BTreeMap<&'static str, u64>,
+}
+
+impl Software {
+    fn collector(self) -> &'static str {
+        match self {
+            Self::Apache => "apache",
+            Self::Nginx => "nginx",
+            Self::PhpFpm => "php_fpm",
+        }
+    }
+
+    /// Apache only gives the version meant for programs when asked with `?auto`,
+    /// which is easy to leave off, so it's added.
+    fn request_url(self, url: &str) -> String {
+        if self != Self::Apache {
+            return url.to_string();
+        }
+        let (page, fragment) = url.split_once('#').unwrap_or((url, ""));
+        let asked = page
+            .split_once('?')
+            .is_some_and(|(_, query)| query.split('&').any(|part| part == "auto"));
+        let mut request = if asked {
+            page.to_string()
+        } else if page.contains('?') {
+            format!("{page}&auto")
+        } else {
+            format!("{page}?auto")
+        };
+        if !fragment.is_empty() {
+            request = format!("{request}#{fragment}");
+        }
+        request
+    }
+
+    fn read(self, text: &str) -> Result<Reading, &'static str> {
+        match self {
+            Self::Apache => read_apache(text),
+            Self::Nginx => read_nginx(text),
+            Self::PhpFpm => read_php_fpm(text),
+        }
+    }
+
+    /// Whether a page answered, which every page says.
+    fn up(self) -> &'static str {
+        match self {
+            Self::Apache => "apache.up",
+            Self::Nginx => "nginx.up",
+            Self::PhpFpm => "php_fpm.up",
+        }
+    }
+
+    /// A page's metrics that are read as they are, and what each is read from. A
+    /// running total is read as the page gave it, not as its change.
+    fn fields(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Apache => &APACHE_FIELDS,
+            Self::Nginx => &NGINX_FIELDS,
+            Self::PhpFpm => &PHP_FPM_FIELDS,
+        }
+    }
+
+    /// Every metric a page has.
+    fn metrics(self) -> &'static [&'static str] {
+        match self {
+            Self::Apache => &APACHE_METRICS,
+            Self::Nginx => &NGINX_METRICS,
+            Self::PhpFpm => &PHP_FPM_METRICS,
+        }
+    }
+
+    /// One read of a page, or each of a list, as entries under the page's own name
+    /// only, as each is read apart from the others. It's apart from the collector
+    /// so it can be tried without one, which would ask for a page.
+    fn entries(self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let named = rows_of(output)
+            .iter()
+            .filter_map(|page| Some((page.get("name")?.as_str()?, page)));
+        for (name, page) in named {
+            let series = [name];
+            // A page that didn't answer is a value of whether it's up, and why is
+            // the error of everything it would have said.
+            entries.read(self.up(), &series, at(page, "up"));
+            let why = filled(at(page, "error")).as_str();
+            if self == Self::Apache {
+                let usage = percent(at(page, "busy_workers"), at(page, "worker_slots"));
+                match why {
+                    Some(why) if usage.is_none() => {
+                        entries.error("apache.worker_usage", &series, why);
+                    }
+                    _ => entries.number("apache.worker_usage", &series, usage),
+                }
+            }
+            for (metric, field) in self.fields() {
+                entries.read_or(metric, &series, at(page, field), why);
+            }
+        }
+        entries.done()
+    }
+}
+
+const APACHE_FIELDS: [(&str, &str); 8] = [
+    ("apache.requests", "requests_total"),
+    ("apache.traffic", "bytes_total"),
+    ("apache.busy_workers", "busy_workers"),
+    ("apache.idle_workers", "idle_workers"),
+    ("apache.worker_slots", "worker_slots"),
+    ("apache.connections", "connections"),
+    ("apache.cpu_load", "cpu_load"),
+    ("apache.uptime", "uptime_secs"),
+];
+
+const NGINX_FIELDS: [(&str, &str); 7] = [
+    ("nginx.connections", "connections"),
+    ("nginx.requests", "requests_total"),
+    ("nginx.accepted", "accepted_total"),
+    ("nginx.dropped", "dropped_total"),
+    ("nginx.reading", "reading"),
+    ("nginx.writing", "writing"),
+    ("nginx.waiting", "waiting"),
+];
+
+const PHP_FPM_FIELDS: [(&str, &str); 8] = [
+    ("php_fpm.requests", "requests_total"),
+    ("php_fpm.active_processes", "active_processes"),
+    ("php_fpm.idle_processes", "idle_processes"),
+    ("php_fpm.total_processes", "total_processes"),
+    ("php_fpm.listen_queue", "listen_queue"),
+    ("php_fpm.max_children_reached", "max_children_reached_total"),
+    ("php_fpm.slow_requests", "slow_requests_total"),
+    ("php_fpm.uptime", "uptime_secs"),
+];
+
+/// Every metric of a page: what's said or worked out apart from its fields, then
+/// each field's.
+const APACHE_METRICS: [&str; 10] =
+    metrics_of(&["apache.up", "apache.worker_usage"], &APACHE_FIELDS);
+const NGINX_METRICS: [&str; 8] = metrics_of(&["nginx.up"], &NGINX_FIELDS);
+const PHP_FPM_METRICS: [&str; 9] = metrics_of(&["php_fpm.up"], &PHP_FPM_FIELDS);
+
+/// What a page is called on charts: its address without the query, which is
+/// only ever options such as `?auto` or `?json`.
+fn label(url: &str) -> String {
+    url.split(['?', '#']).next().unwrap_or(url).to_string()
+}
+
+/// `Name: value` lines, by name in lower case.
+fn named_values(text: &str) -> BTreeMap<String, &str> {
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_lowercase(), value.trim()))
+        .collect()
+}
+
+fn number(values: &BTreeMap<String, &str>, name: &str) -> Option<f64> {
+    values
+        .get(name)?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn total(values: &BTreeMap<String, &str>, name: &str) -> Option<u64> {
+    values.get(name)?.parse().ok()
+}
+
+impl Reading {
+    fn level(&mut self, name: &'static str, value: Option<f64>) {
+        if let Some(value) = value {
+            self.levels.insert(name, value);
+        }
+    }
+
+    fn total(&mut self, name: &'static str, value: Option<u64>) {
+        if let Some(value) = value {
+            self.totals.insert(name, value);
+        }
+    }
+}
+
+/// The page `mod_status` gives with `?auto`. Totals need `ExtendedStatus`, which
+/// is on by default, and connections only come from the event MPM.
+fn read_apache(text: &str) -> Result<Reading, &'static str> {
+    let values = named_values(text);
+    let busy = number(&values, "busyworkers").ok_or(NOT_APACHE)?;
+    let mut reading = Reading::default();
+    reading.level("busy_workers", Some(busy));
+    reading.level("idle_workers", number(&values, "idleworkers"));
+    // One character per worker slot, whatever it's doing.
+    let slots = values
+        .get("scoreboard")
+        .map(|board| board.chars().count() as f64);
+    reading.level("worker_slots", slots.filter(|slots| *slots > 0.0));
+    reading.level("connections", number(&values, "connstotal"));
+    reading.level("cpu_load", number(&values, "cpuload"));
+    let uptime = number(&values, "serveruptimeseconds").or_else(|| number(&values, "uptime"));
+    reading.level("uptime_secs", uptime);
+    reading.total("requests", total(&values, "total accesses"));
+    let bytes = total(&values, "total kbytes").map(|kilobytes| kilobytes.saturating_mul(1024));
+    reading.total("bytes", bytes);
+    Ok(reading)
+}
+
+/// `stub_status`, which looks like this:
+///
+/// ```text
+/// Active connections: 291
+/// server accepts handled requests
+///  16630948 16630948 31070465
+/// Reading: 6 Writing: 179 Waiting: 106
+/// ```
+fn read_nginx(text: &str) -> Result<Reading, &'static str> {
+    let mut reading = Reading::default();
+    let mut lines = text.lines().map(str::trim);
+    let mut counted = false;
+    while let Some(line) = lines.next() {
+        if let Some(active) = line.strip_prefix("Active connections:") {
+            reading.level("connections", active.trim().parse().ok());
+        } else if line == "server accepts handled requests" {
+            let counts: Vec<u64> = lines
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .filter_map(|count| count.parse().ok())
+                .collect();
+            if let [accepted, handled, requests] = counts[..] {
+                reading.total("accepted", Some(accepted));
+                // Accepted and never handled means nginx ran out of connections.
+                reading.total("dropped", Some(accepted.saturating_sub(handled)));
+                reading.total("requests", Some(requests));
+                counted = true;
+            }
+        } else if line.starts_with("Reading:") {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for pair in words.chunks(2) {
+                let [name, value] = pair else { continue };
+                let name = match *name {
+                    "Reading:" => "reading",
+                    "Writing:" => "writing",
+                    "Waiting:" => "waiting",
+                    _ => continue,
+                };
+                reading.level(name, value.parse().ok());
+            }
+        }
+    }
+    if !counted || !reading.levels.contains_key("connections") {
+        return Err(NOT_NGINX);
+    }
+    Ok(reading)
+}
+
+/// A pool's status, as plain text or as JSON with `?json`. Both use the same
+/// names, such as `accepted conn`.
+fn read_php_fpm(text: &str) -> Result<Reading, &'static str> {
+    // JSON's numbers are written out again, so both forms are read the same way.
+    let numbers: BTreeMap<String, String>;
+    let values: BTreeMap<String, &str> = if text.trim_start().starts_with('{') {
+        let json: Map<String, Value> = serde_json::from_str(text).map_err(|_| NOT_PHP_FPM)?;
+        numbers = json
+            .into_iter()
+            .filter(|(_, value)| value.is_number())
+            .map(|(name, value)| (name, value.to_string()))
+            .collect();
+        numbers
+            .iter()
+            .map(|(name, value)| (name.clone(), value.as_str()))
+            .collect()
+    } else {
+        named_values(text)
+    };
+    let level = |name: &str| number(&values, name);
+    let count = |name: &str| total(&values, name);
+
+    let requests = count("accepted conn").ok_or(NOT_PHP_FPM)?;
+    let mut reading = Reading::default();
+    reading.total("requests", Some(requests));
+    reading.total("max_children_reached", count("max children reached"));
+    reading.total("slow_requests", count("slow requests"));
+    reading.level("listen_queue", level("listen queue"));
+    reading.level("idle_processes", level("idle processes"));
+    reading.level("active_processes", level("active processes"));
+    reading.level("total_processes", level("total processes"));
+    reading.level("uptime_secs", level("start since"));
+    Ok(reading)
+}
+
+struct Page {
+    software: Software,
+    url: String,
+    label: String,
+}
+
+async fn read_page(page: Arc<Page>) -> Result<Reading, String> {
+    match fetch_page(&page.software.request_url(&page.url), TIMEOUT, None).await {
+        Ok(text) => page.software.read(&text).map_err(str::to_string),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+fn failed(label: &str, error: &str) -> Value {
+    json!({ "name": label, "up": 0, "error": error })
+}
+
+/// The last running totals read from one page, to turn the next into changes.
+#[derive(Default)]
+struct Totals(BTreeMap<&'static str, Change>);
+
+impl Totals {
+    /// A page's row, with each running total as its change since the page was last
+    /// read. The first read has nothing to compare with, so it has none, and so
+    /// does the first after a failure.
+    fn row(&mut self, label: &str, read: Result<Reading, String>) -> Value {
+        let reading = match read {
+            Ok(reading) => reading,
+            Err(error) => {
+                self.0.clear();
+                return failed(label, &error);
+            }
+        };
+        let mut row = json!({ "name": label, "up": 1 });
+        for (name, value) in reading.levels {
+            row[name] = json!(value);
+        }
+        for (name, total) in reading.totals {
+            if let Some(change) = self.0.entry(name).or_default().update(Some(total)) {
+                row[name] = json!(change);
+            }
+            row[format!("{name}_total")] = json!(total);
+        }
+        row
+    }
+}
+
+pub struct StatusPageCollector {
+    software: Software,
+    background: Background,
+}
+
+impl StatusPageCollector {
+    pub fn new(software: Software, urls: Vec<String>, interval: Duration) -> Result<Self> {
+        let urls = if urls.is_empty() {
+            default_status_page(software.collector())
+                .map(str::to_string)
+                .into_iter()
+                .collect()
+        } else {
+            urls
+        };
+        let mut background = Background::new();
+        for url in urls {
+            let page = Arc::new(Page {
+                software,
+                label: label(&url),
+                url,
+            });
+            let label = page.label.clone();
+            let mut totals = Totals::default();
+            background.repeat(
+                interval,
+                Some(TIMEOUT),
+                move || read_page(page.clone()),
+                move |read| {
+                    let missed = |missed: Missed| missed.pick(&TIMED_OUT, &FAILED_UNEXPECTEDLY);
+                    totals.row(
+                        &label,
+                        read.unwrap_or_else(|why| Err(missed(why).to_string())),
+                    )
+                },
+            )?;
+        }
+        Ok(Self {
+            software,
+            background,
+        })
+    }
+}
+
+impl Collector for StatusPageCollector {
+    fn name(&self) -> &'static str {
+        self.software.collector()
+    }
+
+    fn collect(&mut self) -> Result<Value> {
+        Ok(self.background.rows())
+    }
+
+    fn metrics(&self) -> Vec<String> {
+        names(self.software.metrics())
+    }
+
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        self.software.entries(output, time)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::Instant;
+
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
+    use super::*;
+    use crate::background::testing::{each_is_for_a_series, read_once};
+
+    /// A collector of one software's pages that reads none, so nothing is asked
+    /// for. Made with no addresses, it would ask for the usual one.
+    fn reading_nothing(software: Software) -> StatusPageCollector {
+        StatusPageCollector {
+            software,
+            background: Background::new(),
+        }
+    }
+
+    #[test]
+    fn apache_entries_have_a_series_for_each_page() {
+        let collector = reading_nothing(Software::Apache);
+        let output = json!([
+            { "name": "http://localhost/server-status", "up": 1,
+              "busy_workers": 3.0, "idle_workers": 72.0, "worker_slots": 15.0,
+              "connections": 4.0, "cpu_load": 0.0234, "uptime_secs": 86400.0,
+              "requests": 30, "requests_total": 12000,
+              "bytes": 1024, "bytes_total": 2097152 },
+            // Without ExtendedStatus, and read for the first time.
+            { "name": "http://web2/server-status", "up": 1, "busy_workers": 1.0 },
+            { "name": "http://web3/server-status", "up": 0, "error": "timed out" },
+            // One without a name can't be told from the others.
+            { "up": 1, "busy_workers": 2.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        let timed_out = || json!({ "error": "timed out" });
+        assert_eq!(
+            said(&entries),
+            [
+                (of("apache.up[http://localhost/server-status]"), json!(1)),
+                (
+                    of("apache.worker_usage[http://localhost/server-status]"),
+                    json!(20.0)
+                ),
+                // The running totals, not their changes.
+                (
+                    of("apache.requests[http://localhost/server-status]"),
+                    json!(12000)
+                ),
+                (
+                    of("apache.traffic[http://localhost/server-status]"),
+                    json!(2097152)
+                ),
+                (
+                    of("apache.busy_workers[http://localhost/server-status]"),
+                    json!(3.0)
+                ),
+                (
+                    of("apache.idle_workers[http://localhost/server-status]"),
+                    json!(72.0)
+                ),
+                (
+                    of("apache.worker_slots[http://localhost/server-status]"),
+                    json!(15.0)
+                ),
+                (
+                    of("apache.connections[http://localhost/server-status]"),
+                    json!(4.0)
+                ),
+                (
+                    of("apache.cpu_load[http://localhost/server-status]"),
+                    json!(0.0234)
+                ),
+                (
+                    of("apache.uptime[http://localhost/server-status]"),
+                    json!(86400.0)
+                ),
+                (of("apache.up[http://web2/server-status]"), json!(1)),
+                (
+                    of("apache.worker_usage[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.requests[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (of("apache.traffic[http://web2/server-status]"), Value::Null),
+                (
+                    of("apache.busy_workers[http://web2/server-status]"),
+                    json!(1.0)
+                ),
+                (
+                    of("apache.idle_workers[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.worker_slots[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.connections[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.cpu_load[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (of("apache.uptime[http://web2/server-status]"), Value::Null),
+                // Not answering is what was found, and why is the error of
+                // everything the page would have said.
+                (of("apache.up[http://web3/server-status]"), json!(0)),
+                (
+                    of("apache.worker_usage[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.requests[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (of("apache.traffic[http://web3/server-status]"), timed_out()),
+                (
+                    of("apache.busy_workers[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.idle_workers[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.worker_slots[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.connections[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.cpu_load[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (of("apache.uptime[http://web3/server-status]"), timed_out()),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn nginx_entries_have_a_series_for_each_page() {
+        let collector = reading_nothing(Software::Nginx);
+        let output = json!([
+            { "name": "a", "up": 1, "connections": 291.0, "reading": 6.0,
+              "writing": 179.0, "waiting": 106.0,
+              "requests": 30, "requests_total": 31070465,
+              "accepted": 5, "accepted_total": 16630948,
+              "dropped": 1, "dropped_total": 8 },
+            { "name": "b", "up": 0, "error": NOT_NGINX },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        let not_nginx = || json!({ "error": NOT_NGINX });
+        assert_eq!(
+            said(&entries),
+            [
+                (of("nginx.up[a]"), json!(1)),
+                (of("nginx.connections[a]"), json!(291.0)),
+                (of("nginx.requests[a]"), json!(31070465)),
+                (of("nginx.accepted[a]"), json!(16630948)),
+                (of("nginx.dropped[a]"), json!(8)),
+                (of("nginx.reading[a]"), json!(6.0)),
+                (of("nginx.writing[a]"), json!(179.0)),
+                (of("nginx.waiting[a]"), json!(106.0)),
+                (of("nginx.up[b]"), json!(0)),
+                (of("nginx.connections[b]"), not_nginx()),
+                (of("nginx.requests[b]"), not_nginx()),
+                (of("nginx.accepted[b]"), not_nginx()),
+                (of("nginx.dropped[b]"), not_nginx()),
+                (of("nginx.reading[b]"), not_nginx()),
+                (of("nginx.writing[b]"), not_nginx()),
+                (of("nginx.waiting[b]"), not_nginx()),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn php_fpm_entries_have_a_series_for_each_pool() {
+        let collector = reading_nothing(Software::PhpFpm);
+        let output = json!([
+            { "name": "a", "up": 1, "listen_queue": 2.0, "idle_processes": 4.0,
+              "active_processes": 1.0, "total_processes": 5.0, "uptime_secs": 3600.0,
+              "requests": 10, "requests_total": 5000,
+              "max_children_reached": 0, "max_children_reached_total": 1,
+              "slow_requests_total": 7 },
+            { "name": "b", "up": 0, "error": "timed out" },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        let timed_out = || json!({ "error": "timed out" });
+        assert_eq!(
+            said(&entries),
+            [
+                (of("php_fpm.up[a]"), json!(1)),
+                (of("php_fpm.requests[a]"), json!(5000)),
+                (of("php_fpm.active_processes[a]"), json!(1.0)),
+                (of("php_fpm.idle_processes[a]"), json!(4.0)),
+                (of("php_fpm.total_processes[a]"), json!(5.0)),
+                (of("php_fpm.listen_queue[a]"), json!(2.0)),
+                (of("php_fpm.max_children_reached[a]"), json!(1)),
+                (of("php_fpm.slow_requests[a]"), json!(7)),
+                (of("php_fpm.uptime[a]"), json!(3600.0)),
+                (of("php_fpm.up[b]"), json!(0)),
+                (of("php_fpm.requests[b]"), timed_out()),
+                (of("php_fpm.active_processes[b]"), timed_out()),
+                (of("php_fpm.idle_processes[b]"), timed_out()),
+                (of("php_fpm.total_processes[b]"), timed_out()),
+                (of("php_fpm.listen_queue[b]"), timed_out()),
+                (of("php_fpm.max_children_reached[b]"), timed_out()),
+                (of("php_fpm.slow_requests[b]"), timed_out()),
+                (of("php_fpm.uptime[b]"), timed_out()),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn with_no_pages_or_none_read_yet_nothing_is_said() {
+        for software in [Software::Apache, Software::Nginx, Software::PhpFpm] {
+            let mut collector = reading_nothing(software);
+            assert_eq!(collector.collect().unwrap(), json!([]));
+            assert_eq!(collector.read(time()).unwrap(), []);
+            // Nothing one page says is about the others.
+            for output in [json!([]), Value::Null] {
+                assert_eq!(collector.entries(&output, time()), []);
+            }
+        }
+    }
+
+    #[test]
+    fn each_pages_read_is_its_own_and_handed_over_once() {
+        let mut totals = Totals::default();
+        let up = totals.row("a", read_nginx(NGINX).map_err(str::to_string));
+        let down = Totals::default().row("b", Err(TIMED_OUT.to_string()));
+        let mut collector = StatusPageCollector {
+            software: Software::Nginx,
+            background: Background::holding([up, down]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 2 * NGINX_METRICS.len());
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
+    }
+
+    #[test]
+    fn what_a_page_says_becomes_entries_of_its_running_totals() {
+        let collector = reading_nothing(Software::Nginx);
+        let mut totals = Totals::default();
+        // The first read has no change, and still has its totals.
+        let first = totals.row("p", read_nginx(NGINX).map_err(str::to_string));
+        assert!(first.get("requests").is_none(), "{first}");
+        assert_eq!(first["requests_total"], 31070465);
+        let entries = collector.entries(&json!([first]), time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("nginx.up[p]"), json!(1)),
+                (of("nginx.connections[p]"), json!(291.0)),
+                (of("nginx.requests[p]"), json!(31070465)),
+                (of("nginx.accepted[p]"), json!(16630948)),
+                (of("nginx.dropped[p]"), json!(8)),
+                (of("nginx.reading[p]"), json!(6.0)),
+                (of("nginx.writing[p]"), json!(179.0)),
+                (of("nginx.waiting[p]"), json!(106.0)),
+            ]
+        );
+
+        let down = totals.row("p", Err(TIMED_OUT.to_string()));
+        let entries = collector.entries(&json!([down]), time());
+        assert_eq!(said(&entries)[0], (of("nginx.up[p]"), json!(0)));
+        assert_eq!(
+            said(&entries)[1],
+            (of("nginx.connections[p]"), json!({ "error": TIMED_OUT }))
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        for (software, page) in [(Software::Apache, APACHE), (Software::PhpFpm, PHP_FPM)] {
+            let collector = reading_nothing(software);
+            let row = Totals::default().row("p", software.read(page).map_err(str::to_string));
+            let entries = collector.entries(&json!([row]), time());
+            every_metric_has_an_entry(&collector, &entries);
+            // Everything these pages say is there, so every metric has a value.
+            assert!(
+                said(&entries).iter().all(|(_, value)| !value.is_null()),
+                "{entries:?}"
+            );
+        }
+    }
+
+    const APACHE: &str = "localhost
+ServerVersion: Apache/2.4.62 (Debian)
+ServerMPM: event
+ServerUptimeSeconds: 86400
+Uptime: 86400
+Load1: 0.10
+Total Accesses: 12000
+Total kBytes: 2048
+Total Duration: 5000
+CPULoad: .0234
+ReqPerSec: .138889
+BusyWorkers: 3
+GracefulWorkers: 0
+IdleWorkers: 72
+ConnsTotal: 4
+ConnsAsyncWriting: 0
+ConnsAsyncKeepAlive: 1
+ConnsAsyncClosing: 0
+Scoreboard: __W_K___.......
+";
+
+    const NGINX: &str = "Active connections: 291
+server accepts handled requests
+ 16630948 16630940 31070465
+Reading: 6 Writing: 179 Waiting: 106
+";
+
+    const PHP_FPM: &str = "pool:                 www
+process manager:      dynamic
+start time:           08/Nov/2026:09:00:00 +0000
+start since:          3600
+accepted conn:        5000
+listen queue:         2
+max listen queue:     9
+listen queue len:     511
+idle processes:       4
+active processes:     1
+total processes:      5
+max active processes: 5
+max children reached: 1
+slow requests:        7
+";
+
+    fn reading(levels: &[(&'static str, f64)], totals: &[(&'static str, u64)]) -> Reading {
+        Reading {
+            levels: levels.iter().copied().collect(),
+            totals: totals.iter().copied().collect(),
+        }
+    }
+
+    #[test]
+    fn apache_says_how_busy_its_workers_are() {
+        assert_eq!(
+            read_apache(APACHE).unwrap(),
+            reading(
+                &[
+                    ("busy_workers", 3.0),
+                    ("idle_workers", 72.0),
+                    ("worker_slots", 15.0),
+                    ("connections", 4.0),
+                    ("cpu_load", 0.0234),
+                    ("uptime_secs", 86400.0),
+                ],
+                &[("requests", 12000), ("bytes", 2048 * 1024)],
+            )
+        );
+    }
+
+    #[test]
+    fn apache_without_extended_status_still_counts_workers() {
+        let plain = "BusyWorkers: 1\nIdleWorkers: 9\nScoreboard: W_________\n";
+        assert_eq!(
+            read_apache(plain).unwrap(),
+            reading(
+                &[
+                    ("busy_workers", 1.0),
+                    ("idle_workers", 9.0),
+                    ("worker_slots", 10.0)
+                ],
+                &[],
+            )
+        );
+    }
+
+    #[test]
+    fn apache_asked_without_auto_is_asked_with_it() {
+        let apache = Software::Apache;
+        let asked = |url| apache.request_url(url);
+        assert_eq!(
+            asked("http://localhost/server-status"),
+            "http://localhost/server-status?auto"
+        );
+        assert_eq!(
+            asked("http://localhost/server-status?auto"),
+            "http://localhost/server-status?auto"
+        );
+        assert_eq!(
+            asked("http://localhost/server-status?refresh=5"),
+            "http://localhost/server-status?refresh=5&auto"
+        );
+        assert_eq!(
+            asked("http://localhost/status?automatic"),
+            "http://localhost/status?automatic&auto"
+        );
+        assert_eq!(
+            Software::Nginx.request_url("http://localhost/nginx_status"),
+            "http://localhost/nginx_status"
+        );
+    }
+
+    #[test]
+    fn the_page_for_people_is_not_mistaken_for_numbers() {
+        let html = "<html><body><h1>Apache Server Status</h1></body></html>";
+        assert_eq!(read_apache(html), Err(NOT_APACHE));
+        assert_eq!(read_nginx(html), Err(NOT_NGINX));
+        assert_eq!(read_php_fpm(html), Err(NOT_PHP_FPM));
+        assert_eq!(read_nginx(APACHE), Err(NOT_NGINX));
+        assert_eq!(read_php_fpm(NGINX), Err(NOT_PHP_FPM));
+    }
+
+    #[test]
+    fn nginx_counts_connections_and_what_it_dropped() {
+        assert_eq!(
+            read_nginx(NGINX).unwrap(),
+            reading(
+                &[
+                    ("connections", 291.0),
+                    ("reading", 6.0),
+                    ("writing", 179.0),
+                    ("waiting", 106.0),
+                ],
+                &[
+                    ("accepted", 16630948),
+                    ("dropped", 8),
+                    ("requests", 31070465)
+                ],
+            )
+        );
+    }
+
+    #[test]
+    fn php_fpm_reads_the_same_from_text_and_json() {
+        let expected = reading(
+            &[
+                ("listen_queue", 2.0),
+                ("idle_processes", 4.0),
+                ("active_processes", 1.0),
+                ("total_processes", 5.0),
+                ("uptime_secs", 3600.0),
+            ],
+            &[
+                ("requests", 5000),
+                ("max_children_reached", 1),
+                ("slow_requests", 7),
+            ],
+        );
+        assert_eq!(read_php_fpm(PHP_FPM).unwrap(), expected);
+        let json = r#"{"pool":"www","process manager":"dynamic","start time":1762592400,
+            "start since":3600,"accepted conn":5000,"listen queue":2,"max listen queue":9,
+            "listen queue len":511,"idle processes":4,"active processes":1,
+            "total processes":5,"max active processes":5,"max children reached":1,
+            "slow requests":7}"#;
+        assert_eq!(read_php_fpm(json).unwrap(), expected);
+        assert_eq!(read_php_fpm("{ not json"), Err(NOT_PHP_FPM));
+    }
+
+    #[test]
+    fn pages_are_named_without_their_options() {
+        assert_eq!(
+            label("http://localhost/server-status?auto"),
+            "http://localhost/server-status"
+        );
+        assert_eq!(
+            label("http://127.0.0.1:8080/fpm#x"),
+            "http://127.0.0.1:8080/fpm"
+        );
+    }
+
+    /// A page that answers every request with the body the test has moved it on to.
+    struct Served {
+        address: String,
+        showing: Arc<AtomicUsize>,
+    }
+
+    impl Served {
+        fn show(&self, body: usize) {
+            self.showing.store(body, Ordering::Relaxed);
+        }
+    }
+
+    /// Serves the first of `bodies`, or nothing if there are none, until told to
+    /// move on, so what the collector reads doesn't depend on how fast it reads.
+    fn serve(bodies: Vec<&'static str>) -> Served {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let showing = Arc::new(AtomicUsize::new(0));
+        let shown = Arc::clone(&showing);
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                // The whole request goes first: closing with some of it unread makes
+                // Windows reset the connection, losing the answer.
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    match stream.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(size) => request.extend_from_slice(&buffer[..size]),
+                    }
+                }
+                let body = bodies
+                    .get(shown.load(Ordering::Relaxed))
+                    .or(bodies.last())
+                    .copied()
+                    .unwrap_or_default();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        Served { address, showing }
+    }
+
+    fn collect_until(collector: &mut StatusPageCollector, done: impl Fn(&Value) -> bool) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let output = collector.collect().unwrap();
+            if done(&output) {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "gave up waiting: {output}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn totals_become_the_change_since_the_page_was_last_read() {
+        let first = "Active connections: 1\nserver accepts handled requests\n 10 10 100\nReading: 0 Writing: 1 Waiting: 0\n";
+        let second = "Active connections: 2\nserver accepts handled requests\n 15 14 130\nReading: 0 Writing: 1 Waiting: 1\n";
+        let served = serve(vec![first, second]);
+        let address = &served.address;
+        let url = format!("http://{address}/nginx_status");
+        let mut collector =
+            StatusPageCollector::new(Software::Nginx, vec![url], Duration::from_millis(200))
+                .unwrap();
+
+        let output = collect_until(&mut collector, |output| output[0]["connections"] == 1.0);
+        let page = &output[0];
+        assert_eq!(page["name"], format!("http://{address}/nginx_status"));
+        assert_eq!(page["up"], 1);
+        // Nothing to compare with yet.
+        assert!(page.get("requests").is_none(), "{page}");
+        assert!(page.get("totals").is_none(), "{page}");
+
+        served.show(1);
+        let output = collect_until(&mut collector, |output| output[0]["connections"] == 2.0);
+        let page = &output[0];
+        assert_eq!(page["requests"], 30);
+        assert_eq!(page["accepted"], 5);
+        assert_eq!(page["dropped"], 1);
+    }
+
+    #[test]
+    fn a_page_that_cannot_be_read_says_why() {
+        let address = serve(vec!["<html>It works!</html>"]).address;
+        let url = format!("http://{address}/server-status");
+        let mut collector =
+            StatusPageCollector::new(Software::Apache, vec![url], Duration::from_millis(200))
+                .unwrap();
+        let output = collect_until(&mut collector, |output| output.is_array());
+        assert_eq!(output[0]["up"], 0);
+        assert_eq!(output[0]["error"], NOT_APACHE);
+    }
+
+    #[test]
+    fn a_page_that_stops_answering_starts_its_totals_afresh() {
+        let mut totals = Totals::default();
+        let requests = |requests: u64| Ok(reading(&[], &[("requests", requests)]));
+        assert!(totals.row("p", requests(100)).get("requests").is_none());
+        assert_eq!(totals.row("p", requests(150))["requests"], 50);
+        // Read again before the page changed, it changed by nothing since then.
+        assert_eq!(totals.row("p", requests(150))["requests"], 0);
+
+        let down = totals.row("p", Err(TIMED_OUT.to_string()));
+        assert_eq!(down, failed("p", TIMED_OUT));
+        let row = totals.row("p", requests(900));
+        assert!(row.get("requests").is_none(), "{row}");
+        assert_eq!(row["up"], 1);
+    }
+}

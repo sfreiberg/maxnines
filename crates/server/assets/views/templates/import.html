@@ -1,0 +1,94 @@
+{% extends "layouts/application.html" %}
+{% block title %}Import template · MaxNines{% endblock title %}
+{% block head %}<script src="/assets/js/template_import.js" defer></script>{% endblock head %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a></p>
+<h1>Import template</h1>
+<p class="hint">A template someone else wrote, as HCL. It's kept as it comes: importing a newer version of it replaces it, leaving alone what you've turned off and your own copies of its alerts. Nothing is saved until you've seen what it would do.</p>
+{% if error %}<pre class="error" role="alert">{{ error }}</pre>{% endif %}
+
+{% if preview %}
+<section class="card" id="import-preview">
+  <h2>{{ preview.name }}</h2>
+  <p class="hint"><code>{{ preview.key }}</code> · {{ preview.target }}{% if preview.description %} · {{ preview.description }}{% endif %}</p>
+  {% if preview.problems %}
+  <div class="error" role="alert">
+    <p>It can't be imported as it is:</p>
+    <ul class="changes">{% for problem in preview.problems %}<li>{{ problem }}</li>{% endfor %}</ul>
+  </div>
+  {% elif preview.outcome == "added" %}
+  <p class="notice">This would add a template.</p>
+  {% elif preview.outcome == "updated" %}
+  <div class="notice">
+    <p>This would replace the <code>{{ preview.key }}</code> template imported before:</p>
+    <ul class="changes">{% for change in preview.changes %}<li>{{ change }}</li>{% endfor %}</ul>
+  </div>
+  {% else %}
+  <p class="notice">This is what's imported already, so importing it would change nothing.</p>
+  {% endif %}
+
+  {% if preview.alerts %}
+  <h3>Alerts</h3>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Name</th><th>Alerts when</th><th></th></tr></thead>
+    <tbody>
+      {% for alert in preview.alerts %}
+      <tr>
+        <td>{{ alert.name }}<span class="under"><code>{{ alert.key }}</code></span></td>
+        <td>{% if alert.warning %}<div class="condition"><span class="badge warn">Warning</span> <code>{{ alert.warning }}</code></div>{% endif %}{% if alert.critical %}<div class="condition"><span class="badge bad">Critical</span> <code>{{ alert.critical }}</code></div>{% endif %}</td>
+        <td>{% if not alert.enabled %}<span class="badge neutral">Disabled</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if preview.metrics %}
+  <h3>Metrics</h3>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Name</th><th>Labels</th></tr></thead>
+    <tbody>
+      {% for metric in preview.metrics %}<tr><td><code>{{ metric.name }}</code></td><td>{{ metric.labels | join(sep=", ") }}</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if preview.sql %}
+  <h3>SQL it would run</h3>
+  {% for query in preview.sql %}
+  <p class="label">{{ query.from }}</p>
+  {% for statement in query.statements %}<pre class="table-scroll"><code>{{ statement }}</code></pre>{% endfor %}
+  {% endfor %}
+  {% endif %}
+
+  {% if preview.counters %}
+  <h3>Performance counters it would read</h3>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Counter set</th><th>Counters</th></tr></thead>
+    <tbody>
+      {% for counters in preview.counters %}<tr><td>{{ counters.object }}<span class="under"><code>{{ counters.key }}</code></span></td><td>{{ counters.counters | join(sep=", ") }}</td></tr>{% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+</section>
+{% endif %}
+
+<form method="post" action="/templates/import" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <label>A file
+    <input type="file" accept=".hcl,text/plain" data-fills="import-hcl">
+    <small>Choosing one puts what's in it in the box below.</small>
+  </label>
+  <label>HCL
+    <textarea name="hcl" id="import-hcl" rows="{% if preview %}8{% else %}18{% endif %}" spellcheck="false" class="mono" required>{{ hcl }}</textarea>
+  </label>
+  <div class="actions">
+    {% if can_edit %}
+    {% if preview and preview.outcome and preview.outcome != "unchanged" %}<button type="submit" name="confirm" value="yes">Import template</button>{% endif %}
+    <button type="submit"{% if preview and preview.outcome %} class="secondary"{% endif %}>{% if preview %}Look again{% else %}See what it would do{% endif %}</button>
+    {% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="/templates">Cancel</a>
+  </div>
+</form>
+{% endblock content %}

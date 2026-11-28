@@ -1,0 +1,11 @@
+{% for run in runs %}
+<section class="card action-run" id="run-{{ run.id }}">
+  <div class="title-row">
+    <h2><code>{{ run.action }}</code></h2>
+    <span class="badge {{ run.class }}">{{ run.status }}</span>
+  </div>
+  <p class="note">{{ run.why }} · {{ run.asked }}{% if run.given %} · <code>{{ run.given }}</code>{% endif %}{% if run.detail %} · {{ run.detail }}{% endif %}</p>
+  {% if run.output %}<pre class="action-output">{{ run.output }}</pre>{% elif not run.waiting %}<p class="empty">It printed nothing.</p>{% endif %}
+  {% if run.truncated %}<p class="note">It printed more than is kept, so the rest was cut off.</p>{% endif %}
+</section>
+{% endfor %}

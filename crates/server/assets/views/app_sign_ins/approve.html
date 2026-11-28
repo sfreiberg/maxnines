@@ -1,0 +1,27 @@
+{% extends "layouts/application.html" %}
+{% block title %}Sign in {{ app }} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+{% if known %}<h1>Sign in {{ app }}?</h1>{% elif document %}<h1>Sign in {{ app }}?</h1>
+<p class="error">This isn't one of MaxNines' own apps. It's described at <strong>{{ app_host }}</strong>{% if redirect_host %}, and allowing it sends you back to <strong>{{ redirect_host }}</strong>{% endif %}. {% if redirect_host %}Only allow it if you started connecting it yourself, just now, and you trust {{ redirect_host }}.{% else %}It answers on this computer, so nothing proves what it is: any program here could use its description. Only allow it if you started signing it in yourself, just now, on this computer, and you trust it.{% endif %}</p>{% else %}<h1>Sign in an app calling itself {{ app_id }}?</h1>
+<p class="error">This isn't one of MaxNines' own apps, and nothing proves what it is: any program can give itself any name. Only allow it if you started signing it in yourself, just now, on this computer, and you trust it.</p>{% endif %}
+<p class="subtitle">{% if known %}{{ app }}{% else %}It{% endif %}{% if device %} on <strong>{{ device }}</strong>{% endif %} wants to act as you, {{ email }}. It sees what you see, can do what the role below allows, and its changes are recorded as yours. It stays signed in for up to 90 days after it was last used, until you revoke it under Settings, then Signed-in apps.</p>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+{% if user_code %}<p class="hint">Check that the device shows <code>{{ user_code }}</code> before you allow it.</p>{% endif %}
+
+<form method="post" action="{{ action }}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {% for field in hidden %}<input type="hidden" name="{{ field.name }}" value="{{ field.value }}">
+  {% endfor %}
+  <label>What it can do
+    <select name="chosen_role">
+      {% for role in roles %}<option value="{{ role.value }}"{% if role.value == chosen_role %} selected{% endif %}>{{ role.label }}: {{ role.adds }}</option>{% endfor %}
+    </select>
+    <small>Choose the lowest that does what you need. It never does more than your own role allows.</small>
+  </label>
+  <div class="actions">
+    <button type="submit" name="decision" value="allow">Allow</button>
+    <button type="submit" name="decision" value="deny" class="secondary">Deny</button>
+  </div>
+</form>
+{% endblock content %}

@@ -1,0 +1,72 @@
+[package]
+name = "maxnines-cli"
+description = "maxnines, the command line for a MaxNines server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "maxnines"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22"
+chrono.workspace = true
+clap = { workspace = true, features = ["env"] }
+clap_complete = "4"
+clap_mangen = "0.3.4"
+comfy-table = { version = "7.1.4", default-features = false }
+gethostname = "1"
+hcl-rs.workspace = true
+humantime = "2.3"
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+webbrowser = "1"
+
+# The system's key store for tokens where it needs nothing outside the binary. On
+# Linux that would be Secret Service, which needs the D-Bus library and so couldn't be
+# a static binary, so tokens go in a file only the owner can read, as gh and kubectl do.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+# The release workflow writes the man pages and completions into cli-files with
+# packaging/cli-files.sh before packaging.
+[package.metadata.deb]
+name = "maxnines-cli"
+maintainer = "MaxNines <https://github.com/sfreiberg/maxnines/issues>"
+copyright = "2026 Sam Freiberg"
+license-file = ["../../LICENSE", "0"]
+extended-description = "maxnines works with a MaxNines server from a terminal, through its API: lists\nhosts, alerts and checks, acknowledges and silences alerts, and calls anything\nelse in the API."
+section = "admin"
+priority = "optional"
+# Fully static, so it needs nothing else.
+depends = ""
+assets = [
+  ["target/release/maxnines", "usr/bin/", "755"],
+  ["target/release/cli-files/man/*.1.gz", "usr/share/man/man1/", "644"],
+  ["target/release/cli-files/maxnines.bash", "usr/share/bash-completion/completions/maxnines", "644"],
+  ["target/release/cli-files/_maxnines", "usr/share/zsh/vendor-completions/_maxnines", "644"],
+  ["target/release/cli-files/maxnines.fish", "usr/share/fish/vendor_completions.d/maxnines.fish", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "maxnines-cli"
+description = "maxnines works with a MaxNines server from a terminal, through its API: lists\nhosts, alerts and checks, acknowledges and silences alerts, and calls anything\nelse in the API."
+summary = "MaxNines command line"
+assets = [
+  { source = "target/release/maxnines", dest = "/usr/bin/maxnines", mode = "755" },
+  { source = "target/release/cli-files/man/*.1.gz", dest = "/usr/share/man/man1/", mode = "644" },
+  { source = "target/release/cli-files/maxnines.bash", dest = "/usr/share/bash-completion/completions/maxnines", mode = "644" },
+  { source = "target/release/cli-files/_maxnines", dest = "/usr/share/zsh/site-functions/_maxnines", mode = "644" },
+  { source = "target/release/cli-files/maxnines.fish", dest = "/usr/share/fish/vendor_completions.d/maxnines.fish", mode = "644" },
+  { source = "../../LICENSE", dest = "/usr/share/licenses/maxnines-cli/LICENSE", mode = "644", doc = true },
+]
+auto-req = "no"

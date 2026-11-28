@@ -1,0 +1,43 @@
+# Captures what each Linux package manager prints for the commands the agent's
+# updates collector runs, in a container of each system, so the collector's
+# parsers are tested against real output. It runs by hand from the Actions tab, and
+# by itself only when this file or its script changes, never for other pushes, so
+# CI is no slower. Download its artifacts into crates/agent/fixtures/updates/.
+name: Capture update outputs
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/capture-update-outputs.yml
+      - crates/agent/fixtures/updates/capture.sh
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - debian:12
+          - rockylinux:9
+          - fedora:latest
+          - opensuse/leap:latest
+          - opensuse/tumbleweed:latest
+          - archlinux:latest
+          - alpine:latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker run --rm -v "$PWD:/work" -w /work "${{ matrix.image }}" sh crates/agent/fixtures/updates/capture.sh
+      - id: name
+        run: echo "name=$(echo '${{ matrix.image }}' | tr ':/' '--')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: updates-${{ steps.name.outputs.name }}
+          path: out/

@@ -1,0 +1,112 @@
+/var/cache/zypp:
+total 24
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Aug  3 08:27 ..
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 packages
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 raw
+drwxr-xr-x 5 root root 4096 Nov 24 05:37 solv
+
+/var/cache/zypp/packages:
+total 12
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 openSUSE:repo-oss
+
+/var/cache/zypp/packages/openSUSE:repo-oss:
+total 16
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 %2E%2E
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .preload
+
+/var/cache/zypp/packages/openSUSE:repo-oss/%2E%2E:
+total 12
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 x86_64
+
+/var/cache/zypp/packages/openSUSE:repo-oss/%2E%2E/x86_64:
+total 8
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 ..
+
+/var/cache/zypp/packages/openSUSE:repo-oss/.preload:
+total 8
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+
+/var/cache/zypp/raw:
+total 16
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 openSUSE:repo-openh264
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 openSUSE:repo-oss
+
+/var/cache/zypp/raw/openSUSE:repo-openh264:
+total 12
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+lrwxrwxrwx 1 root root    6 Nov 24 05:37 .repo_gpgcheck -> ./true
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repodata
+
+/var/cache/zypp/raw/openSUSE:repo-openh264/repodata:
+total 24
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root 3034 Nov 24 05:37 c0eb0977441dadc81f1b080841005fc85f23b07e3f5f24064875c83602cbf6a0bcc8de059d6da0fcc570a9e9e681b0b6ee405f9ae9e8860c6c7e458d13a68ab3-primary.xml.gz
+-rw-r--r-- 1 root root 2637 Nov 24 05:37 ec98203328e3e4a9839087efd0f81b2532f160cac4964502d782558072338ee71e92889fcc26a23cee9aaf60a0f4eee92c242e56dffee607e471d52b103f37d0-filelists-ext.xml.gz
+-rw-r--r-- 1 root root 2953 Nov 24 05:37 repomd.xml
+-rw-r--r-- 1 root root  827 Nov 24 05:37 repomd.xml.asc
+
+/var/cache/zypp/raw/openSUSE:repo-oss:
+total 20
+drwxr-xr-x 3 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 4 root root 4096 Nov 24 05:37 ..
+lrwxrwxrwx 1 root root    6 Nov 24 05:37 .repo_gpgcheck -> ./true
+-rw-r--r-- 1 root root  853 Nov 24 05:37 mirrorlist
+-rw-r--r-- 1 root root   64 Nov 24 05:37 mirrorlist.cookie
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 repodata
+
+/var/cache/zypp/raw/openSUSE:repo-oss/repodata:
+total 25912
+drwxr-xr-x 2 root root     4096 Nov 24 05:37 .
+drwxr-xr-x 3 root root     4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root 12390401 Nov 24 05:37 19d5b20c40edf24e28555df61373b40adbc6521a95651a4da98ef402e13d3d5287c36fb48311ecebf9195dac338219786c7c31644c4bb9a38e95c03956b404e0-primary.xml.zst
+-rw-r--r-- 1 root root  3372106 Nov 24 05:37 73c503ec1d5bdaee3cd47b6a9c1d239a2dd7c33ea051722c0c3c4d167a4df7fe2a630e2a00d7cccb024fc205386cdd97865149567086a8584e0b90d8de8a2490-appdata-icons.tar.gz
+-rw-r--r-- 1 root root  4285724 Nov 24 05:37 80b809661ca08c4967baa5cf168f65d52dcac71c557d74a9c1253e6d36d8c34039fb46eb6dee3ecdae855f29e74ee27af305e0a7e2c6296d21ef5950764464a8-susedata.xml.zst
+-rw-r--r-- 1 root root  6072744 Nov 24 05:37 93b18e295a1fb35e028e7b5d14b3c435579f025316ebed8b365d601ffcc7d5b512c6b392a65ea9a11dc5aca350542d7327d93eb0126b76f3fca5fc85eca8d6b3-appdata.xml.gz
+-rw-r--r-- 1 root root   368990 Nov 24 05:37 f805a7f21ea99f655c08d173b4ec25f03ee88c88970c708df8423cc5ec49ca8bf09a2d120ff0df02323e722de0fc37e12413d8c52c22fda789a908bd9f254de3-updateinfo.xml.zst
+-rw-r--r-- 1 root root    14406 Nov 24 05:37 repomd.xml
+-rw-r--r-- 1 root root      827 Nov 24 05:37 repomd.xml.asc
+
+/var/cache/zypp/solv:
+total 20
+drwxr-xr-x 5 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 1 root root 4096 Nov 24 05:37 ..
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 @System
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 openSUSE:repo-openh264
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 openSUSE:repo-oss
+
+/var/cache/zypp/solv/@System:
+total 508
+drwxr-xr-x 2 root root   4096 Nov 24 05:37 .
+drwxr-xr-x 5 root root   4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root     76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 498104 Nov 24 05:37 solv
+-rw-r--r-- 1 root root   4560 Nov 24 05:37 solv.idx
+
+/var/cache/zypp/solv/openSUSE:repo-openh264:
+total 24
+drwxr-xr-x 2 root root 4096 Nov 24 05:37 .
+drwxr-xr-x 5 root root 4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root   76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 5915 Nov 24 05:37 solv
+-rw-r--r-- 1 root root  557 Nov 24 05:37 solv.idx
+
+/var/cache/zypp/solv/openSUSE:repo-oss:
+total 24592
+drwxr-xr-x 2 root root     4096 Nov 24 05:37 .
+drwxr-xr-x 5 root root     4096 Nov 24 05:37 ..
+-rw-r--r-- 1 root root       76 Nov 24 05:37 cookie
+-rw-r--r-- 1 root root 23377983 Nov 24 05:37 solv
+-rw-r--r-- 1 root root  1788921 Nov 24 05:37 solv.idx

@@ -1,0 +1,68 @@
+<div class="repeat">
+  {% set e = errors | get(key=p, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+  <label>Key
+    <input type="text" name="{{ p }}key" value="{{ counters.key }}"{% if part_only %} readonly{% endif %} spellcheck="false">
+    {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Counter set
+    <input type="text" name="{{ p }}object" value="{{ counters.object }}" spellcheck="false" placeholder="Web Service">
+    {% set e = errors | get(key=p ~ "object", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <div class="field-row">
+    <label>Label instances as
+      <input type="text" name="{{ p }}label" value="{{ counters.label }}" spellcheck="false" placeholder="site">
+      {% set e = errors | get(key=p ~ "label", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Only the instance
+      <input type="text" name="{{ p }}instance" value="{{ counters.instance }}" spellcheck="false">
+      {% set e = errors | get(key=p ~ "instance", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </div>
+  <label>Instances matching
+    <input type="text" name="{{ p }}pattern" value="{{ counters.pattern }}" spellcheck="false" placeholder="^\d+_(?<pool>.+)$">
+    <small>A regular expression whose named groups become labels.</small>
+    {% set e = errors | get(key=p ~ "pattern", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Leave out
+    <textarea name="{{ p }}exclude" rows="1" spellcheck="false">{{ counters.exclude }}</textarea>
+    <small>Instances, one to a line.</small>
+  </label>
+  <label>Groups from counters
+    <textarea name="{{ p }}groups" rows="1" spellcheck="false" placeholder="pid = ID Process">{{ counters.groups }}</textarea>
+    {% set e = errors | get(key=p ~ "groups", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <div class="field-row">
+    <label>Join counter set
+      <input type="text" name="{{ p }}join.object" value="{{ counters.join_object }}" spellcheck="false">
+      {% set e = errors | get(key=p ~ "join.object", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Join pattern
+      <input type="text" name="{{ p }}join.pattern" value="{{ counters.join_pattern }}" spellcheck="false">
+      {% set e = errors | get(key=p ~ "join.pattern", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </div>
+  {% set e = errors | get(key=p ~ "join.", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  <div class="field-row">
+    <label>Every
+      <input type="text" name="{{ p }}interval" value="{{ counters.interval }}" spellcheck="false" placeholder="As the agent's">
+      {% set e = errors | get(key=p ~ "interval", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Since version
+      <input type="text" name="{{ p }}since" value="{{ counters.since }}" spellcheck="false">
+      {% set e = errors | get(key=p ~ "since", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </div>
+  <label>Only when
+    <input type="text" name="{{ p }}when" value="{{ counters.when }}" spellcheck="false" autocomplete="off" data-cel="when">
+    {% set e = errors | get(key=p ~ "when", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  {% if not part_only %}<label class="checkbox"><input type="checkbox" name="{{ p }}enabled"{% if counters.enabled %} checked{% endif %}> Enabled</label>{% endif %}
+  {% set e = errors | get(key=p ~ "metrics", default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+  {% for metric in counters.metrics %}
+  {% set mp = p ~ "metric." ~ loop.index0 ~ "." %}
+  {% set remove = "counters." ~ c ~ ".metric." ~ loop.index0 %}
+  {% include "templates/_metric.html" %}
+  {% endfor %}
+  <button type="submit" name="form_action" value="add:counters.{{ c }}.metric" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add metric</button>
+  {% if not part_only %}<button type="submit" name="form_action" value="remove:counters.{{ c }}" class="danger" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove counters</button>{% endif %}
+</div>

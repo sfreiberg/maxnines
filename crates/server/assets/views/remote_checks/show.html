@@ -1,0 +1,164 @@
+{% extends "layouts/live.html" %}
+{% block title %}{{ name }} · Checks · MaxNines{% endblock title %}
+{% block refresh_every %}60s{% endblock refresh_every %}
+{% block content %}
+<p class="breadcrumb"><a href="/checks">Checks</a>{% if host %} · <a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% endif %}</p>
+<div class="title-row">
+  <div>
+    <h1>{{ name }}</h1>
+    <p class="subtitle check-target"><span class="badge neutral">{{ kind }}</span> {% if target %}<code>{{ target }}</code>{% endif %} <span>{% if host %}· about <a href="/hosts/{{ host.id }}">{{ host.hostname }}</a>{% endif %}</span></p>
+  </div>
+  <div class="actions">
+    {% if can_respond and enabled and kind != "heartbeat" %}
+    <form method="post" action="/checks/{{ id }}/run">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">Check now</button>
+    </form>
+    {% endif %}
+    {% if can_edit %}
+    <form method="post" action="/checks/{{ id }}/pause">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">{% if enabled %}Pause{% else %}Resume{% endif %}</button>
+    </form>
+    <a class="button secondary" href="/checks/{{ id }}/edit">Edit</a>
+    {% endif %}
+  </div>
+</div>
+
+<section class="stats" aria-label="How it is">
+  {% for tile in tiles %}
+  <div class="stats-cell">
+    <span class="label">{{ tile.label }}</span>
+    <span class="stats-value{% if tile.tone %} {{ tile.tone }}{% endif %}">{% if tile.label == "Status" and tile.tone %}<span class="status-dot {{ tile.tone }}" aria-hidden="true"></span>{% endif %}{{ tile.value }}</span>
+    <span class="stats-note">{{ tile.note }}</span>
+  </div>
+  {% endfor %}
+</section>
+
+{% if ping_url %}
+<section id="ping-address" class="card">
+  <div class="title-row">
+    <h2>Ping address</h2>
+    <form method="post" action="/checks/{{ id }}/ping-address">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">New address</button>
+    </form>
+  </div>
+  <p>Have the work fetch this when it finishes, such as with <code>curl -fsS -m 10 --retry 3</code>:</p>
+  <p><code class="ping-url">{{ ping_url }}</code></p>
+  <p class="hint">Add <code>/start</code> to the address as it starts, to time each run, and <code>/fail</code> when it fails, to be told at once. Anyone with the address can say the work ran, so keep it like a password. <strong>New address</strong> stops this one working at once. See <a href="/docs/checks#heartbeats">Heartbeats</a>.</p>
+</section>
+{% endif %}
+
+{% if alerts %}
+<section class="card">
+  {% for alert in alerts %}
+  <div class="problem">
+    {% if alert.severity == "critical" %}<span class="badge bad">Critical</span>{% else %}<span class="badge warn">Warning</span>{% endif %}
+    <span class="text">{{ alert.summary }}</span>
+    <a class="button secondary" href="/alerts">View</a>
+  </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+<section class="card">
+  <div class="title-row">
+    <h2>Availability</h2>
+    <span class="note">Each bar is half an hour of the last day</span>
+  </div>
+  <div class="check-bars" role="img" aria-label="Whether it passed in each half hour of the last 24 hours">
+    {% for bar in bars %}<span class="check-bar {{ bar }}"></span>{% endfor %}
+  </div>
+  <div class="check-bars-axis"><span>24 hours ago</span><span>12 hours ago</span><span>Now</span></div>
+  <div class="uptimes">
+    {% for uptime in uptimes %}
+    <div class="uptime">
+      <span class="label">{{ uptime.label }}</span>
+      <span class="stats-value{% if uptime.tone %} {{ uptime.tone }}{% endif %}">{% if uptime.percent %}{{ uptime.percent }}{% else %}–{% endif %}</span>
+      <span class="stats-note">{{ uptime.note }}</span>
+    </div>
+    {% endfor %}
+    <div class="uptime check-key">
+      <span><span class="check-bar passed"></span>Passed every run</span>
+      <span><span class="check-bar failed"></span>Failed at least once</span>
+      <span><span class="check-bar not_run"></span>Not run</span>
+    </div>
+  </div>
+  <p class="hint">Worked out from saved results, so a failure is placed to within the time between them. Longer ranges are kept less finely, as the server's retention settings say.</p>
+</section>
+
+<div class="split">
+  <section id="maintenance" class="card maintenance">
+    <h2>Maintenance</h2>
+    {% if maintenance %}
+    <div class="problem">
+      <span class="badge warn">Silenced</span>
+      <span class="text">Notifications about this check are held until {{ maintenance.until }}{% if maintenance.window %}, by the {{ maintenance.why }} maintenance window{% else %}: {{ maintenance.why }}{% if maintenance.by %}, started by {{ maintenance.by }}{% endif %}{% endif %}. Alerts still show, and any still firing then are sent when it ends.</span>
+      {% if maintenance.just_this_one and can_respond %}
+      <form method="post" action="/checks/{{ id }}/maintenance/end">
+        <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+        <button type="submit" class="secondary">End now</button>
+      </form>
+      {% elif maintenance.window %}
+      <a class="button secondary" href="/alerts/maintenance">Maintenance windows</a>
+      {% else %}
+      <a class="button secondary" href="/alerts/silences">Silences</a>
+      {% endif %}
+    </div>
+    {% elif can_respond %}
+    <form method="post" action="/checks/{{ id }}/maintenance" class="maintenance-form">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <label>Silence this check for
+        <select name="duration_secs">
+          {% for choice in maintenance_choices %}
+          <option value="{{ choice.secs }}"{% if choice.chosen %} selected{% endif %}>{{ choice.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>Reason
+        <input type="text" name="reason" maxlength="255" placeholder="Maintenance on {{ name }}" autocomplete="off">
+      </label>
+      <button type="submit" class="secondary">Start maintenance</button>
+    </form>
+    <p class="hint">Holds back every notification about this check, such as while its site is redeployed, and nothing else on {% if host %}{{ host.hostname }}{% else %}its host{% endif %}. It keeps running, and alerts still show.</p>
+    {% else %}
+    <p class="empty">Nothing is holding back notifications about this check.</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>Alert rules</h2>
+    {% if rules %}
+    <ul class="check-rules">
+      {% for rule in rules %}
+      <li><a href="/alerts/rules/{{ rule.id }}/edit">{{ rule.name }}</a> <span class="note">{{ rule.severity }}{% if rule.conditional %}, if its condition matches{% endif %}</span></li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="empty">No rule watches this check, so nobody is told when it fails.</p>
+    {% endif %}
+    {% if can_edit %}<div class="actions"><a class="button secondary" href="/alerts/rules/new">Add an alert rule</a></div>{% endif %}
+  </section>
+</div>
+
+<nav class="tabs" aria-label="Time range">
+  {% for option in ranges %}
+  <a href="/checks/{{ id }}?range={{ option.key }}"{% if option.selected %} class="selected" aria-current="true"{% endif %}>{{ option.label }}</a>
+  {% endfor %}
+</nav>
+<p class="hint">Times are in {{ time_zone }}. The page updates every minute.</p>
+
+<div class="charts">
+  {% for item in charts %}
+  {% set chart = item.chart %}
+  <section class="chart-card">
+    <div class="chart-heading">
+      <h2>{{ chart.title }}</h2>
+      {% if chart.has_data and item.table %}<a href="{{ item.table }}">View data</a>{% endif %}
+    </div>
+    {% include "metrics/_chart_body.html" %}
+  </section>
+  {% endfor %}
+</div>
+{% endblock content %}

@@ -1,0 +1,193 @@
+{% extends "layouts/application.html" %}
+{% block title %}{{ template.name }} · Templates · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a></p>
+<div id="template">
+<div class="title-row">
+  <div>
+    <h1>{{ template.name }}{% if not enabled %} <span class="badge neutral">Disabled</span>{% endif %}</h1>
+    {% if original %}<p class="hint">{% if enabled_choice %}{% if enabled %}Enabled{% else %}Disabled{% endif %} by your choice, whatever a newer version says.{% else %}{% if enabled %}Enabled{% else %}Disabled{% endif %} as the template comes, which a newer version can change.{% endif %}</p>{% endif %}
+    <p class="hint">{% if origin == "built_in" %}Comes with MaxNines{% if upgraded %} · updated {{ upgraded }}{% endif %}{% elif origin == "imported" %}Imported{% if upgraded %} · updated {{ upgraded }}{% endif %}{% else %}Yours{% endif %} · <code>{{ template.key }}</code> · {{ target }}</p>
+  </div>
+  {% if can_edit %}
+  <div class="actions">
+    <form method="post" action="/templates/{{ id }}/{% if enabled %}disable{% else %}enable{% endif %}" hx-post="/templates/{{ id }}/{% if enabled %}disable{% else %}enable{% endif %}" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">{% if enabled %}Disable{% else %}Enable{% endif %}</button>
+    </form>
+    {% if enabled_choice %}
+    <form method="post" action="/templates/{{ id }}/follow" hx-post="/templates/{{ id }}/follow" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+      <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+      <button type="submit" class="secondary">Follow the template</button>
+    </form>
+    {% endif %}
+    {% if not original %}<a class="button" href="/templates/{{ id }}/edit">Edit</a>{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% if template.description %}<p>{{ template.description }}</p>{% endif %}
+{% if config_rule %}<p class="hint">Its agent settings are the <a href="/rules/{{ config_rule.id }}/edit">{{ config_rule.name }} config rule</a>, in force while it's enabled, rather than part of its HCL.</p>{% endif %}
+{% if original %}<p class="hint">{% if origin == "imported" %}Importing a newer version replaces{% else %}Upgrades replace{% endif %} what this template says. Changing one of its alerts, queries, discover or counters blocks makes a copy of your own, used in its place, which that leaves alone, and turning it or a part of it off lasts through it.</p>{% endif %}
+
+<section class="card">
+  <h2>Hosts</h2>
+  <p class="hint">It's for the hosts given it here and those the condition picks by their facts. With neither, it's for every host. On each, it runs for {{ target | lower }}.</p>
+  {% if can_edit %}
+  <form method="post" action="/templates/{{ id }}/hosts" class="stacked" hx-post="/templates/{{ id }}/hosts" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    {% if hosts_error %}<p class="field-error">{{ hosts_error }}</p>{% endif %}
+    <label>Hosts matching
+      <input type="text" name="applies_to" value="{{ applies_to | default(value='') }}" spellcheck="false" autocomplete="off" data-cel="applies_to" placeholder="facts.custom.role == 'db'">
+      <small>CEL over a host's facts. Leave empty for every host, or only those given it below.{% if original %} {% if applies_to_chosen %}Your choice, whatever a newer version says{% if ships_applies_to %}: it comes as <code>{{ ships_applies_to }}</code>{% else %}: it comes for every host{% endif %}.{% else %}As the template comes, which a newer version can change.{% endif %}{% endif %}</small>
+    </label>
+    {% if hosts %}
+    <div class="checks" role="group" aria-label="Hosts given it">
+      {% for host in hosts %}
+      <label class="checkbox"><input type="checkbox" name="host.{{ host.id }}"{% if host.given %} checked{% endif %}> {{ host.hostname }}</label>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <div class="actions"><button type="submit" class="secondary">Save hosts</button></div>
+  </form>
+  {% else %}
+  <p>{% if applies_to %}Hosts where <code>{{ applies_to }}</code>{% if given_hosts %}, and {{ given_hosts | join(sep=", ") }}{% endif %}{% elif given_hosts %}{{ given_hosts | join(sep=", ") }}{% else %}Every host{% endif %}</p>
+  {% endif %}
+</section>
+
+<section class="card">
+  <h2>Where it runs</h2>
+  <p class="hint">Each host it's on and for, each database it reads there, what its discovery found and what it reads now, which is what the host is sent, and anything going wrong.</p>
+  {% set by_template = false %}
+  {% include "templates/_runs.html" %}
+  {% if not runs %}<p class="empty">It runs nowhere yet: it's off, or no host it's for has what it runs for.</p>{% endif %}
+</section>
+
+{% for section in part_sections %}
+{% set rows = section.rows %}
+{% if rows %}
+<section class="card">
+  <h2>{{ section.title }}</h2>
+  <p class="hint">{{ section.hint }}{% if original %} Changing one makes a copy of your own, used in its place, which upgrades leave alone.{% endif %}</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Key</th><th>Reads</th><th>Every</th><th></th><th></th></tr></thead>
+    <tbody>
+      {% for part in rows %}
+      <tr{% if not part.enabled %} class="disabled"{% endif %}>
+        <td><code class="nowrap">{{ part.key }}</code>{% if part.metrics %}<span class="under">Says more about {{ part.metrics | join(sep=", ") }}</span>{% endif %}</td>
+        <td>
+          <details><summary>{% if part.kind == "counters" %}{{ part.reads }}{% else %}{{ part.reads | truncate(length=60) }}{% endif %}</summary><pre class="table-scroll"><code>{{ part.reads }}</code></pre></details>
+          {% if part.when %}<div class="condition">Only when <code>{{ part.when }}</code></div>{% endif %}
+          {% if part.since %}<div class="condition">Since version <code>{{ part.since }}</code></div>{% endif %}
+          {% if part.copied %}<div class="hint">Your own copy.{% if part.changed %} A newer version changed the template's on {{ part.changed }}.{% endif %}</div>
+          <details><summary>As the template comes</summary><pre class="table-scroll"><code>{{ part.comes_as }}</code></pre></details>{% endif %}
+        </td>
+        <td class="nowrap">{{ part.every }}</td>
+        <td>{% if not part.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if part.copied %} <span class="badge hollow">Yours</span>{% endif %}{% if part.enabled_chosen %}<span class="under">{% if part.enabled %}On{% else %}Off{% endif %} by your choice</span>{% endif %}</td>
+        <td>
+          {% if can_edit %}
+          <div class="actions row-actions">
+            {% if part.turns_off %}
+            <form method="post" action="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/{% if part.enabled %}disable{% else %}enable{% endif %}" hx-post="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/{% if part.enabled %}disable{% else %}enable{% endif %}" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">{% if part.enabled %}Disable{% else %}Enable{% endif %}</button>
+            </form>
+            {% endif %}
+            <a class="button secondary" href="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/edit">Change</a>
+            {% if original and (part.copied or part.enabled_chosen) %}
+            <form method="post" action="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/reset" hx-post="/templates/{{ id }}/{{ part.segment }}/{{ part.key }}/reset" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">Reset to template</button>
+            </form>
+            {% endif %}
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+{% endfor %}
+
+<section class="card">
+  <h2>Alerts</h2>
+  {% if alerts %}
+  <div class="table-scroll"><table>
+    <thead><tr><th>Name</th><th>Alerts when</th><th>For</th><th></th><th></th></tr></thead>
+    <tbody>
+      {% for alert in alerts %}
+      <tr{% if not alert.enabled %} class="disabled"{% endif %}>
+        <td><a href="/alerts/rules/{{ alert.rule_id }}/edit">{{ alert.name }}</a><span class="under"><code>{{ alert.key }}</code></span>{% if alert.built_in and alert.built_in.name != alert.name %}<span class="under">Comes as: {{ alert.built_in.name }}</span>{% endif %}</td>
+        <td>
+          {% if alert.warning %}<div class="condition"><span class="badge warn">Warning</span> <code>{{ alert.warning }}</code></div>{% endif %}
+          {% if alert.critical %}<div class="condition"><span class="badge bad">Critical</span> <code>{{ alert.critical }}</code></div>{% endif %}
+          {% if alert.built_in %}
+          <div class="hint">Your own copy. It comes as{% if alert.built_in.warning %} warning <code>{{ alert.built_in.warning }}</code>{% endif %}{% if alert.built_in.warning and alert.built_in.critical %},{% endif %}{% if alert.built_in.critical %} critical <code>{{ alert.built_in.critical }}</code>{% endif %}, for {{ alert.built_in.hold }}.{% if alert.built_in_changed %} A newer version changed that on {{ alert.built_in_changed }}.{% endif %}</div>
+          {% endif %}
+          {% if alert.picks_by_discovery %}<div class="hint">Only for the databases where what discovery found fits its <code>when</code> or <code>since</code>.</div>{% endif %}
+        </td>
+        <td class="nowrap">{{ alert.hold }}</td>
+        <td>{% if not alert.enabled %}<span class="badge neutral">Disabled</span>{% endif %}{% if alert.built_in %} <span class="badge hollow">Yours</span>{% endif %}{% if alert.enabled_chosen and not alert.built_in %}<span class="under">{% if alert.enabled %}On{% else %}Off{% endif %} by your choice</span>{% endif %}</td>
+        <td>
+          {% if can_edit %}
+          <div class="actions row-actions">
+            <form method="post" action="/templates/{{ id }}/alerts/{{ alert.rule_id }}/{% if alert.enabled %}disable{% else %}enable{% endif %}" hx-post="/templates/{{ id }}/alerts/{{ alert.rule_id }}/{% if alert.enabled %}disable{% else %}enable{% endif %}" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">{% if alert.enabled %}Disable{% else %}Enable{% endif %}</button>
+            </form>
+            <a class="button secondary" href="/alerts/rules/{{ alert.rule_id }}/edit">Change</a>
+            {% if alert.built_in or alert.enabled_chosen %}
+            <form method="post" action="/templates/{{ id }}/alerts/{{ alert.rule_id }}/reset" hx-post="/templates/{{ id }}/alerts/{{ alert.rule_id }}/reset" hx-target="#template" hx-select="#template" hx-swap="morph:outerHTML">
+              <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+              <button type="submit" class="secondary">Reset to template</button>
+            </form>
+            {% endif %}
+          </div>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+  {% else %}
+  <p class="empty">This template has no alerts.</p>
+  {% endif %}
+</section>
+
+{% if metrics %}
+<section class="card">
+  <h2>Metrics</h2>
+  <p class="hint">Its alerts use these by their short names, like <code>{{ metrics[0].short }}</code>, and anything else by its full name, like <code>{{ metrics[0].name }}</code>.</p>
+  <div class="table-scroll"><table>
+    <thead><tr><th>Name</th><th>Kind</th><th>Labels</th><th>Unit</th><th>From</th></tr></thead>
+    <tbody>
+      {% for metric in metrics %}
+      <tr>
+        <td>{{ metric.title }}<span class="under"><code>{{ metric.name }}</code>{% if metric.description %} · {{ metric.description }}{% endif %}</span></td>
+        <td>{{ metric.kind }}</td>
+        <td>{{ metric.labels }}</td>
+        <td>{{ metric.unit }}</td>
+        <td>{{ metric.from }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+</div>
+
+<section class="card">
+  <h2>HCL</h2>
+  <p class="hint">Written out from the template as it's kept.</p>
+  <p class="hint"><a href="/templates/{{ id }}/export">Export</a>{% if not original and can_edit %} · <a href="/templates/{{ id }}/edit/hcl">Edit as HCL</a>{% endif %}</p>
+  <pre class="table-scroll"><code>{{ source }}</code></pre>
+</section>
+
+{% if origin != "built_in" and can_edit %}
+<form method="post" action="/templates/{{ id }}/delete" class="delete-form">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

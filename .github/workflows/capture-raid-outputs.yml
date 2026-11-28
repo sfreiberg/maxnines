@@ -1,0 +1,89 @@
+# Captures what Linux software RAID, ZFS, Storage Spaces and AppleRAID say about
+# arrays and pools built for it, in each state the agent's raid collector reads,
+# so its parsers are tested against real output. It runs by hand from the Actions
+# tab, and by itself only when this file, its scripts or the collector's Windows
+# script change, never for other pushes, so CI is no slower. Download its
+# artifacts into crates/agent/fixtures/raid/.
+name: Capture RAID outputs
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/capture-raid-outputs.yml
+      - crates/agent/fixtures/raid/capture-*
+      - crates/agent/src/raid.ps1
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-22.04]
+    steps:
+      - uses: actions/checkout@v5
+      - run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq mdadm zfsutils-linux >/dev/null
+          # zinject, which slows a scan down enough to be seen, where it's packaged.
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq zfs-test >/dev/null || true
+      - run: sudo sh crates/agent/fixtures/raid/capture-md.sh
+      - run: sudo sh crates/agent/fixtures/raid/capture-zfs.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: raid-${{ matrix.runner }}
+          path: out/
+
+  # GitHub has no FreeBSD runners, so this runs in a FreeBSD virtual machine:
+  # 14 has OpenZFS 2.2 in its base system, and 15 has 2.4, which prints JSON too.
+  freebsd:
+    name: FreeBSD ${{ matrix.release }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["14.3", "15.0"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          copyback: true
+          run: sh crates/agent/fixtures/raid/capture-zfs.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: raid-freebsd-${{ matrix.release }}
+          path: out/
+
+  windows:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-2025, windows-2022]
+    steps:
+      - uses: actions/checkout@v5
+      - shell: powershell
+        run: .\crates\agent\fixtures\raid\capture-windows.ps1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: raid-${{ matrix.runner }}
+          path: out/
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo sh crates/agent/fixtures/raid/capture-macos.sh
+      - uses: actions/upload-artifact@v7
+        with:
+          name: raid-macos
+          path: out/

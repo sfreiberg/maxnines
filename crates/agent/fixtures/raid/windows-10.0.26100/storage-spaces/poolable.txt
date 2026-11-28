@@ -1,0 +1,12 @@
+
+FriendlyName      BusType             CanPool CannotPoolReason              Size
+------------      -------             ------- ----------------              ----
+Msft Virtual Disk File Backed Virtual    True                         8589934592
+Msft Virtual Disk File Backed Virtual    True                         8589934592
+Msft Virtual Disk File Backed Virtual    True                         8589934592
+Msft Virtual Disk SAS                   False Insufficient Capacity 161061273600
+Msft Virtual Disk SAS                   False Insufficient Capacity 161061273600
+Msft Virtual Disk File Backed Virtual    True                         8589934592
+
+
+

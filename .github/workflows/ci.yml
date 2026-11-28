@@ -1,0 +1,74 @@
+# Checks formatting, runs clippy and runs every test, on each system the agent
+# and server are built for. Much of the agent only compiles on one system, so each
+# gets its own clippy and tests.
+#
+# It runs for pull requests, for pushes to main, and by hand from the Actions tab.
+# A branch's commits are checked through its pull request, so each runs once. The
+# release workflow runs this too, for the tagged commit, and publishes nothing
+# unless it passes.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer commit on the same branch or pull request replaces a run still going.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  licenses:
+    name: Licenses
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Every dependency's license has to be one deny.toml allows. Advisories
+      # aren't checked here, as a new one would fail a change that didn't cause it.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+  test:
+    name: Clippy and tests on ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux, runner: ubuntu-24.04 }
+          - { name: macOS, runner: macos-15 }
+          - { name: Windows, runner: windows-2025 }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      # The build goes where .cargo/config.toml says, not ./target. A run whose
+      # tests fail still saves what it built, which is the slow part.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target.nosync"
+          cache-on-failure: true
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Every crate's tests run, so one run shows every failure.
+      - run: cargo test --workspace --locked --no-fail-fast

@@ -1,0 +1,49 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if name %}Edit variable{% else %}Add variable{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/dashboards/{{ dashboard_id }}/edit">{{ dashboard_name }}</a></p>
+<h1>{% if name %}Edit variable{% else %}Add variable{% endif %}</h1>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<form method="post" action="/dashboards/{{ dashboard_id }}/variables{% if name %}/{{ name }}{% endif %}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+
+  <label>Name
+    <input type="text" name="name" value="{{ variable.name }}" required maxlength="32" pattern="\$?[A-Za-z][A-Za-z0-9_]*">
+    <span class="note">Widgets use it as <code>$name</code>. Letters, digits and _, starting with a letter.</span>
+  </label>
+
+  <label>Label
+    <input type="text" name="label" value="{{ variable.label }}" maxlength="100">
+    <span class="note">What the picker is called. Leave it empty to use the name.</span>
+  </label>
+
+  <label>Picks
+    <select name="kind">
+      <option value="host"{% if variable.kind == "host" %} selected{% endif %}>One host</option>
+      <option value="fact"{% if variable.kind == "fact" %} selected{% endif %}>A value of a fact, or all of them</option>
+    </select>
+  </label>
+
+  <label>Fact
+    <input type="text" name="fact" value="{{ variable.fact }}" maxlength="200" placeholder="os.name">
+    <span class="note">Only used for a value of a fact. The picker offers the values the hosts have.</span>
+  </label>
+
+  <label>Hosts
+    <input type="text" name="filter" value="{{ variable.filter }}" maxlength="500" placeholder="os=windows">
+    <span class="note">Which hosts it offers, or whose values it offers, in the same filter as the Hosts list. Leave it empty for every host.</span>
+  </label>
+
+  <button type="submit">{% if name %}Save{% else %}Add variable{% endif %}</button>
+</form>
+
+{% if name %}
+<form method="post" action="/dashboards/{{ dashboard_id }}/variables/{{ name }}/delete">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <button type="submit" class="danger">Delete</button>
+</form>
+{% endif %}
+{% endblock content %}

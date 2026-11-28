@@ -1,0 +1,22 @@
+{% extends "layouts/public.html" %}
+{% block title %}Set your password · MaxNines{% endblock title %}
+{% block content %}
+{% if person %}
+<div>
+  <h1>Set your password</h1>
+  <p class="subtitle">For {{ person.email }}.</p>
+</div>
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+<form method="post" action="/setup/{{ link }}" class="stacked">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  <input type="text" name="username" value="{{ person.email }}" autocomplete="username" hidden>
+  <label>New password <input type="password" name="password" autocomplete="new-password" minlength="12" required autofocus><small>At least 12 characters. A few random words work well.</small></label>
+  <label>Confirm password <input type="password" name="confirm" autocomplete="new-password" required></label>
+  <button type="submit">Set password</button>
+</form>
+{% else %}
+<h1>This link has stopped working</h1>
+<p class="hint">It's already been used, or it's more than 7 days old. Ask whoever added you for a new one.</p>
+<a class="button secondary" href="/login">Sign in</a>
+{% endif %}
+{% endblock content %}

@@ -1,0 +1,4 @@
+{% extends "layouts/application.html" %}
+{% block head %}<noscript><meta http-equiv="refresh" content="60"></noscript>{% endblock head %}
+{% block status %}<span id="live-status" class="live-pill">Live</span>{% endblock status %}
+{% block main_attributes %} hx-get="" hx-trigger="every {% block refresh_every %}15s{% endblock refresh_every %}" hx-select="#page" hx-select-oob="#alerts-link:morph:outerHTML" hx-swap="morph:outerHTML"{% endblock main_attributes %}

@@ -1,0 +1,6 @@
+
+curl-minimal.x86_64                 7.76.1-44.el9_9.1                     baseos
+expat.x86_64                        2.5.0-9.el9_9.8                       baseos
+libcurl-minimal.x86_64              7.76.1-44.el9_9.1                     baseos
+systemd-libs.x86_64                 252-79.el9_9.1.rocky.0.1              baseos
+vim-minimal.x86_64                  2:8.2.2637-44.el9_9                   baseos

@@ -1,0 +1,5 @@
+state=0
+status=0x2001
+maxerror=181018
+esterror=5237
+offset=409969

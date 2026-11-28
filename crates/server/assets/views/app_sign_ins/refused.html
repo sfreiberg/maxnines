@@ -1,0 +1,8 @@
+{% extends "layouts/application.html" %}
+{% block title %}Can't sign in this app · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<h1>This app can't be signed in</h1>
+<p class="error">{{ message }}</p>
+<p><a href="/">Back to the overview</a></p>
+{% endblock content %}

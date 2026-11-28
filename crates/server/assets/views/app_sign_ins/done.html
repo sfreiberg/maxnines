@@ -1,0 +1,12 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if approved %}Signed in{% else %}Not signed in{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+{% if approved %}
+<h1>{{ app }} is signed in</h1>
+<p class="subtitle">{% if device %}On {{ device }}. {% endif %}You can close this page and go back to it. Revoke it any time under <a href="/settings/apps">Signed-in apps</a>.</p>
+{% else %}
+<h1>{{ app }} wasn't signed in</h1>
+<p class="subtitle">It's been told no. You can close this page.</p>
+{% endif %}
+{% endblock content %}

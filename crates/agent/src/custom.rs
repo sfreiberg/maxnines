@@ -1,0 +1,878 @@
+//! Your own metrics, from commands defined in the agent's config file.
+//!
+//! The commands stay in that file on purpose. The server only chooses which names
+//! to collect, so it can never make a host run anything new, even if someone
+//! takes it over. Commands run directly, without a shell.
+//!
+//! A command prints one number, or a JSON object of names and numbers so that one
+//! run can report several things. Only those numbers are reported. Other output
+//! could hold secrets, so failures are described by fixed messages and nothing else.
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+
+use anyhow::{Result, ensure};
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at, filled, names};
+use maxnines_protocol::entries::Entry;
+use maxnines_protocol::is_custom_metric_name;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+use tokio::sync::{oneshot, watch};
+use tokio::time::timeout;
+
+use crate::background::{Background, FAILED_UNEXPECTEDLY, rows_of};
+use crate::collector::Collector;
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_DEFINITIONS: usize = 64;
+
+/// A number is short, so anything past this is a command doing something else.
+const MAX_OUTPUT_BYTES: usize = 4096;
+
+/// How long a command gets to be cleaned up once its own time limit is up.
+const GRACE: Duration = Duration::from_secs(1);
+
+const NOT_DEFINED: &str = "not defined on this agent";
+const TIMED_OUT: &str = "timed out";
+const NOT_STARTED: &str = "couldn't start the command";
+const NOT_READ: &str = "couldn't read the command's output";
+const TOO_MUCH_OUTPUT: &str = "printed too much";
+const NOT_A_NUMBER: &str = "didn't print a number or a JSON object of numbers";
+
+/// How many values one command can report. Each one is a series on the server.
+const MAX_VALUES: usize = 32;
+
+/// One `custom_metric` block in the agent's config.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CustomMetric {
+    /// The program, then its arguments.
+    pub command: Vec<String>,
+    #[serde(
+        rename = "timeout_secs",
+        default,
+        with = "maxnines_protocol::time::optional_seconds"
+    )]
+    pub timeout: Option<Duration>,
+}
+
+impl CustomMetric {
+    fn limit(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_TIMEOUT)
+    }
+}
+
+/// Everything the agent's config defines, by name.
+pub type Definitions = BTreeMap<String, CustomMetric>;
+
+pub fn check_definitions(definitions: &Definitions) -> Result<()> {
+    ensure!(
+        definitions.len() <= MAX_DEFINITIONS,
+        "at most {MAX_DEFINITIONS} custom metrics can be defined"
+    );
+    for (name, metric) in definitions {
+        ensure!(
+            is_custom_metric_name(name),
+            "custom metric name {name:?} can only use letters, digits, ., - and _"
+        );
+        ensure!(
+            metric
+                .command
+                .first()
+                .is_some_and(|program| !program.is_empty()),
+            "custom metric {name:?} needs a command"
+        );
+        ensure!(
+            metric
+                .timeout
+                .is_none_or(|timeout| (Duration::from_secs(1)..=MAX_TIMEOUT).contains(&timeout)),
+            "custom metric {name:?} needs a timeout_secs from 1 to {}",
+            MAX_TIMEOUT.as_secs()
+        );
+    }
+    Ok(())
+}
+
+pub struct CustomCollector {
+    background: Background,
+}
+
+impl CustomCollector {
+    pub fn new(names: Vec<String>, definitions: &Definitions, interval: Duration) -> Result<Self> {
+        let mut background = Background::new();
+        for name in names {
+            let Some(metric) = definitions.get(&name).cloned() else {
+                background.constant(Value::Array(report(&name, Err(NOT_DEFINED.to_string()))));
+                continue;
+            };
+            let limit = metric.limit();
+            let wanted = Arc::new((name, metric));
+            let late = Value::Array(report(&wanted.0, Err(TIMED_OUT.to_string())));
+            let broke = Value::Array(report(&wanted.0, Err(FAILED_UNEXPECTEDLY.to_string())));
+            let reported = wanted.clone();
+            background.repeat(
+                interval,
+                Some(limit + GRACE),
+                move || {
+                    let wanted = wanted.clone();
+                    async move { measure(&wanted.0, &wanted.1, limit).await }
+                },
+                move |found| match found {
+                    Ok(result) => Value::Array(report(&reported.0, result)),
+                    Err(missed) => missed.pick(&late, &broke),
+                },
+            )?;
+        }
+        Ok(Self { background })
+    }
+}
+
+impl Collector for CustomCollector {
+    fn name(&self) -> &'static str {
+        "custom"
+    }
+
+    fn collect(&mut self) -> Result<Value> {
+        Ok(self.background.rows())
+    }
+
+    fn metrics(&self) -> Vec<String> {
+        names(&CUSTOM_METRICS)
+    }
+
+    fn read(&mut self, _time: DateTime<Utc>) -> Result<Vec<Entry>> {
+        Ok(self
+            .background
+            .read(|result, time| self.entries(result, time)))
+    }
+
+    /// One command's run, or each item of a list, under the command's own names
+    /// only, as each runs apart from the others.
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let named = rows_of(output)
+            .iter()
+            .filter_map(|item| Some((item.get("name")?.as_str()?, item)));
+        for (name, item) in named {
+            let value = at(item, "value");
+            // One of a command's several values, which says nothing of whether the
+            // command worked.
+            if item.get("ok").is_none() {
+                entries.read("custom.value", &[name], value);
+                continue;
+            }
+            // A command that failed is a value of whether it worked, and why is the
+            // error of the value it didn't give. Its own item says something of
+            // its value every time, so the error ends when it works again, even
+            // when its values are items of their own.
+            entries.read("custom.ok", &[name], at(item, "ok"));
+            let why = filled(at(item, "error")).as_str();
+            entries.read_or("custom.value", &[name], value, why);
+        }
+        entries.done()
+    }
+}
+
+/// A custom metric's metrics: whether its command worked, and each value it gave.
+const CUSTOM_METRICS: [&str; 2] = ["custom.ok", "custom.value"];
+
+/// What a command printed.
+#[derive(Debug, PartialEq)]
+enum Reading {
+    One(f64),
+    /// Full series names and their values.
+    Several(BTreeMap<String, f64>),
+}
+
+/// One item per series. Whether the command worked goes on an item of its own
+/// when there are several values, as a failure can't say which ones it would have
+/// given, and it's what an alert watches.
+fn report(name: &str, result: Result<Reading, String>) -> Vec<Value> {
+    match result {
+        Ok(Reading::One(value)) => vec![json!({ "name": name, "ok": 1, "value": value })],
+        Ok(Reading::Several(values)) => std::iter::once(json!({ "name": name, "ok": 1 }))
+            .chain(
+                values
+                    .into_iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value })),
+            )
+            .collect(),
+        Err(error) => vec![json!({ "name": name, "ok": 0, "error": error })],
+    }
+}
+
+/// Runs a command and gives what it printed.
+async fn measure(name: &str, metric: &CustomMetric, limit: Duration) -> Result<Reading, String> {
+    // A little more than is allowed, to tell when there was too much.
+    match run_command(&metric.command, limit, MAX_OUTPUT_BYTES as u64 + 1).await {
+        Ok((status, output)) => interpret(name, status, &output),
+        Err(failure) => Err(failure.to_string()),
+    }
+}
+
+/// Why a command defined in the agent's config gave nothing to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Failure {
+    NotStarted,
+    NotRead,
+    TimedOut,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotStarted => NOT_STARTED,
+            Self::NotRead => NOT_READ,
+            Self::TimedOut => TIMED_OUT,
+        })
+    }
+}
+
+/// Runs a command from the agent's config, as custom metrics and check commands
+/// both do: directly rather than through a shell, with nothing to read and its
+/// errors ignored, and in a process group of its own so that running out of time
+/// stops what it started too. Up to `max_output` bytes of what it prints are read,
+/// and the rest is let go, which also stops a command that's still writing from
+/// waiting on it.
+pub(crate) async fn run_command(
+    command: &[String],
+    limit: Duration,
+    max_output: u64,
+) -> Result<(ExitStatus, Vec<u8>), Failure> {
+    let (program, arguments) = command.split_first().ok_or(Failure::NotStarted)?;
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command.spawn().map_err(|_| Failure::NotStarted)?;
+    let id = child.id();
+    let stdout = child.stdout.take().ok_or(Failure::NotRead)?;
+    let outputs = Outputs::read(vec![Box::new(stdout)], max_output);
+    match timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => {
+            let printed = outputs.settle().await;
+            Ok((status, printed.into_iter().next().unwrap_or_default()))
+        }
+        Ok(Err(_)) => Err(Failure::NotRead),
+        Err(_) => {
+            stop_group(id);
+            Err(Failure::TimedOut)
+        }
+    }
+}
+
+/// How long what a command printed is still read once it has ended, for what was
+/// left in the pipe.
+const READ_AFTER_EXIT: Duration = Duration::from_millis(500);
+
+/// How much more than is kept is read and let go while a command runs, so one that
+/// prints a lot can finish, while one that prints without end is stopped.
+const LET_GO_BYTES: u64 = 1024 * 1024;
+
+/// A command's outputs, each read on a task of its own as it runs. Up to a number
+/// of bytes of each is kept, and the rest read and let go rather than left unread,
+/// as a command whose output is closed on it is stopped by the signal that says so,
+/// as if it had failed. While it runs, more than [`LET_GO_BYTES`] past what's kept
+/// closes it, which stops a command printing without end. Once it's ended, what
+/// still holds an output, such as a program it started, has it read until it lets
+/// it go, so that program carries on.
+pub(crate) struct Outputs {
+    kept: Vec<Arc<Mutex<Vec<u8>>>>,
+    settled: Vec<oneshot::Receiver<()>>,
+    ended: watch::Sender<bool>,
+}
+
+type Output = Box<dyn AsyncRead + Unpin + Send>;
+
+impl Outputs {
+    pub(crate) fn read(outputs: Vec<Output>, keep: u64) -> Self {
+        let (ended, ended_seen) = watch::channel(false);
+        let mut kept = Vec::new();
+        let mut settled = Vec::new();
+        for output in outputs {
+            let held = Arc::new(Mutex::new(Vec::new()));
+            let (settle, settling) = oneshot::channel();
+            tokio::spawn(read_output(
+                output,
+                keep,
+                held.clone(),
+                settle,
+                ended_seen.clone(),
+            ));
+            kept.push(held);
+            settled.push(settling);
+        }
+        Self {
+            kept,
+            settled,
+            ended,
+        }
+    }
+
+    /// What each output printed, once its command has ended or been stopped: what
+    /// was left in the pipes is read for a moment more.
+    pub(crate) async fn settle(self) -> Vec<Vec<u8>> {
+        self.ended.send_replace(true);
+        let settling = async {
+            for settled in self.settled {
+                let _ = settled.await;
+            }
+        };
+        let _ = timeout(READ_AFTER_EXIT, settling).await;
+        self.kept
+            .iter()
+            .map(|kept| std::mem::take(&mut *kept.lock().unwrap_or_else(PoisonError::into_inner)))
+            .collect()
+    }
+}
+
+/// Reads one output for [`Outputs`], saying it's settled once `keep` bytes are
+/// kept or it's closed.
+async fn read_output(
+    mut output: Output,
+    keep: u64,
+    kept: Arc<Mutex<Vec<u8>>>,
+    settle: oneshot::Sender<()>,
+    ended: watch::Receiver<bool>,
+) {
+    let mut settle = Some(settle);
+    let mut let_go = 0;
+    let mut buffer = vec![0; 8192];
+    loop {
+        let read = match output.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => read,
+        };
+        let mut rest = &buffer[..read];
+        if settle.is_some() {
+            let mut held = kept.lock().unwrap_or_else(PoisonError::into_inner);
+            let room = usize::try_from(keep).unwrap_or(usize::MAX) - held.len();
+            let taken = rest.len().min(room);
+            held.extend_from_slice(&rest[..taken]);
+            rest = &rest[taken..];
+            if held.len() as u64 >= keep {
+                settle.take().map(|settle| settle.send(()));
+            }
+        }
+        if !*ended.borrow() {
+            let_go += rest.len() as u64;
+            if let_go > LET_GO_BYTES {
+                break;
+            }
+        }
+    }
+    if let Some(settle) = settle {
+        let _ = settle.send(());
+    }
+}
+
+fn interpret(name: &str, status: ExitStatus, output: &[u8]) -> Result<Reading, String> {
+    if output.len() > MAX_OUTPUT_BYTES {
+        return Err(TOO_MUCH_OUTPUT.to_string());
+    }
+    if !status.success() {
+        return Err(match status.code() {
+            Some(code) => format!("exited with status {code}"),
+            None => "was stopped by a signal".to_string(),
+        });
+    }
+    parse_output(name, output).ok_or_else(|| NOT_A_NUMBER.to_string())
+}
+
+fn parse_output(name: &str, output: &[u8]) -> Option<Reading> {
+    let text = std::str::from_utf8(output).ok()?.trim();
+    if let Ok(value) = text.parse::<f64>() {
+        return value.is_finite().then_some(Reading::One(value));
+    }
+
+    let values: BTreeMap<String, f64> = serde_json::from_str(text).ok()?;
+    if values.is_empty() || values.len() > MAX_VALUES {
+        return None;
+    }
+    let named: BTreeMap<String, f64> = values
+        .into_iter()
+        .map(|(key, value)| (format!("{name}.{key}"), value))
+        .collect();
+    named
+        .keys()
+        .all(|name| is_custom_metric_name(name))
+        .then_some(Reading::Several(named))
+}
+
+/// Dropping the child only stops the command, not what it started.
+#[cfg(unix)]
+pub(crate) fn stop_group(id: Option<u32>) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    let group = id
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw);
+    if let Some(group) = group {
+        // It may have just finished by itself, which is fine.
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn stop_group(_id: Option<u32>) {}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    use std::time::Instant;
+
+    use maxnines_collectors::entries::testing::{
+        every_entry_is_for_its_metrics, every_metric_has_an_entry, said, time,
+    };
+
+    use super::*;
+    use crate::background::testing::{each_is_for_a_series, read_once};
+
+    /// Running nothing, so no program is started.
+    fn running_nothing() -> CustomCollector {
+        CustomCollector::new(Vec::new(), &Definitions::new(), Duration::from_secs(3600)).unwrap()
+    }
+
+    #[test]
+    fn custom_entries_have_a_series_for_each_command_and_each_of_its_values() {
+        let collector = running_nothing();
+        let output = json!([
+            { "name": "queue", "ok": 1, "value": 12.0 },
+            // One that gave several values, each an item of its own.
+            { "name": "app", "ok": 1 },
+            { "name": "app.jobs", "value": 3.0 },
+            { "name": "app.workers" },
+            // One that failed says why.
+            { "name": "backup", "ok": 0, "error": "timed out" },
+            // One without a name can't be told from the others.
+            { "ok": 1, "value": 1.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("custom.ok[queue]"), json!(1)),
+                (of("custom.value[queue]"), json!(12.0)),
+                (of("custom.ok[app]"), json!(1)),
+                (of("custom.value[app]"), Value::Null),
+                (of("custom.value[app.jobs]"), json!(3.0)),
+                (of("custom.value[app.workers]"), Value::Null),
+                // Failing is what it found, and why is the error of its value.
+                (of("custom.ok[backup]"), json!(0)),
+                (of("custom.value[backup]"), json!({ "error": "timed out" })),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+        each_is_for_a_series(&entries);
+
+        // With no commands, or none run yet, nothing is said, as nothing one
+        // command says is about the others.
+        for output in [json!([]), Value::Null] {
+            assert_eq!(collector.entries(&output, time()), []);
+        }
+    }
+
+    #[test]
+    fn each_commands_run_is_its_own_and_handed_over_once() {
+        let several = Reading::Several(BTreeMap::from([("app.jobs".to_string(), 3.0)]));
+        let mut collector = CustomCollector {
+            background: Background::holding([
+                Value::Array(report("app", Ok(several))),
+                Value::Array(report("gone", Err(NOT_DEFINED.to_string()))),
+            ]),
+        };
+        let read = read_once(&mut collector);
+        assert_eq!(read.len(), 3 + 2);
+        each_is_for_a_series(&read);
+        every_entry_is_for_its_metrics(&collector, &read);
+    }
+
+    #[test]
+    fn what_a_command_reports_becomes_entries() {
+        let collector = running_nothing();
+        let several = Reading::Several(BTreeMap::from([("app.jobs".to_string(), 3.0)]));
+        let mut output = report("queue", Ok(Reading::One(12.0)));
+        output.extend(report("app", Ok(several)));
+        output.extend(report("gone", Err(NOT_DEFINED.to_string())));
+        let entries = collector.entries(&Value::Array(output), time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("custom.ok[queue]"), json!(1)),
+                (of("custom.value[queue]"), json!(12.0)),
+                (of("custom.ok[app]"), json!(1)),
+                (of("custom.value[app]"), Value::Null),
+                (of("custom.value[app.jobs]"), json!(3.0)),
+                (of("custom.ok[gone]"), json!(0)),
+                (of("custom.value[gone]"), json!({ "error": NOT_DEFINED })),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn running_no_commands_collects_and_says_nothing() {
+        let mut collector = running_nothing();
+        assert_eq!(collector.collect().unwrap(), json!([]));
+        assert_eq!(collector.read(time()).unwrap(), []);
+    }
+
+    fn metric(command: &[&str]) -> CustomMetric {
+        CustomMetric {
+            command: command.iter().map(ToString::to_string).collect(),
+            timeout: None,
+        }
+    }
+
+    fn definitions(entries: &[(&str, CustomMetric)]) -> Definitions {
+        entries
+            .iter()
+            .map(|(name, metric)| (name.to_string(), metric.clone()))
+            .collect()
+    }
+
+    fn one(output: &[u8]) -> Option<f64> {
+        match parse_output("m", output)? {
+            Reading::One(value) => Some(value),
+            Reading::Several(_) => None,
+        }
+    }
+
+    #[test]
+    fn numbers_are_read_however_they_are_written() {
+        assert_eq!(one(b"12\n"), Some(12.0));
+        assert_eq!(one(b"  -1.5  \n"), Some(-1.5));
+        assert_eq!(one(b"2e3"), Some(2000.0));
+    }
+
+    #[test]
+    fn anything_else_is_not_a_number() {
+        for output in [
+            &b""[..],
+            b"ok",
+            b"12 items",
+            b"1\n2\n",
+            b"NaN",
+            b"inf",
+            b"-inf",
+            b"\xff\xfe",
+        ] {
+            assert_eq!(parse_output("m", output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn a_json_object_gives_several_values_under_the_metric_name() {
+        let output = br#"{ "depth": 12, "oldest.secs": 3.5 }"#;
+        let expected = BTreeMap::from([
+            ("queue.depth".to_string(), 12.0),
+            ("queue.oldest.secs".to_string(), 3.5),
+        ]);
+        assert_eq!(
+            parse_output("queue", output),
+            Some(Reading::Several(expected))
+        );
+    }
+
+    #[test]
+    fn json_that_is_not_a_flat_object_of_numbers_is_refused() {
+        for output in [
+            &br#"{}"#[..],
+            br#"[1, 2]"#,
+            br#"{ "a": "text" }"#,
+            br#"{ "a": { "b": 1 } }"#,
+            br#"{ "a": null }"#,
+            br#"{ "two words": 1 }"#,
+            br#"{ "<!here>": 1 }"#,
+        ] {
+            assert_eq!(parse_output("m", output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn a_name_too_long_for_a_series_is_refused() {
+        let output = format!(r#"{{ "{}": 1 }}"#, "x".repeat(64));
+        assert_eq!(parse_output("m", output.as_bytes()), None);
+    }
+
+    #[test]
+    fn there_is_a_limit_on_values() {
+        let fields = |count: usize| {
+            let fields: Vec<String> = (0..count).map(|i| format!(r#""v{i}": 1"#)).collect();
+            format!("{{ {} }}", fields.join(", "))
+        };
+        assert!(parse_output("m", fields(MAX_VALUES).as_bytes()).is_some());
+        assert!(parse_output("m", fields(MAX_VALUES + 1).as_bytes()).is_none());
+    }
+
+    #[test]
+    fn a_report_has_the_value_or_the_problem() {
+        assert_eq!(
+            report("a", Ok(Reading::One(2.5))),
+            [json!({ "name": "a", "ok": 1, "value": 2.5 })]
+        );
+        assert_eq!(
+            report("a", Err("broke".to_string())),
+            [json!({ "name": "a", "ok": 0, "error": "broke" })]
+        );
+    }
+
+    #[test]
+    fn several_values_report_that_the_command_worked_on_its_own_item() {
+        let values = BTreeMap::from([("a.x".to_string(), 1.0)]);
+        assert_eq!(
+            report("a", Ok(Reading::Several(values))),
+            [
+                json!({ "name": "a", "ok": 1 }),
+                json!({ "name": "a.x", "value": 1.0 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn sensible_definitions_are_accepted() {
+        let mut slow = metric(&["/bin/true"]);
+        slow.timeout = Some(MAX_TIMEOUT);
+        check_definitions(&definitions(&[("queue.depth-1_a", slow)])).unwrap();
+    }
+
+    #[test]
+    fn bad_definitions_are_refused() {
+        let good = metric(&["/bin/true"]);
+        let timed = |secs| CustomMetric {
+            timeout: Some(Duration::from_secs(secs)),
+            ..good.clone()
+        };
+        for (name, bad) in [
+            ("no command", metric(&[])),
+            ("empty program", metric(&[""])),
+            ("no time", timed(0)),
+            ("too long", timed(MAX_TIMEOUT.as_secs() + 1)),
+        ] {
+            let name = name.replace(' ', "_");
+            let refused = check_definitions(&definitions(&[(&name, bad)]));
+            assert!(refused.is_err(), "{name}");
+        }
+
+        for name in ["", "two words", "-flag", "a/b", "a;b"] {
+            let refused = check_definitions(&definitions(&[(name, good.clone())]));
+            assert!(refused.is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn there_is_a_limit_on_definitions() {
+        let many: Definitions = (0..=MAX_DEFINITIONS)
+            .map(|index| (format!("m{index}"), metric(&["/bin/true"])))
+            .collect();
+        assert!(check_definitions(&many).is_err());
+    }
+
+    #[test]
+    fn a_timeout_defaults_to_ten_seconds() {
+        assert_eq!(metric(&["x"]).limit(), Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    mod running {
+        use std::thread;
+
+        use super::*;
+
+        const LIMIT: Duration = Duration::from_secs(5);
+
+        async fn shell(script: &str) -> Result<Reading, String> {
+            measure("m", &metric(&["/bin/sh", "-c", script]), LIMIT).await
+        }
+
+        fn wait_until(condition: impl Fn() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !condition() {
+                assert!(Instant::now() < deadline, "it never happened");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        fn is_running(pid: &str) -> bool {
+            std::process::Command::new("kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        }
+
+        #[tokio::test]
+        async fn a_command_gives_the_number_it_prints() {
+            assert_eq!(shell("echo 42.5").await, Ok(Reading::One(42.5)));
+        }
+
+        #[tokio::test]
+        async fn a_command_can_give_several_values_in_one_run() {
+            let result = shell(r#"echo '{"depth": 3}'"#).await;
+            let expected = BTreeMap::from([("m.depth".to_string(), 3.0)]);
+            assert_eq!(result, Ok(Reading::Several(expected)));
+        }
+
+        #[tokio::test]
+        async fn arguments_are_not_read_by_a_shell() {
+            let folder = tempfile::tempdir().unwrap();
+            let marker = folder.path().join("ran");
+            let attack = format!("1; touch {}", marker.display());
+
+            let result = measure("m", &metric(&["/bin/echo", &attack]), LIMIT).await;
+
+            assert_eq!(result, Err(NOT_A_NUMBER.to_string()));
+            assert!(!marker.exists());
+        }
+
+        #[tokio::test]
+        async fn a_failing_command_reports_its_status_and_not_its_output() {
+            assert_eq!(
+                shell("echo secret; echo secret >&2; exit 3").await,
+                Err("exited with status 3".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn other_output_is_never_reported() {
+            assert_eq!(
+                shell("echo password=secret").await,
+                Err(NOT_A_NUMBER.to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn only_standard_output_is_read() {
+            assert_eq!(shell("echo noise >&2; echo 7").await, Ok(Reading::One(7.0)));
+        }
+
+        #[tokio::test]
+        async fn a_program_that_is_not_there_says_so() {
+            let result = measure("m", &metric(&["/no/such/program"]), LIMIT).await;
+            assert_eq!(result, Err(NOT_STARTED.to_string()));
+        }
+
+        #[tokio::test]
+        async fn a_killed_command_says_so() {
+            assert_eq!(
+                shell("kill -9 $$").await,
+                Err("was stopped by a signal".to_string())
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stuck_command_times_out() {
+            let started = Instant::now();
+            let stuck = metric(&["/bin/sleep", "30"]);
+            let result = measure("m", &stuck, Duration::from_millis(100)).await;
+            assert_eq!(result, Err(TIMED_OUT.to_string()));
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+
+        #[tokio::test]
+        async fn a_timeout_also_stops_what_the_command_started() {
+            let folder = tempfile::tempdir().unwrap();
+            let file = folder.path().join("pid");
+            // Written in one go, so it's never read half done.
+            let script = format!(
+                "sleep 30 & echo $! > {file}.new; mv {file}.new {file}; wait",
+                file = file.display()
+            );
+
+            // Long enough for a busy host to start the shell and what it starts.
+            let stuck = metric(&["/bin/sh", "-c", &script]);
+            let result = measure("m", &stuck, Duration::from_secs(2)).await;
+
+            assert_eq!(result, Err(TIMED_OUT.to_string()));
+            let pid = std::fs::read_to_string(&file).unwrap();
+            assert!(!pid.trim().is_empty());
+            wait_until(|| !is_running(pid.trim()));
+        }
+
+        #[tokio::test]
+        async fn a_flood_of_output_is_cut_off() {
+            let started = Instant::now();
+            assert_eq!(
+                measure("m", &metric(&["/usr/bin/yes"]), LIMIT).await,
+                Err(TOO_MUCH_OUTPUT.to_string())
+            );
+            assert!(started.elapsed() < LIMIT);
+        }
+
+        #[tokio::test]
+        async fn output_up_to_the_limit_is_read() {
+            let padded = format!("printf '%{MAX_OUTPUT_BYTES}s' 5");
+            assert_eq!(shell(&padded).await, Ok(Reading::One(5.0)));
+        }
+
+        fn latest(collector: &mut CustomCollector, name: &str) -> Option<Value> {
+            let results = collector.collect().unwrap();
+            results
+                .as_array()?
+                .iter()
+                .find(|item| item["name"] == name)
+                .cloned()
+        }
+
+        #[test]
+        fn only_the_names_the_server_asks_for_are_run() {
+            let folder = tempfile::tempdir().unwrap();
+            let marker = folder.path().join("ran");
+            let touch = format!("touch {}; echo 1", marker.display());
+            let defined = definitions(&[
+                ("wanted", metric(&["/bin/echo", "3"])),
+                ("other", metric(&["/bin/sh", "-c", &touch])),
+            ]);
+
+            let names = vec!["wanted".to_string()];
+            let mut collector =
+                CustomCollector::new(names, &defined, Duration::from_millis(20)).unwrap();
+            wait_until(|| collector.background_has_results());
+
+            assert_eq!(
+                latest(&mut collector, "wanted").unwrap()["value"].as_f64(),
+                Some(3.0)
+            );
+            assert_eq!(latest(&mut collector, "other"), None);
+            assert!(!marker.exists());
+        }
+
+        #[test]
+        fn a_name_the_agent_does_not_define_is_never_run() {
+            let names = vec!["/bin/sh".to_string()];
+            let mut collector =
+                CustomCollector::new(names, &Definitions::new(), Duration::from_millis(20))
+                    .unwrap();
+            wait_until(|| collector.background_has_results());
+            assert_eq!(
+                latest(&mut collector, "/bin/sh").unwrap()["error"],
+                NOT_DEFINED
+            );
+        }
+
+        impl CustomCollector {
+            fn background_has_results(&self) -> bool {
+                self.background
+                    .rows()
+                    .as_array()
+                    .is_some_and(|list| !list.is_empty())
+            }
+        }
+    }
+}

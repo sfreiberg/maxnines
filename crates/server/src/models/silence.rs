@@ -1,0 +1,22 @@
+use sea_orm::entity::prelude::*;
+
+#[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
+#[sea_orm(table_name = "silences")]
+pub struct Model {
+    #[sea_orm(primary_key)]
+    pub id: i64,
+    pub rule_id: Option<i64>,
+    /// None for every host.
+    pub filter: Option<String>,
+    /// The one series it's for. None for every series.
+    pub series: Option<String>,
+    pub reason: String,
+    pub created_by: String,
+    pub starts_at: DateTimeUtc,
+    pub ends_at: DateTimeUtc,
+}
+
+#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+pub enum Relation {}
+
+impl ActiveModelBehavior for ActiveModel {}

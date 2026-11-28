@@ -1,0 +1,41 @@
+{% extends "layouts/live.html" %}
+{% block title %}Actions · {{ hostname }} · MaxNines{% endblock title %}
+{% block refresh_every %}5s{% endblock refresh_every %}
+{% block content %}
+<p class="breadcrumb"><a href="/hosts">Hosts</a> / <a href="/hosts/{{ host_id }}">{{ hostname }}</a></p>
+<div>
+  <h1>Actions</h1>
+  <p class="subtitle">What this host's agent can be asked to run, and what each run printed. Some are built into the agent and only look. The rest are commands in the agent's own config file, which is the only place one can be added. Alert rules can run them when an alert starts.</p>
+</div>
+
+{% if error %}<p class="error">{{ error }}</p>{% endif %}
+
+<section class="card" id="run-now" hx-preserve="true">
+  <h2>Run now</h2>
+  {% if not available %}
+  <p class="empty">This host's agent hasn't reported any actions. It needs MaxNines 0.1.0-alpha.5 or newer.</p>
+  {% elif not can_respond %}
+  <p class="note">Running an action takes the responder role. This host has: {% for action in available %}<code>{{ action.name }}</code>{% if not loop.last %}, {% endif %}{% endfor %}.</p>
+  {% else %}
+  {% if not online %}<p class="note">This host's agent isn't connected, so nothing can run until it is.</p>{% endif %}
+  {% for action in available %}
+  <form method="post" action="/hosts/{{ host_id }}/actions" class="host-filter action-form">
+    <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="{{ action.name }}">
+    <code class="action-name">{{ action.name }}</code>
+    {% for variable in action.needs %}
+    <div class="host-filter-box"><input type="text" name="variable_{{ variable }}" aria-label="{{ variable }}" placeholder="{{ variable }}" maxlength="255" spellcheck="false" required></div>
+    {% endfor %}
+    <div class="host-filter-box"><input type="number" name="timeout_secs" aria-label="Time limit in seconds" value="{{ default_timeout }}" min="1" max="600" title="Time limit in seconds"></div>
+    <button type="submit" class="secondary">Run</button>
+  </form>
+  {% endfor %}
+  {% endif %}
+</section>
+
+{% if runs %}
+{% include "actions/_runs.html" %}
+{% else %}
+<p class="empty">Nothing has been run on this host yet.</p>
+{% endif %}
+{% endblock content %}

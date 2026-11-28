@@ -1,0 +1,32 @@
+{% extends "layouts/application.html" %}
+{% block title %}Location rules · MaxNines{% endblock title %}
+{% block content %}
+<p class="breadcrumb"><a href="/map">Map</a></p>
+<div class="title-row">
+  <div>
+    <h1>Location rules</h1>
+    <p class="subtitle">Each rule puts the hosts its filter matches in one place. Where several match a host, the highest priority decides.</p>
+  </div>
+  {% if can_edit %}<a class="button" href="/map/rules/new">Add a location</a>{% endif %}
+</div>
+{% if rules %}
+<div class="tablebox"><table>
+  <thead>
+    <tr><th class="number">Priority</th><th>Name</th><th>Place</th><th>Hosts</th><th class="number">Placed</th></tr>
+  </thead>
+  <tbody>
+    {% for rule in rules %}
+    <tr>
+      <td class="number">{{ rule.priority }}</td>
+      <td><a href="/map/rules/{{ rule.id }}/edit">{{ rule.name }}</a></td>
+      <td>{{ rule.place }}</td>
+      <td>{% if rule.filter %}<code>{{ rule.filter }}</code>{% else %}Every host{% endif %}</td>
+      <td class="number">{{ rule.hosts }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table></div>
+{% else %}
+<p class="empty">There are no location rules, so nothing is on the map yet.</p>
+{% endif %}
+{% endblock content %}

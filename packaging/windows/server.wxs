@@ -1,0 +1,358 @@
+<!--
+  The server's Windows installer, built by the release workflow with WiX:
+
+    wix build -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+      -ext WixToolset.Firewall.wixext
+      -d Version=0.1.0 -d Program=path\to\maxnines-server.exe -d License=LICENSE
+      -o maxnines-server.msi packaging\windows\server.wxs
+
+  It asks for the address people and agents use, the port, HTTPS, and the
+  first administrator, who sets a password in the browser when it finishes.
+  Each can also be given for a silent install, where everything has a default
+  but the administrator:
+
+    msiexec /i maxnines-server.msi SERVER_ADDRESS=https://monitor.example.com PORT=443
+      HTTPS=automatic ACME_EMAIL=you@example.com ADMIN_EMAIL=you@example.com
+      ADMIN_NAME="Your Name" /qn
+
+  HTTPS is none, automatic (Let's Encrypt) or files, with CERTIFICATE_FILE and
+  KEY_FILE. The server writes its own config, with its configure command, so
+  only these values change and anything added by hand is kept. Modify, in
+  Settings > Apps, asks again and restarts the service. Uninstalling leaves
+  the config and databases in C:\ProgramData\MaxNines\Server.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+  <!-- The service's own account, NT SERVICE\MaxNinesServer, which Windows names
+       from the service's name, so it's known before the service exists. -->
+  <?define ServiceSid = "S-1-5-80-4185855007-1177842744-2721872280-2574161336-224657692" ?>
+
+  <Package Name="MaxNines Server"
+           Manufacturer="MaxNines"
+           Version="$(var.Version)"
+           UpgradeCode="A366FC8E-9DB7-4C19-AD5B-E90396D98C38">
+
+    <!-- A pre-release's suffix can't go in an MSI version, so two of them can
+         have the same one, and the later one still has to upgrade. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/sfreiberg/maxnines" />
+
+    <!-- Windows on Arm runs x64 programs by translating them, which works but
+         costs memory and time. One already installed can still be changed or
+         removed, or replaced by installing the Arm64 one over it. -->
+    <?if $(sys.BUILDARCH) = x64 ?>
+    <util:QueryNativeMachine />
+    <Launch Condition="Installed OR WIX_NATIVE_MACHINE &lt;&gt; 43620"
+            Message="This installer is for x64 processors, and this computer has an Arm processor. Use the MaxNines Server installer with aarch64 in its name instead." />
+    <?endif?>
+
+    <!-- Remembered for Modify by the server whenever it starts, from its config,
+         under the same names. One given on the command line wins. -->
+    <?foreach SETTING in SERVER_ADDRESS;PORT;HTTPS;ACME_EMAIL;CERTIFICATE_FILE;KEY_FILE ?>
+    <Property Id="$(SETTING)" Secure="yes">
+      <RegistrySearch Id="Remembered_$(SETTING)" Root="HKLM" Key="SOFTWARE\MaxNines\Server"
+                      Name="$(SETTING)" Type="raw" Bitness="always64" />
+    </Property>
+    <SetProperty Id="CMDLINE_$(SETTING)" Value="[$(SETTING)]" Before="AppSearch" Sequence="first" />
+    <SetProperty Id="$(SETTING)" Value="[CMDLINE_$(SETTING)]" After="AppSearch" Sequence="first"
+                 Condition="CMDLINE_$(SETTING)" />
+    <?endforeach?>
+
+    <!-- Defaults for a first install. The address uses the port, so it comes after. -->
+    <SetProperty Id="PORT" Action="Default_PORT" Value="9000" After="AppSearch" Sequence="first" Condition="NOT PORT" />
+    <SetProperty Id="HTTPS" Action="Default_HTTPS" Value="none" After="AppSearch" Sequence="first" Condition="NOT HTTPS" />
+    <SetProperty Id="SERVER_ADDRESS" Action="Default_SERVER_ADDRESS" Value="http://[ComputerName]:[PORT]" Before="LaunchConditions"
+                 Sequence="first" Condition="NOT SERVER_ADDRESS" />
+
+    <!-- The first administrator, on a first install only. -->
+    <Property Id="ADMIN_EMAIL" Secure="yes" />
+    <Property Id="ADMIN_NAME" Secure="yes" />
+    <!-- Where the link for them to set a password goes: the installing person's
+         own temporary folder, which the finish page opens. -->
+    <Property Id="SETUP_LINK_FILE" Secure="yes" />
+    <SetProperty Id="SETUP_LINK_FILE" Value="[TempFolder]MaxNines setup.url" Before="CostInitialize"
+                 Sequence="ui" Condition="NOT SETUP_LINK_FILE" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ProgramFolder" Name="MaxNines">
+        <Directory Id="INSTALLFOLDER" Name="Server" />
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="DataParent" Name="MaxNines">
+        <Directory Id="ServerData" Name="Server" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Server" Title="MaxNines Server">
+      <Component Directory="INSTALLFOLDER">
+        <File Id="ServerExe" Source="$(var.Program)" Name="maxnines-server.exe" KeyPath="yes" />
+        <!-- It runs as its own account, which Windows makes for the service and
+             which can do almost nothing but what it's given here: its data folder.
+             Windows restarts it 30 seconds after a failure, stopping with an error
+             included, and gives it a minute to save everything at shutdown. -->
+        <ServiceInstall Name="MaxNinesServer"
+                        DisplayName="MaxNines Server"
+                        Description="Receives and stores metrics from MaxNines agents."
+                        Type="ownProcess"
+                        Start="auto"
+                        ErrorControl="normal"
+                        Arguments="--config &quot;[ServerData]server.hcl&quot; service run"
+                        Account="NT SERVICE\MaxNinesServer"
+                        Vital="yes">
+          <ServiceConfig PreShutdownDelay="60000"
+                         FailureActionsWhen="failedToStopOrReturnedError"
+                         OnInstall="yes" OnReinstall="yes" />
+          <!-- Windows Installer's own way of setting these is refused access,
+               so WiX's sets them. -->
+          <util:ServiceConfig FirstFailureActionType="restart" SecondFailureActionType="restart"
+                              ThirdFailureActionType="restart" RestartServiceDelayInSeconds="30"
+                              ResetPeriodInDays="1" />
+        </ServiceInstall>
+        <ServiceControl Name="MaxNinesServer" Start="install" Stop="both" Remove="uninstall" Wait="yes" />
+        <!-- For the program rather than a port, so changing the port in Modify
+             needs nothing here. -->
+        <fw:FirewallException Id="ServerFirewall" Name="MaxNines Server" Program="[#ServerExe]"
+                              Scope="any" Profile="all"
+                              Description="Lets agents and browsers reach the MaxNines server." />
+      </Component>
+
+      <Component Directory="INSTALLFOLDER">
+        <File Source="$(var.License)" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+
+      <!-- So maxnines-server works in any command prompt, for adding users. The
+           key is also where the configure command saves the settings for Modify.
+           Only administrators can change it, as Windows has it, and never the
+           service, so a server that's been taken over can't choose what the
+           installer does next. -->
+      <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="9256D95A-943D-41DB-BF06-10FBD33861BE">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MaxNines\Server" Name="InstallFolder"
+                       Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\MaxNines\Server" Action="removeOnUninstall" />
+        <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set"
+                     System="yes" Permanent="no" />
+      </Component>
+
+      <!-- Holds the config and the databases, so only Windows, administrators and
+           the server can get in. The server can make and change files inside,
+           but can't delete or rename the folder, or change who can open anything,
+           even what it makes, which being its owner would otherwise let it. The
+           configure command makes server.hcl itself read-only to the server. -->
+      <Component Id="DataFolder" Directory="ServerData" Guid="8036C532-D4FB-4D3B-8EE1-47CDE2132BB8">
+        <CreateFolder>
+          <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;;0x1201bf;;;$(var.ServiceSid))(A;OICIIO;0x1301bf;;;$(var.ServiceSid))(A;OICIIO;0x1301bf;;;OW)" />
+        </CreateFolder>
+      </Component>
+    </Feature>
+
+    <!-- Writes the config once the program is there, before the service starts,
+         and adds the administrator on a first install. Upgrades and repairs leave
+         the config alone unless given something to change. -->
+    <SetProperty Id="ConfigureServer"
+                 Value="&quot;[#ServerExe]&quot; --config &quot;[ServerData]server.hcl&quot; configure --address &quot;[SERVER_ADDRESS]&quot; --port &quot;[PORT]&quot; --https &quot;[HTTPS]&quot; --acme-email &quot;[ACME_EMAIL]&quot; --certificate-file &quot;[CERTIFICATE_FILE]&quot; --key-file &quot;[KEY_FILE]&quot; --admin-email &quot;[ADMIN_EMAIL]&quot; --admin-name &quot;[ADMIN_NAME]&quot; --setup-link-file &quot;[SETUP_LINK_FILE]&quot;"
+                 Before="ConfigureServer" Sequence="execute"
+                 Condition="NOT REMOVE~=&quot;ALL&quot; AND NOT REINSTALL AND (NOT WIX_UPGRADE_DETECTED OR CMDLINE_SERVER_ADDRESS OR CMDLINE_PORT OR CMDLINE_HTTPS OR CMDLINE_ACME_EMAIL OR CMDLINE_CERTIFICATE_FILE OR CMDLINE_KEY_FILE OR ADMIN_EMAIL)" />
+    <CustomAction Id="ConfigureServer" DllEntry="WixQuietExec" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="ConfigureServer" Before="StartServices" Condition="NOT REMOVE~=&quot;ALL&quot; AND NOT REINSTALL AND (NOT WIX_UPGRADE_DETECTED OR CMDLINE_SERVER_ADDRESS OR CMDLINE_PORT OR CMDLINE_HTTPS OR CMDLINE_ACME_EMAIL OR CMDLINE_CERTIFICATE_FILE OR CMDLINE_KEY_FILE OR ADMIN_EMAIL)" />
+    </InstallExecuteSequence>
+
+    <!-- The finish page opens the link, in the installing person's browser. -->
+    <CustomAction Id="OpenSetupLink" DllEntry="WixShellExec" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)"
+                  Impersonate="yes" Return="ignore" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+
+    <UI Id="ServerUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Property="WixShellExecTarget" Value="[SETUP_LINK_FILE]" Order="1"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="OpenSetupLink" Order="2"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <!-- Installing: Welcome, Address, HTTPS, Administrator, Ready.
+           Modify: Address, HTTPS, Ready. -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="AddressDlg" Condition="NOT Installed" />
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Condition="Installed AND PATCH" />
+
+      <Publish Dialog="AddressDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Condition="NOT Installed" />
+      <Publish Dialog="AddressDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Condition="Installed" />
+      <Publish Dialog="AddressDlg" Control="Next" Property="MESSAGE" Order="1"
+               Value="Enter the address people will open in a browser, starting with https:// or http://."
+               Condition="NOT (SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;http://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;ws://&quot;)" />
+      <Publish Dialog="AddressDlg" Control="Next" Property="MESSAGE" Order="2"
+               Value="Enter the port, a number from 1 to 65535." Condition="NOT PORT" />
+      <Publish Dialog="AddressDlg" Control="Next" Event="SpawnDialog" Value="MessageDlg" Order="3"
+               Condition="NOT (SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;http://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;ws://&quot;) OR NOT PORT" />
+      <Publish Dialog="AddressDlg" Control="Next" Event="NewDialog" Value="HttpsDlg" Order="4"
+               Condition="(SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;http://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;ws://&quot;) AND PORT" />
+
+      <Publish Dialog="HttpsDlg" Control="Back" Event="NewDialog" Value="AddressDlg" />
+      <Publish Dialog="HttpsDlg" Control="Next" Property="MESSAGE" Order="1"
+               Value="With HTTPS, the server's address starts with https://. Go back and change it."
+               Condition="HTTPS &lt;&gt; &quot;none&quot; AND NOT (SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot;)" />
+      <Publish Dialog="HttpsDlg" Control="Next" Property="MESSAGE" Order="2"
+               Value="Enter both the certificate file and the key file."
+               Condition="HTTPS = &quot;files&quot; AND (NOT CERTIFICATE_FILE OR NOT KEY_FILE)" />
+      <Publish Dialog="HttpsDlg" Control="Next" Event="SpawnDialog" Value="MessageDlg" Order="3"
+               Condition="(HTTPS &lt;&gt; &quot;none&quot; AND NOT (SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot;)) OR (HTTPS = &quot;files&quot; AND (NOT CERTIFICATE_FILE OR NOT KEY_FILE))" />
+      <Publish Dialog="HttpsDlg" Control="Next" Event="NewDialog" Value="AdminDlg" Order="4"
+               Condition="NOT Installed AND NOT ((HTTPS &lt;&gt; &quot;none&quot; AND NOT (SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot;)) OR (HTTPS = &quot;files&quot; AND (NOT CERTIFICATE_FILE OR NOT KEY_FILE)))" />
+      <Publish Dialog="HttpsDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="5"
+               Condition="Installed AND NOT ((HTTPS &lt;&gt; &quot;none&quot; AND NOT (SERVER_ADDRESS ~&lt;&lt; &quot;https://&quot; OR SERVER_ADDRESS ~&lt;&lt; &quot;wss://&quot;)) OR (HTTPS = &quot;files&quot; AND (NOT CERTIFICATE_FILE OR NOT KEY_FILE)))" />
+
+      <Publish Dialog="AdminDlg" Control="Back" Event="NewDialog" Value="HttpsDlg" />
+      <Publish Dialog="AdminDlg" Control="Next" Property="MESSAGE" Order="1"
+               Value="Enter both an email address and a name, or neither."
+               Condition="(ADMIN_EMAIL AND NOT ADMIN_NAME) OR (ADMIN_NAME AND NOT ADMIN_EMAIL)" />
+      <Publish Dialog="AdminDlg" Control="Next" Event="SpawnDialog" Value="MessageDlg" Order="2"
+               Condition="(ADMIN_EMAIL AND NOT ADMIN_NAME) OR (ADMIN_NAME AND NOT ADMIN_EMAIL)" />
+      <Publish Dialog="AdminDlg" Control="Next" Property="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Order="3"
+               Value="Open MaxNines to set [ADMIN_NAME]'s password" Condition="ADMIN_EMAIL AND ADMIN_NAME" />
+      <Publish Dialog="AdminDlg" Control="Next" Property="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Order="4"
+               Value="{}" Condition="NOT ADMIN_EMAIL" />
+      <Publish Dialog="AdminDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="5"
+               Condition="(ADMIN_EMAIL AND ADMIN_NAME) OR (NOT ADMIN_EMAIL AND NOT ADMIN_NAME)" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="AdminDlg" Order="1"
+               Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="HttpsDlg" Order="2"
+               Condition="Installed AND WixUI_InstallMode = &quot;Change&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="3"
+               Condition="Installed AND NOT PATCH AND WixUI_InstallMode &lt;&gt; &quot;Change&quot;" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="4"
+               Condition="Installed AND PATCH" />
+
+      <!-- Settings > Apps: Modify asks for the address and HTTPS again. -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="AddressDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+      <Dialog Id="AddressDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Address" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Where people and agents reach this server." />
+
+        <Control Id="AddressLabel" Type="Text" X="20" Y="58" Width="330" Height="30"
+                 Text="&amp;Address people will open in a browser, and agents will connect to, such as https://monitor.example.com. Behind a proxy, give the proxy's address." />
+        <Control Id="Address" Type="Edit" X="20" Y="90" Width="330" Height="18" Property="SERVER_ADDRESS" Text="{1024}" />
+
+        <Control Id="PortLabel" Type="Text" X="20" Y="122" Width="330" Height="30"
+                 Text="&amp;Port to listen on. It's usually the one in the address, unless a proxy or router forwards to it. Windows Firewall will let it through." />
+        <Control Id="Port" Type="Edit" X="20" Y="154" Width="60" Height="18" Property="PORT" Integer="yes" Text="{5}" />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="HttpsDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}HTTPS" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="Without it, passwords and agent data cross the network unencrypted." />
+
+        <Control Id="Https" Type="RadioButtonGroup" X="20" Y="52" Width="330" Height="56" Property="HTTPS">
+          <RadioButtonGroup Property="HTTPS">
+            <RadioButton Value="none" X="0" Y="0" Width="330" Height="16"
+                         Text="&amp;None: a proxy handles HTTPS, or it's a small trusted network" />
+            <RadioButton Value="automatic" X="0" Y="20" Width="330" Height="16"
+                         Text="&amp;Automatic certificate from Let's Encrypt, which needs port 443 open to the internet" />
+            <RadioButton Value="files" X="0" Y="40" Width="330" Height="16"
+                         Text="&amp;Your own certificate, from files in PEM format" />
+          </RadioButtonGroup>
+        </Control>
+
+        <Control Id="EmailLabel" Type="Text" X="35" Y="114" Width="315" Height="10"
+                 Text="&amp;Email Let's Encrypt can contact about the certificate, if you like:"
+                 EnableCondition="HTTPS = &quot;automatic&quot;" DisableCondition="HTTPS &lt;&gt; &quot;automatic&quot;" />
+        <Control Id="Email" Type="Edit" X="35" Y="126" Width="315" Height="18" Property="ACME_EMAIL" Text="{254}"
+                 EnableCondition="HTTPS = &quot;automatic&quot;" DisableCondition="HTTPS &lt;&gt; &quot;automatic&quot;" />
+
+        <Control Id="CertificateLabel" Type="Text" X="35" Y="154" Width="315" Height="10"
+                 Text="&amp;Certificate file, followed by any intermediates:"
+                 EnableCondition="HTTPS = &quot;files&quot;" DisableCondition="HTTPS &lt;&gt; &quot;files&quot;" />
+        <Control Id="Certificate" Type="Edit" X="35" Y="166" Width="315" Height="18" Property="CERTIFICATE_FILE" Text="{1024}"
+                 EnableCondition="HTTPS = &quot;files&quot;" DisableCondition="HTTPS &lt;&gt; &quot;files&quot;" />
+        <Control Id="KeyLabel" Type="Text" X="35" Y="190" Width="315" Height="10"
+                 Text="&amp;Key file, without a passphrase:"
+                 EnableCondition="HTTPS = &quot;files&quot;" DisableCondition="HTTPS &lt;&gt; &quot;files&quot;" />
+        <Control Id="Key" Type="Edit" X="35" Y="202" Width="315" Height="18" Property="KEY_FILE" Text="{1024}"
+                 EnableCondition="HTTPS = &quot;files&quot;" DisableCondition="HTTPS &lt;&gt; &quot;files&quot;" />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="AdminDlg" Width="370" Height="270" Title="[ProductName] Setup">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="WixUI_Bmp_Banner" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="370" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="200" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="{\WixUI_Font_Title}Administrator" />
+        <Control Id="Description" Type="Text" X="25" Y="23" Width="280" Height="15" Transparent="yes" NoPrefix="yes"
+                 Text="The first person who can sign in." />
+
+        <Control Id="Intro" Type="Text" X="20" Y="58" Width="330" Height="40" NoPrefix="yes"
+                 Text="Nobody can sign up, so the first administrator is added here. They'll set a password in the browser when setup finishes, and can then add everyone else. Leave both empty to add them later with: maxnines-server users create" />
+
+        <Control Id="EmailLabel" Type="Text" X="20" Y="104" Width="330" Height="10" Text="&amp;Email address:" />
+        <Control Id="Email" Type="Edit" X="20" Y="116" Width="330" Height="18" Property="ADMIN_EMAIL" Text="{254}" />
+        <Control Id="NameLabel" Type="Text" X="20" Y="144" Width="330" Height="10" Text="&amp;Name:" />
+        <Control Id="Name" Type="Edit" X="20" Y="156" Width="330" Height="18" Property="ADMIN_NAME" Text="{200}" />
+
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)" />
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)" />
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+      </Dialog>
+
+      <Dialog Id="MessageDlg" Width="260" Height="85" Title="[ProductName] Setup" NoMinimize="yes">
+        <Control Id="Text" Type="Text" X="15" Y="15" Width="230" Height="30" Text="[MESSAGE]" />
+        <Control Id="OK" Type="PushButton" X="102" Y="57" Width="56" Height="17" Default="yes" Cancel="yes" Text="!(loc.WixUIOK)">
+          <Publish Event="EndDialog" Value="Return" />
+        </Control>
+      </Dialog>
+    </UI>
+    <UIRef Id="WixUI_Common" />
+  </Package>
+</Wix>

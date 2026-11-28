@@ -1,0 +1,7 @@
+{% if pages.previous or pages.next %}
+<nav class="pages" aria-label="Pages">
+  {% if pages.previous %}<a class="button secondary" href="{{ pages.previous }}" rel="prev">Previous</a>{% endif %}
+  <span class="note">{{ pages.first }} to {{ pages.last }} of {{ pages.total }}</span>
+  {% if pages.next %}<a class="button secondary" href="{{ pages.next }}" rel="next">Next</a>{% endif %}
+</nav>
+{% endif %}

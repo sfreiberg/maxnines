@@ -1,0 +1,153 @@
+//! Silences, which keep notifications back for a while.
+
+use anyhow::{Context, Result};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set, TransactionTrait,
+};
+use serde_json::json;
+
+use super::audit::record_change;
+use super::{Database, silence};
+use crate::audit::{self, Kind, Snapshot};
+use crate::silences::{Silence, SilenceInput};
+use crate::times::Timestamp;
+
+fn to_silence(row: silence::Model) -> Silence {
+    Silence {
+        id: row.id,
+        all_alerts: row.rule_id.is_none() && row.filter.is_none() && row.series.is_none(),
+        rule_id: row.rule_id,
+        filter: row.filter,
+        series: row.series,
+        reason: row.reason,
+        created_by: row.created_by,
+        starts_at: row.starts_at,
+        ends_at: row.ends_at,
+    }
+}
+
+/// A silence as the audit log compares them, named by its reason.
+fn snapshot(row: &silence::Model) -> Snapshot {
+    let fields = json!({
+        "rule_id": row.rule_id,
+        "filter": row.filter,
+        "series": row.series,
+        "reason": row.reason,
+        "starts": audit::time(row.starts_at),
+        "ends": audit::time(row.ends_at),
+    });
+    let name = if row.reason.is_empty() {
+        "Silence"
+    } else {
+        &row.reason
+    };
+    Snapshot::new(name, fields)
+}
+
+async fn load<C: ConnectionTrait>(connection: &C, id: i64) -> Result<Option<silence::Model>> {
+    silence::Entity::find_by_id(id)
+        .one(connection)
+        .await
+        .context("loading silence")
+}
+
+impl Database {
+    /// The one that lasts longest comes first.
+    pub async fn active_silences(&self, now: Timestamp) -> Result<Vec<Silence>> {
+        let rows = silence::Entity::find()
+            .filter(silence::Column::StartsAt.lte(now))
+            .filter(silence::Column::EndsAt.gt(now))
+            .order_by_desc(silence::Column::EndsAt)
+            .order_by_desc(silence::Column::Id)
+            .all(&self.connection)
+            .await
+            .context("loading silences")?;
+        Ok(rows.into_iter().map(to_silence).collect())
+    }
+
+    /// The ones that ended most recently.
+    pub async fn ended_silences(&self, now: Timestamp, limit: u64) -> Result<Vec<Silence>> {
+        let rows = silence::Entity::find()
+            .filter(silence::Column::EndsAt.lte(now))
+            .order_by_desc(silence::Column::EndsAt)
+            .order_by_desc(silence::Column::Id)
+            .limit(limit)
+            .all(&self.connection)
+            .await
+            .context("loading silences")?;
+        Ok(rows.into_iter().map(to_silence).collect())
+    }
+
+    pub async fn get_silence(&self, id: i64) -> Result<Option<Silence>> {
+        let row = silence::Entity::find_by_id(id)
+            .one(&self.connection)
+            .await
+            .context("loading silence")?;
+        Ok(row.map(to_silence))
+    }
+
+    /// Starts now, and `by` says who asked for it.
+    pub async fn create_silence(
+        &self,
+        input: &SilenceInput,
+        by: &str,
+        now: Timestamp,
+    ) -> Result<i64> {
+        let row = silence::ActiveModel {
+            rule_id: Set(input.rule_id),
+            filter: Set(input.filter.as_deref().and_then(crate::text::trimmed)),
+            series: Set(input.series.as_deref().and_then(crate::text::trimmed)),
+            reason: Set(input.reason.trim().to_string()),
+            created_by: Set(by.to_string()),
+            starts_at: Set(now),
+            ends_at: Set(now
+                .checked_add_signed(input.duration)
+                .context("invalid duration")?),
+            ..Default::default()
+        };
+        let transaction = self.connection.begin().await.context("saving silence")?;
+        let row = row.insert(&transaction).await.context("saving silence")?;
+        let after = snapshot(&row);
+        record_change(
+            &transaction,
+            Kind::Silence,
+            row.id,
+            None,
+            Some(&after),
+            None,
+        )
+        .await?;
+        transaction.commit().await.context("saving silence")?;
+        Ok(row.id)
+    }
+
+    /// Returns false if there's no such silence running.
+    pub async fn end_silence(&self, id: i64, now: Timestamp) -> Result<bool> {
+        let transaction = self.connection.begin().await.context("ending silence")?;
+        let before = load(&transaction, id).await?;
+        let result = silence::Entity::update_many()
+            .col_expr(silence::Column::EndsAt, Expr::value(now))
+            .filter(silence::Column::Id.eq(id))
+            .filter(silence::Column::EndsAt.gt(now))
+            .exec(&transaction)
+            .await
+            .context("ending silence")?;
+        if result.rows_affected > 0 {
+            let after = load(&transaction, id).await?;
+            let (before, after) = (before.as_ref().map(snapshot), after.as_ref().map(snapshot));
+            record_change(
+                &transaction,
+                Kind::Silence,
+                id,
+                before.as_ref(),
+                after.as_ref(),
+                None,
+            )
+            .await?;
+        }
+        transaction.commit().await.context("ending silence")?;
+        Ok(result.rows_affected > 0)
+    }
+}

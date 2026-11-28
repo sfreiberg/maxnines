@@ -1,0 +1,10 @@
+Personalities : [raid0] [raid1] [raid4] [raid5] [raid6] [raid10] 
+md1 : active raid5 loop4[3] loop3[1] loop2[0]
+      258048 blocks super 1.2 level 5, 512k chunk, algorithm 2 [3/2] [UU_]
+      [>....................]  recovery =  2.3% (3456/129024) finish=1.8min speed=1152K/sec
+      
+md0 : active raid1 loop1[1] loop0[0]
+      130048 blocks super 1.2 [2/2] [UU]
+      [>....................]  resync =  3.1% (4480/130048) finish=1.3min speed=1493K/sec
+      
+unused devices: <none>

@@ -1,0 +1,5 @@
+state=0
+status=0x0
+maxerror=1550
+esterror=27
+offset=0

@@ -1,0 +1,37 @@
+  pool: tank
+ state: ONLINE
+status: One or more devices is currently being resilvered.  The pool will
+	continue to function, possibly in a degraded state.
+action: Wait for the resilver to complete.
+  scan: resilver in progress since Wed Nov 25 02:13:08 2026
+	232M / 832M scanned, 46.6M / 832M issued at 5.17M/s
+	30.6M resilvered, 5.60% done, no estimated completion time
+config:
+
+	NAME                          STATE     READ WRITE CKSUM
+	tank                          ONLINE       0     0     0
+	  mirror-0                    ONLINE       0     0     0
+	    /var/tmp/zfs-capture/m1   ONLINE       0     0     0
+	    /var/tmp/zfs-capture/m2   ONLINE       0     0     0  (resilvering)
+	logs	
+	  /var/tmp/zfs-capture/log    ONLINE       0     0     0
+	cache
+	  /var/tmp/zfs-capture/cache  ONLINE       0     0     0
+	spares
+	  /var/tmp/zfs-capture/spare  AVAIL   
+
+errors: No known data errors
+
+  pool: vault
+ state: ONLINE
+  scan: resilvered 15.5K in 00:00:00 with 0 errors on Wed Nov 25 02:13:03 2026
+config:
+
+	NAME                         STATE     READ WRITE CKSUM
+	vault                        ONLINE       0     0     0
+	  raidz1-0                   ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r1  ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r2  ONLINE       0     0     0
+	    /var/tmp/zfs-capture/r3  ONLINE       0     0     0
+
+errors: No known data errors

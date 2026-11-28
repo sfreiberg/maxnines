@@ -1,0 +1,2 @@
+ls: /run/reboot-required: No such file or directory
+ls: /var/run/reboot-required: No such file or directory

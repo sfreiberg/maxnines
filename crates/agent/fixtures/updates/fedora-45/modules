@@ -1,0 +1,9 @@
+/lib/modules:
+total 12
+drwxr-xr-x 2 root root 4096 Jul 15 00:00 .
+dr-xr-xr-x 1 root root 4096 Nov  1 06:47 ..
+
+/usr/lib/modules:
+total 12
+drwxr-xr-x 2 root root 4096 Jul 15 00:00 .
+dr-xr-xr-x 1 root root 4096 Nov  1 06:47 ..

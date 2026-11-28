@@ -1,0 +1,205 @@
+{% extends "layouts/application.html" %}
+{% block title %}{% if id %}Edit template{% else %}Add template{% endif %} · MaxNines{% endblock title %}
+{% block main_class %} class="narrow"{% endblock main_class %}
+{% block content %}
+<p class="breadcrumb"><a href="/settings">Settings</a> / <a href="/templates">Templates</a></p>
+<h1>{% if id %}Edit template{% else %}Add template{% endif %}</h1>
+<nav class="tabs" aria-label="How to edit">
+  <a class="selected" href="{% if id %}/templates/{{ id }}/edit{% else %}/templates/new{% endif %}" aria-current="page">Form</a>
+  <a href="{% if id %}/templates/{{ id }}/edit/hcl{% else %}/templates/new/hcl{% endif %}">HCL</a>
+</nav>
+{% set action = "/templates" %}{% if id %}{% set action = "/templates/" ~ id %}{% endif %}
+<form method="post" action="{{ action }}" class="stacked template-form" id="template-form" data-cel-local="{{ local_metrics }}">
+  <input type="hidden" name="authenticity_token" value="{{ csrf_token }}">
+  {# Pressing Enter uses the first button in a form, so it has to be Save. #}
+  {% if can_edit %}<button type="submit" class="default-submit" tabindex="-1" aria-hidden="true">Save template</button>{% endif %}
+  {% if problem_count > 0 %}<p class="error" role="alert">{% if problem_count == 1 %}One thing needs{% else %}{{ problem_count }} things need{% endif %} changing before this can be saved: see below.</p>{% endif %}
+  {% set e = errors | get(key="", default="") %}{% if e %}<p class="error">{{ e }}</p>{% endif %}
+
+  <label>Name
+    <input type="text" name="name" value="{{ form.name }}" required maxlength="255">
+    {% set e = errors | get(key="name", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Key
+    <input type="text" name="key" value="{{ form.key }}" required maxlength="64" spellcheck="false" autocomplete="off" placeholder="myapp">
+    <small>Starts its metrics' names, like <code>myapp.connections</code>: lowercase letters, digits and underscores.</small>
+    {% set e = errors | get(key="key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+  <label>Description
+    <input type="text" name="description" value="{{ form.description }}" maxlength="1000">
+    {% set e = errors | get(key="description", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+  </label>
+
+  <fieldset>
+    <legend>Runs for</legend>
+    <label>What it's for
+      <select name="target">
+        <option value=""{% if form.target == "" %} selected{% endif %}>Every host, once</option>
+        <option value="database"{% if form.target == "database" %} selected{% endif %}>Each database of a kind</option>
+        <option value="service"{% if form.target == "service" %} selected{% endif %}>Each Windows host with a service</option>
+        <option value="os"{% if form.target == "os" %} selected{% endif %}>Each host running one of some operating systems</option>
+      </select>
+    </label>
+    <label>Database
+      <input type="text" name="database" value="{{ form.database }}" spellcheck="false" placeholder="postgres">
+      <small>For each database of this kind in an agent's config.</small>
+      {% set e = errors | get(key="database", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Service
+      <input type="text" name="service" value="{{ form.service }}" spellcheck="false" placeholder="W3SVC">
+      {% set e = errors | get(key="service", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <div class="checks" role="group" aria-label="Operating systems">
+      {% for system in operating_systems %}
+      <label class="checkbox"><input type="checkbox" name="os.{{ system[0] }}"{% if system[0] in form.os %} checked{% endif %}> {{ system[1] }}</label>
+      {% endfor %}
+      {% set e = errors | get(key="os", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </div>
+    <label>Which hosts
+      <input type="text" name="applies_to" value="{{ form.applies_to }}" spellcheck="false" autocomplete="off" data-cel="applies_to" placeholder="facts.custom.role == 'db'">
+      <small>CEL over a host's facts. Leave empty for every host. Hosts can also be given it by hand on its page.</small>
+      {% set e = errors | get(key="applies_to", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Oldest version
+      <input type="text" name="min_version" value="{{ form.min_version }}" spellcheck="false" placeholder="10">
+      {% set e = errors | get(key="min_version", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Services to watch
+      <input type="text" name="services" value="{{ form.services }}" spellcheck="false" placeholder="W3SVC, WAS">
+      <small>Comma separated.</small>
+      {% set e = errors | get(key="services", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+    <label>Renamed from
+      <input type="text" name="renamed_from" value="{{ form.renamed_from }}" spellcheck="false">
+      <small>Keys it had before, comma separated.</small>
+      {% set e = errors | get(key="renamed_from", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+    </label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Discovery</legend>
+    <p class="hint">Each discover block runs first, then every interval, an hour unless it says. What they find is what <code>when</code> and <code>since</code> look at, so what changes quickly, such as which server is the primary, can be looked at more often than what hardly changes.</p>
+    {% for discover in form.discover %}
+    {% set d = "discover." ~ loop.index0 ~ "." %}
+    {% set di = loop.index0 %}
+    {% include "templates/_discover.html" %}
+    {% endfor %}
+    <button type="submit" name="form_action" value="add:discover" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add discover block</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Notices</legend>
+    {% for notice in form.notices %}
+    {% set p = "notice." ~ loop.index0 ~ "." %}
+    <div class="repeat">
+      {% set e = errors | get(key=p, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+      <label>Key
+        <input type="text" name="{{ p }}key" value="{{ notice.key }}" spellcheck="false">
+        {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <label>Shown when
+        <input type="text" name="{{ p }}when" value="{{ notice.when }}" spellcheck="false" autocomplete="off" data-cel="when">
+        {% set e = errors | get(key=p ~ "when", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <label>Text
+        <input type="text" name="{{ p }}text" value="{{ notice.text }}">
+        {% set e = errors | get(key=p ~ "text", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <button type="submit" name="form_action" value="remove:notice.{{ loop.index0 }}" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove notice</button>
+    </div>
+    {% endfor %}
+    <button type="submit" name="form_action" value="add:notice" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add notice</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Queries</legend>
+    <p class="hint">Each column becomes a metric, named after the template's key: <code>key.column</code>.</p>
+    {% for query in form.queries %}
+    {% set q = loop.index0 %}
+    {% set p = "query." ~ q ~ "." %}
+    {% include "templates/_query.html" %}
+    {% endfor %}
+    <button type="submit" name="form_action" value="add:query" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add query</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Performance counters</legend>
+    {% for counters in form.counters %}
+    {% set c = loop.index0 %}
+    {% set p = "counters." ~ c ~ "." %}
+    {% include "templates/_counters.html" %}
+    {% endfor %}
+    <button type="submit" name="form_action" value="add:counters" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add counters</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Alerts</legend>
+    <p class="hint">Each becomes an alert rule. Use the template's own metrics by their short names, other metrics by their full names, <code>facts.</code>, <code>online</code>, <code>reporting</code>, <code>hostname</code> and <code>series</code>.</p>
+    {% for alert in form.alerts %}
+    {% set p = "alert." ~ loop.index0 ~ "." %}
+    <div class="repeat">
+      {% set e = errors | get(key=p, default="") %}{% if e %}<p class="field-error">{{ e }}</p>{% endif %}
+      <div class="field-row">
+        <label>Name
+          <input type="text" name="{{ p }}name" value="{{ alert.name }}" maxlength="255">
+          {% set e = errors | get(key=p ~ "name", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+        </label>
+        <label>Key
+          <input type="text" name="{{ p }}key" value="{{ alert.key }}" spellcheck="false">
+          {% set e = errors | get(key=p ~ "key", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+        </label>
+      </div>
+      <label>Warning when
+        <input type="text" name="{{ p }}warning" value="{{ alert.warning }}" maxlength="2000" spellcheck="false" autocomplete="off" data-cel="condition">
+        {% set e = errors | get(key=p ~ "warning", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <label>Critical when
+        <input type="text" name="{{ p }}critical" value="{{ alert.critical }}" maxlength="2000" spellcheck="false" autocomplete="off" data-cel="condition">
+        {% set e = errors | get(key=p ~ "critical", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <div class="field-row">
+        <label>For at least
+          <input type="text" name="{{ p }}for" value="{{ alert.hold }}" spellcheck="false" placeholder="5m">
+          {% set e = errors | get(key=p ~ "for", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+        </label>
+        <label>Forecasts look back
+          <input type="text" name="{{ p }}window" value="{{ alert.window }}" spellcheck="false" placeholder="6h">
+          {% set e = errors | get(key=p ~ "window", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+        </label>
+      </div>
+      <label>Summary
+        <input type="text" name="{{ p }}summary" value="{{ alert.summary }}" maxlength="1000" spellcheck="false" autocomplete="off">
+        {% set e = errors | get(key=p ~ "summary", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <label>Summary when it clears
+        <input type="text" name="{{ p }}resolved_summary" value="{{ alert.resolved_summary }}" maxlength="1000" spellcheck="false" autocomplete="off">
+        <small>With <code>{{ '{{' }} hostname }}</code>, <code>{{ '{{' }} instance }}</code>, <code>{{ '{{' }} labels.name }}</code> and any metric, like <code>{{ '{{' }} connections }}</code>.</small>
+        {% set e = errors | get(key=p ~ "resolved_summary", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+      </label>
+      <div class="field-row">
+        <label>Only when
+          <input type="text" name="{{ p }}when" value="{{ alert.when }}" spellcheck="false" autocomplete="off" data-cel="when">
+          {% set e = errors | get(key=p ~ "when", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+        </label>
+        <label>Since version
+          <input type="text" name="{{ p }}since" value="{{ alert.since }}" spellcheck="false">
+          {% set e = errors | get(key=p ~ "since", default="") %}{% if e %}<small class="field-error">{{ e }}</small>{% endif %}
+        </label>
+      </div>
+      <label class="checkbox"><input type="checkbox" name="{{ p }}enabled"{% if alert.enabled %} checked{% endif %}> Enabled</label>
+      <button type="submit" name="form_action" value="remove:alert.{{ loop.index0 }}" class="danger" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Remove alert</button>
+    </div>
+    {% endfor %}
+    <button type="submit" name="form_action" value="add:alert" class="secondary" formnovalidate hx-post="{{ action }}" hx-target="#template-form" hx-select="#template-form" hx-swap="morph:outerHTML">Add alert</button>
+  </fieldset>
+
+  <label class="checkbox">
+    <input type="checkbox" name="enabled"{% if form.enabled %} checked{% endif %}> Enabled
+  </label>
+
+  <div class="actions">
+    {% if can_edit %}<button type="submit">Save template</button>{% else %}<span class="note">Your role lets you look at this, but not change it.</span>{% endif %}
+    <a class="button secondary" href="{% if id %}/templates/{{ id }}{% else %}/templates{% endif %}">Cancel</a>
+  </div>
+</form>
+{% endblock content %}

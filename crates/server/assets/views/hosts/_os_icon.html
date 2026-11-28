@@ -1,0 +1,8 @@
+{#- An agent's system as its logo. `os_family` is one of a fixed few names worked
+    out on the server, so nothing an agent sends ends up in the markup. -#}
+{%- if os_family == "macos" -%}<span class="os-icon os-macos" role="img" aria-label="macOS" title="macOS"></span>
+{%- elif os_family == "linux" -%}<span class="os-icon os-linux" role="img" aria-label="Linux" title="Linux"></span>
+{%- elif os_family == "windows" -%}<span class="os-icon os-windows" role="img" aria-label="Windows" title="Windows"></span>
+{%- elif os_family == "freebsd" -%}<span class="os-icon os-freebsd" role="img" aria-label="FreeBSD" title="FreeBSD"></span>
+{%- elif os_family == "openbsd" -%}<span class="os-icon os-openbsd" role="img" aria-label="OpenBSD" title="OpenBSD"></span>
+{%- endif -%}

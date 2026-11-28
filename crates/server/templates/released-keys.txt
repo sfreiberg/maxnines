@@ -1,0 +1,16 @@
+# The key of every built-in template a release has shipped, one per line. A key
+# here has to stay a built-in template's key, or be in one's renamed_from, so a
+# server upgraded past it keeps what people changed. Add a template's key here
+# when adding the template.
+host
+postgres
+clickhouse
+mysql
+macos
+mongodb
+unifi
+drives
+updates
+redis
+raid
+time_sync

@@ -1,0 +1,13 @@
+Reference ID    : 50484330 (PHC0)
+Stratum         : 1
+Ref time (UTC)  : Wed Nov 25 05:03:55 2026
+System time     : 0.000008261 seconds fast of NTP time
+Last offset     : +0.000006841 seconds
+RMS offset      : 0.000019417 seconds
+Frequency       : 18.336 ppm slow
+Residual freq   : +0.016 ppm
+Skew            : 0.386 ppm
+Root delay      : 0.000000001 seconds
+Root dispersion : 0.000018117 seconds
+Update interval : 8.0 seconds
+Leap status     : Normal

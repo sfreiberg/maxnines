@@ -1,0 +1,20 @@
+{% extends "layouts/application.html" %}
+{% block title %}Search · Docs · MaxNines{% endblock title %}
+{% block content %}
+<div class="docs-layout">
+  {% include "docs/_contents.html" %}
+  <article class="docs-page">
+    <h1>Search</h1>
+    {% if not query %}
+    <p>Type what you're looking for in the box.</p>
+    {% elif hits %}
+    <ol class="docs-results">
+      {% for hit in hits %}<li><a href="{{ hit.link }}">{{ hit.chapter }}{% if hit.heading != hit.chapter %}: {{ hit.heading }}{% endif %}</a><p>{{ hit.excerpt }}</p></li>
+      {% endfor %}
+    </ol>
+    {% else %}
+    <p>Nothing in the docs mentions all of “{{ query }}”.</p>
+    {% endif %}
+  </article>
+</div>
+{% endblock content %}

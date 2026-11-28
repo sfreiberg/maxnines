@@ -1,0 +1,105 @@
+<!--
+  The command line's Windows installer, built by the release workflow with WiX:
+
+    wix build -arch x64 -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+      -d Version=0.1.0 -d Program=path\to\maxnines.exe -d License=LICENSE
+      -o maxnines-cli.msi packaging\windows\cli.wxs
+
+  It puts maxnines.exe in C:\Program Files\MaxNines\Command Line and that folder
+  on the PATH, for everyone on the computer. It asks nothing, so a silent install
+  is just:
+
+    msiexec /i maxnines-cli.msi /qn
+
+  Each person's sign-ins are their own, in %APPDATA%\maxnines and Credential
+  Manager, and uninstalling leaves them.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="MaxNines Command Line"
+           Manufacturer="MaxNines"
+           Version="$(var.Version)"
+           UpgradeCode="8BF0B634-A4BD-419C-8FF3-A1C25706CA30">
+
+    <!-- A pre-release's suffix can't go in an MSI version, so two of them can
+         have the same one, and the later one still has to upgrade. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/sfreiberg/maxnines" />
+
+    <!-- Windows on Arm would run the x64 program by translating it, slower than
+         the Arm64 one, as the agent's and server's installers say. One already
+         installed can still be removed, or replaced by installing the Arm64 one. -->
+    <?if $(sys.BUILDARCH) = x64 ?>
+    <util:QueryNativeMachine />
+    <Launch Condition="Installed OR WIX_NATIVE_MACHINE &lt;&gt; 43620"
+            Message="This installer is for x64 processors, and this computer has an Arm processor. Use the MaxNines Command Line installer with aarch64 in its name instead." />
+    <?endif?>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ProgramFolder" Name="MaxNines">
+        <Directory Id="INSTALLFOLDER" Name="Command Line" />
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="CommandLine" Title="MaxNines Command Line">
+      <Component Directory="INSTALLFOLDER">
+        <File Id="CliExe" Source="$(var.Program)" Name="maxnines.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Directory="INSTALLFOLDER">
+        <File Source="$(var.License)" Name="LICENSE.txt" KeyPath="yes" />
+      </Component>
+
+      <!-- So maxnines works in any command prompt. -->
+      <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="DDE84DA4-09BB-4FB4-A61C-6D84039C0692">
+        <RegistryValue Root="HKLM" Key="SOFTWARE\MaxNines\Command Line" Name="InstallFolder"
+                       Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+        <RemoveRegistryKey Root="HKLM" Key="SOFTWARE\MaxNines\Command Line" Action="removeOnUninstall" />
+        <Environment Id="Path" Name="PATH" Value="[INSTALLFOLDER]" Part="last" Action="set"
+                     System="yes" Permanent="no" />
+      </Component>
+    </Feature>
+
+    <!-- Installing: Welcome, then Ready. There's nothing to ask. -->
+    <UI Id="CliUI">
+      <TextStyle Id="WixUI_Font_Normal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="WixUI_Font_Bigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="WixUI_Font_Title" FaceName="Tahoma" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="WixUI_Font_Normal" />
+
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+      <DialogRef Id="WelcomeDlg" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" />
+
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="1"
+               Condition="NOT Installed OR PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Order="2"
+               Condition="Installed AND NOT PATCH" />
+
+      <!-- Settings > Apps: there's nothing to change, so only Repair and Remove. -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+    </UI>
+    <UIRef Id="WixUI_Common" />
+    <!-- Hides Change in Settings > Apps, as there's nothing to change. -->
+    <Property Id="ARPNOMODIFY" Value="1" />
+  </Package>
+</Wix>

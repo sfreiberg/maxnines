@@ -1,0 +1,10 @@
+05:04:00 state=0 status=0x0 maxerror=25 esterror=8 offset=0 
+05:04:30 state=0 status=0x0 maxerror=3017 esterror=5 offset=0 
+05:05:00 state=0 status=0x0 maxerror=2014 esterror=3 offset=0 
+05:05:30 state=0 status=0x0 maxerror=1012 esterror=2 offset=0 
+05:06:00 state=0 status=0x0 maxerror=14 esterror=4 offset=0 
+05:06:30 state=0 status=0x0 maxerror=3019 esterror=7 offset=0 
+05:07:00 state=0 status=0x0 maxerror=2014 esterror=4 offset=0 
+05:07:30 state=0 status=0x0 maxerror=1021 esterror=7 offset=0 
+05:08:00 state=0 status=0x0 maxerror=4012 esterror=3 offset=0 
+05:08:30 state=0 status=0x0 maxerror=3011 esterror=2 offset=0 
