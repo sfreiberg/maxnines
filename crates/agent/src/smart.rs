@@ -18,6 +18,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at, failed, filled};
+use maxnines_protocol::entries::Entry;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -71,7 +74,82 @@ impl Collector for SmartCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &SMART_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let rows = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        // Why no drive could be asked is the error of every metric.
+        let problem = rows
+            .iter()
+            .find_map(|row| filled(at(row, "problem")).as_str());
+        if let Some(problem) = problem {
+            return failed(&SMART_METRICS, time, problem);
+        }
+        let mut entries = Entries::at(time);
+        let named = rows
+            .iter()
+            .filter_map(|drive| Some((drive.get("name")?.as_str()?, drive)));
+        let mut any = false;
+        for (name, drive) in named {
+            any = true;
+            // Why a drive couldn't be read is its note, which is the error of
+            // whatever it has nothing for. Its device and whether it's asleep are
+            // still known.
+            let why = filled(at(drive, "note")).as_str();
+            for (metric, field) in SMART_FIELDS {
+                let read = filled(at(drive, field));
+                match why {
+                    Some(why) if read.is_null() => entries.error(metric, &[name], why),
+                    _ => entries.read(metric, &[name], read),
+                }
+            }
+        }
+        // With no drives, or none asked yet, each metric has nothing.
+        if !any {
+            for metric in SMART_METRICS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        entries.done()
+    }
 }
+
+/// A drive's metrics, and what each is read from: what the drive counts, then what
+/// it is, where it is and whether it was asleep.
+const SMART_FIELDS: [(&str, &str); 19] = [
+    ("smart.healthy", "healthy"),
+    ("smart.temperature", "temperature_celsius"),
+    ("smart.power_on", "power_on_secs"),
+    ("smart.power_cycles", "power_cycles"),
+    ("smart.reallocated", "reallocated"),
+    ("smart.pending", "pending"),
+    ("smart.uncorrectable", "uncorrectable"),
+    ("smart.crc_errors", "crc_errors"),
+    ("smart.used", "used_percent"),
+    ("smart.spare", "spare_percent"),
+    ("smart.spare_threshold", "spare_threshold_percent"),
+    ("smart.media_errors", "media_errors"),
+    ("smart.unsafe_shutdowns", "unsafe_shutdowns"),
+    ("smart.critical_warning", "critical_warning"),
+    ("smart.device", "device"),
+    ("smart.model", "model"),
+    ("smart.serial", "serial"),
+    ("smart.protocol", "protocol"),
+    ("smart.asleep", "asleep"),
+];
+
+const SMART_METRICS: [&str; 19] = {
+    let mut metrics = [""; 19];
+    let mut at = 0;
+    while at < SMART_FIELDS.len() {
+        metrics[at] = SMART_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// What one look at every drive found.
 #[derive(Debug, PartialEq)]
@@ -562,6 +640,157 @@ fn parse_windows(json: &[u8]) -> std::result::Result<Vec<Drive>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// A collector that never asks a drive anything.
+    fn asking_nothing() -> SmartCollector {
+        SmartCollector {
+            background: Background::new(),
+        }
+    }
+
+    #[test]
+    fn smart_entries_have_a_series_for_each_drive() {
+        let collector = asking_nothing();
+        let output = json!([
+            { "name": "Samsung SSD 870 EVO 1TB S6PT", "device": "/dev/sda",
+              "model": "Samsung SSD 870 EVO 1TB", "serial": "S6PT", "protocol": "ATA",
+              "healthy": 1, "temperature_celsius": 31.0, "power_on_secs": 3600.0,
+              "power_cycles": 412.0, "reallocated": 0.0, "pending": 0.0,
+              "uncorrectable": 0.0, "crc_errors": 2.0, "asleep": 0, "note": "" },
+            // Asleep since the agent started, so it has never been asked.
+            { "name": "/dev/sdc", "device": "/dev/sdc", "asleep": 1, "note": "" },
+            // One without a name can't be told from the others.
+            { "device": "/dev/sdx", "healthy": 1 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let sda = "Samsung SSD 870 EVO 1TB S6PT";
+        let of = |metric: &str, drive: &str| format!("{metric}[{drive}]");
+        assert_eq!(
+            said(&entries),
+            [
+                (of("smart.healthy", sda), json!(1)),
+                (of("smart.temperature", sda), json!(31.0)),
+                (of("smart.power_on", sda), json!(3600.0)),
+                (of("smart.power_cycles", sda), json!(412.0)),
+                (of("smart.reallocated", sda), json!(0.0)),
+                (of("smart.pending", sda), json!(0.0)),
+                (of("smart.uncorrectable", sda), json!(0.0)),
+                (of("smart.crc_errors", sda), json!(2.0)),
+                // Only NVMe drives say these.
+                (of("smart.used", sda), Value::Null),
+                (of("smart.spare", sda), Value::Null),
+                (of("smart.spare_threshold", sda), Value::Null),
+                (of("smart.media_errors", sda), Value::Null),
+                (of("smart.unsafe_shutdowns", sda), Value::Null),
+                (of("smart.critical_warning", sda), Value::Null),
+                (of("smart.device", sda), json!("/dev/sda")),
+                (of("smart.model", sda), json!("Samsung SSD 870 EVO 1TB")),
+                (of("smart.serial", sda), json!("S6PT")),
+                (of("smart.protocol", sda), json!("ATA")),
+                (of("smart.asleep", sda), json!(0)),
+                (of("smart.healthy", "/dev/sdc"), Value::Null),
+                (of("smart.temperature", "/dev/sdc"), Value::Null),
+                (of("smart.power_on", "/dev/sdc"), Value::Null),
+                (of("smart.power_cycles", "/dev/sdc"), Value::Null),
+                (of("smart.reallocated", "/dev/sdc"), Value::Null),
+                (of("smart.pending", "/dev/sdc"), Value::Null),
+                (of("smart.uncorrectable", "/dev/sdc"), Value::Null),
+                (of("smart.crc_errors", "/dev/sdc"), Value::Null),
+                (of("smart.used", "/dev/sdc"), Value::Null),
+                (of("smart.spare", "/dev/sdc"), Value::Null),
+                (of("smart.spare_threshold", "/dev/sdc"), Value::Null),
+                (of("smart.media_errors", "/dev/sdc"), Value::Null),
+                (of("smart.unsafe_shutdowns", "/dev/sdc"), Value::Null),
+                (of("smart.critical_warning", "/dev/sdc"), Value::Null),
+                (of("smart.device", "/dev/sdc"), json!("/dev/sdc")),
+                (of("smart.model", "/dev/sdc"), Value::Null),
+                (of("smart.serial", "/dev/sdc"), Value::Null),
+                (of("smart.protocol", "/dev/sdc"), Value::Null),
+                (of("smart.asleep", "/dev/sdc"), json!(1)),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no drives, or none asked yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(none.len(), SMART_METRICS.len());
+            assert!(
+                said(&none)
+                    .iter()
+                    .all(|(name, value)| !name.contains('[') && value.is_null())
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn why_a_drive_could_not_be_read_is_the_error_of_what_it_has_nothing_for() {
+        let collector = asking_nothing();
+        let mut known = Known::default();
+        let output = known.publish(Ok(Round::Drives(vec![
+            parse_drive("/dev/nvme0", NVME.as_bytes()),
+            parse_drive("/dev/sdd", UNREADABLE.as_bytes()),
+        ])));
+        let entries = collector.entries(&output, time());
+        every_metric_has_an_entry(&collector, &entries);
+        let said = said(&entries);
+        assert_eq!(said.len(), 2 * SMART_METRICS.len());
+        let why = json!({ "error": "/dev/sdd: Unknown USB bridge [0x152d:0x0578 (0x214)]" });
+        for (name, value) in &said {
+            let Some(metric) = name.strip_suffix("[/dev/sdd]") else {
+                // The drive that was read has no errors.
+                assert!(value.get("error").is_none(), "{name}: {value}");
+                continue;
+            };
+            let expected = match metric {
+                "smart.device" => json!("/dev/sdd"),
+                "smart.asleep" => json!(0),
+                _ => why.clone(),
+            };
+            assert_eq!(value, &expected, "{name}");
+        }
+        let nvme = "Samsung SSD 980 PRO 1TB S5GXNF0R654321B";
+        for (metric, value) in [
+            ("smart.healthy", json!(1)),
+            ("smart.used", json!(3.0)),
+            ("smart.spare", json!(100.0)),
+            ("smart.spare_threshold", json!(10.0)),
+            ("smart.unsafe_shutdowns", json!(57.0)),
+            ("smart.protocol", json!("NVMe")),
+            // Only ATA drives say this.
+            ("smart.reallocated", Value::Null),
+        ] {
+            assert!(
+                said.contains(&(format!("{metric}[{nvme}]"), value)),
+                "{metric}: {said:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn why_no_drive_could_be_asked_is_the_error_of_every_metric() {
+        let collector = asking_nothing();
+        let mut known = Known::default();
+        let output = known.publish(Ok(Round::Problem("smartctl isn't installed".into())));
+        let entries = collector.entries(&output, time());
+        let said = said(&entries);
+        assert_eq!(said.len(), SMART_METRICS.len());
+        for (name, value) in said {
+            assert!(!name.contains('['), "{name}");
+            assert_eq!(value, json!({ "error": "smartctl isn't installed" }));
+        }
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn a_collector_that_has_asked_nothing_collects_nothing_for_each_metric() {
+        let mut collector = asking_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     /// A SATA SSD in good health, as smartctl 7.4 prints it.
     const SATA: &str = r#"{

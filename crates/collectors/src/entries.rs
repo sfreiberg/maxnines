@@ -77,6 +77,15 @@ pub fn at<'a>(output: &'a Value, path: &str) -> &'a Value {
         .unwrap_or(&Value::Null)
 }
 
+/// What's there, or null for text that's empty, which is how output whose texts are
+/// always there says it has none.
+pub fn filled(value: &Value) -> &Value {
+    match value.as_str() {
+        Some(text) if text.trim().is_empty() => &Value::Null,
+        _ => value,
+    }
+}
+
 /// `part` as a percentage of `whole`, or nothing when either isn't a number or
 /// there's no whole to be a share of.
 pub fn percent(part: &Value, whole: &Value) -> Option<f64> {
@@ -177,6 +186,16 @@ pub(crate) mod tests {
         assert_eq!(at(&output, "load"), &json!({ "one": 1.5 }));
         for nothing in ["load.two", "none", "load.one.more", "cores.one"] {
             assert_eq!(at(&output, nothing), &Value::Null, "{nothing}");
+        }
+    }
+
+    #[test]
+    fn empty_text_is_nothing_and_everything_else_is_itself() {
+        for empty in [json!(""), json!("  ")] {
+            assert_eq!(filled(&empty), &Value::Null);
+        }
+        for kept in [json!("ext4"), json!(0), json!(false), Value::Null] {
+            assert_eq!(filled(&kept), &kept);
         }
     }
 

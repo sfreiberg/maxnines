@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
+use maxnines_collectors::entries::{Entries, at};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Value, json};
 
 use crate::background::{Background, Busy, FAILED_UNEXPECTEDLY};
@@ -80,7 +82,61 @@ impl Collector for FileCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &FILE_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let paths = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = paths
+            .iter()
+            .filter_map(|found| Some((found.get("path")?.as_str()?, found)));
+        let mut any = false;
+        for (path, found) in named {
+            any = true;
+            // A path that couldn't be looked at says why, which is the error of
+            // everything about it.
+            let why = at(found, "error")
+                .as_str()
+                .filter(|why| !why.trim().is_empty());
+            for (metric, field) in FILE_FIELDS {
+                match why {
+                    Some(why) => entries.error(metric, &[path], why),
+                    None => entries.read(metric, &[path], at(found, field)),
+                }
+            }
+        }
+        // With no paths to watch, or none looked at yet, each metric has nothing.
+        if !any {
+            for metric in FILE_METRICS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        entries.done()
+    }
 }
+
+/// A path's metrics, and what each is read from. Only a folder has entries, and a
+/// path that's missing only says so.
+const FILE_FIELDS: [(&str, &str); 5] = [
+    ("file.exists", "exists"),
+    ("file.size", "size_bytes"),
+    ("file.age", "age_secs"),
+    ("file.folder", "is_folder"),
+    ("file.entries", "entries"),
+];
+
+const FILE_METRICS: [&str; 5] = {
+    let mut metrics = [""; 5];
+    let mut at = 0;
+    while at < FILE_FIELDS.len() {
+        metrics[at] = FILE_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// A path that can't be reached in time says nothing about whether it exists,
 /// so it has no `exists` value, and an alert on it holds its state.
@@ -147,9 +203,124 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
 
     fn path_of(path: &Path) -> String {
         path.to_str().unwrap().to_string()
+    }
+
+    /// Watching nothing, so nothing is looked at.
+    fn watching_nothing() -> FileCollector {
+        FileCollector::new(Vec::new(), Duration::from_secs(3600)).unwrap()
+    }
+
+    #[test]
+    fn file_entries_have_a_series_for_each_path() {
+        let collector = watching_nothing();
+        let output = json!([
+            { "path": "/srv/backup.tar", "exists": 1, "is_folder": false,
+              "age_secs": 90.5, "size_bytes": 5 },
+            { "path": "/srv/backups", "exists": 1, "is_folder": true,
+              "age_secs": 0.0, "entries": 3, "size_bytes": 12 },
+            { "path": "/srv/nope", "exists": 0 },
+            { "path": "/mnt/nfs", "error": "timed out" },
+            // One without a path can't be told from the others.
+            { "exists": 1 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let timed_out = json!({ "error": "timed out" });
+        assert_eq!(
+            said(&entries),
+            [
+                ("file.exists[/srv/backup.tar]".to_string(), json!(1)),
+                ("file.size[/srv/backup.tar]".to_string(), json!(5)),
+                ("file.age[/srv/backup.tar]".to_string(), json!(90.5)),
+                ("file.folder[/srv/backup.tar]".to_string(), json!(false)),
+                ("file.entries[/srv/backup.tar]".to_string(), Value::Null),
+                ("file.exists[/srv/backups]".to_string(), json!(1)),
+                ("file.size[/srv/backups]".to_string(), json!(12)),
+                ("file.age[/srv/backups]".to_string(), json!(0.0)),
+                ("file.folder[/srv/backups]".to_string(), json!(true)),
+                ("file.entries[/srv/backups]".to_string(), json!(3)),
+                // A missing path has nothing else to say.
+                ("file.exists[/srv/nope]".to_string(), json!(0)),
+                ("file.size[/srv/nope]".to_string(), Value::Null),
+                ("file.age[/srv/nope]".to_string(), Value::Null),
+                ("file.folder[/srv/nope]".to_string(), Value::Null),
+                ("file.entries[/srv/nope]".to_string(), Value::Null),
+                // One that couldn't be looked at says why, and not that it's missing.
+                ("file.exists[/mnt/nfs]".to_string(), timed_out.clone()),
+                ("file.size[/mnt/nfs]".to_string(), timed_out.clone()),
+                ("file.age[/mnt/nfs]".to_string(), timed_out.clone()),
+                ("file.folder[/mnt/nfs]".to_string(), timed_out.clone()),
+                ("file.entries[/mnt/nfs]".to_string(), timed_out),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no paths, or none looked at yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(
+                said(&none),
+                [
+                    ("file.exists".to_string(), Value::Null),
+                    ("file.size".to_string(), Value::Null),
+                    ("file.age".to_string(), Value::Null),
+                    ("file.folder".to_string(), Value::Null),
+                    ("file.entries".to_string(), Value::Null),
+                ]
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn what_looking_at_a_path_says_becomes_entries() {
+        let collector = watching_nothing();
+        let folder = tempfile::tempdir().unwrap();
+        let file = folder.path().join("backup.tar");
+        fs::write(&file, "12345").unwrap();
+        let (file, missing) = (path_of(&file), path_of(&folder.path().join("nope")));
+        // An hour on, so the file's age is known whatever its clock says.
+        let later = maxnines_protocol::time::now() + TimeDelta::hours(1);
+        let refused = io::Error::from(io::ErrorKind::PermissionDenied);
+        let output = json!([
+            inspect(&file, later),
+            inspect(&missing, later),
+            unreadable(&"/srv/secret".to_string(), &refused),
+        ]);
+        let entries = collector.entries(&output, time());
+        every_metric_has_an_entry(&collector, &entries);
+        let said = said(&entries);
+        assert_eq!(said.len(), 3 * 5);
+        for (name, value) in [
+            (format!("file.exists[{file}]"), json!(1)),
+            (format!("file.size[{file}]"), json!(5)),
+            (format!("file.folder[{file}]"), json!(false)),
+            (format!("file.entries[{file}]"), Value::Null),
+            (format!("file.exists[{missing}]"), json!(0)),
+            (format!("file.age[{missing}]"), Value::Null),
+            (
+                "file.exists[/srv/secret]".to_string(),
+                json!({ "error": "not allowed" }),
+            ),
+        ] {
+            assert!(said.contains(&(name.clone(), value)), "{name}: {said:?}");
+        }
+        let age = said
+            .iter()
+            .find(|(name, _)| name == &format!("file.age[{file}]"))
+            .and_then(|(_, age)| age.as_f64());
+        assert!(age >= Some(3590.0), "{said:?}");
+    }
+
+    #[test]
+    fn watching_no_paths_really_collects_nothing_for_each_metric() {
+        let mut collector = watching_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
     }
 
     #[test]

@@ -19,8 +19,11 @@ use bollard::models::{
 };
 use bollard::query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder};
 use bollard::{API_DEFAULT_VERSION, Docker};
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use futures_util::future::join_all;
+use maxnines_collectors::entries::{Entries, at, percent};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 use tracing::warn;
 
@@ -110,7 +113,77 @@ impl Collector for ContainerCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.latest().pop().unwrap_or_default())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &CONTAINER_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        container_entries(output, time)
+    }
 }
+
+/// What was read of each container, as entries. It's apart from the collector so
+/// it can be tried without one, which would look for Docker.
+fn container_entries(output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+    let mut entries = Entries::at(time);
+    let containers = output.as_array().map(Vec::as_slice).unwrap_or_default();
+    let named = containers
+        .iter()
+        .filter_map(|container| Some((container.get("name")?.as_str()?, container)));
+    let mut any = false;
+    for (name, container) in named {
+        any = true;
+        let series = [name];
+        let of_limit = percent(
+            at(container, "memory_bytes"),
+            at(container, "memory_limit_bytes"),
+        );
+        entries.number("container.memory_limit", &series, of_limit);
+        for (metric, field) in CONTAINER_FIELDS {
+            entries.read(metric, &series, at(container, field));
+        }
+    }
+    // With no containers, or when they couldn't be read, each metric has nothing.
+    if !any {
+        for metric in CONTAINER_METRICS {
+            entries.nothing(metric, &[]);
+        }
+    }
+    entries.done()
+}
+
+/// A container's metrics that are read as they are, and what each is read from.
+/// What it received, sent, read and wrote are Docker's own running totals since
+/// the container started. One that isn't running has only what it is and how it
+/// ended.
+const CONTAINER_FIELDS: [(&str, &str); 14] = [
+    ("container.up", "up"),
+    ("container.cpu", "cpu_percent"),
+    ("container.memory", "memory_bytes"),
+    ("container.memory_limit_bytes", "memory_limit_bytes"),
+    ("container.received", "received_bytes"),
+    ("container.sent", "sent_bytes"),
+    ("container.read", "read_bytes"),
+    ("container.written", "written_bytes"),
+    ("container.restarts", "restarts"),
+    ("container.processes", "processes"),
+    ("container.image", "image"),
+    ("container.state", "state"),
+    ("container.health", "health"),
+    ("container.exit_code", "exit_code"),
+];
+
+/// Every metric a container has: the one worked out, then those read as they are.
+const CONTAINER_METRICS: [&str; 15] = {
+    let mut metrics = ["container.memory_limit"; 15];
+    let mut at = 0;
+    while at < CONTAINER_FIELDS.len() {
+        metrics[at + 1] = CONTAINER_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// Logs why containers can't be read, once for each new reason, as they're read
 /// every interval.
@@ -338,6 +411,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
 
     fn summary(name: &str) -> ContainerSummary {
         ContainerSummary {
@@ -509,6 +583,136 @@ mod tests {
         // 2,000 of the host's 10,000, whatever its number of CPUs.
         assert_eq!(row["cpu_percent"], 20.0);
         assert!(row.get("system_total").is_none());
+    }
+
+    /// Only says which metrics the collector has, as a real one looks for Docker.
+    struct Metrics;
+
+    impl Collector for Metrics {
+        fn name(&self) -> &'static str {
+            "containers"
+        }
+
+        fn collect(&mut self) -> Result<Value> {
+            Ok(Value::Null)
+        }
+
+        fn metrics(&self) -> &'static [&'static str] {
+            &CONTAINER_METRICS
+        }
+    }
+
+    #[test]
+    fn container_entries_have_a_series_for_each_container() {
+        let output = json!([
+            { "name": "web", "image": "nginx:1.27", "state": "running", "health": "healthy",
+              "up": 1, "restarts": 3, "cpu_percent": 12.5, "memory_bytes": 200,
+              "memory_limit_bytes": 1000, "memory_percent": 20.0,
+              "received_bytes": 11000, "sent_bytes": 22000, "read_bytes": 5000,
+              "written_bytes": 7000, "processes": 4 },
+            { "name": "worker", "image": "app", "state": "exited", "exit_code": 1,
+              "up": 0, "restarts": 4 },
+            // One without a name can't be told from the others.
+            { "image": "busybox", "up": 1 },
+        ]);
+        let entries = container_entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("container.memory_limit[web]"), json!(20.0)),
+                (of("container.up[web]"), json!(1)),
+                (of("container.cpu[web]"), json!(12.5)),
+                (of("container.memory[web]"), json!(200)),
+                (of("container.memory_limit_bytes[web]"), json!(1000)),
+                // The running totals, as Docker counts them.
+                (of("container.received[web]"), json!(11000)),
+                (of("container.sent[web]"), json!(22000)),
+                (of("container.read[web]"), json!(5000)),
+                (of("container.written[web]"), json!(7000)),
+                (of("container.restarts[web]"), json!(3)),
+                (of("container.processes[web]"), json!(4)),
+                (of("container.image[web]"), json!("nginx:1.27")),
+                (of("container.state[web]"), json!("running")),
+                (of("container.health[web]"), json!("healthy")),
+                (of("container.exit_code[web]"), Value::Null),
+                // One that isn't running uses nothing.
+                (of("container.memory_limit[worker]"), Value::Null),
+                (of("container.up[worker]"), json!(0)),
+                (of("container.cpu[worker]"), Value::Null),
+                (of("container.memory[worker]"), Value::Null),
+                (of("container.memory_limit_bytes[worker]"), Value::Null),
+                (of("container.received[worker]"), Value::Null),
+                (of("container.sent[worker]"), Value::Null),
+                (of("container.read[worker]"), Value::Null),
+                (of("container.written[worker]"), Value::Null),
+                (of("container.restarts[worker]"), json!(4)),
+                (of("container.processes[worker]"), Value::Null),
+                (of("container.image[worker]"), json!("app")),
+                (of("container.state[worker]"), json!("exited")),
+                (of("container.health[worker]"), Value::Null),
+                (of("container.exit_code[worker]"), json!(1)),
+            ]
+        );
+        every_metric_has_an_entry(&Metrics, &entries);
+
+        // With no containers, or when they couldn't be read, each has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = container_entries(&output, time());
+            assert_eq!(none.len(), CONTAINER_METRICS.len());
+            assert!(
+                said(&none)
+                    .iter()
+                    .all(|(name, value)| !name.contains('[') && value.is_null())
+            );
+            every_metric_has_an_entry(&Metrics, &none);
+        }
+    }
+
+    #[test]
+    fn what_docker_says_of_a_container_becomes_entries() {
+        let mut running = describe(
+            &summary("web"),
+            &inspected(
+                ContainerStateStatusEnum::RUNNING,
+                0,
+                Some(HealthStatusEnum::HEALTHY),
+            ),
+            Some(&stats(500, 10_000)),
+        );
+        // A first sample has no CPU use yet.
+        settle_cpu(&mut running, &HashMap::new(), &mut HashMap::new());
+        let finished = describe(
+            &summary("migrate"),
+            &inspected(ContainerStateStatusEnum::EXITED, 0, None),
+            None,
+        );
+        let entries = container_entries(&json!([running, finished]), time());
+        every_metric_has_an_entry(&Metrics, &entries);
+        let said = said(&entries);
+        assert_eq!(said.len(), 2 * CONTAINER_METRICS.len());
+        for (name, value) in [
+            ("container.up[web]", json!(1)),
+            ("container.cpu[web]", Value::Null),
+            ("container.memory[web]", json!(200)),
+            ("container.memory_limit[web]", json!(20.0)),
+            ("container.memory_limit_bytes[web]", json!(1000)),
+            ("container.received[web]", json!(11)),
+            ("container.sent[web]", json!(22)),
+            ("container.read[web]", json!(5)),
+            ("container.written[web]", json!(7)),
+            ("container.health[web]", json!("healthy")),
+            // One that finished cleanly isn't up or down.
+            ("container.up[migrate]", Value::Null),
+            ("container.state[migrate]", json!("exited")),
+            ("container.exit_code[migrate]", json!(0)),
+            ("container.restarts[migrate]", json!(3)),
+        ] {
+            assert!(
+                said.contains(&(name.to_string(), value)),
+                "{name}: {said:?}"
+            );
+        }
     }
 
     #[test]

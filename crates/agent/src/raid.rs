@@ -14,6 +14,9 @@
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_protocol::entries::Entry;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -61,7 +64,103 @@ impl Collector for RaidCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &RAID_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let rows = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = rows
+            .iter()
+            .filter_map(|row| Some((row.get("name")?.as_str()?, row)));
+        let (mut arrays, mut pools) = (false, false);
+        for (name, row) in named {
+            // What couldn't be asked says why, under the name of what was asked,
+            // which is never an array's. Whatever it would have found could have
+            // been an array or a pool, so it's the error of every metric.
+            if let Some(problem) = filled(at(row, "problem")).as_str() {
+                (arrays, pools) = (true, true);
+                for metric in RAID_METRICS {
+                    entries.error(metric, &[name], problem);
+                }
+                continue;
+            }
+            arrays = true;
+            for (metric, field) in RAID_FIELDS {
+                entries.read(metric, &[name], filled(at(row, field)));
+            }
+            if at(row, "kind") == "zfs" {
+                pools = true;
+                for (metric, field) in ZFS_FIELDS {
+                    entries.read(metric, &[name], at(row, field));
+                }
+            }
+        }
+        // With no arrays, or none looked at yet, each metric has nothing, as do
+        // ZFS's own on a host whose arrays are all something else.
+        if !arrays {
+            for (metric, _) in RAID_FIELDS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        if !pools {
+            for (metric, _) in ZFS_FIELDS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        entries.done()
+    }
 }
+
+/// The metrics every array has, and what each is read from: how it is, then what it
+/// is and what its system says of it. The devices that aren't working are one text,
+/// each with what's wrong with it, as that's all that's known of them.
+const RAID_FIELDS: [(&str, &str); 13] = [
+    ("raid.degraded", "degraded"),
+    ("raid.failed", "failed"),
+    ("raid.rebuilding", "rebuilding"),
+    ("raid.rebuild_progress", "rebuild_percent"),
+    ("raid.scrub_progress", "scrub_percent"),
+    ("raid.speed", "speed_bytes_per_sec"),
+    ("raid.devices", "devices"),
+    ("raid.working_devices", "working_devices"),
+    ("raid.kind", "kind"),
+    ("raid.level", "level"),
+    ("raid.state", "state"),
+    ("raid.not_working", "not_working"),
+    ("raid.note", "note"),
+];
+
+/// What only a ZFS pool has.
+const ZFS_FIELDS: [(&str, &str); 10] = [
+    ("zfs.size", "size_bytes"),
+    ("zfs.used", "used_percent"),
+    ("zfs.fragmentation", "fragmentation_percent"),
+    ("zfs.read_errors", "read_errors"),
+    ("zfs.write_errors", "write_errors"),
+    ("zfs.checksum_errors", "checksum_errors"),
+    ("zfs.data_errors", "data_errors"),
+    ("zfs.scrub_age", "scrub_age_secs"),
+    ("zfs.scrub_repaired", "scrub_repaired_bytes"),
+    ("zfs.scrub_errors", "scrub_errors"),
+];
+
+/// Every metric: each array's, then each pool's.
+const RAID_METRICS: [&str; 23] = {
+    let mut metrics = [""; 23];
+    let mut at = 0;
+    while at < RAID_FIELDS.len() {
+        metrics[at] = RAID_FIELDS[at].0;
+        at += 1;
+    }
+    while at < metrics.len() {
+        metrics[at] = ZFS_FIELDS[at - RAID_FIELDS.len()].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// What one look found: each array, and what couldn't be read, by what it was
 /// asked with.
@@ -1154,6 +1253,198 @@ fn parse_storage_spaces(json: &[u8]) -> std::result::Result<Vec<Array>, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// A collector that never looks at anything.
+    fn looking_at_nothing() -> RaidCollector {
+        RaidCollector {
+            background: Background::new(),
+        }
+    }
+
+    #[test]
+    fn raid_entries_have_a_series_for_each_array_and_pool() {
+        let collector = looking_at_nothing();
+        let output = json!([
+            { "name": "/dev/md0", "kind": "md", "level": "raid1", "state": "recovering",
+              "not_working": "1 rebuilding", "note": "", "devices": 2, "working_devices": 1,
+              "degraded": 1, "failed": 0, "rebuilding": 1, "rebuild_percent": 12.5,
+              "speed_bytes_per_sec": 1048576.0 },
+            { "name": "tank", "kind": "zfs", "level": "raidz1", "state": "ONLINE",
+              "not_working": "", "note": "", "devices": 3, "working_devices": 3,
+              "degraded": 0, "failed": 0, "rebuilding": 0, "scrub_percent": 40.0,
+              "size_bytes": 1000.0, "used_percent": 25.0, "fragmentation_percent": 3.0,
+              "read_errors": 0.0, "write_errors": 0.0, "checksum_errors": 2.0,
+              "data_errors": 0.0, "scrub_age_secs": 3600.0, "scrub_repaired_bytes": 0.0 },
+            // One without a name can't be told from the others.
+            { "kind": "md", "degraded": 1 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("raid.degraded[/dev/md0]"), json!(1)),
+                (of("raid.failed[/dev/md0]"), json!(0)),
+                (of("raid.rebuilding[/dev/md0]"), json!(1)),
+                (of("raid.rebuild_progress[/dev/md0]"), json!(12.5)),
+                (of("raid.scrub_progress[/dev/md0]"), Value::Null),
+                (of("raid.speed[/dev/md0]"), json!(1048576.0)),
+                (of("raid.devices[/dev/md0]"), json!(2)),
+                (of("raid.working_devices[/dev/md0]"), json!(1)),
+                (of("raid.kind[/dev/md0]"), json!("md")),
+                (of("raid.level[/dev/md0]"), json!("raid1")),
+                (of("raid.state[/dev/md0]"), json!("recovering")),
+                (of("raid.not_working[/dev/md0]"), json!("1 rebuilding")),
+                // Text that's empty is nothing to say.
+                (of("raid.note[/dev/md0]"), Value::Null),
+                (of("raid.degraded[tank]"), json!(0)),
+                (of("raid.failed[tank]"), json!(0)),
+                (of("raid.rebuilding[tank]"), json!(0)),
+                (of("raid.rebuild_progress[tank]"), Value::Null),
+                (of("raid.scrub_progress[tank]"), json!(40.0)),
+                (of("raid.speed[tank]"), Value::Null),
+                (of("raid.devices[tank]"), json!(3)),
+                (of("raid.working_devices[tank]"), json!(3)),
+                (of("raid.kind[tank]"), json!("zfs")),
+                (of("raid.level[tank]"), json!("raidz1")),
+                (of("raid.state[tank]"), json!("ONLINE")),
+                (of("raid.not_working[tank]"), Value::Null),
+                (of("raid.note[tank]"), Value::Null),
+                // Only a pool has ZFS's own.
+                (of("zfs.size[tank]"), json!(1000.0)),
+                (of("zfs.used[tank]"), json!(25.0)),
+                (of("zfs.fragmentation[tank]"), json!(3.0)),
+                (of("zfs.read_errors[tank]"), json!(0.0)),
+                (of("zfs.write_errors[tank]"), json!(0.0)),
+                (of("zfs.checksum_errors[tank]"), json!(2.0)),
+                (of("zfs.data_errors[tank]"), json!(0.0)),
+                (of("zfs.scrub_age[tank]"), json!(3600.0)),
+                (of("zfs.scrub_repaired[tank]"), json!(0.0)),
+                (of("zfs.scrub_errors[tank]"), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no arrays, or none looked at yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(none.len(), RAID_METRICS.len());
+            assert!(
+                said(&none)
+                    .iter()
+                    .all(|(name, value)| !name.contains('[') && value.is_null())
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn a_host_with_arrays_and_no_pools_has_nothing_for_what_only_zfs_says() {
+        let collector = looking_at_nothing();
+        let found = Found {
+            arrays: vec![Array {
+                name: "/dev/md0".into(),
+                kind: "md",
+                level: "raid1".into(),
+                state: "clean".into(),
+                devices: 2,
+                working_devices: 2,
+                ..Array::default()
+            }],
+            problems: Vec::new(),
+        };
+        let entries = collector.entries(&found.to_value(), time());
+        every_metric_has_an_entry(&collector, &entries);
+        let said = said(&entries);
+        assert_eq!(said.len(), RAID_METRICS.len());
+        assert!(said.contains(&("raid.degraded[/dev/md0]".to_string(), json!(0))));
+        assert!(said.contains(&("raid.state[/dev/md0]".to_string(), json!("clean"))));
+        for (metric, _) in ZFS_FIELDS {
+            assert!(
+                said.contains(&(metric.to_string(), Value::Null)),
+                "{metric}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_could_not_be_asked_is_an_error_under_the_name_of_what_was_asked() {
+        let collector = looking_at_nothing();
+        // zpool couldn't be asked, while md's arrays were read.
+        let found = Found {
+            arrays: vec![Array {
+                name: "/dev/md0".into(),
+                kind: "md",
+                degraded: true,
+                ..Array::default()
+            }],
+            problems: vec![("/usr/sbin/zpool", "zpool couldn't be run".into())],
+        };
+        let entries = collector.entries(&found.to_value(), time());
+        every_metric_has_an_entry(&collector, &entries);
+        let read = said(&entries);
+        assert_eq!(read.len(), RAID_FIELDS.len() + RAID_METRICS.len());
+        assert!(read.contains(&("raid.degraded[/dev/md0]".to_string(), json!(1))));
+        for metric in RAID_METRICS {
+            assert!(
+                read.contains(&(
+                    format!("{metric}[/usr/sbin/zpool]"),
+                    json!({ "error": "zpool couldn't be run" })
+                )),
+                "{metric}: {read:?}"
+            );
+        }
+
+        // A look that didn't finish has nothing else.
+        let unfinished = Found::unfinished(Missed::Panicked).to_value();
+        let entries = collector.entries(&unfinished, time());
+        every_metric_has_an_entry(&collector, &entries);
+        assert_eq!(entries.len(), RAID_METRICS.len());
+        for (name, value) in said(&entries) {
+            assert!(name.ends_with("[raid]"), "{name}");
+            assert!(value["error"].is_string(), "{name}: {value}");
+        }
+    }
+
+    /// `zpool list` still says how full a pool is when `zpool status` can't
+    /// describe it, and nothing is made up for the rest.
+    #[test]
+    fn a_pool_status_could_not_describe_has_nothing_for_what_was_not_said() {
+        let collector = looking_at_nothing();
+        let pools = parse_zpool("tank\tDEGRADED\t1000\t5\t40\n", "", after_capture());
+        let found = Found {
+            arrays: pools,
+            problems: Vec::new(),
+        };
+        let entries = collector.entries(&found.to_value(), time());
+        every_metric_has_an_entry(&collector, &entries);
+        let said = said(&entries);
+        for (name, value) in [
+            ("raid.degraded[tank]", json!(1)),
+            ("raid.state[tank]", json!("DEGRADED")),
+            ("raid.devices[tank]", Value::Null),
+            ("raid.working_devices[tank]", Value::Null),
+            ("zfs.size[tank]", json!(1000.0)),
+            ("zfs.used[tank]", json!(40.0)),
+            ("zfs.fragmentation[tank]", json!(5.0)),
+            ("zfs.read_errors[tank]", Value::Null),
+            ("zfs.data_errors[tank]", Value::Null),
+        ] {
+            assert!(
+                said.contains(&(name.to_string(), value)),
+                "{name}: {said:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_collector_that_has_looked_at_nothing_collects_nothing_for_each_metric() {
+        let mut collector = looking_at_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     /// What a capture-raid-outputs run kept, under `fixtures/raid/`.
     fn fixture(path: &str) -> String {

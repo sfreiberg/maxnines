@@ -16,6 +16,9 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 
 use crate::background::Background;
@@ -64,7 +67,54 @@ impl Collector for UpdatesCollector {
             .next()
             .unwrap_or(Value::Null))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &UPDATES_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        // Why nothing could be asked is the error of whatever wasn't read. What was
+        // asked is still known.
+        let problem = filled(at(output, "problem")).as_str();
+        for (metric, series, field) in UPDATES_FIELDS {
+            let read = filled(at(output, field));
+            match problem {
+                Some(problem) if read.is_null() => entries.error(metric, series, problem),
+                // Each system says its own numbers, so the others have nothing, as
+                // they all do before the first look.
+                _ => entries.read(metric, series, read),
+            }
+        }
+        entries.done()
+    }
 }
+
+/// The metrics, what each one's series is called, and what it's read from: the
+/// numbers, then what was asked and what went wrong with part of asking.
+const UPDATES_FIELDS: [(&str, &[&str], &str); 7] = [
+    ("updates.pending", &["Updates"], "pending"),
+    ("updates.security", &["Security updates"], "security"),
+    ("updates.vulnerable", &["Vulnerable packages"], "vulnerable"),
+    (
+        "updates.reboot_required",
+        &["Reboot required"],
+        "reboot_required",
+    ),
+    ("updates.lists_age", &["Package lists"], "lists_age_secs"),
+    ("updates.manager", &[], "manager"),
+    ("updates.note", &[], "note"),
+];
+
+const UPDATES_METRICS: [&str; 7] = {
+    let mut metrics = [""; 7];
+    let mut at = 0;
+    while at < UPDATES_FIELDS.len() {
+        metrics[at] = UPDATES_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// What one look found. A number left out wasn't known: the system doesn't say it,
 /// or asking failed.
@@ -853,6 +903,154 @@ fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// A collector that never asks a package manager anything.
+    fn asking_nothing() -> UpdatesCollector {
+        UpdatesCollector {
+            background: Background::new(),
+        }
+    }
+
+    #[test]
+    fn updates_entries_are_what_this_systems_package_manager_says() {
+        let collector = asking_nothing();
+        let output = json!({
+            "manager": "apt", "asked": 1, "pending": 3, "security": 1,
+            "reboot_required": 0, "lists_age_secs": 7200, "problem": "",
+            "note": "apt-check isn't installed, so security updates aren't counted",
+        });
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("updates.pending[Updates]".to_string(), json!(3)),
+                ("updates.security[Security updates]".to_string(), json!(1)),
+                // Only FreeBSD says this.
+                (
+                    "updates.vulnerable[Vulnerable packages]".to_string(),
+                    Value::Null
+                ),
+                (
+                    "updates.reboot_required[Reboot required]".to_string(),
+                    json!(0)
+                ),
+                ("updates.lists_age[Package lists]".to_string(), json!(7200)),
+                ("updates.manager".to_string(), json!("apt")),
+                (
+                    "updates.note".to_string(),
+                    json!("apt-check isn't installed, so security updates aren't counted")
+                ),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // Before the first look, each metric has nothing.
+        let none = collector.entries(&Value::Null, time());
+        assert_eq!(
+            said(&none),
+            [
+                ("updates.pending[Updates]".to_string(), Value::Null),
+                (
+                    "updates.security[Security updates]".to_string(),
+                    Value::Null
+                ),
+                (
+                    "updates.vulnerable[Vulnerable packages]".to_string(),
+                    Value::Null
+                ),
+                (
+                    "updates.reboot_required[Reboot required]".to_string(),
+                    Value::Null
+                ),
+                ("updates.lists_age[Package lists]".to_string(), Value::Null),
+                ("updates.manager".to_string(), Value::Null),
+                ("updates.note".to_string(), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &none);
+    }
+
+    #[test]
+    fn why_updates_could_not_be_asked_about_is_the_error_of_what_was_not_read() {
+        let collector = asking_nothing();
+        let output = Found::problem("pacman", "checkupdates isn't installed").to_value();
+        let entries = collector.entries(&output, time());
+        let error = json!({ "error": "checkupdates isn't installed" });
+        assert_eq!(
+            said(&entries),
+            [
+                ("updates.pending[Updates]".to_string(), error.clone()),
+                (
+                    "updates.security[Security updates]".to_string(),
+                    error.clone()
+                ),
+                (
+                    "updates.vulnerable[Vulnerable packages]".to_string(),
+                    error.clone()
+                ),
+                (
+                    "updates.reboot_required[Reboot required]".to_string(),
+                    error.clone()
+                ),
+                (
+                    "updates.lists_age[Package lists]".to_string(),
+                    error.clone()
+                ),
+                // What was asked is still known.
+                ("updates.manager".to_string(), json!("pacman")),
+                ("updates.note".to_string(), error),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn what_a_look_found_becomes_entries() {
+        let collector = asking_nothing();
+        let found = Found {
+            manager: "pkg",
+            pending: Some(0),
+            vulnerable: Some(2),
+            reboot_required: Some(true),
+            notes: vec!["pkg audit couldn't be run.".into()],
+            ..Found::default()
+        };
+        let entries = collector.entries(&found.to_value(), time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("updates.pending[Updates]".to_string(), json!(0)),
+                (
+                    "updates.security[Security updates]".to_string(),
+                    Value::Null
+                ),
+                (
+                    "updates.vulnerable[Vulnerable packages]".to_string(),
+                    json!(2)
+                ),
+                (
+                    "updates.reboot_required[Reboot required]".to_string(),
+                    json!(1)
+                ),
+                ("updates.lists_age[Package lists]".to_string(), Value::Null),
+                ("updates.manager".to_string(), json!("pkg")),
+                (
+                    "updates.note".to_string(),
+                    json!("pkg audit couldn't be run.")
+                ),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn a_collector_that_has_asked_nothing_collects_nothing_for_each_metric() {
+        let mut collector = asking_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, Value::Null);
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     /// What a package manager printed, as captured on a real system by
     /// `fixtures/updates/capture.sh`.
