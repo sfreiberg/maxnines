@@ -104,6 +104,10 @@ other metrics has none, and can. The keys taken are:
 
 `agent`, `apache`, `check`, `clock`, `command`, `container`, `counter`, `cpu`, `custom`, `database_account`, `disk`, `file`, `gpu`, `host`, `memory`, `network`, `nginx`, `openmetrics`, `php_fpm`, `process`, `raid`, `sensor`, `server`, `service`, `smart`, `system`, `time_sync`, `top`, `unifi`, `updates`, `zfs`.
 
+No template can have the key `facts` or `labels` either, with or without metrics of
+its own. Conditions and summaries use those for a host's facts and a series' labels,
+as in `facts.os.family` and `{{ labels.slot }}`.
+
 An agent is sent what it reads all at once, so a template can have up to 64 discover
 blocks and queries together, each SQL statement up to 64 KB with what fills it, each
 query up to 256 labels and metrics, and each `interval` up to a day. A host is sent

@@ -288,6 +288,48 @@ fn a_template_with_metrics_cannot_have_a_key_built_in_metrics_start_with() {
     assert_eq!(problems(free), Vec::<String>::new());
 }
 
+/// A template called what conditions start a name of their own with would have its
+/// metrics read in place of it.
+#[test]
+fn a_template_cannot_have_a_key_conditions_use() {
+    for (key, example) in [
+        ("facts", "facts.os.family"),
+        ("labels", "{{ labels.slot }}"),
+    ] {
+        let with_metrics = format!(
+            r#"template "{key}" {{
+                 name     = "A"
+                 database = "postgres"
+                 query "q" {{ sql = "SELECT 1 AS os" }}
+               }}"#
+        );
+        let refused = format!(
+            "template {key:?}, key: {key:?} is what conditions and summaries call something \
+             of their own, as in {example}, so a template can't be called it"
+        );
+        assert_eq!(problems(&with_metrics), std::slice::from_ref(&refused));
+        // With or without metrics, so there's one rule to know.
+        let alerts_only = format!(
+            r#"template "{key}" {{
+                 name = "A"
+                 alert "full" {{
+                   name    = "Disk full"
+                   warning = "disk.usage > 90"
+                 }}
+               }}"#
+        );
+        assert_eq!(problems(&alerts_only), [refused]);
+    }
+    // The other things a condition knows are one word, which no metric's name is.
+    let free = r#"template "series" {
+             name     = "A"
+             database = "postgres"
+             query "q" { sql = "SELECT 1 AS os" }
+           }"#;
+    assert_eq!(problems(free), Vec::<String>::new());
+    assert_eq!(crate::alert_conditions::Variable::Facts.name(), "facts");
+}
+
 /// Every built-in metric's name is one, and the keys the docs say are taken are
 /// what they start with, worked out from them.
 #[test]

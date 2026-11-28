@@ -239,6 +239,23 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
             ),
         ));
     }
+    // `facts.os.family` and a summary's `{{ labels.slot }}` are read a part at a
+    // time, so a template's metric `facts.os` would be what they found first.
+    if KEYS_CONDITIONS_USE.contains(&template.key.as_str()) {
+        problems.push(Problem::new(
+            Place::Template,
+            "key",
+            format!(
+                "{:?} is what conditions and summaries call something of their own, as in \
+                 {}, so a template can't be called it",
+                template.key,
+                match template.key.as_str() {
+                    "facts" => "facts.os.family",
+                    _ => "{{ labels.slot }}",
+                }
+            ),
+        ));
+    }
     let catalog = catalog.with_template(template);
     let names = Names {
         catalog: &catalog,
@@ -266,6 +283,10 @@ pub fn check(template: &Template, facts: &Value, catalog: &Catalog) -> Vec<Probl
     }
     problems
 }
+
+/// The keys no template can have, as conditions and summaries read names that start
+/// with them a part at a time: a host's facts, and a series' labels.
+pub const KEYS_CONDITIONS_USE: [&str; 2] = ["facts", "labels"];
 
 /// Whether a template has metrics of its own under a key that the metrics MaxNines
 /// has built in start with.
