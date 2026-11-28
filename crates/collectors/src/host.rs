@@ -36,6 +36,17 @@ impl Collector for HostCollector {
             "booted_at": booted_at,
         }))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &["host.uptime", "host.booted_at"]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        entries.read("host.uptime", &["Uptime"], at(output, "uptime_secs"));
+        entries.read("host.booted_at", &[], at(output, "booted_at"));
+        entries.done()
+    }
 }
 
 pub struct CpuCollector {
@@ -343,6 +354,8 @@ impl Collector for DiskCollector {
                     "kind": disk.kind().to_string(),
                     "read_bytes": usage.read_bytes,
                     "written_bytes": usage.written_bytes,
+                    "read_bytes_total": usage.total_read_bytes,
+                    "written_bytes_total": usage.total_written_bytes,
                 });
                 if let Some((total, free)) = inodes(disk.mount_point()) {
                     output["inodes_total"] = json!(total);
@@ -359,7 +372,70 @@ impl Collector for DiskCollector {
 
         Ok(Value::Array(disks))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &DISK_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let disks = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = disks
+            .iter()
+            .filter_map(|disk| Some((disk.get("mount_point")?.as_str()?, disk)));
+        let mut any = false;
+        for (mount_point, disk) in named {
+            any = true;
+            let series = [mount_point];
+            let used = percent(at(disk, "used_bytes"), at(disk, "total_bytes"));
+            entries.number("disk.usage", &series, used);
+            let inodes = percent(at(disk, "inodes_used"), at(disk, "inodes_total"));
+            entries.number("disk.inodes", &series, inodes);
+            for (metric, field) in DISK_FIELDS {
+                entries.read(metric, &series, at(disk, field));
+            }
+        }
+        if !any {
+            for metric in DISK_METRICS {
+                entries.nothing(metric, &[]);
+            }
+        }
+        entries.done()
+    }
 }
+
+/// A disk's metrics that are read as they are, and what each is read from. What's
+/// read and written are running totals since the disk appeared.
+const DISK_FIELDS: [(&str, &str); 16] = [
+    ("disk.total", "total_bytes"),
+    ("disk.used", "used_bytes"),
+    ("disk.available", "available_bytes"),
+    ("disk.read", "read_bytes_total"),
+    ("disk.written", "written_bytes_total"),
+    ("disk.busy", "busy_percent"),
+    ("disk.read_ops", "read_ops_per_sec"),
+    ("disk.write_ops", "write_ops_per_sec"),
+    ("disk.read_latency", "read_latency_secs"),
+    ("disk.write_latency", "write_latency_secs"),
+    ("disk.queue", "queue_length"),
+    ("disk.device", "name"),
+    ("disk.file_system", "file_system"),
+    ("disk.kind", "kind"),
+    ("disk.removable", "removable"),
+    ("disk.read_only", "read_only"),
+];
+
+/// Every metric a disk has: those worked out, then those read as they are.
+const DISK_METRICS: [&str; 18] = {
+    let mut metrics = ["disk.usage"; 18];
+    metrics[1] = "disk.inodes";
+    let mut at = 0;
+    while at < DISK_FIELDS.len() {
+        metrics[at + 2] = DISK_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// Total and free inodes. A disk can run out of these with plenty of space left.
 /// Windows file systems don't have them, and some Unix ones report none.
@@ -441,10 +517,23 @@ impl Collector for NetworkCollector {
                     "total_transmitted_bytes": data.total_transmitted(),
                     "total_receive_errors": data.total_errors_on_received(),
                     "total_transmit_errors": data.total_errors_on_transmitted(),
+                    "total_packets_received": data.total_packets_received(),
+                    "total_packets_transmitted": data.total_packets_transmitted(),
                     "link_up": link_up(data.operational_state()),
                 });
                 let name = name.to_string_lossy().into_owned();
                 let (before, after) = (self.drops.get(&name), drops.get(&name));
+                if let (Some(after), Some(fields)) = (after, stats.as_object_mut()) {
+                    let totals = [
+                        ("total_receive_drops", after.received),
+                        ("total_transmit_drops", after.transmitted),
+                    ];
+                    for (field, total) in totals {
+                        if let Some(total) = total {
+                            fields.insert(field.into(), json!(total));
+                        }
+                    }
+                }
                 if let (Some(before), Some(after), Some(fields)) =
                     (before, after, stats.as_object_mut())
                 {
@@ -465,7 +554,54 @@ impl Collector for NetworkCollector {
 
         Ok(Value::Object(interfaces))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &NETWORK_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let interfaces = output
+            .as_object()
+            .filter(|interfaces| !interfaces.is_empty());
+        let Some(interfaces) = interfaces else {
+            for (metric, _) in NETWORK_FIELDS {
+                entries.nothing(metric, &[]);
+            }
+            return entries.done();
+        };
+        for (name, interface) in interfaces {
+            for (metric, field) in NETWORK_FIELDS {
+                entries.read(metric, &[name], at(interface, field));
+            }
+        }
+        entries.done()
+    }
 }
+
+/// An interface's metrics, and what each is read from: running totals since the
+/// interface appeared, and whether its link is up, where the system says.
+const NETWORK_FIELDS: [(&str, &str); 9] = [
+    ("network.received", "total_received_bytes"),
+    ("network.transmitted", "total_transmitted_bytes"),
+    ("network.packets.received", "total_packets_received"),
+    ("network.packets.transmitted", "total_packets_transmitted"),
+    ("network.errors.received", "total_receive_errors"),
+    ("network.errors.transmitted", "total_transmit_errors"),
+    ("network.drops.received", "total_receive_drops"),
+    ("network.drops.transmitted", "total_transmit_drops"),
+    ("network.link", "link_up"),
+];
+
+const NETWORK_METRICS: [&str; 9] = {
+    let mut metrics = [""; 9];
+    let mut at = 0;
+    while at < NETWORK_FIELDS.len() {
+        metrics[at] = NETWORK_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 /// 1 or 0 where the system says, and nothing where it doesn't, so that an
 /// interface with no known state can't set off an alert.
@@ -607,6 +743,134 @@ mod tests {
                 "{name}: {said:?}"
             );
         }
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn what_disks_interfaces_and_the_host_really_say_becomes_entries_for_their_metrics() {
+        let mut disk = DiskCollector::new(None).unwrap();
+        let output = disk.collect().unwrap();
+        every_metric_has_an_entry(&disk, &disk.entries(&output, time()));
+        let mut network = NetworkCollector::new().unwrap();
+        let output = network.collect().unwrap();
+        every_metric_has_an_entry(&network, &network.entries(&output, time()));
+        let mut host = HostCollector;
+        let output = host.collect().unwrap();
+        let entries = host.entries(&output, time());
+        every_metric_has_an_entry(&host, &entries);
+        assert!(said(&entries)[0].1.is_number());
+    }
+
+    #[test]
+    fn disk_entries_have_a_series_for_each_mount_point() {
+        let output = json!([
+            { "name": "/dev/sda1", "mount_point": "/", "file_system": "ext4", "kind": "SSD",
+              "total_bytes": 1000, "available_bytes": 400, "used_bytes": 600,
+              "removable": false, "read_only": false,
+              "read_bytes": 5, "written_bytes": 6,
+              "read_bytes_total": 5000, "written_bytes_total": 6000,
+              "inodes_total": 200, "inodes_used": 50,
+              "read_ops_per_sec": 1.5, "busy_percent": 12.0 },
+            { "name": "C:", "mount_point": "C:\\", "file_system": "NTFS", "kind": "HDD",
+              "total_bytes": 0, "available_bytes": 0, "used_bytes": 0,
+              "removable": true, "read_only": true },
+        ]);
+        let collector = DiskCollector::new(None).unwrap();
+        let entries = collector.entries(&output, time());
+        let said = said(&entries);
+        for (name, value) in [
+            ("disk.usage[/]", json!(60.0)),
+            ("disk.inodes[/]", json!(25.0)),
+            ("disk.total[/]", json!(1000)),
+            ("disk.used[/]", json!(600)),
+            ("disk.available[/]", json!(400)),
+            // The running totals, not the change since the last sample.
+            ("disk.read[/]", json!(5000)),
+            ("disk.written[/]", json!(6000)),
+            ("disk.read_ops[/]", json!(1.5)),
+            ("disk.busy[/]", json!(12.0)),
+            // Not measured on this system, or on a first sample.
+            ("disk.queue[/]", Value::Null),
+            ("disk.write_latency[/]", Value::Null),
+            ("disk.device[/]", json!("/dev/sda1")),
+            ("disk.file_system[/]", json!("ext4")),
+            ("disk.kind[/]", json!("SSD")),
+            ("disk.removable[/]", json!(false)),
+            ("disk.read_only[/]", json!(false)),
+            // A disk of no size has no share in use, and Windows has no inodes.
+            ("disk.usage[C:\\]", Value::Null),
+            ("disk.inodes[C:\\]", Value::Null),
+            ("disk.read_only[C:\\]", json!(true)),
+        ] {
+            assert!(
+                said.contains(&(name.to_string(), value.clone())),
+                "{name}: {said:?}"
+            );
+        }
+        assert_eq!(said.len(), 2 * 18);
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no disks, each metric says it has nothing.
+        let none = collector.entries(&json!([]), time());
+        assert_eq!(none.len(), 18);
+        assert!(none.iter().all(|entry| entry.series.is_empty()));
+        every_metric_has_an_entry(&collector, &none);
+    }
+
+    #[test]
+    fn network_entries_have_a_series_for_each_interface() {
+        let output = json!({
+            "en0": {
+                "received_bytes": 1, "transmitted_bytes": 2,
+                "total_received_bytes": 1000, "total_transmitted_bytes": 2000,
+                "total_packets_received": 30, "total_packets_transmitted": 40,
+                "total_receive_errors": 1, "total_transmit_errors": 0,
+                "total_receive_drops": 7, "link_up": 1,
+            },
+            "en1": { "total_received_bytes": 5 },
+        });
+        let collector = NetworkCollector::new().unwrap();
+        let entries = collector.entries(&output, time());
+        let said = said(&entries);
+        for (name, value) in [
+            ("network.received[en0]", json!(1000)),
+            ("network.transmitted[en0]", json!(2000)),
+            ("network.packets.received[en0]", json!(30)),
+            ("network.packets.transmitted[en0]", json!(40)),
+            ("network.errors.received[en0]", json!(1)),
+            ("network.errors.transmitted[en0]", json!(0)),
+            ("network.drops.received[en0]", json!(7)),
+            // Not every system counts both.
+            ("network.drops.transmitted[en0]", Value::Null),
+            ("network.link[en0]", json!(1)),
+            ("network.received[en1]", json!(5)),
+            ("network.link[en1]", Value::Null),
+        ] {
+            assert!(
+                said.contains(&(name.to_string(), value.clone())),
+                "{name}: {said:?}"
+            );
+        }
+        assert_eq!(said.len(), 2 * 9);
+        every_metric_has_an_entry(&collector, &entries);
+
+        let none = collector.entries(&json!({}), time());
+        assert_eq!(none.len(), 9);
+        every_metric_has_an_entry(&collector, &none);
+    }
+
+    #[test]
+    fn host_entries_are_how_long_it_has_been_up_and_since_when() {
+        let collector = HostCollector;
+        let output = json!({ "uptime_secs": 3600, "booted_at": "2026-11-28T08:00:00Z" });
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("host.uptime[Uptime]".to_string(), json!(3600)),
+                ("host.booted_at".to_string(), json!("2026-11-28T08:00:00Z")),
+            ]
+        );
         every_metric_has_an_entry(&collector, &entries);
     }
 
