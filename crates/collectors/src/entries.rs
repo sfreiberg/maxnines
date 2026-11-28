@@ -64,6 +64,16 @@ impl Entries {
         });
     }
 
+    /// Says each of these metrics has nothing, unless it has an entry already: one
+    /// read from only some kinds of item has none when there are none of that kind.
+    pub fn fill(&mut self, metrics: &[&str]) {
+        for metric in metrics {
+            if !self.entries.iter().any(|entry| entry.metric == *metric) {
+                self.nothing(metric, &[]);
+            }
+        }
+    }
+
     pub fn done(self) -> Vec<Entry> {
         self.entries
     }
@@ -175,6 +185,22 @@ pub(crate) mod tests {
                 ("a.not".to_string(), Value::Null),
                 ("a.none[x]".to_string(), Value::Null),
                 ("a.failed".to_string(), json!({ "error": "no" })),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_metric_without_an_entry_is_filled_in_with_nothing() {
+        let mut entries = Entries::at(time());
+        entries.read("a.count", &["x"], &json!(3));
+        entries.error("a.failed", &["x"], "no");
+        entries.fill(&["a.count", "a.failed", "a.missing"]);
+        assert_eq!(
+            said(&entries.done()),
+            [
+                ("a.count[x]".to_string(), json!(3)),
+                ("a.failed[x]".to_string(), json!({ "error": "no" })),
+                ("a.missing".to_string(), Value::Null),
             ]
         );
     }

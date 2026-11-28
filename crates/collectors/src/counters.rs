@@ -14,9 +14,12 @@
 use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use maxnines_protocol::entries::Entry;
 use serde_json::{Map, Value, json};
 
 use crate::Collector;
+use crate::entries::{Entries, at, filled};
 
 /// The most instances one wildcard path reports, as `\Process(*)` has one for every
 /// program running and each is a series on the server.
@@ -158,7 +161,55 @@ impl Collector for CounterCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(output(&self.counters.read()))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &COUNTER_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = items
+            .iter()
+            .filter_map(|item| Some((item.get("name")?.as_str()?, item)));
+        for (name, item) in named {
+            let value = at(item, "value");
+            // One instance of a wildcard path, which says nothing of whether the
+            // path works.
+            if item.get("ok").is_none() {
+                entries.read("counter.value", &[name], value);
+                continue;
+            }
+            // A path that fails is a value of whether it works, and why is the
+            // error of what it didn't give. Its own item says something of its
+            // value every time, so the error ends when it works again, even when
+            // its values are its instances'.
+            entries.read("counter.ok", &[name], at(item, "ok"));
+            let why = filled(at(item, "error")).as_str();
+            match why {
+                Some(why) if value.is_null() => entries.error("counter.value", &[name], why),
+                _ => entries.read("counter.value", &[name], value),
+            }
+            // Only a wildcard path has instances to leave out.
+            if name.contains("(*)") {
+                let dropped = at(item, "dropped");
+                match why {
+                    Some(why) if dropped.is_null() => {
+                        entries.error("counter.dropped", &[name], why);
+                    }
+                    _ => entries.read("counter.dropped", &[name], dropped),
+                }
+            }
+        }
+        // With no paths, or none with a wildcard, the metric has nothing.
+        entries.fill(&COUNTER_METRICS);
+        entries.done()
+    }
 }
+
+/// A counter's metrics: whether its path works, each value, and how many
+/// instances of a wildcard path were beyond the most reported.
+const COUNTER_METRICS: [&str; 3] = ["counter.ok", "counter.value", "counter.dropped"];
 
 #[cfg(windows)]
 pub(crate) mod pdh {
@@ -376,6 +427,129 @@ pub(crate) mod pdh {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entries::tests::{every_metric_has_an_entry, said, time};
+
+    #[test]
+    fn counter_entries_have_a_series_for_each_path_and_each_instance() {
+        let collector = CounterCollector::new(Vec::new());
+        let output = json!([
+            { "name": r"\Memory\Available MBytes", "ok": 1, "value": 2048.0 },
+            { "name": r"\PhysicalDisk(*)\Disk Reads/sec", "ok": 1, "dropped": 2 },
+            { "name": r"\PhysicalDisk(0 C:)\Disk Reads/sec", "value": 3.0 },
+            // A rate waiting for its second look.
+            { "name": r"\PhysicalDisk(_Total)\Disk Writes/sec", "ok": 1 },
+            // Paths that fail say why.
+            { "name": r"\Nothing\Here", "ok": 0, "error": NOT_FOUND },
+            { "name": r"\Nothing(*)\Here", "ok": 0, "error": NOT_READ },
+            // One without a name can't be told from the others.
+            { "ok": 1, "value": 1.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of(r"counter.ok[\Memory\Available MBytes]"), json!(1)),
+                (
+                    of(r"counter.value[\Memory\Available MBytes]"),
+                    json!(2048.0)
+                ),
+                (of(r"counter.ok[\PhysicalDisk(*)\Disk Reads/sec]"), json!(1)),
+                (
+                    of(r"counter.value[\PhysicalDisk(*)\Disk Reads/sec]"),
+                    Value::Null
+                ),
+                (
+                    of(r"counter.dropped[\PhysicalDisk(*)\Disk Reads/sec]"),
+                    json!(2)
+                ),
+                (
+                    of(r"counter.value[\PhysicalDisk(0 C:)\Disk Reads/sec]"),
+                    json!(3.0)
+                ),
+                (
+                    of(r"counter.ok[\PhysicalDisk(_Total)\Disk Writes/sec]"),
+                    json!(1)
+                ),
+                (
+                    of(r"counter.value[\PhysicalDisk(_Total)\Disk Writes/sec]"),
+                    Value::Null
+                ),
+                // Failing is what was found, and why is the error of what the
+                // path didn't give.
+                (of(r"counter.ok[\Nothing\Here]"), json!(0)),
+                (
+                    of(r"counter.value[\Nothing\Here]"),
+                    json!({ "error": NOT_FOUND })
+                ),
+                (of(r"counter.ok[\Nothing(*)\Here]"), json!(0)),
+                (
+                    of(r"counter.value[\Nothing(*)\Here]"),
+                    json!({ "error": NOT_READ })
+                ),
+                (
+                    of(r"counter.dropped[\Nothing(*)\Here]"),
+                    json!({ "error": NOT_READ })
+                ),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no paths, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(
+                said(&none),
+                [
+                    (of("counter.ok"), Value::Null),
+                    (of("counter.value"), Value::Null),
+                    (of("counter.dropped"), Value::Null),
+                ]
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn what_was_read_of_each_path_becomes_entries() {
+        let collector = CounterCollector::new(Vec::new());
+        let path = r"\Memory\Available MBytes".to_string();
+        let readings = [
+            (
+                path.clone(),
+                Reading::Values {
+                    values: vec![(path.clone(), 12.5)],
+                    dropped: 0,
+                },
+            ),
+            (r"\Nothing\Here".to_string(), Reading::Failed(NOT_FOUND)),
+        ];
+        let entries = collector.entries(&output(&readings), time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of(r"counter.ok[\Memory\Available MBytes]"), json!(1)),
+                (of(r"counter.value[\Memory\Available MBytes]"), json!(12.5)),
+                (of(r"counter.ok[\Nothing\Here]"), json!(0)),
+                (
+                    of(r"counter.value[\Nothing\Here]"),
+                    json!({ "error": NOT_FOUND })
+                ),
+                // Neither path has a wildcard.
+                (of("counter.dropped"), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn reading_no_counters_really_collects_nothing_for_each_metric() {
+        let mut collector = CounterCollector::new(Vec::new());
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     #[test]
     fn each_instance_gets_its_own_path() {

@@ -7,14 +7,17 @@
 //! it by name. So a login never comes from the server, never goes to it, and is
 //! only ever sent to the address beside it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
+use chrono::{DateTime, Utc};
 use maxnines_checks::Login;
 use maxnines_checks::openmetrics::{MAX_SERIES, Page, TIMED_OUT, TIMEOUT, Totals};
+use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::{check_metrics_pages, is_page_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -160,7 +163,8 @@ impl OpenMetricsCollector {
                             Missed::Panicked => FAILED_UNEXPECTEDLY,
                         })
                     });
-                    Value::Array(totals.settle(rows))
+                    let read = running_totals(&rows);
+                    Value::Array(with_totals(totals.settle(rows), &read))
                 },
             )?;
         }
@@ -181,6 +185,81 @@ impl Collector for OpenMetricsCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &OPENMETRICS_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let rows = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = rows
+            .iter()
+            .filter_map(|row| Some((row.get("name")?.as_str()?, row)));
+        // Each series is named as its row is: a page by its name, and a line by its
+        // page's name and the line, labels and all.
+        for (name, row) in named {
+            if row.get("up").is_some() {
+                // A page that didn't answer is a value of whether it's up, and why
+                // is the error of what it would have said of itself.
+                entries.read("openmetrics.up", &[name], at(row, "up"));
+                let dropped = at(row, "dropped");
+                match filled(at(row, "error")).as_str() {
+                    Some(why) if dropped.is_null() => {
+                        entries.error("openmetrics.dropped", &[name], why);
+                    }
+                    _ => entries.read("openmetrics.dropped", &[name], dropped),
+                }
+            } else if row.get("change").is_some() {
+                // The running total as the page gave it, not its change.
+                entries.read("openmetrics.rate", &[name], at(row, "change_total"));
+            } else {
+                entries.read("openmetrics.value", &[name], at(row, "value"));
+            }
+        }
+        // With no pages, none read yet, or none with a line of a metric's sort,
+        // the metric has nothing.
+        entries.fill(&OPENMETRICS_METRICS);
+        entries.done()
+    }
+}
+
+/// A page's metrics: whether it answered and how many series were over the limit,
+/// then each of its lines, as a level or as a running total.
+const OPENMETRICS_METRICS: [&str; 4] = [
+    "openmetrics.up",
+    "openmetrics.dropped",
+    "openmetrics.value",
+    "openmetrics.rate",
+];
+
+/// The running totals among what was read of a page, by series, before they're
+/// settled into changes. A series listed twice keeps its first, as settling does.
+fn running_totals(read: &[Value]) -> HashMap<String, Value> {
+    let mut totals = HashMap::new();
+    for row in read {
+        if let Some([Value::String(name), total, Value::Bool(true)]) =
+            row.as_array().map(Vec::as_slice)
+        {
+            totals.entry(name.clone()).or_insert_with(|| total.clone());
+        }
+    }
+    totals
+}
+
+/// A sample's rows, each change with the running total it was worked out from
+/// beside it, as `change_total`.
+fn with_totals(mut rows: Vec<Value>, totals: &HashMap<String, Value>) -> Vec<Value> {
+    for row in &mut rows {
+        if row.get("change").is_none() {
+            continue;
+        }
+        let total = row["name"].as_str().and_then(|name| totals.get(name));
+        if let Some(total) = total {
+            row["change_total"] = total.clone();
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -195,6 +274,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
 
     /// A page that answers every request with the body the test has moved it on to.
     struct Served {
@@ -294,13 +374,138 @@ mod tests {
         });
         assert_eq!(
             row(&output, &named("jobs_total")),
-            Some(&json!({ "name": named("jobs_total"), "change": 30.0 }))
+            Some(&json!({ "name": named("jobs_total"), "change": 30.0, "change_total": 130.0 }))
         );
         // It went backwards, so whatever it counts started again.
+        let restarts = row(&output, &named("restarts_total")).unwrap();
+        assert_eq!(restarts["change"], 0.0);
+        assert_eq!(restarts["change_total"], 2.0);
+    }
+
+    /// Reading nothing, so nothing is reached.
+    fn reading_nothing() -> OpenMetricsCollector {
+        let interval = Duration::from_secs(3600);
+        OpenMetricsCollector::new(Vec::new(), &[], &[], &PageDefinitions::new(), interval).unwrap()
+    }
+
+    #[test]
+    fn page_entries_have_a_series_for_each_page_and_each_of_its_lines() {
+        let collector = reading_nothing();
+        let requests = r#"app:9100 http_requests_total{method="GET",code="200"}"#;
+        let output = json!([
+            { "name": "app:9100", "up": 1, "dropped": 5 },
+            { "name": "app:9100 queue", "value": 1.5 },
+            { "name": requests, "change": 30.0, "change_total": 1057.0 },
+            // A change with no total beside it has nothing to give.
+            { "name": "app:9100 jobs_total", "change": 2.0 },
+            // A line whose number isn't one.
+            { "name": "app:9100 odd" },
+            // A page that didn't answer says why.
+            { "name": "node", "up": 0, "error": "timed out" },
+            // One without a name can't be told from the others.
+            { "value": 2.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
         assert_eq!(
-            row(&output, &named("restarts_total")).unwrap()["change"],
-            0.0
+            said(&entries),
+            [
+                (of("openmetrics.up[app:9100]"), json!(1)),
+                (of("openmetrics.dropped[app:9100]"), json!(5)),
+                (of("openmetrics.value[app:9100 queue]"), json!(1.5)),
+                // The running total, under the line's own name with its labels.
+                (format!("openmetrics.rate[{requests}]"), json!(1057.0)),
+                (of("openmetrics.rate[app:9100 jobs_total]"), Value::Null),
+                (of("openmetrics.value[app:9100 odd]"), Value::Null),
+                // Not answering is what was found, and why is the error of what
+                // the page would have said of itself.
+                (of("openmetrics.up[node]"), json!(0)),
+                (
+                    of("openmetrics.dropped[node]"),
+                    json!({ "error": "timed out" })
+                ),
+            ]
         );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // A page with no lines kept leaves those metrics with nothing.
+        let only_page = json!([{ "name": "app:9100", "up": 1, "dropped": 0 }]);
+        let entries = collector.entries(&only_page, time());
+        assert_eq!(
+            said(&entries),
+            [
+                (of("openmetrics.up[app:9100]"), json!(1)),
+                (of("openmetrics.dropped[app:9100]"), json!(0)),
+                (of("openmetrics.value"), Value::Null),
+                (of("openmetrics.rate"), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no pages, or none read yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(
+                said(&none),
+                [
+                    (of("openmetrics.up"), Value::Null),
+                    (of("openmetrics.dropped"), Value::Null),
+                    (of("openmetrics.value"), Value::Null),
+                    (of("openmetrics.rate"), Value::Null),
+                ]
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn a_change_keeps_the_running_total_it_was_worked_out_from() {
+        let page = json!({ "name": "app:9100", "up": 1, "dropped": 0 });
+        let read = |jobs: f64| {
+            vec![
+                page.clone(),
+                json!(["app:9100 jobs_total", jobs, true]),
+                // Listed twice, which keeps its first.
+                json!(["app:9100 jobs_total", 999.0, true]),
+                json!(["app:9100 queue", 1.5, false]),
+            ]
+        };
+        let mut totals = Totals::default();
+        let mut sample = |jobs: f64| {
+            let read = read(jobs);
+            let running = running_totals(&read);
+            with_totals(totals.settle(read), &running)
+        };
+        // The first has nothing to compare with, so it isn't there at all.
+        assert_eq!(
+            sample(100.0),
+            [
+                page.clone(),
+                json!({ "name": "app:9100 queue", "value": 1.5 })
+            ]
+        );
+        let rows = sample(130.0);
+        let jobs = rows.iter().find(|row| row["name"] == "app:9100 jobs_total");
+        assert_eq!(jobs.unwrap()["change_total"], 130.0, "{rows:?}");
+
+        let collector = reading_nothing();
+        let entries = collector.entries(&Value::Array(rows), time());
+        assert!(
+            said(&entries).contains(&(
+                "openmetrics.rate[app:9100 jobs_total]".to_string(),
+                json!(130.0)
+            )),
+            "{entries:?}"
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn reading_no_pages_really_collects_nothing_for_each_metric() {
+        let mut collector = reading_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
     }
 
     #[test]

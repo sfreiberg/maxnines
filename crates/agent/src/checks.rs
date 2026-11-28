@@ -15,7 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use chrono::{DateTime, Utc};
 use maxnines_checks::{Credentials, failed_report, limit, run_signed_in, timed_out_report};
+use maxnines_collectors::entries::{Entries, at, filled, percent};
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::{Check, CheckKind, LocalCheck, MAX_CHECK_NAME_LEN, is_check_name};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -279,7 +282,164 @@ impl Collector for CheckCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &CHECK_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let checks = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = checks
+            .iter()
+            .filter_map(|check| Some((check.get("name")?.as_str()?, check)));
+        for (name, check) in named {
+            let series = [name];
+            // One that couldn't be run doesn't say its kind, so any metric might
+            // be its.
+            let kind = at(check, "kind").as_str().and_then(CheckKind::parse);
+            // Why the domain's registration couldn't be looked up, which is the
+            // error of what the lookup would have said.
+            let no_domain = filled(at(check, "domain_error")).as_str();
+            for (metric, field, kinds) in &CHECK_FIELDS {
+                let read = filled(at(check, field));
+                let why = no_domain.filter(|_| read.is_null() && DOMAIN_METRICS.contains(metric));
+                match why {
+                    Some(why) => entries.error(metric, &series, why),
+                    // What it found is said whatever its kind.
+                    None if kinds.has(kind) || !read.is_null() => {
+                        entries.read(metric, &series, read);
+                    }
+                    None => {}
+                }
+            }
+            let usage = percent(
+                at(check, "memory_used_bytes"),
+                at(check, "memory_limit_bytes"),
+            );
+            if MEMCACHED.has(kind) || usage.is_some() {
+                entries.number("check.memory_usage", &series, usage);
+            }
+        }
+        // With no checks, none run yet, or none of the kind a metric is read from,
+        // the metric has nothing.
+        entries.fill(&CHECK_METRICS);
+        entries.done()
+    }
 }
+
+/// The kinds of check a metric is read from.
+enum Kinds {
+    Every,
+    Only(&'static [CheckKind]),
+    Except(&'static [CheckKind]),
+}
+
+impl Kinds {
+    /// Whether a check of this kind reads the metric. One whose kind isn't known
+    /// might.
+    fn has(&self, kind: Option<CheckKind>) -> bool {
+        let Some(kind) = kind else { return true };
+        match self {
+            Self::Every => true,
+            Self::Only(kinds) => kinds.contains(&kind),
+            Self::Except(kinds) => !kinds.contains(&kind),
+        }
+    }
+}
+
+/// Every kind that opens a connection of its own, which looking up a name and
+/// pinging don't.
+const CONNECTS: Kinds = Kinds::Except(&[CheckKind::Dns, CheckKind::Ping]);
+/// Every kind that can use TLS, and so reads a certificate.
+const SECURED: Kinds = Kinds::Except(&[CheckKind::Tcp, CheckKind::Dns, CheckKind::Ping]);
+/// Every kind that talks to the server it reaches in that server's own protocol,
+/// and so can sign in to it or read what version it is.
+const SIGNS_IN: Kinds = Kinds::Except(&[
+    CheckKind::Tcp,
+    CheckKind::Http,
+    CheckKind::Tls,
+    CheckKind::Dns,
+    CheckKind::Ping,
+]);
+/// The kinds that ask whether TLS is offered without signing in.
+const OFFERS_TLS: Kinds = Kinds::Only(&[
+    CheckKind::Postgres,
+    CheckKind::Smtp,
+    CheckKind::Imap,
+    CheckKind::Pop3,
+    CheckKind::Ftp,
+    CheckKind::Ldap,
+]);
+const HTTP: Kinds = Kinds::Only(&[CheckKind::Http]);
+const DNS: Kinds = Kinds::Only(&[CheckKind::Dns]);
+const PING: Kinds = Kinds::Only(&[CheckKind::Ping]);
+const SSH: Kinds = Kinds::Only(&[CheckKind::Ssh]);
+const MEMCACHED: Kinds = Kinds::Only(&[CheckKind::Memcached]);
+const LDAP: Kinds = Kinds::Only(&[CheckKind::Ldap]);
+const MQTT: Kinds = Kinds::Only(&[CheckKind::Mqtt]);
+
+/// A check's metrics that are read as they are, what each is read from, and the
+/// kinds of check that read it. Being down is a value of `check.up`, and why is
+/// the text of `check.error`, as a check that's down has still found things out.
+const CHECK_FIELDS: [(&str, &str, Kinds); 40] = [
+    ("check.up", "up", Kinds::Every),
+    ("check.kind", "kind", Kinds::Every),
+    ("check.error", "error", Kinds::Every),
+    ("check.response", "response_secs", Kinds::Every),
+    ("check.dns", "dns_secs", Kinds::Every),
+    ("check.connect", "connect_secs", CONNECTS),
+    ("check.tls", "tls_secs", SECURED),
+    ("check.tls_version", "tls_version", SECURED),
+    ("check.cert_valid", "cert_valid", SECURED),
+    ("check.hostname_valid", "hostname_valid", SECURED),
+    ("check.cert_valid_from", "cert_valid_from", SECURED),
+    ("check.cert_valid_until", "cert_valid_until", SECURED),
+    ("check.cert_days", "cert_days_left", SECURED),
+    ("check.tls_offered", "tls_offered", OFFERS_TLS),
+    ("check.server_version", "server_version", SIGNS_IN),
+    ("check.signed_in", "signed_in", SIGNS_IN),
+    ("check.first_byte", "first_byte_secs", HTTP),
+    ("check.download", "download_secs", HTTP),
+    ("check.status", "status", HTTP),
+    ("check.protocol", "protocol", HTTP),
+    ("check.size", "content_length", HTTP),
+    ("check.compressed", "compressed", HTTP),
+    ("check.regex_matched", "regex_matched", HTTP),
+    ("check.domain_days", "domain_days_left", HTTP),
+    ("check.domain_expires_at", "domain_expires_at", HTTP),
+    ("check.records", "records", DNS),
+    ("check.packet_loss", "packet_loss_percent", PING),
+    ("check.rtt_min", "rtt_min_secs", PING),
+    ("check.rtt_max", "rtt_max_secs", PING),
+    ("check.rtt_stddev", "rtt_stddev_secs", PING),
+    ("check.host_key", "host_key", SSH),
+    ("check.sign_in_methods", "sign_in_methods", SSH),
+    ("check.password_sign_in", "password_sign_in", SSH),
+    ("check.hit_rate", "hit_rate_percent", MEMCACHED),
+    ("check.memory_used", "memory_used_bytes", MEMCACHED),
+    ("check.memory_limit", "memory_limit_bytes", MEMCACHED),
+    ("check.evictions", "evictions", MEMCACHED),
+    ("check.connections", "connections", MEMCACHED),
+    ("check.search", "search_secs", LDAP),
+    ("check.round_trip", "round_trip_secs", MQTT),
+];
+
+/// What looking up a domain's registration says, which have why it couldn't be
+/// looked up as their error.
+const DOMAIN_METRICS: [&str; 2] = ["check.domain_days", "check.domain_expires_at"];
+
+/// Every metric a check has: those read as they are, then the share of its memory
+/// Memcached uses, which is worked out.
+const CHECK_METRICS: [&str; 41] = {
+    let mut metrics = ["check.memory_usage"; 41];
+    let mut at = 0;
+    while at < CHECK_FIELDS.len() {
+        metrics[at] = CHECK_FIELDS[at].0;
+        at += 1;
+    }
+    metrics
+};
 
 #[cfg(test)]
 mod tests {
@@ -288,6 +448,238 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// Running nothing, so nothing is reached.
+    fn checking_nothing() -> CheckCollector {
+        CheckCollector::new(
+            Vec::new(),
+            &[],
+            &CheckDefinitions::new(),
+            Duration::from_secs(3600),
+        )
+        .unwrap()
+    }
+
+    /// What the entries say of one check, without its name.
+    fn said_of(entries: &[Entry], check: &str) -> Vec<(String, Value)> {
+        let series = format!("[{check}]");
+        said(entries)
+            .into_iter()
+            .filter_map(|(name, value)| Some((name.strip_suffix(&series)?.to_string(), value)))
+            .collect()
+    }
+
+    #[test]
+    fn check_entries_have_a_series_for_each_check_with_the_metrics_of_its_kind() {
+        let collector = checking_nothing();
+        let output = json!([
+            { "name": "port", "kind": "tcp", "up": 1, "response_secs": 0.02,
+              "dns_secs": 0.001, "connect_secs": 0.019 },
+            // Down, with what it found out before it failed.
+            { "name": "site", "kind": "http", "up": 0, "error": "it answered 503",
+              "dns_secs": 0.001, "connect_secs": 0.01, "tls_secs": 0.03,
+              "first_byte_secs": 0.2, "download_secs": 0.01, "status": 503,
+              "protocol": "HTTP/2.0", "content_length": 512, "compressed": true,
+              "tls_version": "TLS 1.3", "cert_valid": true, "hostname_valid": true,
+              "cert_valid_from": "2026-10-01T00:00:00Z",
+              "cert_valid_until": "2026-12-30T00:00:00Z", "cert_days_left": 32,
+              "domain_error": "the registry didn't answer in time" },
+            { "name": "cache", "kind": "memcached", "up": 1, "response_secs": 0.01,
+              "server_version": "1.6.31", "hit_rate_percent": 90.0, "evictions": 4,
+              "memory_used_bytes": 250, "memory_limit_bytes": 1000, "connections": 3 },
+            // One without a name can't be told from the others.
+            { "kind": "tcp", "up": 1 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said_of(&entries, "port"),
+            [
+                (of("check.up"), json!(1)),
+                (of("check.kind"), json!("tcp")),
+                (of("check.error"), Value::Null),
+                (of("check.response"), json!(0.02)),
+                (of("check.dns"), json!(0.001)),
+                (of("check.connect"), json!(0.019)),
+            ]
+        );
+        assert_eq!(
+            said_of(&entries, "site"),
+            [
+                // Down is what it found, and why is said beside it.
+                (of("check.up"), json!(0)),
+                (of("check.kind"), json!("http")),
+                (of("check.error"), json!("it answered 503")),
+                (of("check.response"), Value::Null),
+                (of("check.dns"), json!(0.001)),
+                (of("check.connect"), json!(0.01)),
+                (of("check.tls"), json!(0.03)),
+                (of("check.tls_version"), json!("TLS 1.3")),
+                (of("check.cert_valid"), json!(true)),
+                (of("check.hostname_valid"), json!(true)),
+                (of("check.cert_valid_from"), json!("2026-10-01T00:00:00Z")),
+                (of("check.cert_valid_until"), json!("2026-12-30T00:00:00Z")),
+                (of("check.cert_days"), json!(32)),
+                (of("check.first_byte"), json!(0.2)),
+                (of("check.download"), json!(0.01)),
+                (of("check.status"), json!(503)),
+                (of("check.protocol"), json!("HTTP/2.0")),
+                (of("check.size"), json!(512)),
+                (of("check.compressed"), json!(true)),
+                (of("check.regex_matched"), Value::Null),
+                // Why the registration couldn't be looked up is the error of what
+                // looking it up would have said.
+                (
+                    of("check.domain_days"),
+                    json!({ "error": "the registry didn't answer in time" })
+                ),
+                (
+                    of("check.domain_expires_at"),
+                    json!({ "error": "the registry didn't answer in time" })
+                ),
+            ]
+        );
+        assert_eq!(
+            said_of(&entries, "cache"),
+            [
+                (of("check.up"), json!(1)),
+                (of("check.kind"), json!("memcached")),
+                (of("check.error"), Value::Null),
+                (of("check.response"), json!(0.01)),
+                (of("check.dns"), Value::Null),
+                (of("check.connect"), Value::Null),
+                (of("check.tls"), Value::Null),
+                (of("check.tls_version"), Value::Null),
+                (of("check.cert_valid"), Value::Null),
+                (of("check.hostname_valid"), Value::Null),
+                (of("check.cert_valid_from"), Value::Null),
+                (of("check.cert_valid_until"), Value::Null),
+                (of("check.cert_days"), Value::Null),
+                (of("check.server_version"), json!("1.6.31")),
+                (of("check.signed_in"), Value::Null),
+                (of("check.hit_rate"), json!(90.0)),
+                (of("check.memory_used"), json!(250)),
+                (of("check.memory_limit"), json!(1000)),
+                (of("check.evictions"), json!(4)),
+                (of("check.connections"), json!(3)),
+                (of("check.memory_usage"), json!(25.0)),
+            ]
+        );
+        // The metrics no check here is of the kind for have nothing.
+        let unread: Vec<(String, Value)> = said(&entries)
+            .into_iter()
+            .filter(|(name, _)| !name.contains('['))
+            .collect();
+        assert_eq!(
+            unread,
+            [
+                (of("check.tls_offered"), Value::Null),
+                (of("check.records"), Value::Null),
+                (of("check.packet_loss"), Value::Null),
+                (of("check.rtt_min"), Value::Null),
+                (of("check.rtt_max"), Value::Null),
+                (of("check.rtt_stddev"), Value::Null),
+                (of("check.host_key"), Value::Null),
+                (of("check.sign_in_methods"), Value::Null),
+                (of("check.password_sign_in"), Value::Null),
+                (of("check.search"), Value::Null),
+                (of("check.round_trip"), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no checks, or none run yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            let nothing: Vec<(String, Value)> = CHECK_METRICS
+                .iter()
+                .map(|metric| (metric.to_string(), Value::Null))
+                .collect();
+            assert_eq!(said(&none), nothing);
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn a_check_says_what_it_found_whatever_its_kind_and_one_of_no_kind_might_say_anything() {
+        let collector = checking_nothing();
+        let output = json!([
+            // Not something a TCP check finds out, but it's there.
+            { "name": "port", "kind": "tcp", "up": 1, "records": 2,
+              "memory_used_bytes": 1, "memory_limit_bytes": 4 },
+            // One the agent couldn't run says only that, and why.
+            { "name": "nowhere", "up": 0, "error": "the agent's config has no check named \"nowhere\"" },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said_of(&entries, "port"),
+            [
+                (of("check.up"), json!(1)),
+                (of("check.kind"), json!("tcp")),
+                (of("check.error"), Value::Null),
+                (of("check.response"), Value::Null),
+                (of("check.dns"), Value::Null),
+                (of("check.connect"), Value::Null),
+                (of("check.records"), json!(2)),
+                (of("check.memory_used"), json!(1)),
+                (of("check.memory_limit"), json!(4)),
+                (of("check.memory_usage"), json!(25.0)),
+            ]
+        );
+        let nowhere = said_of(&entries, "nowhere");
+        let metrics: Vec<&str> = nowhere.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(metrics, CHECK_METRICS);
+        for (metric, value) in &nowhere {
+            let expected = match metric.as_str() {
+                "check.up" => json!(0),
+                "check.error" => json!("the agent's config has no check named \"nowhere\""),
+                _ => Value::Null,
+            };
+            assert_eq!(value, &expected, "{metric}");
+        }
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn what_a_check_that_never_finished_reports_becomes_entries() {
+        let collector = checking_nothing();
+        let ping = Check::new("gateway", CheckKind::Ping, "192.0.2.1");
+        let web = Check::new("site", CheckKind::Http, "https://example.com/");
+        let output = json!([
+            timed_out_report(&ping),
+            failed_report(&web, FAILED_UNEXPECTEDLY)
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said_of(&entries, "gateway"),
+            [
+                (of("check.up"), json!(0)),
+                (of("check.kind"), json!("ping")),
+                (of("check.error"), json!("timed out")),
+                (of("check.response"), Value::Null),
+                (of("check.dns"), Value::Null),
+                (of("check.packet_loss"), Value::Null),
+                (of("check.rtt_min"), Value::Null),
+                (of("check.rtt_max"), Value::Null),
+                (of("check.rtt_stddev"), Value::Null),
+            ]
+        );
+        let site = said_of(&entries, "site");
+        assert_eq!(site[0], (of("check.up"), json!(0)));
+        assert_eq!(site[2], (of("check.error"), json!(FAILED_UNEXPECTEDLY)));
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn running_no_checks_really_collects_nothing_for_each_metric() {
+        let mut collector = checking_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     #[test]
     fn the_collector_reports_what_its_checks_found() {

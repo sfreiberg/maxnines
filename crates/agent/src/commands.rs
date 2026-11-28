@@ -19,6 +19,9 @@ use crate::background::{Background, FAILED_UNEXPECTEDLY};
 use crate::collector::Collector;
 use crate::custom::{Failure, run_command};
 use anyhow::{Result, ensure};
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::is_custom_metric_name;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -139,7 +142,45 @@ impl Collector for CommandCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &COMMAND_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = items
+            .iter()
+            .filter_map(|item| Some((item.get("name")?.as_str()?, item)));
+        for (name, item) in named {
+            // A plugin's own item has its status, and each of its values is an item
+            // of its own without one.
+            if item.get("status").is_none() {
+                entries.read("command.value", &[name], at(item, "value"));
+                continue;
+            }
+            // One that couldn't be run is unknown, which is a status like any
+            // other, and its message says why.
+            entries.read("command.status", &[name], at(item, "status"));
+            entries.read("command.ok", &[name], at(item, "ok"));
+            entries.read("command.message", &[name], filled(at(item, "message")));
+        }
+        // With no plugins, none run yet, or none that gave a value, the metric has
+        // nothing.
+        entries.fill(&COMMAND_METRICS);
+        entries.done()
+    }
 }
+
+/// A plugin's metrics: how it exited, whether that was OK, the first line it
+/// printed, and each value of its performance data.
+const COMMAND_METRICS: [&str; 4] = [
+    "command.status",
+    "command.ok",
+    "command.message",
+    "command.value",
+];
 
 /// How a plugin's run went.
 #[derive(Debug, PartialEq)]
@@ -324,6 +365,112 @@ fn reading_value(reading: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// Running nothing, so no program is started.
+    fn running_nothing() -> CommandCollector {
+        CommandCollector::new(Vec::new(), &CheckCommands::new(), Duration::from_secs(3600)).unwrap()
+    }
+
+    #[test]
+    fn command_entries_have_a_series_for_each_plugin_and_each_of_its_values() {
+        let collector = running_nothing();
+        let output = json!([
+            { "name": "load", "status": 1, "ok": 0, "message": "LOAD WARNING" },
+            { "name": "load.load1", "value": 4.5 },
+            // It printed nothing to say why.
+            { "name": "raid", "status": 0, "ok": 1, "message": "" },
+            // One that couldn't be run is unknown, and says why.
+            { "name": "backup", "status": 3, "ok": 0, "message": "timed out" },
+            // A status with nothing else said.
+            { "name": "odd", "status": 2 },
+            // A value that isn't a number.
+            { "name": "odd.size" },
+            // One without a name can't be told from the others.
+            { "status": 0, "ok": 1 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("command.status[load]"), json!(1)),
+                (of("command.ok[load]"), json!(0)),
+                (of("command.message[load]"), json!("LOAD WARNING")),
+                (of("command.value[load.load1]"), json!(4.5)),
+                (of("command.status[raid]"), json!(0)),
+                (of("command.ok[raid]"), json!(1)),
+                (of("command.message[raid]"), Value::Null),
+                (of("command.status[backup]"), json!(3)),
+                (of("command.ok[backup]"), json!(0)),
+                (of("command.message[backup]"), json!("timed out")),
+                (of("command.status[odd]"), json!(2)),
+                (of("command.ok[odd]"), Value::Null),
+                (of("command.message[odd]"), Value::Null),
+                (of("command.value[odd.size]"), Value::Null),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no plugins, or none run yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(
+                said(&none),
+                [
+                    (of("command.status"), Value::Null),
+                    (of("command.ok"), Value::Null),
+                    (of("command.message"), Value::Null),
+                    (of("command.value"), Value::Null),
+                ]
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn what_a_plugin_reports_becomes_entries() {
+        let collector = running_nothing();
+        let worked = Outcome {
+            status: OK,
+            message: "DISK OK".to_string(),
+            values: BTreeMap::from([("/".to_string(), 2048.0)]),
+        };
+        let mut output = worked.report("disk");
+        output.extend(Outcome::problem(NOT_DEFINED).report("gone"));
+        let entries = collector.entries(&Value::Array(output), time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("command.status[disk]"), json!(0)),
+                (of("command.ok[disk]"), json!(1)),
+                (of("command.message[disk]"), json!("DISK OK")),
+                (of("command.value[disk./]"), json!(2048.0)),
+                (of("command.status[gone]"), json!(3)),
+                (of("command.ok[gone]"), json!(0)),
+                (of("command.message[gone]"), json!(NOT_DEFINED)),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // A plugin with no values leaves that metric with nothing.
+        let output = Value::Array(Outcome::problem(NOT_DEFINED).report("gone"));
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries).last(),
+            Some(&(of("command.value"), Value::Null))
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn running_no_plugins_really_collects_nothing_for_each_metric() {
+        let mut collector = running_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     fn command(command: &[&str]) -> CheckCommand {
         CheckCommand {

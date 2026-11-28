@@ -6,14 +6,19 @@
 //! Running totals, such as requests served, are turned into the change since the
 //! page was last read here, as the server expects for a rate. A page that stops
 //! answering starts afresh when it's back, rather than counting the gap as one burst.
+//! Each total is also there as the page gave it, under its name with `_total`
+//! added, which is what its entry says.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use maxnines_checks::fetch_page;
+use maxnines_collectors::entries::{Entries, at, filled, percent};
 use maxnines_protocol::default_status_page;
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::totals::Change;
 use serde_json::{Map, Value, json};
 
@@ -83,7 +88,128 @@ impl Software {
             Self::PhpFpm => read_php_fpm(text),
         }
     }
+
+    /// Whether a page answered, which every page says.
+    fn up(self) -> &'static str {
+        match self {
+            Self::Apache => "apache.up",
+            Self::Nginx => "nginx.up",
+            Self::PhpFpm => "php_fpm.up",
+        }
+    }
+
+    /// A page's metrics that are read as they are, and what each is read from. A
+    /// running total is read as the page gave it, not as its change.
+    fn fields(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::Apache => &APACHE_FIELDS,
+            Self::Nginx => &NGINX_FIELDS,
+            Self::PhpFpm => &PHP_FPM_FIELDS,
+        }
+    }
+
+    /// Every metric a page has.
+    fn metrics(self) -> &'static [&'static str] {
+        match self {
+            Self::Apache => &APACHE_METRICS,
+            Self::Nginx => &NGINX_METRICS,
+            Self::PhpFpm => &PHP_FPM_METRICS,
+        }
+    }
+
+    /// What was read of each page, as entries. It's apart from the collector so it
+    /// can be tried without one, which would ask for a page.
+    fn entries(self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let pages = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = pages
+            .iter()
+            .filter_map(|page| Some((page.get("name")?.as_str()?, page)));
+        for (name, page) in named {
+            let series = [name];
+            // A page that didn't answer is a value of whether it's up, and why is
+            // the error of everything it would have said.
+            entries.read(self.up(), &series, at(page, "up"));
+            let why = filled(at(page, "error")).as_str();
+            if self == Self::Apache {
+                let usage = percent(at(page, "busy_workers"), at(page, "worker_slots"));
+                match why {
+                    Some(why) if usage.is_none() => {
+                        entries.error("apache.worker_usage", &series, why);
+                    }
+                    _ => entries.number("apache.worker_usage", &series, usage),
+                }
+            }
+            for (metric, field) in self.fields() {
+                let read = at(page, field);
+                match why {
+                    Some(why) if read.is_null() => entries.error(metric, &series, why),
+                    _ => entries.read(metric, &series, read),
+                }
+            }
+        }
+        // With no pages, or none read yet, each metric has nothing.
+        entries.fill(self.metrics());
+        entries.done()
+    }
 }
+
+const APACHE_FIELDS: [(&str, &str); 8] = [
+    ("apache.requests", "requests_total"),
+    ("apache.traffic", "bytes_total"),
+    ("apache.busy_workers", "busy_workers"),
+    ("apache.idle_workers", "idle_workers"),
+    ("apache.worker_slots", "worker_slots"),
+    ("apache.connections", "connections"),
+    ("apache.cpu_load", "cpu_load"),
+    ("apache.uptime", "uptime_secs"),
+];
+
+const NGINX_FIELDS: [(&str, &str); 7] = [
+    ("nginx.connections", "connections"),
+    ("nginx.requests", "requests_total"),
+    ("nginx.accepted", "accepted_total"),
+    ("nginx.dropped", "dropped_total"),
+    ("nginx.reading", "reading"),
+    ("nginx.writing", "writing"),
+    ("nginx.waiting", "waiting"),
+];
+
+const PHP_FPM_FIELDS: [(&str, &str); 8] = [
+    ("php_fpm.requests", "requests_total"),
+    ("php_fpm.active_processes", "active_processes"),
+    ("php_fpm.idle_processes", "idle_processes"),
+    ("php_fpm.total_processes", "total_processes"),
+    ("php_fpm.listen_queue", "listen_queue"),
+    ("php_fpm.max_children_reached", "max_children_reached_total"),
+    ("php_fpm.slow_requests", "slow_requests_total"),
+    ("php_fpm.uptime", "uptime_secs"),
+];
+
+/// Every metric of a page: what's said or worked out apart from its fields, then
+/// each field's.
+const fn metrics_of<const METRICS: usize>(
+    first: &[&'static str],
+    fields: &[(&'static str, &'static str)],
+) -> [&'static str; METRICS] {
+    assert!(first.len() + fields.len() == METRICS);
+    let mut metrics = [""; METRICS];
+    let mut at = 0;
+    while at < METRICS {
+        metrics[at] = if at < first.len() {
+            first[at]
+        } else {
+            fields[at - first.len()].0
+        };
+        at += 1;
+    }
+    metrics
+}
+
+const APACHE_METRICS: [&str; 10] =
+    metrics_of(&["apache.up", "apache.worker_usage"], &APACHE_FIELDS);
+const NGINX_METRICS: [&str; 8] = metrics_of(&["nginx.up"], &NGINX_FIELDS);
+const PHP_FPM_METRICS: [&str; 9] = metrics_of(&["php_fpm.up"], &PHP_FPM_FIELDS);
 
 /// What a page is called on charts: its address without the query, which is
 /// only ever options such as `?auto` or `?json`.
@@ -273,6 +399,7 @@ impl Totals {
             if let Some(change) = self.0.entry(name).or_default().update(Some(total)) {
                 row[name] = json!(change);
             }
+            row[format!("{name}_total")] = json!(total);
         }
         row
     }
@@ -330,6 +457,14 @@ impl Collector for StatusPageCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        self.software.metrics()
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        self.software.entries(output, time)
+    }
 }
 
 #[cfg(test)]
@@ -341,6 +476,286 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// A collector of one software's pages that reads none, so nothing is asked
+    /// for. Made with no addresses, it would ask for the usual one.
+    fn reading_nothing(software: Software) -> StatusPageCollector {
+        StatusPageCollector {
+            software,
+            background: Background::new(),
+        }
+    }
+
+    #[test]
+    fn apache_entries_have_a_series_for_each_page() {
+        let collector = reading_nothing(Software::Apache);
+        let output = json!([
+            { "name": "http://localhost/server-status", "up": 1,
+              "busy_workers": 3.0, "idle_workers": 72.0, "worker_slots": 15.0,
+              "connections": 4.0, "cpu_load": 0.0234, "uptime_secs": 86400.0,
+              "requests": 30, "requests_total": 12000,
+              "bytes": 1024, "bytes_total": 2097152 },
+            // Without ExtendedStatus, and read for the first time.
+            { "name": "http://web2/server-status", "up": 1, "busy_workers": 1.0 },
+            { "name": "http://web3/server-status", "up": 0, "error": "timed out" },
+            // One without a name can't be told from the others.
+            { "up": 1, "busy_workers": 2.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        let timed_out = || json!({ "error": "timed out" });
+        assert_eq!(
+            said(&entries),
+            [
+                (of("apache.up[http://localhost/server-status]"), json!(1)),
+                (
+                    of("apache.worker_usage[http://localhost/server-status]"),
+                    json!(20.0)
+                ),
+                // The running totals, not their changes.
+                (
+                    of("apache.requests[http://localhost/server-status]"),
+                    json!(12000)
+                ),
+                (
+                    of("apache.traffic[http://localhost/server-status]"),
+                    json!(2097152)
+                ),
+                (
+                    of("apache.busy_workers[http://localhost/server-status]"),
+                    json!(3.0)
+                ),
+                (
+                    of("apache.idle_workers[http://localhost/server-status]"),
+                    json!(72.0)
+                ),
+                (
+                    of("apache.worker_slots[http://localhost/server-status]"),
+                    json!(15.0)
+                ),
+                (
+                    of("apache.connections[http://localhost/server-status]"),
+                    json!(4.0)
+                ),
+                (
+                    of("apache.cpu_load[http://localhost/server-status]"),
+                    json!(0.0234)
+                ),
+                (
+                    of("apache.uptime[http://localhost/server-status]"),
+                    json!(86400.0)
+                ),
+                (of("apache.up[http://web2/server-status]"), json!(1)),
+                (
+                    of("apache.worker_usage[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.requests[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (of("apache.traffic[http://web2/server-status]"), Value::Null),
+                (
+                    of("apache.busy_workers[http://web2/server-status]"),
+                    json!(1.0)
+                ),
+                (
+                    of("apache.idle_workers[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.worker_slots[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.connections[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (
+                    of("apache.cpu_load[http://web2/server-status]"),
+                    Value::Null
+                ),
+                (of("apache.uptime[http://web2/server-status]"), Value::Null),
+                // Not answering is what was found, and why is the error of
+                // everything the page would have said.
+                (of("apache.up[http://web3/server-status]"), json!(0)),
+                (
+                    of("apache.worker_usage[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.requests[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (of("apache.traffic[http://web3/server-status]"), timed_out()),
+                (
+                    of("apache.busy_workers[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.idle_workers[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.worker_slots[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.connections[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (
+                    of("apache.cpu_load[http://web3/server-status]"),
+                    timed_out()
+                ),
+                (of("apache.uptime[http://web3/server-status]"), timed_out()),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn nginx_entries_have_a_series_for_each_page() {
+        let collector = reading_nothing(Software::Nginx);
+        let output = json!([
+            { "name": "a", "up": 1, "connections": 291.0, "reading": 6.0,
+              "writing": 179.0, "waiting": 106.0,
+              "requests": 30, "requests_total": 31070465,
+              "accepted": 5, "accepted_total": 16630948,
+              "dropped": 1, "dropped_total": 8 },
+            { "name": "b", "up": 0, "error": NOT_NGINX },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        let not_nginx = || json!({ "error": NOT_NGINX });
+        assert_eq!(
+            said(&entries),
+            [
+                (of("nginx.up[a]"), json!(1)),
+                (of("nginx.connections[a]"), json!(291.0)),
+                (of("nginx.requests[a]"), json!(31070465)),
+                (of("nginx.accepted[a]"), json!(16630948)),
+                (of("nginx.dropped[a]"), json!(8)),
+                (of("nginx.reading[a]"), json!(6.0)),
+                (of("nginx.writing[a]"), json!(179.0)),
+                (of("nginx.waiting[a]"), json!(106.0)),
+                (of("nginx.up[b]"), json!(0)),
+                (of("nginx.connections[b]"), not_nginx()),
+                (of("nginx.requests[b]"), not_nginx()),
+                (of("nginx.accepted[b]"), not_nginx()),
+                (of("nginx.dropped[b]"), not_nginx()),
+                (of("nginx.reading[b]"), not_nginx()),
+                (of("nginx.writing[b]"), not_nginx()),
+                (of("nginx.waiting[b]"), not_nginx()),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn php_fpm_entries_have_a_series_for_each_pool() {
+        let collector = reading_nothing(Software::PhpFpm);
+        let output = json!([
+            { "name": "a", "up": 1, "listen_queue": 2.0, "idle_processes": 4.0,
+              "active_processes": 1.0, "total_processes": 5.0, "uptime_secs": 3600.0,
+              "requests": 10, "requests_total": 5000,
+              "max_children_reached": 0, "max_children_reached_total": 1,
+              "slow_requests_total": 7 },
+            { "name": "b", "up": 0, "error": "timed out" },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        let timed_out = || json!({ "error": "timed out" });
+        assert_eq!(
+            said(&entries),
+            [
+                (of("php_fpm.up[a]"), json!(1)),
+                (of("php_fpm.requests[a]"), json!(5000)),
+                (of("php_fpm.active_processes[a]"), json!(1.0)),
+                (of("php_fpm.idle_processes[a]"), json!(4.0)),
+                (of("php_fpm.total_processes[a]"), json!(5.0)),
+                (of("php_fpm.listen_queue[a]"), json!(2.0)),
+                (of("php_fpm.max_children_reached[a]"), json!(1)),
+                (of("php_fpm.slow_requests[a]"), json!(7)),
+                (of("php_fpm.uptime[a]"), json!(3600.0)),
+                (of("php_fpm.up[b]"), json!(0)),
+                (of("php_fpm.requests[b]"), timed_out()),
+                (of("php_fpm.active_processes[b]"), timed_out()),
+                (of("php_fpm.idle_processes[b]"), timed_out()),
+                (of("php_fpm.total_processes[b]"), timed_out()),
+                (of("php_fpm.listen_queue[b]"), timed_out()),
+                (of("php_fpm.max_children_reached[b]"), timed_out()),
+                (of("php_fpm.slow_requests[b]"), timed_out()),
+                (of("php_fpm.uptime[b]"), timed_out()),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn with_no_pages_or_none_read_yet_each_metric_has_nothing() {
+        for software in [Software::Apache, Software::Nginx, Software::PhpFpm] {
+            let mut collector = reading_nothing(software);
+            assert_eq!(collector.collect().unwrap(), json!([]));
+            for output in [json!([]), Value::Null] {
+                let none = collector.entries(&output, time());
+                let nothing: Vec<(String, Value)> = collector
+                    .metrics()
+                    .iter()
+                    .map(|metric| (metric.to_string(), Value::Null))
+                    .collect();
+                assert_eq!(said(&none), nothing);
+                every_metric_has_an_entry(&collector, &none);
+            }
+        }
+    }
+
+    #[test]
+    fn what_a_page_says_becomes_entries_of_its_running_totals() {
+        let collector = reading_nothing(Software::Nginx);
+        let mut totals = Totals::default();
+        // The first read has no change, and still has its totals.
+        let first = totals.row("p", read_nginx(NGINX).map_err(str::to_string));
+        assert!(first.get("requests").is_none(), "{first}");
+        assert_eq!(first["requests_total"], 31070465);
+        let entries = collector.entries(&json!([first]), time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("nginx.up[p]"), json!(1)),
+                (of("nginx.connections[p]"), json!(291.0)),
+                (of("nginx.requests[p]"), json!(31070465)),
+                (of("nginx.accepted[p]"), json!(16630948)),
+                (of("nginx.dropped[p]"), json!(8)),
+                (of("nginx.reading[p]"), json!(6.0)),
+                (of("nginx.writing[p]"), json!(179.0)),
+                (of("nginx.waiting[p]"), json!(106.0)),
+            ]
+        );
+
+        let down = totals.row("p", Err(TIMED_OUT.to_string()));
+        let entries = collector.entries(&json!([down]), time());
+        assert_eq!(said(&entries)[0], (of("nginx.up[p]"), json!(0)));
+        assert_eq!(
+            said(&entries)[1],
+            (of("nginx.connections[p]"), json!({ "error": TIMED_OUT }))
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        for (software, page) in [(Software::Apache, APACHE), (Software::PhpFpm, PHP_FPM)] {
+            let collector = reading_nothing(software);
+            let row = Totals::default().row("p", software.read(page).map_err(str::to_string));
+            let entries = collector.entries(&json!([row]), time());
+            every_metric_has_an_entry(&collector, &entries);
+            // Everything these pages say is there, so every metric has a value.
+            assert!(
+                said(&entries).iter().all(|(_, value)| !value.is_null()),
+                "{entries:?}"
+            );
+        }
+    }
 
     const APACHE: &str = "localhost
 ServerVersion: Apache/2.4.62 (Debian)

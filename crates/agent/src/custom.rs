@@ -15,6 +15,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Result, ensure};
+use chrono::{DateTime, Utc};
+use maxnines_collectors::entries::{Entries, at, filled};
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::is_custom_metric_name;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -139,7 +142,43 @@ impl Collector for CustomCollector {
     fn collect(&mut self) -> Result<Value> {
         Ok(self.background.rows())
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &CUSTOM_METRICS
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let items = output.as_array().map(Vec::as_slice).unwrap_or_default();
+        let named = items
+            .iter()
+            .filter_map(|item| Some((item.get("name")?.as_str()?, item)));
+        for (name, item) in named {
+            let value = at(item, "value");
+            // One of a command's several values, which says nothing of whether the
+            // command worked.
+            if item.get("ok").is_none() {
+                entries.read("custom.value", &[name], value);
+                continue;
+            }
+            // A command that failed is a value of whether it worked, and why is the
+            // error of the value it didn't give. Its own item says something of
+            // its value every time, so the error ends when it works again, even
+            // when its values are items of their own.
+            entries.read("custom.ok", &[name], at(item, "ok"));
+            match filled(at(item, "error")).as_str() {
+                Some(why) if value.is_null() => entries.error("custom.value", &[name], why),
+                _ => entries.read("custom.value", &[name], value),
+            }
+        }
+        // With no commands, or none run yet, each metric has nothing.
+        entries.fill(&CUSTOM_METRICS);
+        entries.done()
+    }
 }
+
+/// A custom metric's metrics: whether its command worked, and each value it gave.
+const CUSTOM_METRICS: [&str; 2] = ["custom.ok", "custom.value"];
 
 /// What a command printed.
 #[derive(Debug, PartialEq)]
@@ -393,6 +432,90 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::collector::test_entries::{every_metric_has_an_entry, said, time};
+
+    /// Running nothing, so no program is started.
+    fn running_nothing() -> CustomCollector {
+        CustomCollector::new(Vec::new(), &Definitions::new(), Duration::from_secs(3600)).unwrap()
+    }
+
+    #[test]
+    fn custom_entries_have_a_series_for_each_command_and_each_of_its_values() {
+        let collector = running_nothing();
+        let output = json!([
+            { "name": "queue", "ok": 1, "value": 12.0 },
+            // One that gave several values, each an item of its own.
+            { "name": "app", "ok": 1 },
+            { "name": "app.jobs", "value": 3.0 },
+            { "name": "app.workers" },
+            // One that failed says why.
+            { "name": "backup", "ok": 0, "error": "timed out" },
+            // One without a name can't be told from the others.
+            { "ok": 1, "value": 1.0 },
+        ]);
+        let entries = collector.entries(&output, time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("custom.ok[queue]"), json!(1)),
+                (of("custom.value[queue]"), json!(12.0)),
+                (of("custom.ok[app]"), json!(1)),
+                (of("custom.value[app]"), Value::Null),
+                (of("custom.value[app.jobs]"), json!(3.0)),
+                (of("custom.value[app.workers]"), Value::Null),
+                // Failing is what it found, and why is the error of its value.
+                (of("custom.ok[backup]"), json!(0)),
+                (of("custom.value[backup]"), json!({ "error": "timed out" })),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // With no commands, or none run yet, each metric has nothing.
+        for output in [json!([]), Value::Null] {
+            let none = collector.entries(&output, time());
+            assert_eq!(
+                said(&none),
+                [
+                    (of("custom.ok"), Value::Null),
+                    (of("custom.value"), Value::Null),
+                ]
+            );
+            every_metric_has_an_entry(&collector, &none);
+        }
+    }
+
+    #[test]
+    fn what_a_command_reports_becomes_entries() {
+        let collector = running_nothing();
+        let several = Reading::Several(BTreeMap::from([("app.jobs".to_string(), 3.0)]));
+        let mut output = report("queue", Ok(Reading::One(12.0)));
+        output.extend(report("app", Ok(several)));
+        output.extend(report("gone", Err(NOT_DEFINED.to_string())));
+        let entries = collector.entries(&Value::Array(output), time());
+        let of = |name: &str| name.to_string();
+        assert_eq!(
+            said(&entries),
+            [
+                (of("custom.ok[queue]"), json!(1)),
+                (of("custom.value[queue]"), json!(12.0)),
+                (of("custom.ok[app]"), json!(1)),
+                (of("custom.value[app]"), Value::Null),
+                (of("custom.value[app.jobs]"), json!(3.0)),
+                (of("custom.ok[gone]"), json!(0)),
+                (of("custom.value[gone]"), json!({ "error": NOT_DEFINED })),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    #[test]
+    fn running_no_commands_really_collects_nothing_for_each_metric() {
+        let mut collector = running_nothing();
+        let output = collector.collect().unwrap();
+        assert_eq!(output, json!([]));
+        every_metric_has_an_entry(&collector, &collector.entries(&output, time()));
+    }
 
     fn metric(command: &[&str]) -> CustomMetric {
         CustomMetric {
