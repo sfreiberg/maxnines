@@ -6,7 +6,8 @@ use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::Result;
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
+use maxnines_protocol::entries::Entry;
 use maxnines_protocol::totals::{Change, change};
 use serde_json::{Value, json};
 use sysinfo::{Disk, Disks, InterfaceOperationalState, Networks, System};
@@ -14,6 +15,7 @@ use systemstat::Platform;
 
 use crate::Collector;
 use crate::disk_activity::DiskActivity;
+use crate::entries::{Entries, at, percent};
 use crate::file_systems;
 use crate::interface_drops::{self, Drops};
 use crate::system::{self, CpuTime};
@@ -77,8 +79,11 @@ impl Collector for CpuCollector {
         let per_core: Vec<f32> = self.system.cpus().iter().map(|c| c.usage()).collect();
         let load = System::load_average().ok();
         let (context_switches, interrupts) = self.count();
+        let (context_switches_total, interrupts_total) = system::cpu_counters();
 
         Ok(json!({
+            "context_switches_total": context_switches_total,
+            "interrupts_total": interrupts_total,
             "usage_percent": self.system.global_cpu_usage(),
             "per_core_percent": per_core,
             "time_percent": self.time.measure(),
@@ -91,7 +96,69 @@ impl Collector for CpuCollector {
             })),
         }))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &[
+            "cpu.usage",
+            "cpu.cores",
+            "cpu.load",
+            "cpu.time",
+            "cpu.context_switches",
+            "cpu.interrupts",
+        ]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        entries.read("cpu.usage", &["CPU"], at(output, "usage_percent"));
+        match at(output, "per_core_percent").as_array() {
+            Some(cores) if !cores.is_empty() => {
+                for (index, core) in cores.iter().enumerate() {
+                    entries.read("cpu.cores", &[&index.to_string()], core);
+                }
+            }
+            _ => entries.nothing("cpu.cores", &[]),
+        }
+        // Windows has no load average.
+        for (series, field) in [
+            ("1 minute", "load_average.one"),
+            ("5 minutes", "load_average.five"),
+            ("15 minutes", "load_average.fifteen"),
+        ] {
+            entries.read("cpu.load", &[series], at(output, field));
+        }
+        for (series, field) in CPU_TIMES {
+            entries.read(
+                "cpu.time",
+                &[series],
+                at(output, &format!("time_percent.{field}")),
+            );
+        }
+        // Running totals since the host started.
+        entries.read(
+            "cpu.context_switches",
+            &["Switches"],
+            at(output, "context_switches_total"),
+        );
+        entries.read(
+            "cpu.interrupts",
+            &["Interrupts"],
+            at(output, "interrupts_total"),
+        );
+        entries.done()
+    }
 }
+
+/// The kinds of processor time, as a series is called and as it's read.
+const CPU_TIMES: [(&str, &str); 7] = [
+    ("User", "user"),
+    ("System", "system"),
+    ("Nice", "nice"),
+    ("Interrupt", "interrupt"),
+    ("I/O wait", "iowait"),
+    ("Steal", "steal"),
+    ("Idle", "idle"),
+];
 
 pub struct MemoryCollector {
     system: System,
@@ -127,7 +194,10 @@ impl Collector for MemoryCollector {
     fn collect(&mut self) -> Result<Value> {
         self.system.refresh_memory();
         let (swap_in, swap_out) = self.count();
+        let (swap_in_total, swap_out_total) = system::swap_counters();
         Ok(json!({
+            "swap_in_pages_total": swap_in_total,
+            "swap_out_pages_total": swap_out_total,
             "detail": system::memory_detail(&self.stats),
             "swap_in_pages": swap_in,
             "swap_out_pages": swap_out,
@@ -138,7 +208,78 @@ impl Collector for MemoryCollector {
             "swap_used_bytes": self.system.used_swap(),
         }))
     }
+
+    fn metrics(&self) -> &'static [&'static str] {
+        &[
+            "memory.usage",
+            "memory.total",
+            "memory.used",
+            "memory.available",
+            "memory.swap_total",
+            "memory.swap_used",
+            "memory.detail",
+            "memory.swap_activity",
+        ]
+    }
+
+    fn entries(&self, output: &Value, time: DateTime<Utc>) -> Vec<Entry> {
+        let mut entries = Entries::at(time);
+        let memory = percent(at(output, "used_bytes"), at(output, "total_bytes"));
+        entries.number("memory.usage", &["Memory"], memory);
+        // A host with no swap has no share of it in use.
+        let swap = percent(
+            at(output, "swap_used_bytes"),
+            at(output, "swap_total_bytes"),
+        );
+        entries.number("memory.usage", &["Swap"], swap);
+        for (metric, field) in [
+            ("memory.total", "total_bytes"),
+            ("memory.used", "used_bytes"),
+            ("memory.available", "available_bytes"),
+            ("memory.swap_total", "swap_total_bytes"),
+            ("memory.swap_used", "swap_used_bytes"),
+        ] {
+            entries.read(metric, &[], at(output, field));
+        }
+        // Each system has its own kinds, so the others have nothing.
+        for (series, field) in MEMORY_KINDS {
+            entries.read(
+                "memory.detail",
+                &[series],
+                at(output, &format!("detail.{field}")),
+            );
+        }
+        // Running totals since the host started.
+        entries.read(
+            "memory.swap_activity",
+            &["Pages in"],
+            at(output, "swap_in_pages_total"),
+        );
+        entries.read(
+            "memory.swap_activity",
+            &["Pages out"],
+            at(output, "swap_out_pages_total"),
+        );
+        entries.done()
+    }
 }
+
+/// The kinds of memory use, as a series is called and as it's read.
+const MEMORY_KINDS: [(&str, &str); 13] = [
+    ("Active", "active_bytes"),
+    ("Inactive", "inactive_bytes"),
+    ("Wired", "wired_bytes"),
+    ("Cached", "cached_bytes"),
+    ("Buffers", "buffers_bytes"),
+    ("Slab", "slab_bytes"),
+    ("Shared", "shared_bytes"),
+    ("Compressed", "compressed_bytes"),
+    ("Speculative", "speculative_bytes"),
+    ("Purgeable", "purgeable_bytes"),
+    ("ZFS cache", "zfs_arc_bytes"),
+    ("Page file", "page_file_bytes"),
+    ("Free", "free_bytes"),
+];
 
 pub struct DiskCollector {
     disks: Disks,
@@ -352,6 +493,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::entries::tests::{every_metric_has_an_entry, said, time};
 
     #[test]
     fn cpu_time_adds_up_to_the_whole_of_the_time_measured() {
@@ -388,6 +530,112 @@ mod tests {
             "free_bytes"
         };
         assert!(output["detail"][reported].as_u64().is_some(), "{output}");
+    }
+
+    #[test]
+    fn cpu_entries_are_its_metrics_with_a_series_for_each_part() {
+        let output = json!({
+            "usage_percent": 12.5,
+            "per_core_percent": [10.0, 15.0],
+            "time_percent": { "user": 8.0, "system": 4.5, "idle": 87.5 },
+            "context_switches": 40, "context_switches_total": 9000,
+            "interrupts": 7, "interrupts_total": 800,
+            "load_average": { "one": 1.5, "five": 1.0, "fifteen": 0.5 },
+        });
+        let collector = CpuCollector::new().unwrap();
+        let entries = collector.entries(&output, time());
+        assert_eq!(
+            said(&entries),
+            [
+                ("cpu.usage[CPU]".to_string(), json!(12.5)),
+                ("cpu.cores[0]".to_string(), json!(10.0)),
+                ("cpu.cores[1]".to_string(), json!(15.0)),
+                ("cpu.load[1 minute]".to_string(), json!(1.5)),
+                ("cpu.load[5 minutes]".to_string(), json!(1.0)),
+                ("cpu.load[15 minutes]".to_string(), json!(0.5)),
+                ("cpu.time[User]".to_string(), json!(8.0)),
+                ("cpu.time[System]".to_string(), json!(4.5)),
+                // The kinds this system doesn't tell apart have nothing.
+                ("cpu.time[Nice]".to_string(), Value::Null),
+                ("cpu.time[Interrupt]".to_string(), Value::Null),
+                ("cpu.time[I/O wait]".to_string(), Value::Null),
+                ("cpu.time[Steal]".to_string(), Value::Null),
+                ("cpu.time[Idle]".to_string(), json!(87.5)),
+                // The running totals, not the change since the last sample.
+                ("cpu.context_switches[Switches]".to_string(), json!(9000)),
+                ("cpu.interrupts[Interrupts]".to_string(), json!(800)),
+            ]
+        );
+        every_metric_has_an_entry(&collector, &entries);
+
+        // Windows has no load average, and a first sample no times.
+        let bare = collector.entries(&json!({ "usage_percent": 3.0 }), time());
+        let bare = said(&bare);
+        assert!(bare.contains(&("cpu.cores".to_string(), Value::Null)));
+        assert!(bare.contains(&("cpu.load[1 minute]".to_string(), Value::Null)));
+        assert!(bare.contains(&("cpu.interrupts[Interrupts]".to_string(), Value::Null)));
+    }
+
+    #[test]
+    fn memory_entries_work_out_how_much_is_used() {
+        let output = json!({
+            "total_bytes": 1000, "used_bytes": 250, "available_bytes": 700,
+            "swap_total_bytes": 0, "swap_used_bytes": 0,
+            "detail": { "active_bytes": 100, "free_bytes": 600 },
+            "swap_in_pages": 1, "swap_in_pages_total": 50,
+            "swap_out_pages": 2, "swap_out_pages_total": 60,
+        });
+        let collector = MemoryCollector::new().unwrap();
+        let entries = collector.entries(&output, time());
+        let said = said(&entries);
+        assert_eq!(said[0], ("memory.usage[Memory]".to_string(), json!(25.0)));
+        // With no swap there's no share of it in use.
+        assert_eq!(said[1], ("memory.usage[Swap]".to_string(), Value::Null));
+        for (name, value) in [
+            ("memory.total", json!(1000)),
+            ("memory.used", json!(250)),
+            ("memory.available", json!(700)),
+            ("memory.swap_total", json!(0)),
+            ("memory.detail[Active]", json!(100)),
+            ("memory.detail[Free]", json!(600)),
+            ("memory.detail[Wired]", Value::Null),
+            ("memory.swap_activity[Pages in]", json!(50)),
+            ("memory.swap_activity[Pages out]", json!(60)),
+        ] {
+            assert!(
+                said.contains(&(name.to_string(), value.clone())),
+                "{name}: {said:?}"
+            );
+        }
+        every_metric_has_an_entry(&collector, &entries);
+    }
+
+    /// What a real collection says is entries for exactly the collector's metrics.
+    #[test]
+    fn what_cpu_and_memory_really_collect_becomes_entries_for_their_metrics() {
+        let mut cpu = CpuCollector::new().unwrap();
+        let output = cpu.collect().unwrap();
+        let entries = cpu.entries(&output, time());
+        every_metric_has_an_entry(&cpu, &entries);
+        assert!(
+            said(&entries)
+                .iter()
+                .any(|(name, value)| name == "cpu.usage[CPU]" && value.is_number())
+        );
+
+        let mut memory = MemoryCollector::new().unwrap();
+        let output = memory.collect().unwrap();
+        let entries = memory.entries(&output, time());
+        every_metric_has_an_entry(&memory, &entries);
+        let said = said(&entries);
+        assert!(
+            said.iter()
+                .any(|(name, value)| name == "memory.usage[Memory]" && value.is_number())
+        );
+        assert!(
+            said.iter()
+                .any(|(name, value)| name == "memory.total" && value.as_u64() > Some(0))
+        );
     }
 
     #[test]
